@@ -16,6 +16,12 @@ public sealed class AppSettings
     public bool AutoBlockInbound { get; set; } = true;
     public bool AutoBlockOutbound { get; set; } = true;
 
+    /// <summary>Geo lookups use the free ip-api.com endpoint over plain HTTP; set false to disable.</summary>
+    public bool GeoLookupEnabled { get; set; } = true;
+
+    /// <summary>Refresh the allowlist from this repo's GitHub feed; set false to use only local/built-in lists.</summary>
+    public bool AllowlistUseRemoteFeed { get; set; } = true;
+
     public ThreatLevel GetMinLevel()
     {
         return Enum.TryParse<ThreatLevel>(AutoBlockMinLevel, true, out var level)

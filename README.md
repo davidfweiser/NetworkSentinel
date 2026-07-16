@@ -43,7 +43,9 @@ Trusted sites are protected so auto-block (and manual block) will not cut off ev
 | **Your additions** | `%LocalAppData%\NetworkSentinel\allowlist.json` |
 | **Remote feed** | Optional refresh from this repo’s `allowlist-default.json` on GitHub |
 
-Domains are **DNS-resolved** to current IPs (cloud addresses change often). On startup, **Restore good sites** removes any Network Sentinel blocks that hit allowlisted IPs (recovery if GitHub/Grok were blocked earlier).
+Domains are **DNS-resolved** to current IPs (cloud addresses change often); if a DNS pass fails, the previously resolved IPs are kept so an outage never strips protection. `cidrs` entries (e.g. `"140.82.112.0/20"`) in any allowlist file protect whole address ranges. On startup, **Restore good sites** removes any Network Sentinel blocks that hit allowlisted IPs (recovery if GitHub/Grok were blocked earlier).
+
+Auto-block never touches allowlisted IPs. A **manual** block of an allowlisted IP asks for explicit confirmation instead of refusing outright.
 
 > **Note:** Turning auto-block **off** does **not** remove rules already created. Use **Unblock**, **Restore good sites**, **Remove**, or **Remove All** on the Firewall tab.
 
@@ -148,7 +150,9 @@ For firewall / auto-block, start the app **as administrator** (or use **Run as A
 ## Important notes
 
 - This is an **awareness console**, not a substitute for enterprise IDS, EDR, or carefully tuned host firewall policy.
-- Public IP geolocation uses the free `ip-api.com` endpoint (rate-limited, best-effort). LAN/private addresses are labeled as local.
+- Threat heuristics count **new inbound connections to ports this PC is listening on** — long-lived sessions and ordinary outbound client traffic are never treated as probing.
+- Public IP geolocation uses the free `ip-api.com` endpoint (rate-limited, best-effort, **plain HTTP** — remote IPs you talk to are visible on the wire). Set `"GeoLookupEnabled": false` in `%LocalAppData%\NetworkSentinel\settings.json` to disable it; reverse DNS still runs. LAN/private addresses are labeled as local.
+- Set `"AllowlistUseRemoteFeed": false` in the same file to skip the GitHub allowlist feed and use only built-in/local lists.
 - Some system sockets may show as `System` or `PID n` depending on permissions.
 - Existing TCP sessions may remain until they reconnect after a block; new matching traffic is stopped by the firewall.
 - For host hardening, also review Windows Security event **4625** (failed logons) and enable Firewall logging when needed.

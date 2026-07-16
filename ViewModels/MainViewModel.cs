@@ -16,8 +16,14 @@ public partial class MainViewModel : ObservableObject, IDisposable
     private readonly AppSettings _settings;
     private readonly DispatcherTimer _clockTimer;
     private readonly object _autoBlockGate = new();
-    private readonly HashSet<string> _autoBlockAttempted = new(StringComparer.OrdinalIgnoreCase);
+    // Attempt markers expire so a manually unblocked IP can be auto-blocked
+    // again later instead of being ignored until app restart.
+    private readonly Dictionary<string, DateTime> _autoBlockAttempted = new(StringComparer.OrdinalIgnoreCase);
+    private static readonly TimeSpan AutoBlockRetryAfter = TimeSpan.FromMinutes(10);
     private HashSet<string> _blockedIps = new(StringComparer.OrdinalIgnoreCase);
+    private DateTime _blockedIpsRefreshedAt = DateTime.MinValue;
+    private bool _blockedIpsRefreshInFlight;
+    private int _monitorRefreshQueued;
 
     [ObservableProperty] private string _clockText = DateTime.Now.ToString("dddd, MMM d  ·  HH:mm:ss");
     [ObservableProperty] private string _selectedNav = "Dashboard";
@@ -77,6 +83,8 @@ public partial class MainViewModel : ObservableObject, IDisposable
         _blockOutbound = _settings.AutoBlockOutbound;
 
         _firewall.Allowlist = _allowlist;
+        _monitor.GeoLookupsEnabled = _settings.GeoLookupEnabled;
+        _allowlist.UseRemoteFeed = _settings.AllowlistUseRemoteFeed;
         _monitor.Updated += OnMonitorUpdated;
         _monitor.ThreatsDetected += OnThreatsDetected;
         _monitor.Start();
@@ -133,9 +141,21 @@ public partial class MainViewModel : ObservableObject, IDisposable
         if (dispatcher == null) return;
 
         if (dispatcher.CheckAccess())
+        {
             RefreshCollections();
-        else
-            dispatcher.Invoke(RefreshCollections, DispatcherPriority.Background);
+            return;
+        }
+
+        // BeginInvoke (not Invoke) so the monitor thread never stalls behind
+        // the UI, with coalescing so refreshes don't pile up in the queue.
+        if (System.Threading.Interlocked.CompareExchange(ref _monitorRefreshQueued, 1, 0) != 0)
+            return;
+
+        dispatcher.BeginInvoke(() =>
+        {
+            System.Threading.Interlocked.Exchange(ref _monitorRefreshQueued, 0);
+            RefreshCollections();
+        }, DispatcherPriority.Background);
     }
 
     private void OnThreatsDetected(IReadOnlyList<ThreatEvent> threats)
@@ -143,20 +163,24 @@ public partial class MainViewModel : ObservableObject, IDisposable
         if (!AutoBlockEnabled || threats.Count == 0)
             return;
 
-        // Run auto-block off the UI thread; marshal status updates back.
-        try
+        // Run auto-block on the thread pool — firewall COM/netsh calls must
+        // not stall the monitor's polling loop.
+        _ = Task.Run(() =>
         {
-            ProcessAutoBlocks(threats);
-        }
-        catch (Exception ex)
-        {
-            var dispatcher = Application.Current?.Dispatcher;
-            dispatcher?.BeginInvoke(() =>
+            try
             {
-                FirewallMessage = $"Auto-block error: {ex.Message}";
-                UpdateAutoBlockStatusText();
-            });
-        }
+                ProcessAutoBlocks(threats);
+            }
+            catch (Exception ex)
+            {
+                var dispatcher = Application.Current?.Dispatcher;
+                dispatcher?.BeginInvoke(() =>
+                {
+                    FirewallMessage = $"Auto-block error: {ex.Message}";
+                    UpdateAutoBlockStatusText();
+                });
+            }
+        });
     }
 
     private void ProcessAutoBlocks(IReadOnlyList<ThreatEvent> threats)
@@ -200,15 +224,14 @@ public partial class MainViewModel : ObservableObject, IDisposable
 
             lock (_autoBlockGate)
             {
-                if (_autoBlockAttempted.Contains(ip) || _blockedIps.Contains(ip))
+                // Use the cached blocked set — enumerating firewall rules per
+                // threat (IsIpBlocked) is far too slow for this path.
+                if (_blockedIps.Contains(ip))
                     continue;
-                _autoBlockAttempted.Add(ip);
-            }
-
-            if (_firewall.IsIpBlocked(ip))
-            {
-                lock (_autoBlockGate) _blockedIps.Add(ip);
-                continue;
+                if (_autoBlockAttempted.TryGetValue(ip, out var lastAttempt) &&
+                    DateTime.UtcNow - lastAttempt < AutoBlockRetryAfter)
+                    continue;
+                _autoBlockAttempted[ip] = DateTime.UtcNow;
             }
 
             var reason = $"Auto-block · {threat.LevelText} · {threat.TypeText}: {threat.Title}";
@@ -240,9 +263,9 @@ public partial class MainViewModel : ObservableObject, IDisposable
 
     private void RefreshCollections()
     {
-        // Refresh blocked set periodically with monitor ticks (cheap when few rules)
-        try { _blockedIps = _firewall.GetBlockedIps(); }
-        catch { /* ignore */ }
+        // Blocked set refreshes on a background thread at most every 15s —
+        // enumerating all firewall rules on the UI thread each tick froze the UI.
+        RefreshBlockedIpsInBackground();
 
         foreach (var host in _monitor.RemoteHosts)
             host.IsBlocked = _blockedIps.Contains(host.IpAddress);
@@ -266,6 +289,39 @@ public partial class MainViewModel : ObservableObject, IDisposable
         HeroSubtitle = high > 0
             ? $"{high} high/critical · {blocked} blocked · {auto}"
             : $"{blocked} IPs blocked · {auto}";
+    }
+
+    private void RefreshBlockedIpsInBackground(bool force = false)
+    {
+        if (_blockedIpsRefreshInFlight)
+            return;
+        if (!force && DateTime.UtcNow - _blockedIpsRefreshedAt < TimeSpan.FromSeconds(15))
+            return;
+
+        _blockedIpsRefreshInFlight = true;
+        _ = Task.Run(() =>
+        {
+            HashSet<string>? set = null;
+            try { set = _firewall.GetBlockedIps(); }
+            catch { /* keep previous set */ }
+
+            var dispatcher = Application.Current?.Dispatcher;
+            if (dispatcher == null)
+            {
+                _blockedIpsRefreshInFlight = false;
+                return;
+            }
+
+            dispatcher.BeginInvoke(() =>
+            {
+                _blockedIpsRefreshInFlight = false;
+                _blockedIpsRefreshedAt = DateTime.UtcNow;
+                if (set == null) return;
+                _blockedIps = set;
+                foreach (var host in _monitor.RemoteHosts)
+                    host.IsBlocked = _blockedIps.Contains(host.IpAddress);
+            });
+        });
     }
 
     private static ThreatLevel ParseMinLevel(string value)
@@ -357,12 +413,32 @@ public partial class MainViewModel : ObservableObject, IDisposable
             t.Method.Contains(q, StringComparison.OrdinalIgnoreCase));
     }
 
-    private static void Sync<T>(ObservableCollection<T> target, IEnumerable<T> source)
+    /// <summary>
+    /// In-place diff against the target collection instead of Clear()+re-add.
+    /// The monitor hands out stable object instances, so removing the missing
+    /// and moving/inserting the rest preserves selection and scroll position.
+    /// </summary>
+    private static void Sync<T>(ObservableCollection<T> target, IEnumerable<T> source) where T : class
     {
         var list = source.ToList();
-        target.Clear();
-        foreach (var item in list)
-            target.Add(item);
+        var wanted = new HashSet<T>(list);
+
+        for (int i = target.Count - 1; i >= 0; i--)
+        {
+            if (!wanted.Contains(target[i]))
+                target.RemoveAt(i);
+        }
+
+        for (int i = 0; i < list.Count; i++)
+        {
+            var item = list[i];
+            int currentIndex = target.IndexOf(item);
+            if (currentIndex == i) continue;
+            if (currentIndex >= 0)
+                target.Move(currentIndex, i);
+            else
+                target.Insert(i, item);
+        }
     }
 
     partial void OnSearchTextChanged(string value) => RefreshCollections();
@@ -415,6 +491,7 @@ public partial class MainViewModel : ObservableObject, IDisposable
         try
         {
             _blockedIps = _firewall.GetBlockedIps();
+            _blockedIpsRefreshedAt = DateTime.UtcNow;
             var rules = _firewall.GetManagedRules();
             FirewallRules.Clear();
             foreach (var rule in rules)
@@ -543,8 +620,7 @@ public partial class MainViewModel : ObservableObject, IDisposable
             return;
         }
 
-        BlockIpInternal(ManualBlockIp.Trim(), "Manual block from Firewall tab");
-        if (_blockedIps.Contains(ManualBlockIp.Trim()) || FirewallMessage.Contains("Blocked", StringComparison.OrdinalIgnoreCase))
+        if (BlockIpInternal(ManualBlockIp.Trim(), "Manual block from Firewall tab"))
             ManualBlockIp = "";
     }
 
@@ -761,33 +837,47 @@ public partial class MainViewModel : ObservableObject, IDisposable
         }
     }
 
-    private void BlockIpInternal(string ip, string reason)
+    private bool BlockIpInternal(string ip, string reason)
     {
         if (!IsAdmin)
         {
             PromptElevation();
-            return;
+            return false;
         }
 
         if (!FirewallService.TryNormalizeIp(ip, out var normalized, out var error))
         {
             FirewallMessage = error;
             MessageBox.Show(error, "Block IP", MessageBoxButton.OK, MessageBoxImage.Warning);
-            return;
+            return false;
         }
 
         if (FirewallService.IsPrivateOrLocal(normalized))
         {
             FirewallMessage = "Private/local addresses are not blocked by default (would break LAN).";
             MessageBox.Show(FirewallMessage, "Block IP", MessageBoxButton.OK, MessageBoxImage.Information);
-            return;
+            return false;
         }
 
+        // Allowlisted IPs get a confirmed manual override instead of a hard
+        // refusal — shared cloud IPs can host hostile traffic too.
+        bool overrideAllowlist = false;
         if (_allowlist.IsAllowed(normalized, out var allowReason))
         {
-            FirewallMessage = $"Protected by allowlist — not blocked: {normalized} ({allowReason}).";
-            MessageBox.Show(FirewallMessage, "Allowlist protection", MessageBoxButton.OK, MessageBoxImage.Information);
-            return;
+            var overrideAnswer = MessageBox.Show(
+                $"{normalized} is protected by the allowlist ({allowReason}).\n\n" +
+                "Blocking it may break trusted services (GitHub, Microsoft, DNS, …).\n\nBlock it anyway?",
+                "Allowlist protection",
+                MessageBoxButton.YesNo,
+                MessageBoxImage.Warning);
+
+            if (overrideAnswer != MessageBoxResult.Yes)
+            {
+                FirewallMessage = $"Protected by allowlist — not blocked: {normalized} ({allowReason}).";
+                return false;
+            }
+
+            overrideAllowlist = true;
         }
 
         var direction = ResolveDirection();
@@ -797,9 +887,9 @@ public partial class MainViewModel : ObservableObject, IDisposable
             MessageBoxButton.YesNo,
             MessageBoxImage.Warning);
 
-        if (answer != MessageBoxResult.Yes) return;
+        if (answer != MessageBoxResult.Yes) return false;
 
-        var result = _firewall.BlockIp(normalized, direction, reason);
+        var result = _firewall.BlockIp(normalized, direction, reason, overrideAllowlist);
         FirewallMessage = result.Message;
         if (!result.Success)
             MessageBox.Show(result.Message, "Firewall", MessageBoxButton.OK, MessageBoxImage.Warning);
@@ -808,6 +898,7 @@ public partial class MainViewModel : ObservableObject, IDisposable
 
         RefreshFirewallRules();
         RefreshCollections();
+        return result.Success;
     }
 
     private void UnblockIpInternal(string ip)
@@ -819,6 +910,14 @@ public partial class MainViewModel : ObservableObject, IDisposable
         }
 
         var result = _firewall.UnblockIp(ip);
+        if (result.Success && FirewallService.TryNormalizeIp(ip, out var normalized, out _))
+        {
+            lock (_autoBlockGate)
+            {
+                _blockedIps.Remove(normalized);
+                _autoBlockAttempted.Remove(normalized);
+            }
+        }
         FirewallMessage = result.Message;
         if (!result.Success)
             MessageBox.Show(result.Message, "Firewall", MessageBoxButton.OK, MessageBoxImage.Warning);

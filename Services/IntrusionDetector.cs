@@ -6,6 +6,13 @@ namespace NetworkSentinel.Services;
 /// <summary>
 /// Heuristic intrusion / break-in attempt detector based on connection patterns.
 /// This is awareness tooling — not a full IDS/IPS replacement.
+///
+/// Counting model: a "hit" is recorded only when a connection key appears that
+/// was not present in the previous poll (a NEW connection event), never for a
+/// long-lived session that is simply still open. Heuristics only consider
+/// INBOUND events — connections landing on a local port this machine is
+/// actually listening on (or in SYN-RECEIVED) — so outbound ephemeral local
+/// ports from ordinary client traffic can never look like a port scan.
 /// </summary>
 public sealed class IntrusionDetector
 {
@@ -20,6 +27,7 @@ public sealed class IntrusionDetector
     public IReadOnlyList<ThreatEvent> Analyze(
         IReadOnlyList<NetworkConnection> snapshot,
         IReadOnlyDictionary<string, RemoteHost> knownHosts,
+        IReadOnlySet<int> listeningTcpPorts,
         DateTime now)
     {
         var threats = new List<ThreatEvent>();
@@ -27,7 +35,7 @@ public sealed class IntrusionDetector
         {
             PruneEmitHistory(now);
 
-            // Per-IP activity from this snapshot + recent history
+            // Group this snapshot's interesting connections by remote IP
             var byIp = new Dictionary<string, List<NetworkConnection>>(StringComparer.OrdinalIgnoreCase);
             foreach (var c in snapshot)
             {
@@ -48,14 +56,25 @@ public sealed class IntrusionDetector
                     _hosts[ip] = activity;
                 }
 
+                // Record an event only for connections that were NOT present
+                // last poll — i.e. genuinely new sessions, not resampled ones.
+                var currentKeys = new HashSet<string>(StringComparer.Ordinal);
                 foreach (var c in conns)
                 {
-                    activity.PortHits.Enqueue((now, c.LocalPort, c.State, c.RemotePort));
-                    activity.LastSeen = now;
+                    currentKeys.Add(c.Key);
+                    if (activity.ActiveKeys.Contains(c.Key))
+                        continue;
+
+                    bool inbound = listeningTcpPorts.Contains(c.LocalPort) ||
+                                   c.State == TcpConnectionState.SynReceived;
+                    activity.Events.Enqueue((now, c.LocalPort, c.State, inbound));
                 }
 
-                while (activity.PortHits.Count > 0 && now - activity.PortHits.Peek().Time > Window)
-                    activity.PortHits.Dequeue();
+                activity.ActiveKeys = currentKeys;
+                activity.LastSeen = now;
+
+                while (activity.Events.Count > 0 && now - activity.Events.Peek().Time > Window)
+                    activity.Events.Dequeue();
 
                 EvaluateHost(ip, activity, knownHosts, now, threats);
             }
@@ -76,7 +95,9 @@ public sealed class IntrusionDetector
         DateTime now,
         List<ThreatEvent> threats)
     {
-        var recent = activity.PortHits.ToList();
+        // Only inbound events count — outbound client connections use random
+        // ephemeral local ports and must never register as probing.
+        var recent = activity.Events.Where(e => e.Inbound).ToList();
         if (recent.Count == 0) return;
 
         var distinctLocalPorts = recent.Select(x => x.LocalPort).Distinct().Count();
@@ -93,12 +114,12 @@ public sealed class IntrusionDetector
             ? host.GeoSummary
             : "Origin resolving…";
 
-        // Port scan: many different local ports from one remote IP in a short window
+        // Port scan: many different local service ports hit from one remote IP in a short window
         if (distinctLocalPorts >= 8)
         {
             TryAdd(threats, now, ip, ThreatType.PortScan, ThreatLevel.High,
                 "Port scan pattern detected",
-                $"{ip} touched {distinctLocalPorts} different local ports within {Window.TotalSeconds:0}s.",
+                $"{ip} opened connections to {distinctLocalPorts} different local ports within {Window.TotalSeconds:0}s.",
                 origin,
                 "Sequential / multi-port probing");
         }
@@ -111,12 +132,12 @@ public sealed class IntrusionDetector
                 "Multi-port probing");
         }
 
-        // Brute-force style hammering of login services
+        // Brute-force style hammering of login services (repeated NEW sessions)
         if (rdpHits >= 6)
         {
             TryAdd(threats, now, ip, ThreatType.BruteForcePattern, ThreatLevel.Critical,
                 "RDP brute-force pattern",
-                $"{ip} opened {rdpHits} RDP (3389) related sessions/hits in {Window.TotalSeconds:0}s.",
+                $"{ip} opened {rdpHits} new RDP (3389) sessions in {Window.TotalSeconds:0}s.",
                 origin,
                 "Remote Desktop (TCP 3389) hammering");
         }
@@ -125,7 +146,7 @@ public sealed class IntrusionDetector
         {
             TryAdd(threats, now, ip, ThreatType.BruteForcePattern, ThreatLevel.High,
                 "SMB access burst",
-                $"{ip} generated {smbHits} SMB/NetBIOS hits in {Window.TotalSeconds:0}s.",
+                $"{ip} opened {smbHits} new SMB/NetBIOS sessions in {Window.TotalSeconds:0}s.",
                 origin,
                 "SMB / NetBIOS (445/139)");
         }
@@ -134,7 +155,7 @@ public sealed class IntrusionDetector
         {
             TryAdd(threats, now, ip, ThreatType.BruteForcePattern, ThreatLevel.High,
                 "SSH brute-force pattern",
-                $"{ip} generated {sshHits} SSH (22) hits in {Window.TotalSeconds:0}s.",
+                $"{ip} opened {sshHits} new SSH (22) sessions in {Window.TotalSeconds:0}s.",
                 origin,
                 "SSH (TCP 22) hammering");
         }
@@ -159,7 +180,7 @@ public sealed class IntrusionDetector
         {
             TryAdd(threats, now, ip, ThreatType.ManyShortConnections, ThreatLevel.Medium,
                 "Short-lived connection burst",
-                $"{ip} produced {shortLivedLike} non-established / transitional TCP states in {Window.TotalSeconds:0}s.",
+                $"{ip} produced {shortLivedLike} non-established / transitional inbound sessions in {Window.TotalSeconds:0}s.",
                 origin,
                 "Syn flood style / scan noise / flapping");
         }
@@ -168,7 +189,7 @@ public sealed class IntrusionDetector
         {
             TryAdd(threats, now, ip, ThreatType.RapidReconnect, ThreatLevel.Low,
                 "Rapid reconnect activity",
-                $"{ip} generated {recent.Count} connection events against few ports.",
+                $"{ip} opened {recent.Count} new inbound sessions against few ports.",
                 origin,
                 "High-frequency reconnects");
         }
@@ -224,7 +245,8 @@ public sealed class IntrusionDetector
 
     private sealed class HostActivity
     {
-        public Queue<(DateTime Time, int LocalPort, TcpConnectionState State, int RemotePort)> PortHits { get; } = new();
+        public Queue<(DateTime Time, int LocalPort, TcpConnectionState State, bool Inbound)> Events { get; } = new();
+        public HashSet<string> ActiveKeys { get; set; } = new(StringComparer.Ordinal);
         public DateTime LastSeen { get; set; } = DateTime.Now;
     }
 }

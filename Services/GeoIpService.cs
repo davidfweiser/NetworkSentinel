@@ -14,7 +14,16 @@ public sealed class GeoIpService : IDisposable
     };
 
     private readonly ConcurrentDictionary<string, GeoResult> _cache = new();
+    private readonly ConcurrentDictionary<string, DateTime> _failedAt = new();
     private readonly ConcurrentDictionary<string, byte> _inFlight = new();
+    private static readonly TimeSpan FailureRetryAfter = TimeSpan.FromMinutes(10);
+
+    /// <summary>
+    /// When false, the external ip-api.com web lookup is skipped entirely
+    /// (reverse DNS still runs). Note the free ip-api endpoint is plain HTTP,
+    /// so the IPs this machine talks to are visible on the wire when enabled.
+    /// </summary>
+    public bool LookupsEnabled { get; set; } = true;
 
     public GeoIpService()
     {
@@ -37,7 +46,21 @@ public sealed class GeoIpService : IDisposable
         }
 
         if (_cache.TryGetValue(ip, out var cached))
-            return cached;
+        {
+            // Transient failures are retried after a cooldown instead of
+            // pinning "lookup unavailable" for the rest of the session.
+            if (_failedAt.TryGetValue(ip, out var failedAt))
+            {
+                if (DateTime.UtcNow - failedAt < FailureRetryAfter)
+                    return cached;
+                _cache.TryRemove(ip, out _);
+                _failedAt.TryRemove(ip, out _);
+            }
+            else
+            {
+                return cached;
+            }
+        }
 
         if (!_inFlight.TryAdd(ip, 0))
         {
@@ -52,6 +75,21 @@ public sealed class GeoIpService : IDisposable
         try
         {
             string hostName = await ResolveHostNameAsync(ip, ct);
+
+            if (!LookupsEnabled)
+            {
+                var dnsOnly = new GeoResult
+                {
+                    Ip = ip,
+                    HostName = hostName,
+                    Summary = string.IsNullOrWhiteSpace(hostName)
+                        ? "Geo lookup disabled"
+                        : $"Host: {hostName}"
+                };
+                _cache[ip] = dnsOnly;
+                return dnsOnly;
+            }
+
             var geo = await QueryIpApiAsync(ip, ct);
 
             var result = new GeoResult
@@ -81,6 +119,7 @@ public sealed class GeoIpService : IDisposable
                     : $"Host: {hostName}"
             };
             _cache[ip] = fallback;
+            _failedAt[ip] = DateTime.UtcNow;
             return fallback;
         }
         finally

@@ -25,9 +25,14 @@ public sealed class AllowlistService : IDisposable
 
     private readonly HttpClient _http = new() { Timeout = TimeSpan.FromSeconds(12) };
     private readonly object _gate = new();
+    private readonly SemaphoreSlim _resolveGate = new(1, 1);
     private readonly ConcurrentDictionary<string, string> _ipToReason = new(StringComparer.OrdinalIgnoreCase);
     private readonly HashSet<string> _domains = new(StringComparer.OrdinalIgnoreCase);
     private readonly HashSet<string> _staticIps = new(StringComparer.OrdinalIgnoreCase);
+    // Last successfully resolved IPs per domain — kept when a later DNS pass
+    // fails so a DNS outage never strips allowlist protection.
+    private readonly Dictionary<string, HashSet<string>> _domainIps = new(StringComparer.OrdinalIgnoreCase);
+    private readonly List<(IPAddress Network, int Prefix)> _cidrs = new();
     private readonly List<AllowlistEntryView> _entries = new();
     private DateTime _lastResolveUtc = DateTime.MinValue;
     private DateTime _lastRemoteFetchUtc = DateTime.MinValue;
@@ -115,6 +120,15 @@ public sealed class AllowlistService : IDisposable
                 reason = "Static allowlist IP";
                 return true;
             }
+
+            foreach (var (network, prefix) in _cidrs)
+            {
+                if (IsInCidr(address, network, prefix))
+                {
+                    reason = $"Allowlist CIDR {network}/{prefix}";
+                    return true;
+                }
+            }
         }
 
         // Opportunistic refresh if stale (fire-and-forget)
@@ -201,6 +215,11 @@ public sealed class AllowlistService : IDisposable
                     return false;
                 }
             }
+            else if (kind.Equals("CIDR", StringComparison.OrdinalIgnoreCase))
+            {
+                message = "CIDR ranges come from the allowlist JSON files — edit those to remove them.";
+                return false;
+            }
             else
             {
                 message = "Unknown entry kind.";
@@ -232,12 +251,13 @@ public sealed class AllowlistService : IDisposable
     {
         var domains = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         var ips = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var cidrs = new List<(IPAddress Network, int Prefix)>();
 
-        Merge(LoadEmbeddedDefault(), domains, ips);
-        Merge(LoadFromPath(GetBundledDefaultPath()), domains, ips);
+        Merge(LoadEmbeddedDefault(), domains, ips, cidrs);
+        Merge(LoadFromPath(GetBundledDefaultPath()), domains, ips, cidrs);
 
         EnsureUserDatabaseExists();
-        Merge(LoadFromPath(LocalDatabasePath), domains, ips);
+        Merge(LoadFromPath(LocalDatabasePath), domains, ips, cidrs);
 
         lock (_gate)
         {
@@ -245,6 +265,8 @@ public sealed class AllowlistService : IDisposable
             foreach (var d in domains) _domains.Add(d);
             _staticIps.Clear();
             foreach (var ip in ips) _staticIps.Add(ip);
+            _cidrs.Clear();
+            _cidrs.AddRange(cidrs);
         }
 
         foreach (var ip in ips)
@@ -292,6 +314,12 @@ public sealed class AllowlistService : IDisposable
                         _staticIps.Add(s);
                         _ipToReason[s] = "Remote allowlist IP";
                     }
+                }
+
+                foreach (var cidr in file.Cidrs ?? Enumerable.Empty<string>())
+                {
+                    if (TryParseCidr(cidr, out var parsed) && !_cidrs.Contains(parsed))
+                        _cidrs.Add(parsed);
                 }
             }
 
@@ -341,11 +369,18 @@ public sealed class AllowlistService : IDisposable
                         _ipToReason[s] = "Cached remote allowlist IP";
                     }
                 }
+
+                foreach (var cidr in file.Cidrs ?? Enumerable.Empty<string>())
+                {
+                    if (TryParseCidr(cidr, out var parsed) && !_cidrs.Contains(parsed))
+                        _cidrs.Add(parsed);
+                }
             }
         }
     }
 
-    private static void Merge(AllowlistFile? file, HashSet<string> domains, HashSet<string> ips)
+    private static void Merge(AllowlistFile? file, HashSet<string> domains, HashSet<string> ips,
+        List<(IPAddress Network, int Prefix)> cidrs)
     {
         if (file == null) return;
         foreach (var d in file.Domains ?? Enumerable.Empty<string>())
@@ -360,6 +395,12 @@ public sealed class AllowlistService : IDisposable
             if (IPAddress.TryParse(ip, out var a))
                 ips.Add(a.ToString());
         }
+
+        foreach (var cidr in file.Cidrs ?? Enumerable.Empty<string>())
+        {
+            if (TryParseCidr(cidr, out var parsed) && !cidrs.Contains(parsed))
+                cidrs.Add(parsed);
+        }
     }
 
     private async Task ResolveDomainsAsync(bool force, CancellationToken ct = default)
@@ -367,59 +408,83 @@ public sealed class AllowlistService : IDisposable
         if (!force && DateTime.UtcNow - _lastResolveUtc < TimeSpan.FromMinutes(15))
             return;
 
-        List<string> domains;
-        lock (_gate) domains = _domains.ToList();
+        // Serialize resolves — a fire-and-forget refresh must not interleave
+        // with a forced one and race on the resolved-IP map.
+        if (!await _resolveGate.WaitAsync(0, ct))
+            return;
 
-        var map = new ConcurrentDictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        try
+        {
+            List<string> domains;
+            lock (_gate) domains = _domains.ToList();
 
-        // Keep static IPs
-        lock (_gate)
-        {
-            foreach (var ip in _staticIps)
-                map[ip] = "Allowlist static IP";
-        }
+            // Fresh results per domain; domains that fail this pass are absent
+            // and keep their previous IPs.
+            var resolvedNow = new ConcurrentDictionary<string, string[]>(StringComparer.OrdinalIgnoreCase);
 
-        await Parallel.ForEachAsync(domains, new ParallelOptions
-        {
-            MaxDegreeOfParallelism = 6,
-            CancellationToken = ct
-        }, async (domain, token) =>
-        {
-            try
+            await Parallel.ForEachAsync(domains, new ParallelOptions
             {
-                using var cts = CancellationTokenSource.CreateLinkedTokenSource(token);
-                cts.CancelAfter(TimeSpan.FromSeconds(3));
-                var addresses = await Dns.GetHostAddressesAsync(domain, cts.Token);
-                foreach (var addr in addresses)
+                MaxDegreeOfParallelism = 6,
+                CancellationToken = ct
+            }, async (domain, token) =>
+            {
+                try
                 {
-                    if (addr.AddressFamily is AddressFamily.InterNetwork or AddressFamily.InterNetworkV6)
-                        map[addr.ToString()] = $"Allowlist domain: {domain}";
+                    using var cts = CancellationTokenSource.CreateLinkedTokenSource(token);
+                    cts.CancelAfter(TimeSpan.FromSeconds(3));
+                    var addresses = await Dns.GetHostAddressesAsync(domain, cts.Token);
+                    var ips = addresses
+                        .Where(a => a.AddressFamily is AddressFamily.InterNetwork or AddressFamily.InterNetworkV6)
+                        .Select(a => a.ToString())
+                        .ToArray();
+                    if (ips.Length > 0)
+                        resolvedNow[domain] = ips;
+                }
+                catch
+                {
+                    // DNS failure — keep the domain's previously resolved IPs
+                }
+            });
+
+            var map = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            lock (_gate)
+            {
+                foreach (var (domain, ips) in resolvedNow)
+                    _domainIps[domain] = new HashSet<string>(ips, StringComparer.OrdinalIgnoreCase);
+
+                // Drop cached IPs only for domains removed from the allowlist
+                foreach (var gone in _domainIps.Keys.Where(d => !_domains.Contains(d)).ToList())
+                    _domainIps.Remove(gone);
+
+                foreach (var ip in _staticIps)
+                    map[ip] = "Allowlist static IP";
+
+                foreach (var (domain, ips) in _domainIps)
+                {
+                    foreach (var ip in ips)
+                    {
+                        if (!map.ContainsKey(ip))
+                            map[ip] = $"Allowlist domain: {domain}";
+                    }
                 }
             }
-            catch
+
+            foreach (var key in _ipToReason.Keys.ToList())
             {
-                // DNS failure — domain stays listed for later resolve
+                if (!map.ContainsKey(key))
+                    _ipToReason.TryRemove(key, out _);
             }
-        });
 
-        // Replace map carefully: remove old domain-resolved entries, keep static
-        var staticCopy = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-        lock (_gate)
-        {
-            foreach (var ip in _staticIps) staticCopy.Add(ip);
+            foreach (var (ip, reason) in map)
+                _ipToReason[ip] = reason;
+
+            _lastResolveUtc = DateTime.UtcNow;
+            RebuildEntryViews();
         }
-
-        foreach (var key in _ipToReason.Keys.ToList())
+        finally
         {
-            if (!staticCopy.Contains(key) && !map.ContainsKey(key))
-                _ipToReason.TryRemove(key, out _);
+            _resolveGate.Release();
         }
-
-        foreach (var (ip, reason) in map)
-            _ipToReason[ip] = reason;
-
-        _lastResolveUtc = DateTime.UtcNow;
-        RebuildEntryViews();
     }
 
     private void SaveUserDatabase()
@@ -468,6 +533,8 @@ public sealed class AllowlistService : IDisposable
                 _entries.Add(new AllowlistEntryView { Kind = "Domain", Value = d, Detail = "Never block after DNS resolve" });
             foreach (var ip in _staticIps)
                 _entries.Add(new AllowlistEntryView { Kind = "IP", Value = ip, Detail = "Static allowlist IP" });
+            foreach (var (network, prefix) in _cidrs)
+                _entries.Add(new AllowlistEntryView { Kind = "CIDR", Value = $"{network}/{prefix}", Detail = "Allowlist address range" });
             foreach (var kv in _ipToReason.OrderBy(k => k.Key).Take(500))
             {
                 if (_staticIps.Contains(kv.Key)) continue;
@@ -528,7 +595,53 @@ public sealed class AllowlistService : IDisposable
         return domain.Trim().TrimEnd('.');
     }
 
-    public void Dispose() => _http.Dispose();
+    private static bool TryParseCidr(string? cidr, out (IPAddress Network, int Prefix) parsed)
+    {
+        parsed = default;
+        if (string.IsNullOrWhiteSpace(cidr)) return false;
+
+        var parts = cidr.Trim().Split('/');
+        if (parts.Length != 2) return false;
+        if (!IPAddress.TryParse(parts[0], out var network)) return false;
+        if (!int.TryParse(parts[1], out var prefix)) return false;
+
+        int maxPrefix = network.AddressFamily == AddressFamily.InterNetwork ? 32 : 128;
+        if (prefix < 0 || prefix > maxPrefix) return false;
+
+        parsed = (network, prefix);
+        return true;
+    }
+
+    private static bool IsInCidr(IPAddress address, IPAddress network, int prefix)
+    {
+        if (address.AddressFamily == AddressFamily.InterNetworkV6 && address.IsIPv4MappedToIPv6)
+            address = address.MapToIPv4();
+        if (address.AddressFamily != network.AddressFamily) return false;
+
+        var addrBytes = address.GetAddressBytes();
+        var netBytes = network.GetAddressBytes();
+        int fullBytes = prefix / 8;
+        int remainderBits = prefix % 8;
+
+        for (int i = 0; i < fullBytes; i++)
+        {
+            if (addrBytes[i] != netBytes[i]) return false;
+        }
+
+        if (remainderBits > 0)
+        {
+            int mask = 0xFF << (8 - remainderBits);
+            if ((addrBytes[fullBytes] & mask) != (netBytes[fullBytes] & mask)) return false;
+        }
+
+        return true;
+    }
+
+    public void Dispose()
+    {
+        _http.Dispose();
+        _resolveGate.Dispose();
+    }
 }
 
 public sealed class AllowlistFile

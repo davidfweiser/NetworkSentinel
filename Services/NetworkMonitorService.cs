@@ -21,12 +21,23 @@ public sealed class NetworkMonitorService : IDisposable
     private CancellationTokenSource? _cts;
     private Task? _loop;
     private bool _firstPass = true;
+    private int _threatsTodayCount;
+    private int _highThreatCount;
+    private DateTime _threatsTodayDate = DateTime.Now.Date;
 
     public event Action? Updated;
     /// <summary>Raised on the monitor thread with newly detected threats this poll cycle.</summary>
     public event Action<IReadOnlyList<ThreatEvent>>? ThreatsDetected;
 
     public DashboardStats Stats { get; } = new();
+
+    /// <summary>Enables/disables the external geo-IP web lookup (reverse DNS still runs).</summary>
+    public bool GeoLookupsEnabled
+    {
+        get => _geo.LookupsEnabled;
+        set => _geo.LookupsEnabled = value;
+    }
+
     public IReadOnlyList<NetworkConnection> Connections
     {
         get { lock (_sync) return _connections.Values.OrderByDescending(c => c.LastSeen).ToList(); }
@@ -59,8 +70,12 @@ public sealed class NetworkMonitorService : IDisposable
 
     public void Stop()
     {
-        _cts?.Cancel();
-        try { _loop?.Wait(1000); } catch { /* ignore */ }
+        var cts = _cts;
+        var loop = _loop;
+        cts?.Cancel();
+        try { loop?.Wait(2000); } catch { /* ignore */ }
+        cts?.Dispose();
+        _cts = null;
         _loop = null;
         Stats.IsMonitoring = false;
         Stats.StatusText = "Monitoring paused";
@@ -100,12 +115,20 @@ public sealed class NetworkMonitorService : IDisposable
         var liveListenerKeys = new HashSet<string>();
         var activeByIp = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
         var newThreats = new List<ThreatEvent>();
+        var listeningTcpPorts = new HashSet<int>();
 
         lock (_sync)
         {
+            if (now.Date != _threatsTodayDate)
+            {
+                _threatsTodayDate = now.Date;
+                _threatsTodayCount = 0;
+            }
+
             // Listening ports (TCP LISTEN + UDP)
             foreach (var c in tcp.Where(x => x.State == TcpConnectionState.Listen))
             {
+                listeningTcpPorts.Add(c.LocalPort);
                 var lp = new ListeningPort
                 {
                     Protocol = "TCP",
@@ -135,22 +158,25 @@ public sealed class NetworkMonitorService : IDisposable
                 c.ProcessName = _processes.Resolve(c.ProcessId);
                 liveConnectionKeys.Add(c.Key);
 
+                bool isNewConnection;
                 if (_connections.TryGetValue(c.Key, out var existing))
                 {
                     existing.LastSeen = now;
                     existing.ProcessName = c.ProcessName;
+                    isNewConnection = false;
                 }
                 else
                 {
                     c.LastSeen = now;
                     _connections[c.Key] = c;
+                    isNewConnection = true;
                 }
 
                 if (IsTrackableRemote(c.RemoteAddress))
                 {
                     activeByIp.TryGetValue(c.RemoteAddress, out var n);
                     activeByIp[c.RemoteAddress] = n + 1;
-                    UpsertHost(c, now);
+                    UpsertHost(c, now, isNewConnection);
                 }
             }
 
@@ -166,11 +192,12 @@ public sealed class NetworkMonitorService : IDisposable
 
             // Intrusion heuristics
             var activeConns = _connections.Values.ToList();
-            newThreats.AddRange(_detector.Analyze(activeConns, _hosts, now));
+            newThreats.AddRange(_detector.Analyze(activeConns, _hosts, listeningTcpPorts, now));
 
             foreach (var t in newThreats)
             {
                 _threats.Insert(0, t);
+                CountThreat(t);
                 if (_hosts.TryGetValue(t.SourceIp, out var h))
                 {
                     if (t.Level > h.ThreatLevel) h.ThreatLevel = t.Level;
@@ -194,8 +221,9 @@ public sealed class NetworkMonitorService : IDisposable
             Stats.ListeningPorts = _listeners.Count;
             Stats.ActiveConnections = _connections.Count;
             Stats.RemoteHosts = _hosts.Count;
-            Stats.ThreatsToday = _threats.Count(t => t.Timestamp.Date == now.Date);
-            Stats.HighThreats = _threats.Count(t => t.Level >= ThreatLevel.High);
+            // Counters survive the 500-entry cap on the threat list.
+            Stats.ThreatsToday = _threatsTodayCount;
+            Stats.HighThreats = _highThreatCount;
             Stats.StatusText = _firstPass
                 ? "Baseline captured — watching for anomalies"
                 : $"Live · {_connections.Count} sessions · {_hosts.Count} remotes · {_threats.Count} events";
@@ -215,7 +243,7 @@ public sealed class NetworkMonitorService : IDisposable
         Updated?.Invoke();
     }
 
-    private void UpsertHost(NetworkConnection c, DateTime now)
+    private void UpsertHost(NetworkConnection c, DateTime now, bool isNewConnection)
     {
         if (!_hosts.TryGetValue(c.RemoteAddress, out var host))
         {
@@ -230,7 +258,7 @@ public sealed class NetworkMonitorService : IDisposable
 
             if (!_firstPass)
             {
-                _threats.Insert(0, new ThreatEvent
+                var t = new ThreatEvent
                 {
                     Timestamp = now,
                     Type = ThreatType.NewRemoteHost,
@@ -240,12 +268,14 @@ public sealed class NetworkMonitorService : IDisposable
                     Detail = $"First contact from {c.RemoteAddress} → local {c.LocalAddress}:{c.LocalPort} ({c.State}).",
                     Origin = "Resolving…",
                     Method = "New session appearance"
-                });
+                };
+                _threats.Insert(0, t);
+                CountThreat(t);
             }
         }
 
         host.LastSeen = now;
-        host.TotalConnections++;
+        if (isNewConnection) host.TotalConnections++;
         host.LocalPortsContacted.Add(c.LocalPort);
         if (c.RemotePort > 0) host.RemotePortsUsed.Add(c.RemotePort);
         if (host.Status == "New" && (now - host.FirstSeen) > TimeSpan.FromSeconds(30))
@@ -279,34 +309,12 @@ public sealed class NetworkMonitorService : IDisposable
                         c.GeoSummary = geo.Summary;
                     }
 
+                    // Origin is mutable + INPC, so patch in place — keeps the
+                    // same ThreatEvent instances stable for UI diffing.
                     foreach (var t in _threats.Where(x => x.SourceIp == ip &&
                              (x.Origin is "Resolving…" or "Origin resolving…" or "")))
                     {
-                        // ThreatEvent properties are init-only; rebuild origin via reflection-free path:
-                        // we store origin at creation; update matching host is enough for UI host list.
-                        // For threat list display we patch via a mutable approach — recreate not possible.
-                    }
-                }
-
-                // Patch threat origins by replacing list entries
-                lock (_sync)
-                {
-                    for (int i = 0; i < _threats.Count; i++)
-                    {
-                        var t = _threats[i];
-                        if (t.SourceIp != ip) continue;
-                        if (t.Origin is not ("Resolving…" or "Origin resolving…" or "")) continue;
-                        _threats[i] = new ThreatEvent
-                        {
-                            Timestamp = t.Timestamp,
-                            Type = t.Type,
-                            Level = t.Level,
-                            SourceIp = t.SourceIp,
-                            Title = t.Title,
-                            Detail = t.Detail,
-                            Origin = geo.Summary,
-                            Method = t.Method
-                        };
+                        t.Origin = geo.Summary;
                     }
                 }
 
@@ -331,9 +339,20 @@ public sealed class NetworkMonitorService : IDisposable
         return true;
     }
 
+    private void CountThreat(ThreatEvent t)
+    {
+        _threatsTodayCount++;
+        if (t.Level >= ThreatLevel.High) _highThreatCount++;
+    }
+
     public void ClearThreats()
     {
-        lock (_sync) _threats.Clear();
+        lock (_sync)
+        {
+            _threats.Clear();
+            _threatsTodayCount = 0;
+            _highThreatCount = 0;
+        }
         Stats.ThreatsToday = 0;
         Stats.HighThreats = 0;
         Updated?.Invoke();

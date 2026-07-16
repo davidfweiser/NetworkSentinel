@@ -8,6 +8,7 @@ internal static class IpHelper
 {
     private const int AfInet = 2;
     private const int AfInet6 = 23;
+    private const uint ErrorInsufficientBuffer = 122;
 
     private enum TcpTableClass
     {
@@ -98,181 +99,145 @@ internal static class IpHelper
     }
 
     private static List<NetworkConnection> ReadTcpV4()
-    {
-        var result = new List<NetworkConnection>();
-        int size = 0;
-        GetExtendedTcpTable(IntPtr.Zero, ref size, true, AfInet, TcpTableClass.TcpTableOwnerPidAll, 0);
-        var buffer = Marshal.AllocHGlobal(size);
-        try
-        {
-            var ret = GetExtendedTcpTable(buffer, ref size, true, AfInet, TcpTableClass.TcpTableOwnerPidAll, 0);
-            if (ret != 0) return result;
-
-            int count = Marshal.ReadInt32(buffer);
-            IntPtr rowPtr = buffer + 4;
-            int rowSize = Marshal.SizeOf<MibTcpRowOwnerPid>();
-
-            for (int i = 0; i < count; i++)
-            {
-                var row = Marshal.PtrToStructure<MibTcpRowOwnerPid>(rowPtr);
-                var state = (TcpConnectionState)row.State;
-                var local = new IPAddress(row.LocalAddr).ToString();
-                var remote = new IPAddress(row.RemoteAddr).ToString();
-                int localPort = ntohs(row.LocalPort);
-                int remotePort = ntohs(row.RemotePort);
-
-                result.Add(new NetworkConnection
-                {
-                    Protocol = "TCP",
-                    LocalAddress = local,
-                    LocalPort = localPort,
-                    RemoteAddress = remote,
-                    RemotePort = state == TcpConnectionState.Listen ? 0 : remotePort,
-                    State = state,
-                    ProcessId = (int)row.OwningPid
-                });
-
-                rowPtr += rowSize;
-            }
-        }
-        finally
-        {
-            Marshal.FreeHGlobal(buffer);
-        }
-
-        return result;
-    }
+        => ReadTcpTable<MibTcpRowOwnerPid>(AfInet, row => (
+            (TcpConnectionState)row.State,
+            new IPAddress(row.LocalAddr).ToString(),
+            ntohs(row.LocalPort),
+            new IPAddress(row.RemoteAddr).ToString(),
+            ntohs(row.RemotePort),
+            (int)row.OwningPid));
 
     private static List<NetworkConnection> ReadTcpV6()
+        => ReadTcpTable<MibTcp6RowOwnerPid>(AfInet6, row => (
+            (TcpConnectionState)row.State,
+            ToIpString(row.LocalAddr, row.LocalScopeId),
+            ntohs(row.LocalPort),
+            ToIpString(row.RemoteAddr, row.RemoteScopeId),
+            ntohs(row.RemotePort),
+            (int)row.OwningPid));
+
+    private static List<NetworkConnection> ReadTcpTable<TRow>(
+        int addressFamily,
+        Func<TRow, (TcpConnectionState State, string Local, int LocalPort, string Remote, int RemotePort, int Pid)> parse)
+        where TRow : struct
     {
         var result = new List<NetworkConnection>();
         int size = 0;
-        GetExtendedTcpTable(IntPtr.Zero, ref size, true, AfInet6, TcpTableClass.TcpTableOwnerPidAll, 0);
-        if (size <= 0) return result;
+        GetExtendedTcpTable(IntPtr.Zero, ref size, true, addressFamily, TcpTableClass.TcpTableOwnerPidAll, 0);
 
-        var buffer = Marshal.AllocHGlobal(size);
-        try
+        // The table can grow between the size query and the fetch — retry on
+        // ERROR_INSUFFICIENT_BUFFER instead of silently returning an empty poll.
+        for (int attempt = 0; attempt < 3 && size > 0; attempt++)
         {
-            var ret = GetExtendedTcpTable(buffer, ref size, true, AfInet6, TcpTableClass.TcpTableOwnerPidAll, 0);
-            if (ret != 0) return result;
-
-            int count = Marshal.ReadInt32(buffer);
-            IntPtr rowPtr = buffer + 4;
-            int rowSize = Marshal.SizeOf<MibTcp6RowOwnerPid>();
-
-            for (int i = 0; i < count; i++)
+            var buffer = Marshal.AllocHGlobal(size);
+            try
             {
-                var row = Marshal.PtrToStructure<MibTcp6RowOwnerPid>(rowPtr);
-                var state = (TcpConnectionState)row.State;
-                var local = new IPAddress(row.LocalAddr).ToString();
-                var remote = new IPAddress(row.RemoteAddr).ToString();
-                int localPort = ntohs(row.LocalPort);
-                int remotePort = ntohs(row.RemotePort);
+                var ret = GetExtendedTcpTable(buffer, ref size, true, addressFamily, TcpTableClass.TcpTableOwnerPidAll, 0);
+                if (ret == ErrorInsufficientBuffer) continue;
+                if (ret != 0) return result;
 
-                result.Add(new NetworkConnection
+                int count = Marshal.ReadInt32(buffer);
+                IntPtr rowPtr = buffer + 4;
+                int rowSize = Marshal.SizeOf<TRow>();
+
+                for (int i = 0; i < count; i++)
                 {
-                    Protocol = "TCP",
-                    LocalAddress = local,
-                    LocalPort = localPort,
-                    RemoteAddress = remote,
-                    RemotePort = state == TcpConnectionState.Listen ? 0 : remotePort,
-                    State = state,
-                    ProcessId = (int)row.OwningPid
-                });
+                    var row = Marshal.PtrToStructure<TRow>(rowPtr);
+                    var (state, local, localPort, remote, remotePort, pid) = parse(row);
 
-                rowPtr += rowSize;
+                    result.Add(new NetworkConnection
+                    {
+                        Protocol = "TCP",
+                        LocalAddress = local,
+                        LocalPort = localPort,
+                        RemoteAddress = remote,
+                        RemotePort = state == TcpConnectionState.Listen ? 0 : remotePort,
+                        State = state,
+                        ProcessId = pid
+                    });
+
+                    rowPtr += rowSize;
+                }
+
+                return result;
             }
-        }
-        finally
-        {
-            Marshal.FreeHGlobal(buffer);
+            finally
+            {
+                Marshal.FreeHGlobal(buffer);
+            }
         }
 
         return result;
     }
 
     private static List<ListeningPort> ReadUdpV4()
+        => ReadUdpTable<MibUdpRowOwnerPid>(AfInet, row => (
+            new IPAddress(row.LocalAddr).ToString(),
+            ntohs(row.LocalPort),
+            (int)row.OwningPid));
+
+    private static List<ListeningPort> ReadUdpV6()
+        => ReadUdpTable<MibUdp6RowOwnerPid>(AfInet6, row => (
+            ToIpString(row.LocalAddr, row.LocalScopeId),
+            ntohs(row.LocalPort),
+            (int)row.OwningPid));
+
+    private static List<ListeningPort> ReadUdpTable<TRow>(
+        int addressFamily,
+        Func<TRow, (string Local, int Port, int Pid)> parse)
+        where TRow : struct
     {
         var result = new List<ListeningPort>();
         int size = 0;
-        GetExtendedUdpTable(IntPtr.Zero, ref size, true, AfInet, UdpTableClass.UdpTableOwnerPid, 0);
-        var buffer = Marshal.AllocHGlobal(size);
-        try
+        GetExtendedUdpTable(IntPtr.Zero, ref size, true, addressFamily, UdpTableClass.UdpTableOwnerPid, 0);
+
+        for (int attempt = 0; attempt < 3 && size > 0; attempt++)
         {
-            var ret = GetExtendedUdpTable(buffer, ref size, true, AfInet, UdpTableClass.UdpTableOwnerPid, 0);
-            if (ret != 0) return result;
-
-            int count = Marshal.ReadInt32(buffer);
-            IntPtr rowPtr = buffer + 4;
-            int rowSize = Marshal.SizeOf<MibUdpRowOwnerPid>();
-
-            for (int i = 0; i < count; i++)
+            var buffer = Marshal.AllocHGlobal(size);
+            try
             {
-                var row = Marshal.PtrToStructure<MibUdpRowOwnerPid>(rowPtr);
-                var local = new IPAddress(row.LocalAddr).ToString();
-                int localPort = ntohs(row.LocalPort);
+                var ret = GetExtendedUdpTable(buffer, ref size, true, addressFamily, UdpTableClass.UdpTableOwnerPid, 0);
+                if (ret == ErrorInsufficientBuffer) continue;
+                if (ret != 0) return result;
 
-                result.Add(new ListeningPort
+                int count = Marshal.ReadInt32(buffer);
+                IntPtr rowPtr = buffer + 4;
+                int rowSize = Marshal.SizeOf<TRow>();
+
+                for (int i = 0; i < count; i++)
                 {
-                    Protocol = "UDP",
-                    Address = local,
-                    Port = localPort,
-                    ProcessId = (int)row.OwningPid,
-                    ServiceHint = PortCatalog.GetHint(localPort, "UDP")
-                });
+                    var row = Marshal.PtrToStructure<TRow>(rowPtr);
+                    var (local, port, pid) = parse(row);
 
-                rowPtr += rowSize;
+                    result.Add(new ListeningPort
+                    {
+                        Protocol = "UDP",
+                        Address = local,
+                        Port = port,
+                        ProcessId = pid,
+                        ServiceHint = PortCatalog.GetHint(port, "UDP")
+                    });
+
+                    rowPtr += rowSize;
+                }
+
+                return result;
             }
-        }
-        finally
-        {
-            Marshal.FreeHGlobal(buffer);
+            finally
+            {
+                Marshal.FreeHGlobal(buffer);
+            }
         }
 
         return result;
     }
 
-    private static List<ListeningPort> ReadUdpV6()
+    private static string ToIpString(byte[] addressBytes, uint scopeId)
     {
-        var result = new List<ListeningPort>();
-        int size = 0;
-        GetExtendedUdpTable(IntPtr.Zero, ref size, true, AfInet6, UdpTableClass.UdpTableOwnerPid, 0);
-        if (size <= 0) return result;
-
-        var buffer = Marshal.AllocHGlobal(size);
-        try
-        {
-            var ret = GetExtendedUdpTable(buffer, ref size, true, AfInet6, UdpTableClass.UdpTableOwnerPid, 0);
-            if (ret != 0) return result;
-
-            int count = Marshal.ReadInt32(buffer);
-            IntPtr rowPtr = buffer + 4;
-            int rowSize = Marshal.SizeOf<MibUdp6RowOwnerPid>();
-
-            for (int i = 0; i < count; i++)
-            {
-                var row = Marshal.PtrToStructure<MibUdp6RowOwnerPid>(rowPtr);
-                var local = new IPAddress(row.LocalAddr).ToString();
-                int localPort = ntohs(row.LocalPort);
-
-                result.Add(new ListeningPort
-                {
-                    Protocol = "UDP",
-                    Address = local,
-                    Port = localPort,
-                    ProcessId = (int)row.OwningPid,
-                    ServiceHint = PortCatalog.GetHint(localPort, "UDP")
-                });
-
-                rowPtr += rowSize;
-            }
-        }
-        finally
-        {
-            Marshal.FreeHGlobal(buffer);
-        }
-
-        return result;
+        var address = scopeId == 0
+            ? new IPAddress(addressBytes)
+            : new IPAddress(addressBytes, scopeId);
+        return address.ToString();
     }
 
     private static int ntohs(uint port) => (int)(((port & 0xFF) << 8) | ((port >> 8) & 0xFF));

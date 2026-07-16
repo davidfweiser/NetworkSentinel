@@ -237,16 +237,28 @@ public sealed class RemoteHost : INotifyPropertyChanged
         => PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(name));
 }
 
-public sealed class ThreatEvent
+public sealed class ThreatEvent : INotifyPropertyChanged
 {
+    private string _origin = "";
+
     public DateTime Timestamp { get; init; } = DateTime.Now;
     public ThreatType Type { get; init; }
     public ThreatLevel Level { get; init; }
     public string SourceIp { get; init; } = "";
     public string Title { get; init; } = "";
     public string Detail { get; init; } = "";
-    public string Origin { get; init; } = "";
     public string Method { get; init; } = "";
+
+    /// <summary>Mutable so async geo lookups can patch it in place after creation.</summary>
+    public string Origin
+    {
+        get => _origin;
+        set { if (_origin != value) { _origin = value; OnPropertyChanged(); } }
+    }
+
+    public event PropertyChangedEventHandler? PropertyChanged;
+    private void OnPropertyChanged([CallerMemberName] string? name = null)
+        => PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(name));
 
     public string TimeText => Timestamp.ToString("HH:mm:ss");
     public string LevelText => Level.ToString();

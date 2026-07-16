@@ -39,7 +39,7 @@ public sealed class FirewallService
         ? "Running as Administrator — firewall rules can be applied."
         : "Not elevated — use “Run as Admin” to add or remove firewall rules.";
 
-    public FirewallOperationResult BlockIp(string ip, FirewallDirection direction = FirewallDirection.Both, string? reason = null)
+    public FirewallOperationResult BlockIp(string ip, FirewallDirection direction = FirewallDirection.Both, string? reason = null, bool overrideAllowlist = false)
     {
         if (!TryNormalizeIp(ip, out var normalized, out var error))
             return FirewallOperationResult.Fail(error);
@@ -47,7 +47,9 @@ public sealed class FirewallService
         if (IsPrivateOrLocal(normalized))
             return FirewallOperationResult.Fail("Refusing to block private/local addresses (LAN, loopback, link-local).");
 
-        if (Allowlist != null && Allowlist.IsAllowed(normalized, out var allowReason))
+        // overrideAllowlist is only set from an explicit, confirmed user action —
+        // auto-block never bypasses the allowlist.
+        if (!overrideAllowlist && Allowlist != null && Allowlist.IsAllowed(normalized, out var allowReason))
             return FirewallOperationResult.Fail($"Refusing to block allowlisted address {normalized} ({allowReason}).");
 
         if (!IsAdministrator)
@@ -339,11 +341,25 @@ public sealed class FirewallService
 
     private FirewallOperationResult RemoveRuleByName(string name)
     {
+        dynamic? policy = null;
         try
         {
-            dynamic policy = CreateCom("HNetCfg.FwPolicy2");
+            policy = CreateCom("HNetCfg.FwPolicy2");
+
+            // INetFwRules.Remove silently succeeds for a missing name, which
+            // would make "Unblock" report success for rules that never existed —
+            // check existence first so callers get an honest answer.
+            try
+            {
+                dynamic rule = policy.Rules.Item(name);
+                Marshal.FinalReleaseComObject(rule);
+            }
+            catch
+            {
+                return FirewallOperationResult.Fail($"No rule named “{name}”.");
+            }
+
             policy.Rules.Remove(name);
-            Marshal.FinalReleaseComObject(policy);
             return FirewallOperationResult.Ok($"Removed “{name}”.");
         }
         catch
@@ -352,6 +368,11 @@ public sealed class FirewallService
             return netsh.Success
                 ? FirewallOperationResult.Ok($"Removed “{name}”.")
                 : FirewallOperationResult.Fail(netsh.Message);
+        }
+        finally
+        {
+            if (policy != null)
+                Marshal.FinalReleaseComObject(policy);
         }
     }
 
@@ -559,8 +580,14 @@ public sealed class FirewallService
         }
 
         ip = ip.Trim();
-        // strip port if user pasted ip:port
-        if (ip.Contains(':') && IPAddress.TryParse(ip, out _) == false)
+        // strip port / brackets if user pasted "ip:port" or "[v6]:port"
+        if (ip.StartsWith('['))
+        {
+            var end = ip.IndexOf(']');
+            if (end > 1)
+                ip = ip[1..end];
+        }
+        else if (ip.Contains(':') && IPAddress.TryParse(ip, out _) == false)
         {
             // could be ipv4:port
             var idx = ip.LastIndexOf(':');
