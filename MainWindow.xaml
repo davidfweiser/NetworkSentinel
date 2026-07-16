@@ -3,7 +3,7 @@
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
         xmlns:ctrl="clr-namespace:NetworkSentinel.Controls"
         xmlns:vm="clr-namespace:NetworkSentinel.ViewModels"
-        Title="Network Sentinel"
+        Title="{Binding WindowTitle}"
         Height="860" Width="1320"
         MinHeight="720" MinWidth="980"
         WindowStartupLocation="CenterScreen"
@@ -84,6 +84,7 @@
                             <StackPanel Grid.Column="1" VerticalAlignment="Center">
                                 <TextBlock Text="Network Sentinel" FontSize="16" FontWeight="Bold"/>
                                 <TextBlock Text="Port &amp; intrusion watch" Foreground="{StaticResource TextMutedBrush}" FontSize="11"/>
+                                <TextBlock Text="{Binding AppVersion}" Foreground="{StaticResource TextMutedBrush}" FontSize="10" Margin="0,2,0,0" Opacity="0.85"/>
                             </StackPanel>
                         </Grid>
                     </StackPanel>

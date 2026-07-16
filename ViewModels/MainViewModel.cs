@@ -1,4 +1,5 @@
 using System.Collections.ObjectModel;
+using System.Reflection;
 using System.Windows;
 using System.Windows.Threading;
 using CommunityToolkit.Mvvm.ComponentModel;
@@ -54,6 +55,9 @@ public partial class MainViewModel : ObservableObject, IDisposable
     [ObservableProperty] private ThreatEvent? _selectedThreat;
     [ObservableProperty] private NetworkConnection? _selectedConnection;
     [ObservableProperty] private ListeningPort? _selectedPort;
+
+    public string AppVersion { get; } = FormatAppVersion();
+    public string WindowTitle => $"Network Sentinel  ·  {AppVersion}";
 
     public DashboardStats Stats => _monitor.Stats;
     public ObservableCollection<NetworkConnection> Connections { get; } = new();
@@ -945,6 +949,22 @@ public partial class MainViewModel : ObservableObject, IDisposable
             MessageBoxImage.Information);
         if (answer == MessageBoxResult.Yes)
             RunAsAdmin();
+    }
+
+    private static string FormatAppVersion()
+    {
+        var asm = Assembly.GetExecutingAssembly();
+        var info = asm.GetCustomAttribute<AssemblyInformationalVersionAttribute>()?.InformationalVersion;
+        if (!string.IsNullOrWhiteSpace(info))
+        {
+            var plus = info.IndexOf('+');
+            if (plus >= 0)
+                info = info[..plus];
+            return info.StartsWith("v", StringComparison.OrdinalIgnoreCase) ? info : $"v{info}";
+        }
+
+        var version = asm.GetName().Version;
+        return version is null ? "v0.1.0" : $"v{version.Major}.{version.Minor}.{version.Build}";
     }
 
     public void Dispose()
