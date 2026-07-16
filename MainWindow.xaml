@@ -632,6 +632,7 @@
                             <Grid.RowDefinitions>
                                 <RowDefinition Height="Auto"/>
                                 <RowDefinition Height="Auto"/>
+                                <RowDefinition Height="Auto"/>
                             </Grid.RowDefinitions>
                             <Grid.ColumnDefinitions>
                                 <ColumnDefinition Width="*"/>
@@ -693,7 +694,7 @@
                                                       SelectedItem="{Binding AutoBlockMinLevel}"
                                                       IsEnabled="{Binding AutoBlockEnabled}"/>
                                         </StackPanel>
-                                        <TextBlock Text="When ON, new public-IP threats at or above the minimum severity are blocked automatically (no confirmation). Private/LAN IPs and “new host” info events are never auto-blocked."
+                                        <TextBlock Text="When ON, new public-IP threats at or above the minimum severity are blocked automatically (no confirmation). Private/LAN IPs, “new host” info events, and allowlisted sites (GitHub, Grok/xAI, Microsoft, …) are never auto-blocked."
                                                    Foreground="{StaticResource TextMutedBrush}" FontSize="11"
                                                    Margin="0,10,0,0" TextWrapping="Wrap"/>
                                     </StackPanel>
@@ -715,6 +716,9 @@
                                                 </Style>
                                             </Button.Style>
                                         </Button>
+                                        <Button Content="Restore good sites" Style="{StaticResource GhostButton}"
+                                                Command="{Binding RestoreAllowlistedCommand}" MinWidth="150" Margin="0,0,0,8"
+                                                ToolTip="Remove Network Sentinel blocks on allowlisted IPs (GitHub, Grok, etc.)"/>
                                         <Button Content="Run as Admin" Style="{StaticResource GhostButton}"
                                                 Command="{Binding RunAsAdminCommand}" MinWidth="150"
                                                 Visibility="{Binding IsAdmin, Converter={StaticResource BoolToVis}, ConverterParameter=Invert}"/>
@@ -722,8 +726,50 @@
                                 </Grid>
                             </Border>
 
+                            <!-- Known-good allowlist -->
+                            <Border Grid.Row="1" Grid.ColumnSpan="2" Style="{StaticResource Card}" Margin="0,0,0,12">
+                                <DockPanel>
+                                    <StackPanel DockPanel.Dock="Top" Margin="0,0,0,10">
+                                        <TextBlock Text="Known-good allowlist (never block)" FontWeight="Bold" FontSize="15"/>
+                                        <TextBlock Text="{Binding AllowlistStatusText}"
+                                                   Foreground="{StaticResource TextSecondaryBrush}" FontSize="12"
+                                                   Margin="0,4,0,8" TextWrapping="Wrap"/>
+                                        <TextBlock Text="Built-in list includes GitHub, xAI/Grok, Microsoft, Google, Cloudflare DNS, NuGet, and more. Domains are resolved to IPs. You can add your own, edit %LocalAppData%\NetworkSentinel\allowlist.json, or refresh the remote feed from this repo."
+                                                   Foreground="{StaticResource TextMutedBrush}" FontSize="11" TextWrapping="Wrap"/>
+                                        <Grid Margin="0,10,0,0">
+                                            <Grid.ColumnDefinitions>
+                                                <ColumnDefinition Width="*"/>
+                                                <ColumnDefinition Width="Auto"/>
+                                            </Grid.ColumnDefinitions>
+                                            <TextBox Style="{StaticResource ModernTextBox}"
+                                                     Text="{Binding AllowlistInput, UpdateSourceTrigger=PropertyChanged}"
+                                                     ToolTip="Domain (github.com) or IP address"/>
+                                            <StackPanel Grid.Column="1" Orientation="Horizontal" Margin="8,0,0,0">
+                                                <Button Content="Add" Style="{StaticResource PrimaryButton}"
+                                                        Command="{Binding AddAllowlistEntryCommand}" Margin="0,0,6,0" MinWidth="70"/>
+                                                <Button Content="Refresh" Style="{StaticResource GhostButton}"
+                                                        Command="{Binding RefreshAllowlistCommand}" Margin="0,0,6,0"/>
+                                                <Button Content="Remove" Style="{StaticResource GhostButton}"
+                                                        Command="{Binding RemoveAllowlistEntryCommand}" Margin="0,0,6,0"/>
+                                                <Button Content="Open folder" Style="{StaticResource GhostButton}"
+                                                        Command="{Binding OpenAllowlistFolderCommand}"/>
+                                            </StackPanel>
+                                        </Grid>
+                                    </StackPanel>
+                                    <DataGrid ItemsSource="{Binding AllowlistEntries}" Style="{StaticResource ModernDataGrid}"
+                                              SelectedItem="{Binding SelectedAllowlistEntry}"
+                                              MaxHeight="180">
+                                        <DataGrid.Columns>
+                                            <DataGridTextColumn Header="Kind" Binding="{Binding Kind}" Width="90"/>
+                                            <DataGridTextColumn Header="Value" Binding="{Binding Value}" Width="220"/>
+                                            <DataGridTextColumn Header="Detail" Binding="{Binding Detail}" Width="*"/>
+                                        </DataGrid.Columns>
+                                    </DataGrid>
+                                </DockPanel>
+                            </Border>
+
                             <!-- IP block card -->
-                            <Border Grid.Row="1" Style="{StaticResource Card}" Margin="0,0,10,0">
+                            <Border Grid.Row="2" Style="{StaticResource Card}" Margin="0,0,10,0">
                                 <StackPanel>
                                     <TextBlock Text="Block remote IP" FontWeight="Bold" FontSize="15"/>
                                     <TextBlock Text="{Binding FirewallStatusText}" Foreground="{StaticResource TextSecondaryBrush}"
@@ -749,7 +795,7 @@
                             </Border>
 
                             <!-- Port block card -->
-                            <Border Grid.Row="1" Grid.Column="1" Style="{StaticResource Card}">
+                            <Border Grid.Row="2" Grid.Column="1" Style="{StaticResource Card}">
                                 <StackPanel>
                                     <TextBlock Text="Block local port" FontWeight="Bold" FontSize="15"/>
                                     <TextBlock Text="Creates a Windows Defender Firewall rule for a local TCP/UDP port on this PC."

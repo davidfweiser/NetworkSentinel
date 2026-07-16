@@ -34,7 +34,18 @@ Each alert includes **source IP**, **method**, and **where it’s coming from** 
 - Settings stored in `%LocalAppData%\NetworkSentinel\settings.json`
 - **Run as Admin** when elevation is required
 
-> **Note:** Turning auto-block **off** does **not** remove rules already created. Use **Unblock**, **Remove**, or **Remove All** on the Firewall tab.
+### Known-good allowlist (never block)
+Trusted sites are protected so auto-block (and manual block) will not cut off everyday tools:
+
+| Source | Location |
+|--------|----------|
+| **Built-in defaults** | `Data/allowlist-default.json` (GitHub, xAI/Grok, Microsoft, Google, Cloudflare DNS, NuGet, …) |
+| **Your additions** | `%LocalAppData%\NetworkSentinel\allowlist.json` |
+| **Remote feed** | Optional refresh from this repo’s `allowlist-default.json` on GitHub |
+
+Domains are **DNS-resolved** to current IPs (cloud addresses change often). On startup, **Restore good sites** removes any Network Sentinel blocks that hit allowlisted IPs (recovery if GitHub/Grok were blocked earlier).
+
+> **Note:** Turning auto-block **off** does **not** remove rules already created. Use **Unblock**, **Restore good sites**, **Remove**, or **Remove All** on the Firewall tab.
 
 ---
 

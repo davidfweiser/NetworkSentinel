@@ -12,6 +12,7 @@ public partial class MainViewModel : ObservableObject, IDisposable
 {
     private readonly NetworkMonitorService _monitor = new();
     private readonly FirewallService _firewall = new();
+    private readonly AllowlistService _allowlist = new();
     private readonly AppSettings _settings;
     private readonly DispatcherTimer _clockTimer;
     private readonly object _autoBlockGate = new();
@@ -31,6 +32,8 @@ public partial class MainViewModel : ObservableObject, IDisposable
     [ObservableProperty] private string _firewallStatusText = "";
     [ObservableProperty] private string _firewallMessage = "";
     [ObservableProperty] private string _autoBlockStatusText = "Auto-block is off.";
+    [ObservableProperty] private string _allowlistStatusText = "Loading known-good allowlist…";
+    [ObservableProperty] private string _allowlistInput = "";
     [ObservableProperty] private bool _isAdmin;
     [ObservableProperty] private bool _autoBlockEnabled;
     [ObservableProperty] private string _autoBlockMinLevel = nameof(ThreatLevel.High);
@@ -40,6 +43,7 @@ public partial class MainViewModel : ObservableObject, IDisposable
     [ObservableProperty] private bool _blockInbound = true;
     [ObservableProperty] private bool _blockOutbound = true;
     [ObservableProperty] private FirewallRuleInfo? _selectedFirewallRule;
+    [ObservableProperty] private AllowlistEntryView? _selectedAllowlistEntry;
     [ObservableProperty] private RemoteHost? _selectedHost;
     [ObservableProperty] private ThreatEvent? _selectedThreat;
     [ObservableProperty] private NetworkConnection? _selectedConnection;
@@ -51,6 +55,7 @@ public partial class MainViewModel : ObservableObject, IDisposable
     public ObservableCollection<RemoteHost> RemoteHosts { get; } = new();
     public ObservableCollection<ThreatEvent> Threats { get; } = new();
     public ObservableCollection<FirewallRuleInfo> FirewallRules { get; } = new();
+    public ObservableCollection<AllowlistEntryView> AllowlistEntries { get; } = new();
     public ObservableCollection<double> ActivitySeries { get; } = new();
     public ObservableCollection<double> ThreatSeries { get; } = new();
     public ObservableCollection<string> ProtocolOptions { get; } = new() { "TCP", "UDP" };
@@ -71,6 +76,7 @@ public partial class MainViewModel : ObservableObject, IDisposable
         _blockInbound = _settings.AutoBlockInbound;
         _blockOutbound = _settings.AutoBlockOutbound;
 
+        _firewall.Allowlist = _allowlist;
         _monitor.Updated += OnMonitorUpdated;
         _monitor.ThreatsDetected += OnThreatsDetected;
         _monitor.Start();
@@ -79,10 +85,46 @@ public partial class MainViewModel : ObservableObject, IDisposable
         FirewallStatusText = _firewall.PrivilegeText;
         UpdateAutoBlockStatusText();
         RefreshFirewallRules();
+        _ = InitializeAllowlistAsync();
 
         _clockTimer = new DispatcherTimer { Interval = TimeSpan.FromSeconds(1) };
         _clockTimer.Tick += (_, _) => ClockText = DateTime.Now.ToString("dddd, MMM d  ·  HH:mm:ss");
         _clockTimer.Start();
+    }
+
+    private async Task InitializeAllowlistAsync()
+    {
+        try
+        {
+            await _allowlist.InitializeAsync();
+            await Application.Current.Dispatcher.InvokeAsync(() =>
+            {
+                SyncAllowlistUi();
+                // Recovery: free any known-good IPs that were blocked before allowlist existed
+                if (IsAdmin)
+                {
+                    var restored = _firewall.UnblockAllowlistedAddresses();
+                    if (restored.Success && !restored.Message.Contains("No allowlisted", StringComparison.OrdinalIgnoreCase))
+                    {
+                        FirewallMessage = restored.Message;
+                        RefreshFirewallRules();
+                    }
+                }
+            });
+        }
+        catch (Exception ex)
+        {
+            await Application.Current.Dispatcher.InvokeAsync(() =>
+                AllowlistStatusText = $"Allowlist load error: {ex.Message}");
+        }
+    }
+
+    private void SyncAllowlistUi()
+    {
+        AllowlistEntries.Clear();
+        foreach (var e in _allowlist.GetEntries())
+            AllowlistEntries.Add(e);
+        AllowlistStatusText = _allowlist.StatusText;
     }
 
     private void OnMonitorUpdated()
@@ -150,6 +192,10 @@ public partial class MainViewModel : ObservableObject, IDisposable
                 continue;
 
             if (FirewallService.IsPrivateOrLocal(ip))
+                continue;
+
+            // Never auto-block known-good services (GitHub, Grok/xAI, Microsoft, …)
+            if (_allowlist.IsAllowed(ip, out _))
                 continue;
 
             lock (_autoBlockGate)
@@ -590,6 +636,131 @@ public partial class MainViewModel : ObservableObject, IDisposable
         RefreshCollections();
     }
 
+    [RelayCommand]
+    private async Task RefreshAllowlistAsync()
+    {
+        AllowlistStatusText = "Refreshing allowlist (DNS + optional remote feed)…";
+        try
+        {
+            await _allowlist.RefreshAsync();
+            SyncAllowlistUi();
+            if (IsAdmin)
+            {
+                var restored = _firewall.UnblockAllowlistedAddresses();
+                FirewallMessage = restored.Message;
+                RefreshFirewallRules();
+                RefreshCollections();
+            }
+        }
+        catch (Exception ex)
+        {
+            AllowlistStatusText = $"Refresh failed: {ex.Message}";
+        }
+    }
+
+    [RelayCommand]
+    private void AddAllowlistEntry()
+    {
+        var input = AllowlistInput.Trim();
+        if (string.IsNullOrWhiteSpace(input))
+        {
+            FirewallMessage = "Enter a domain (github.com) or IP to protect.";
+            return;
+        }
+
+        bool ok;
+        string message;
+        if (System.Net.IPAddress.TryParse(input, out _))
+            ok = _allowlist.TryAddIp(input, out message);
+        else
+            ok = _allowlist.TryAddDomain(input, out message);
+
+        FirewallMessage = message;
+        AllowlistStatusText = message;
+        if (ok)
+        {
+            AllowlistInput = "";
+            SyncAllowlistUi();
+            if (IsAdmin)
+            {
+                var restored = _firewall.UnblockAllowlistedAddresses();
+                if (restored.Success)
+                    FirewallMessage = message + " · " + restored.Message;
+                RefreshFirewallRules();
+            }
+        }
+        else
+        {
+            MessageBox.Show(message, "Allowlist", MessageBoxButton.OK, MessageBoxImage.Information);
+        }
+    }
+
+    [RelayCommand]
+    private void RemoveAllowlistEntry()
+    {
+        if (SelectedAllowlistEntry == null)
+        {
+            FirewallMessage = "Select an allowlist entry to remove.";
+            return;
+        }
+
+        if (SelectedAllowlistEntry.Kind == "Resolved")
+        {
+            MessageBox.Show(
+                "Resolved IPs come from domain DNS. Remove the Domain entry instead, or wait for the next refresh.",
+                "Allowlist",
+                MessageBoxButton.OK,
+                MessageBoxImage.Information);
+            return;
+        }
+
+        if (!_allowlist.TryRemove(SelectedAllowlistEntry.Value, SelectedAllowlistEntry.Kind, out var message))
+        {
+            MessageBox.Show(message, "Allowlist", MessageBoxButton.OK, MessageBoxImage.Information);
+            return;
+        }
+
+        FirewallMessage = message;
+        SelectedAllowlistEntry = null;
+        SyncAllowlistUi();
+    }
+
+    [RelayCommand]
+    private void RestoreAllowlisted()
+    {
+        if (!IsAdmin)
+        {
+            PromptElevation();
+            return;
+        }
+
+        var result = _firewall.UnblockAllowlistedAddresses();
+        FirewallMessage = result.Message;
+        MessageBox.Show(result.Message, "Restore allowlisted", MessageBoxButton.OK,
+            result.Success ? MessageBoxImage.Information : MessageBoxImage.Warning);
+        RefreshFirewallRules();
+        RefreshCollections();
+    }
+
+    [RelayCommand]
+    private void OpenAllowlistFolder()
+    {
+        try
+        {
+            _allowlist.EnsureUserDatabaseExists();
+            var dir = System.IO.Path.GetDirectoryName(_allowlist.LocalDatabasePath)!;
+            System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo
+            {
+                FileName = dir,
+                UseShellExecute = true
+            });
+        }
+        catch (Exception ex)
+        {
+            MessageBox.Show(ex.Message, "Open allowlist folder", MessageBoxButton.OK, MessageBoxImage.Warning);
+        }
+    }
+
     private void BlockIpInternal(string ip, string reason)
     {
         if (!IsAdmin)
@@ -609,6 +780,13 @@ public partial class MainViewModel : ObservableObject, IDisposable
         {
             FirewallMessage = "Private/local addresses are not blocked by default (would break LAN).";
             MessageBox.Show(FirewallMessage, "Block IP", MessageBoxButton.OK, MessageBoxImage.Information);
+            return;
+        }
+
+        if (_allowlist.IsAllowed(normalized, out var allowReason))
+        {
+            FirewallMessage = $"Protected by allowlist — not blocked: {normalized} ({allowReason}).";
+            MessageBox.Show(FirewallMessage, "Allowlist protection", MessageBoxButton.OK, MessageBoxImage.Information);
             return;
         }
 
@@ -676,6 +854,7 @@ public partial class MainViewModel : ObservableObject, IDisposable
         _monitor.Updated -= OnMonitorUpdated;
         _monitor.ThreatsDetected -= OnThreatsDetected;
         PersistSettings();
+        _allowlist.Dispose();
         _monitor.Dispose();
     }
 }

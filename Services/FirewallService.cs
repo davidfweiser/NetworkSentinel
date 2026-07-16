@@ -15,6 +15,9 @@ public sealed class FirewallService
 {
     public const string RulePrefix = "NetworkSentinel";
 
+    /// <summary>Optional allowlist — when set, known-good IPs cannot be blocked.</summary>
+    public AllowlistService? Allowlist { get; set; }
+
     public bool IsAdministrator
     {
         get
@@ -43,6 +46,9 @@ public sealed class FirewallService
 
         if (IsPrivateOrLocal(normalized))
             return FirewallOperationResult.Fail("Refusing to block private/local addresses (LAN, loopback, link-local).");
+
+        if (Allowlist != null && Allowlist.IsAllowed(normalized, out var allowReason))
+            return FirewallOperationResult.Fail($"Refusing to block allowlisted address {normalized} ({allowReason}).");
 
         if (!IsAdministrator)
             return FirewallOperationResult.Fail("Administrator rights are required to modify the Windows Firewall.");
@@ -162,6 +168,43 @@ public sealed class FirewallService
         }
 
         return FirewallOperationResult.Ok($"Removed {removed} Network Sentinel firewall rule(s).");
+    }
+
+    /// <summary>
+    /// Removes any Network Sentinel IP-block rules that target allowlisted addresses
+    /// (recovery if GitHub/Grok/etc. were blocked before the allowlist existed).
+    /// </summary>
+    public FirewallOperationResult UnblockAllowlistedAddresses()
+    {
+        if (Allowlist == null)
+            return FirewallOperationResult.Fail("Allowlist is not available.");
+
+        if (!IsAdministrator)
+            return FirewallOperationResult.Fail("Administrator rights are required to remove firewall rules.");
+
+        var rules = GetManagedRules().Where(r => r.Kind == FirewallRuleKind.IpBlock).ToList();
+        int removed = 0;
+        var notes = new List<string>();
+
+        foreach (var rule in rules)
+        {
+            var remote = rule.RemoteAddresses;
+            if (string.IsNullOrWhiteSpace(remote)) continue;
+            if (!Allowlist.IsAllowed(remote, out var why)) continue;
+
+            if (RemoveRuleByName(rule.Name).Success)
+            {
+                removed++;
+                notes.Add($"{remote} ({why})");
+            }
+        }
+
+        if (removed == 0)
+            return FirewallOperationResult.Ok("No allowlisted IPs were blocked by Network Sentinel rules.");
+
+        return FirewallOperationResult.Ok(
+            $"Restored {removed} allowlisted address(es): {string.Join("; ", notes.Take(12))}" +
+            (notes.Count > 12 ? "…" : ""));
     }
 
     public IReadOnlyList<FirewallRuleInfo> GetManagedRules()
