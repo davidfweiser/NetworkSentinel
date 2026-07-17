@@ -218,6 +218,20 @@ Optional desktop entry is provided as `networksentinel.desktop` (`Icon=networkse
 
 ---
 
+## Status while minimized (top bar / tray)
+
+While the app is running (including minimized):
+
+| Where | What you see |
+|-------|----------------|
+| **Window title / dock / task list** | Live compact stats, e.g. `NS · 12 sess · 5 ports · 8 hosts · 3 evt` |
+| **System tray / top-bar indicator** | App icon; hover for full summary; click menu for sessions, ports, remotes, threats, auto-block |
+| **Tray actions** | Show window · Pause/Resume monitoring · Quit |
+
+On GNOME / Pop!_OS the indicator appears in the top bar (StatusNotifier / AppIndicator). If the icon is missing, install an AppIndicator extension or `libayatana-appindicator` package for your DE.
+
+---
+
 ## Troubleshooting
 
 | Problem | What to do |
@@ -226,6 +240,7 @@ Optional desktop entry is provided as `networksentinel.desktop` (`Icon=networkse
 | No password dialog for block | Install `policykit-1` (`pkexec`). |
 | `.NET location: Not found` | Set `DOTNET_ROOT` / `PATH` to your .NET install, or use a self-contained publish. |
 | Process names missing | Expected for other users’ sockets without root; monitoring still works. |
+| No tray icon | DE must support StatusNotifier/AppIndicator; window title still updates when minimized. |
 
 ---
 
