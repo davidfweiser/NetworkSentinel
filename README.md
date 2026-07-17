@@ -1,8 +1,10 @@
-# Network Sentinel
+# Network Sentinel (Linux)
 
-Native Windows desktop app for **live network monitoring**, **remote peer tracking**, **break-in heuristics**, and **Windows Firewall blocking** — with a modern dark UI.
+Native **Linux** desktop app for **live network monitoring**, **remote peer tracking**, **break-in heuristics**, and **host firewall blocking** — with a modern dark Avalonia UI.
 
-> **Private repository.** Awareness / monitoring tooling — not a full IDS/IPS replacement.
+> Awareness / monitoring tooling — not a full IDS/IPS replacement.
+
+Linux port of the original Windows WPF Network Sentinel. Platform layers use `/proc/net`, `nftables`/`iptables` (elevated via **pkexec**), and XDG data paths. Version **0.2.0**.
 
 ---
 
@@ -11,15 +13,15 @@ Native Windows desktop app for **live network monitoring**, **remote peer tracki
 ### Monitoring
 | Area | What you get |
 |------|----------------|
-| **Open ports** | TCP listeners and UDP endpoints via Windows IP Helper (`GetExtendedTcpTable` / `GetExtendedUdpTable`) |
-| **Live connections** | Process name, local/remote endpoints, TCP state, origin summary |
+| **Open ports** | TCP listeners and UDP endpoints via `/proc/net/tcp{,6}` and `/proc/net/udp{,6}` |
+| **Live connections** | Process name (via `/proc/*/fd` inode map), local/remote endpoints, TCP state, origin summary |
 | **Remote computers** | Peers observed talking to this PC, reverse DNS, geo/ISP when public |
 | **Activity chart** | Live sparkline of connection samples |
 
 ### Threat awareness
 Heuristics flag patterns such as:
 - Multi-port scans / reconnaissance
-- RDP, SSH, and SMB hammering
+- SSH and SMB hammering
 - Sensitive-port probing (admin, DB, remote access)
 - Short-lived / transitional TCP bursts
 - First-seen remote hosts
@@ -29,10 +31,11 @@ Each alert includes **source IP**, **method**, and **where it’s coming from** 
 ### Firewall & block
 - **Block / unblock** remote IPs (inbound, outbound, or both)
 - **Block local ports** (TCP/UDP)
-- Only manages rules named `NetworkSentinel-*` so other firewall rules are left alone
+- Dedicated **nftables** table `inet networksentinel` when `nft` is available; otherwise **iptables** with `NetworkSentinel-*` comments
+- Only manages rules owned by this app; other firewall rules are left alone
 - **Auto-block** on/off with minimum severity (`Medium` / `High` / `Critical`)
-- Settings stored in `%LocalAppData%\NetworkSentinel\settings.json`
-- **Run as Admin** when elevation is required
+- Settings in `~/.local/share/NetworkSentinel/settings.json` (or `$XDG_DATA_HOME/NetworkSentinel`)
+- **Authorize firewall** — elevates only `nft`/`iptables` via **pkexec** (password dialog). The GUI always runs as your user
 
 ### Known-good allowlist (never block)
 Trusted sites are protected so auto-block (and manual block) will not cut off everyday tools:
@@ -40,52 +43,70 @@ Trusted sites are protected so auto-block (and manual block) will not cut off ev
 | Source | Location |
 |--------|----------|
 | **Built-in defaults** | `Data/allowlist-default.json` (GitHub, xAI/Grok, Microsoft, Google, Cloudflare DNS, NuGet, …) |
-| **Your additions** | `%LocalAppData%\NetworkSentinel\allowlist.json` |
+| **Your additions** | `~/.local/share/NetworkSentinel/allowlist.json` |
 | **Remote feed** | Optional refresh from this repo’s `allowlist-default.json` on GitHub |
 
-Domains are **DNS-resolved** to current IPs (cloud addresses change often); if a DNS pass fails, the previously resolved IPs are kept so an outage never strips protection. `cidrs` entries (e.g. `"140.82.112.0/20"`) in any allowlist file protect whole address ranges. On startup, **Restore good sites** removes any Network Sentinel blocks that hit allowlisted IPs (recovery if GitHub/Grok were blocked earlier).
-
-Auto-block never touches allowlisted IPs. A **manual** block of an allowlisted IP asks for explicit confirmation instead of refusing outright.
-
-> **Note:** Turning auto-block **off** does **not** remove rules already created. Use **Unblock**, **Restore good sites**, **Remove**, or **Remove All** on the Firewall tab.
+Domains are DNS-resolved to current IPs. Auto-block never touches allowlisted IPs. **Restore good sites** removes Network Sentinel blocks that hit allowlisted addresses.
 
 ---
 
 ## Requirements
 
-- **Windows 10 or 11**
-- [.NET 8 SDK](https://dotnet.microsoft.com/download) (or a runtime that can build `net8.0-windows`)
-- **Administrator** rights to create or delete Windows Defender Firewall rules
+- **Linux** (kernel `/proc` networking; tested on Pop!_OS / Ubuntu-class systems)
+- [.NET 8 SDK or runtime](https://dotnet.microsoft.com/download)
+- Desktop libraries for Avalonia (usual X11/Wayland desktop install)
+- **policykit-1** (`pkexec`) recommended for firewall password prompts
+- `nft` (nftables) or `iptables` for host firewall changes
 
 ---
 
 ## Quick start
 
-```powershell
+```bash
 git clone https://github.com/davidfweiser/NetworkSentinel.git
 cd NetworkSentinel
-dotnet run
+dotnet run -c Release
+```
+
+If the .NET SDK was installed with the install script:
+
+```bash
+export PATH="$HOME/.dotnet:$PATH"
+export DOTNET_ROOT="$HOME/.dotnet"
+dotnet run -c Release
 ```
 
 ### Release build
 
-```powershell
+```bash
 dotnet build -c Release
+dotnet publish -c Release -r linux-x64 --self-contained false -o bin/publish
+./bin/publish/NetworkSentinel
 ```
 
-Executable:
+Self-contained (no system .NET runtime needed):
 
-```text
-bin\Release\net8.0-windows\NetworkSentinel.exe
+```bash
+dotnet publish -c Release -r linux-x64 --self-contained true -o bin/publish-sc
+./bin/publish-sc/NetworkSentinel
 ```
 
-Publish (framework-dependent):
+### Firewall / auto-block (important on Wayland)
 
-```powershell
-dotnet publish -c Release -r win-x64 --self-contained false
+**Do not** run the GUI with `sudo` on Wayland — root cannot open your display (`XOpenDisplay failed`).
+
+```bash
+# correct — app as your user
+./NetworkSentinel
+# or:  dotnet run -c Release
+
+# wrong on Wayland:
+# sudo ./NetworkSentinel
 ```
 
-For firewall / auto-block, start the app **as administrator** (or use **Run as Admin** in the UI).
+When you block an IP/port (or click **Authorize firewall**), only `nft`/`iptables` are elevated via **pkexec** and you get a password dialog. Monitoring works without elevation.
+
+Optional desktop entry is provided as `networksentinel.desktop` (install under `~/.local/share/applications/` and adjust `Exec=` to your binary path).
 
 ---
 
@@ -98,14 +119,16 @@ For firewall / auto-block, start the app **as administrator** (or use **Run as A
 | **Remote Computers** | Tracked peers, origin, threat level; block / unblock |
 | **Break-in Attempts** | Heuristic alerts with origin and method |
 | **Open Ports** | Listening TCP/UDP; optional inbound port block |
-| **Firewall & Block** | Manual IP/port rules, auto-block toggle, managed rule list |
+| **Firewall & Block** | Manual IP/port rules, auto-block, allowlist, managed rule list |
 
 ### Auto-block
-1. Run elevated (Administrator).
-2. Turn **Auto-block** **On** (top bar, sidebar, or Firewall tab).
+1. Click **Authorize firewall** (or allow the first pkexec prompt when blocking).
+2. Turn **Auto-block** **On**.
 3. Choose **Minimum severity** (default **High**).
-4. Public IPs that hit that severity get Windows Firewall block rules automatically.
-5. Private/LAN addresses and “new host” info events are **never** auto-blocked.
+4. Public IPs that hit that severity get host firewall drop rules automatically.
+5. Private/LAN addresses, “new host” info events, and allowlisted sites are **never** auto-blocked.
+
+> Turning auto-block **off** does **not** remove rules already created. Use **Unblock**, **Restore good sites**, **Remove**, or **Remove All** on the Firewall tab.
 
 ---
 
@@ -113,8 +136,8 @@ For firewall / auto-block, start the app **as administrator** (or use **Run as A
 
 ```text
 ┌─────────────────┐     poll ~1.2s      ┌──────────────────────┐
-│  Windows stack  │ ─────────────────► │ NetworkMonitorService │
-│  (iphlpapi)     │                    └──────────┬───────────┘
+│  Linux /proc    │ ─────────────────► │ NetworkMonitorService │
+│  net/* + fd map │                    └──────────┬───────────┘
 └─────────────────┘                               │
                                                   ▼
                                        ┌──────────────────────┐
@@ -124,8 +147,8 @@ For firewall / auto-block, start the app **as administrator** (or use **Run as A
                                                   │
                     ┌─────────────────────────────┼─────────────────────────────┐
                     ▼                             ▼                             ▼
-           Geo / DNS lookup              WPF dashboard UI              FirewallService
-           (origin details)              (MVVM + charts)               (COM / netsh)
+           Geo / DNS lookup              Avalonia UI                   FirewallService
+           (origin details)              (MVVM + charts)               pkexec → nft/iptables
 ```
 
 ---
@@ -134,16 +157,30 @@ For firewall / auto-block, start the app **as administrator** (or use **Run as A
 
 | Path | Role |
 |------|------|
-| `Native/IpHelper.cs` | P/Invoke into Windows IP Helper API |
+| `Native/LinuxNetTable.cs` | `/proc/net` parsing + socket inode → PID |
 | `Services/NetworkMonitorService.cs` | Polling loop, host tracking, stats |
 | `Services/IntrusionDetector.cs` | Heuristic threat engine |
 | `Services/GeoIpService.cs` | Reverse DNS + public geo lookup |
-| `Services/FirewallService.cs` | Windows Firewall rule create/list/remove |
-| `Services/AppSettings.cs` | Auto-block preferences (JSON on disk) |
+| `Services/FirewallService.cs` | nftables / iptables via pkexec; rule ledger |
+| `Services/AppSettings.cs` / `AppPaths.cs` | XDG data dir + JSON settings |
+| `Services/DialogService.cs` | Avalonia confirm/info dialogs |
 | `ViewModels/MainViewModel.cs` | UI state, commands, auto-block wiring |
-| `MainWindow.xaml` | Dashboard UI |
+| `MainWindow.axaml` | Avalonia dashboard UI |
 | `Themes/` | Colors and control styles |
 | `Controls/Sparkline.cs` | Live activity chart |
+| `Program.cs` | Entry point; refuses GUI-as-root on Wayland |
+
+---
+
+## Windows → Linux changes
+
+| Windows | Linux |
+|---------|--------|
+| WPF (`net8.0-windows`) | Avalonia 11 (`net8.0`) |
+| `iphlpapi` GetExtendedTcpTable | `/proc/net/tcp{,6}` + `/proc/*/fd` |
+| Windows Firewall COM / netsh | `nft` table `inet networksentinel` or `iptables` |
+| `%LocalAppData%\NetworkSentinel` | `~/.local/share/NetworkSentinel` |
+| Run as Administrator (whole app) | GUI as user; elevate only firewall tools via pkexec |
 
 ---
 
@@ -151,11 +188,22 @@ For firewall / auto-block, start the app **as administrator** (or use **Run as A
 
 - This is an **awareness console**, not a substitute for enterprise IDS, EDR, or carefully tuned host firewall policy.
 - Threat heuristics count **new inbound connections to ports this PC is listening on** — long-lived sessions and ordinary outbound client traffic are never treated as probing.
-- Public IP geolocation uses the free `ip-api.com` endpoint (rate-limited, best-effort, **plain HTTP** — remote IPs you talk to are visible on the wire). Set `"GeoLookupEnabled": false` in `%LocalAppData%\NetworkSentinel\settings.json` to disable it; reverse DNS still runs. LAN/private addresses are labeled as local.
-- Set `"AllowlistUseRemoteFeed": false` in the same file to skip the GitHub allowlist feed and use only built-in/local lists.
-- Some system sockets may show as `System` or `PID n` depending on permissions.
+- Public IP geolocation uses the free `ip-api.com` endpoint (rate-limited, best-effort, **plain HTTP**). Set `"GeoLookupEnabled": false` in settings to disable it; reverse DNS still runs.
+- Set `"AllowlistUseRemoteFeed": false` to skip the GitHub allowlist feed and use only built-in/local lists.
+- Non-root runs still monitor connections for processes you can see; other users’ sockets may show as `Kernel / unknown`.
 - Existing TCP sessions may remain until they reconnect after a block; new matching traffic is stopped by the firewall.
-- For host hardening, also review Windows Security event **4625** (failed logons) and enable Firewall logging when needed.
+- Override (rare): `NETWORKSENTINEL_ALLOW_ROOT_GUI=1` forces allowing a root GUI (only useful on some X11 setups with `xhost`).
+
+---
+
+## Troubleshooting
+
+| Problem | What to do |
+|---------|------------|
+| `XOpenDisplay failed` after `sudo` | Run **without** sudo. Use **Authorize firewall** / pkexec for rules only. |
+| No password dialog for block | Install `policykit-1` (`pkexec`). |
+| `.NET location: Not found` | Set `DOTNET_ROOT` / `PATH` to your .NET install, or use a self-contained publish. |
+| Process names missing | Expected for other users’ sockets without root; monitoring still works. |
 
 ---
 

@@ -1,0 +1,23 @@
+<Application xmlns="https://github.com/avaloniaui"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             xmlns:conv="using:NetworkSentinel.Converters"
+             x:Class="NetworkSentinel.App"
+             RequestedThemeVariant="Dark">
+  <Application.Styles>
+    <FluentTheme />
+    <StyleInclude Source="avares://Avalonia.Controls.DataGrid/Themes/Fluent.xaml"/>
+    <StyleInclude Source="avares://NetworkSentinel/Themes/Controls.axaml"/>
+  </Application.Styles>
+  <Application.Resources>
+    <ResourceDictionary>
+      <ResourceDictionary.MergedDictionaries>
+        <ResourceInclude Source="avares://NetworkSentinel/Themes/Colors.axaml"/>
+      </ResourceDictionary.MergedDictionaries>
+      <conv:ThreatLevelToBrushConverter x:Key="ThreatBrush"/>
+      <conv:BoolToVisibilityConverter x:Key="BoolToVis"/>
+      <conv:MonitoringToTextConverter x:Key="MonitorText"/>
+      <conv:InvertBoolConverter x:Key="InvertBool"/>
+      <FontFamily x:Key="AppFont">Inter, Ubuntu, Cantarell, sans-serif</FontFamily>
+    </ResourceDictionary>
+  </Application.Resources>
+</Application>

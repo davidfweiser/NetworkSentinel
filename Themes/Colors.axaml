@@ -1,0 +1,64 @@
+<ResourceDictionary xmlns="https://github.com/avaloniaui"
+                    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml">
+
+  <Color x:Key="BgDeep">#FF070B16</Color>
+  <Color x:Key="BgPanel">#FF0E1628</Color>
+  <Color x:Key="BgCard">#FF121C31</Color>
+  <Color x:Key="BgCardHover">#FF18243F</Color>
+  <Color x:Key="StrokeSoft">#33A8C5FF</Color>
+  <Color x:Key="StrokeStrong">#557CF9FF</Color>
+  <Color x:Key="TextPrimary">#FFF2F7FF</Color>
+  <Color x:Key="TextSecondary">#FF93A4C3</Color>
+  <Color x:Key="TextMuted">#FF667794</Color>
+  <Color x:Key="AccentCyan">#FF3DE7C8</Color>
+  <Color x:Key="AccentBlue">#FF4C8DFF</Color>
+  <Color x:Key="AccentViolet">#FF9B7BFF</Color>
+  <Color x:Key="AccentPink">#FFFF4D8D</Color>
+  <Color x:Key="AccentAmber">#FFFFB020</Color>
+  <Color x:Key="Danger">#FFFF4D6D</Color>
+  <Color x:Key="Success">#FF3DDC97</Color>
+
+  <SolidColorBrush x:Key="BgDeepBrush" Color="{StaticResource BgDeep}"/>
+  <SolidColorBrush x:Key="BgPanelBrush" Color="{StaticResource BgPanel}"/>
+  <SolidColorBrush x:Key="BgCardBrush" Color="{StaticResource BgCard}"/>
+  <SolidColorBrush x:Key="BgCardHoverBrush" Color="{StaticResource BgCardHover}"/>
+  <SolidColorBrush x:Key="StrokeSoftBrush" Color="{StaticResource StrokeSoft}"/>
+  <SolidColorBrush x:Key="StrokeStrongBrush" Color="{StaticResource StrokeStrong}"/>
+  <SolidColorBrush x:Key="TextPrimaryBrush" Color="{StaticResource TextPrimary}"/>
+  <SolidColorBrush x:Key="TextSecondaryBrush" Color="{StaticResource TextSecondary}"/>
+  <SolidColorBrush x:Key="TextMutedBrush" Color="{StaticResource TextMuted}"/>
+  <SolidColorBrush x:Key="AccentCyanBrush" Color="{StaticResource AccentCyan}"/>
+  <SolidColorBrush x:Key="AccentBlueBrush" Color="{StaticResource AccentBlue}"/>
+  <SolidColorBrush x:Key="AccentVioletBrush" Color="{StaticResource AccentViolet}"/>
+  <SolidColorBrush x:Key="AccentPinkBrush" Color="{StaticResource AccentPink}"/>
+  <SolidColorBrush x:Key="AccentAmberBrush" Color="{StaticResource AccentAmber}"/>
+  <SolidColorBrush x:Key="DangerBrush" Color="{StaticResource Danger}"/>
+  <SolidColorBrush x:Key="SuccessBrush" Color="{StaticResource Success}"/>
+
+  <LinearGradientBrush x:Key="HeroGradient" StartPoint="0%,0%" EndPoint="100%,100%">
+    <GradientStop Color="#FF101B33" Offset="0"/>
+    <GradientStop Color="#FF152447" Offset="0.45"/>
+    <GradientStop Color="#FF1A1840" Offset="1"/>
+  </LinearGradientBrush>
+
+  <LinearGradientBrush x:Key="AccentGradient" StartPoint="0%,0%" EndPoint="100%,100%">
+    <GradientStop Color="#FF3DE7C8" Offset="0"/>
+    <GradientStop Color="#FF4C8DFF" Offset="0.55"/>
+    <GradientStop Color="#FF9B7BFF" Offset="1"/>
+  </LinearGradientBrush>
+
+  <LinearGradientBrush x:Key="DangerGradient" StartPoint="0%,0%" EndPoint="100%,0%">
+    <GradientStop Color="#FFFF4D6D" Offset="0"/>
+    <GradientStop Color="#FFFF8A4C" Offset="1"/>
+  </LinearGradientBrush>
+
+  <LinearGradientBrush x:Key="ChartFill" StartPoint="0%,0%" EndPoint="0%,100%">
+    <GradientStop Color="#663DE7C8" Offset="0"/>
+    <GradientStop Color="#003DE7C8" Offset="1"/>
+  </LinearGradientBrush>
+
+  <LinearGradientBrush x:Key="ThreatChartFill" StartPoint="0%,0%" EndPoint="0%,100%">
+    <GradientStop Color="#66FF4D6D" Offset="0"/>
+    <GradientStop Color="#00FF4D6D" Offset="1"/>
+  </LinearGradientBrush>
+</ResourceDictionary>

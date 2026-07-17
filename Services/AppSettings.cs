@@ -32,16 +32,7 @@ public sealed class AppSettings
     public void SetMinLevel(ThreatLevel level) => AutoBlockMinLevel = level.ToString();
 
     private static string SettingsPath
-    {
-        get
-        {
-            var dir = Path.Combine(
-                Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
-                "NetworkSentinel");
-            Directory.CreateDirectory(dir);
-            return Path.Combine(dir, "settings.json");
-        }
-    }
+        => Path.Combine(AppPaths.DataDirectory, "settings.json");
 
     public static AppSettings Load()
     {

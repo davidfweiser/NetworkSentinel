@@ -1,7 +1,7 @@
 using System.Collections.ObjectModel;
+using System.Diagnostics;
 using System.Reflection;
-using System.Windows;
-using System.Windows.Threading;
+using Avalonia.Threading;
 using CommunityToolkit.Mvvm.ComponentModel;
 using CommunityToolkit.Mvvm.Input;
 using NetworkSentinel.Models;
@@ -17,8 +17,6 @@ public partial class MainViewModel : ObservableObject, IDisposable
     private readonly AppSettings _settings;
     private readonly DispatcherTimer _clockTimer;
     private readonly object _autoBlockGate = new();
-    // Attempt markers expire so a manually unblocked IP can be auto-blocked
-    // again later instead of being ignored until app restart.
     private readonly Dictionary<string, DateTime> _autoBlockAttempted = new(StringComparer.OrdinalIgnoreCase);
     private static readonly TimeSpan AutoBlockRetryAfter = TimeSpan.FromMinutes(10);
     private HashSet<string> _blockedIps = new(StringComparer.OrdinalIgnoreCase);
@@ -109,10 +107,9 @@ public partial class MainViewModel : ObservableObject, IDisposable
         try
         {
             await _allowlist.InitializeAsync();
-            await Application.Current.Dispatcher.InvokeAsync(() =>
+            await Dispatcher.UIThread.InvokeAsync(() =>
             {
                 SyncAllowlistUi();
-                // Recovery: free any known-good IPs that were blocked before allowlist existed
                 if (IsAdmin)
                 {
                     var restored = _firewall.UnblockAllowlistedAddresses();
@@ -126,7 +123,7 @@ public partial class MainViewModel : ObservableObject, IDisposable
         }
         catch (Exception ex)
         {
-            await Application.Current.Dispatcher.InvokeAsync(() =>
+            await Dispatcher.UIThread.InvokeAsync(() =>
                 AllowlistStatusText = $"Allowlist load error: {ex.Message}");
         }
     }
@@ -141,23 +138,18 @@ public partial class MainViewModel : ObservableObject, IDisposable
 
     private void OnMonitorUpdated()
     {
-        var dispatcher = Application.Current?.Dispatcher;
-        if (dispatcher == null) return;
-
-        if (dispatcher.CheckAccess())
+        if (Dispatcher.UIThread.CheckAccess())
         {
             RefreshCollections();
             return;
         }
 
-        // BeginInvoke (not Invoke) so the monitor thread never stalls behind
-        // the UI, with coalescing so refreshes don't pile up in the queue.
-        if (System.Threading.Interlocked.CompareExchange(ref _monitorRefreshQueued, 1, 0) != 0)
+        if (Interlocked.CompareExchange(ref _monitorRefreshQueued, 1, 0) != 0)
             return;
 
-        dispatcher.BeginInvoke(() =>
+        Dispatcher.UIThread.Post(() =>
         {
-            System.Threading.Interlocked.Exchange(ref _monitorRefreshQueued, 0);
+            Interlocked.Exchange(ref _monitorRefreshQueued, 0);
             RefreshCollections();
         }, DispatcherPriority.Background);
     }
@@ -167,8 +159,6 @@ public partial class MainViewModel : ObservableObject, IDisposable
         if (!AutoBlockEnabled || threats.Count == 0)
             return;
 
-        // Run auto-block on the thread pool — firewall COM/netsh calls must
-        // not stall the monitor's polling loop.
         _ = Task.Run(() =>
         {
             try
@@ -177,8 +167,7 @@ public partial class MainViewModel : ObservableObject, IDisposable
             }
             catch (Exception ex)
             {
-                var dispatcher = Application.Current?.Dispatcher;
-                dispatcher?.BeginInvoke(() =>
+                Dispatcher.UIThread.Post(() =>
                 {
                     FirewallMessage = $"Auto-block error: {ex.Message}";
                     UpdateAutoBlockStatusText();
@@ -194,11 +183,10 @@ public partial class MainViewModel : ObservableObject, IDisposable
 
         if (!_firewall.IsAdministrator)
         {
-            var d = Application.Current?.Dispatcher;
-            d?.BeginInvoke(() =>
+            Dispatcher.UIThread.Post(() =>
             {
-                AutoBlockStatusText = "Auto-block is ON, but Administrator rights are required — click Run as Admin.";
-                FirewallMessage = "Auto-block skipped: not running as Administrator.";
+                AutoBlockStatusText = "Auto-block is ON, but firewall elevation is unavailable — install pkexec or click Authorize firewall.";
+                FirewallMessage = "Auto-block skipped: cannot elevate nft/iptables.";
             });
             return;
         }
@@ -211,25 +199,17 @@ public partial class MainViewModel : ObservableObject, IDisposable
         {
             if (threat.Level < minLevel)
                 continue;
-
-            // Never auto-block mere first-seen noise.
             if (threat.Type == ThreatType.NewRemoteHost)
                 continue;
-
             if (!FirewallService.TryNormalizeIp(threat.SourceIp, out var ip, out _))
                 continue;
-
             if (FirewallService.IsPrivateOrLocal(ip))
                 continue;
-
-            // Never auto-block known-good services (GitHub, Grok/xAI, Microsoft, …)
             if (_allowlist.IsAllowed(ip, out _))
                 continue;
 
             lock (_autoBlockGate)
             {
-                // Use the cached blocked set — enumerating firewall rules per
-                // threat (IsIpBlocked) is far too slow for this path.
                 if (_blockedIps.Contains(ip))
                     continue;
                 if (_autoBlockAttempted.TryGetValue(ip, out var lastAttempt) &&
@@ -255,8 +235,7 @@ public partial class MainViewModel : ObservableObject, IDisposable
         if (messages.Count == 0)
             return;
 
-        var dispatcher = Application.Current?.Dispatcher;
-        dispatcher?.BeginInvoke(() =>
+        Dispatcher.UIThread.Post(() =>
         {
             FirewallMessage = string.Join(" · ", messages);
             UpdateAutoBlockStatusText();
@@ -267,8 +246,6 @@ public partial class MainViewModel : ObservableObject, IDisposable
 
     private void RefreshCollections()
     {
-        // Blocked set refreshes on a background thread at most every 15s —
-        // enumerating all firewall rules on the UI thread each tick froze the UI.
         RefreshBlockedIpsInBackground();
 
         foreach (var host in _monitor.RemoteHosts)
@@ -309,14 +286,7 @@ public partial class MainViewModel : ObservableObject, IDisposable
             try { set = _firewall.GetBlockedIps(); }
             catch { /* keep previous set */ }
 
-            var dispatcher = Application.Current?.Dispatcher;
-            if (dispatcher == null)
-            {
-                _blockedIpsRefreshInFlight = false;
-                return;
-            }
-
-            dispatcher.BeginInvoke(() =>
+            Dispatcher.UIThread.Post(() =>
             {
                 _blockedIpsRefreshInFlight = false;
                 _blockedIpsRefreshedAt = DateTime.UtcNow;
@@ -341,12 +311,12 @@ public partial class MainViewModel : ObservableObject, IDisposable
 
         if (!IsAdmin)
         {
-            AutoBlockStatusText = $"Auto-block is ON (≥ {AutoBlockMinLevel}), but you must Run as Admin for rules to apply.";
+            AutoBlockStatusText = $"Auto-block is ON (≥ {AutoBlockMinLevel}), but no elevation helper (pkexec/sudo) was found.";
             return;
         }
 
         AutoBlockStatusText =
-            $"Auto-block is ON — public IPs at {AutoBlockMinLevel}+ severity are blocked in Windows Firewall " +
+            $"Auto-block is ON — public IPs at {AutoBlockMinLevel}+ severity are blocked in the host firewall " +
             $"({(BlockInbound ? "in" : "")}{(BlockInbound && BlockOutbound ? "+" : "")}{(BlockOutbound ? "out" : "")}).";
     }
 
@@ -364,17 +334,11 @@ public partial class MainViewModel : ObservableObject, IDisposable
     {
         PersistSettings();
         if (value && !IsAdmin)
-        {
-            FirewallMessage = "Auto-block enabled, but Administrator rights are required to create firewall rules.";
-        }
+            FirewallMessage = "Auto-block enabled, but no elevation helper found (install policykit-1 / pkexec).";
         else if (value)
-        {
-            FirewallMessage = $"Auto-block enabled for {AutoBlockMinLevel}+ threats.";
-        }
+            FirewallMessage = $"Auto-block enabled for {AutoBlockMinLevel}+ threats (password dialog may appear).";
         else
-        {
             FirewallMessage = "Auto-block disabled.";
-        }
     }
 
     partial void OnAutoBlockMinLevelChanged(string value) => PersistSettings();
@@ -417,11 +381,6 @@ public partial class MainViewModel : ObservableObject, IDisposable
             t.Method.Contains(q, StringComparison.OrdinalIgnoreCase));
     }
 
-    /// <summary>
-    /// In-place diff against the target collection instead of Clear()+re-add.
-    /// The monitor hands out stable object instances, so removing the missing
-    /// and moving/inserting the rest preserves selection and scroll position.
-    /// </summary>
     private static void Sync<T>(ObservableCollection<T> target, IEnumerable<T> source) where T : class
     {
         var list = source.ToList();
@@ -472,10 +431,7 @@ public partial class MainViewModel : ObservableObject, IDisposable
     }
 
     [RelayCommand]
-    private void ToggleAutoBlock()
-    {
-        AutoBlockEnabled = !AutoBlockEnabled;
-    }
+    private void ToggleAutoBlock() => AutoBlockEnabled = !AutoBlockEnabled;
 
     [RelayCommand]
     private void ClearThreats() => _monitor.ClearThreats();
@@ -513,60 +469,65 @@ public partial class MainViewModel : ObservableObject, IDisposable
     }
 
     [RelayCommand]
-    private void RunAsAdmin()
+    private async Task RunAsAdmin()
     {
-        if (IsAdmin)
+        // Never relaunch the GUI as root — that breaks Wayland/X11 (XOpenDisplay).
+        // Instead, pre-authorize pkexec/sudo for firewall tools only.
+        if (_firewall.IsRoot)
         {
-            FirewallMessage = "Already running elevated.";
+            FirewallMessage = "Already running as root (prefer running as your user on Wayland).";
             return;
         }
 
-        var answer = MessageBox.Show(
-            "Network Sentinel will restart with Administrator rights so Windows Firewall rules can be created and removed.\n\nContinue?",
-            "Run as Administrator",
-            MessageBoxButton.YesNo,
-            MessageBoxImage.Question);
+        var answer = await DialogService.ConfirmAsync(
+            "Network Sentinel will request admin rights only for firewall tools (nft/iptables) via a password dialog.\n\n" +
+            "The app itself stays running as your user — do not use “sudo NetworkSentinel” on Wayland.\n\nContinue?",
+            "Authorize firewall");
 
-        if (answer != MessageBoxResult.Yes) return;
+        if (!answer) return;
 
         try
         {
-            _firewall.RestartAsAdministrator();
-            Application.Current.Shutdown();
+            var result = await Task.Run(() => _firewall.AuthorizeElevation());
+            FirewallMessage = result.Message;
+            IsAdmin = _firewall.IsAdministrator;
+            FirewallStatusText = _firewall.PrivilegeText;
+            if (result.Success)
+                await DialogService.ShowInfoAsync(result.Message, "Firewall authorization");
+            else
+                await DialogService.ShowWarningAsync(result.Message, "Authorization failed");
         }
         catch (Exception ex)
         {
-            MessageBox.Show(
-                $"Could not elevate:\n{ex.Message}\n\nYou can also right-click the app and choose “Run as administrator”.",
-                "Elevation failed",
-                MessageBoxButton.OK,
-                MessageBoxImage.Warning);
+            await DialogService.ShowWarningAsync(
+                $"Could not authorize:\n{ex.Message}",
+                "Authorization failed");
         }
     }
 
     [RelayCommand]
-    private void BlockHost(RemoteHost? host)
+    private async Task BlockHost(RemoteHost? host)
     {
         if (host == null) return;
-        BlockIpInternal(host.IpAddress, $"Remote host block · {host.GeoSummary}");
+        await BlockIpInternal(host.IpAddress, $"Remote host block · {host.GeoSummary}");
     }
 
     [RelayCommand]
-    private void UnblockHost(RemoteHost? host)
+    private async Task UnblockHost(RemoteHost? host)
     {
         if (host == null) return;
-        UnblockIpInternal(host.IpAddress);
+        await UnblockIpInternal(host.IpAddress);
     }
 
     [RelayCommand]
-    private void BlockThreatIp(ThreatEvent? threat)
+    private async Task BlockThreatIp(ThreatEvent? threat)
     {
         if (threat == null) return;
-        BlockIpInternal(threat.SourceIp, $"Threat block · {threat.TypeText}: {threat.Title}");
+        await BlockIpInternal(threat.SourceIp, $"Threat block · {threat.TypeText}: {threat.Title}");
     }
 
     [RelayCommand]
-    private void BlockConnectionIp(NetworkConnection? connection)
+    private async Task BlockConnectionIp(NetworkConnection? connection)
     {
         if (connection == null) return;
         if (string.IsNullOrWhiteSpace(connection.RemoteAddress) ||
@@ -576,29 +537,27 @@ public partial class MainViewModel : ObservableObject, IDisposable
             return;
         }
 
-        BlockIpInternal(connection.RemoteAddress, $"Session block · {connection.ProcessName} {connection.DisplayRemote}");
+        await BlockIpInternal(connection.RemoteAddress, $"Session block · {connection.ProcessName} {connection.DisplayRemote}");
     }
 
     [RelayCommand]
-    private void BlockSelectedPort(ListeningPort? port)
+    private async Task BlockSelectedPort(ListeningPort? port)
     {
         if (port == null) return;
 
         if (!IsAdmin)
         {
-            PromptElevation();
+            await PromptElevation();
             return;
         }
 
-        var answer = MessageBox.Show(
+        var answer = await DialogService.ConfirmAsync(
             $"Block inbound traffic to local {port.Protocol} port {port.Port}?\n\n" +
             $"Service: {port.ServiceHint}\nProcess: {port.ProcessName}\n\n" +
-            "This creates a Windows Firewall block rule for that port on this PC.",
-            "Block local port",
-            MessageBoxButton.YesNo,
-            MessageBoxImage.Warning);
+            "This creates a host firewall drop rule for that port on this PC.",
+            "Block local port");
 
-        if (answer != MessageBoxResult.Yes) return;
+        if (!answer) return;
 
         var result = _firewall.BlockPort(
             port.Port,
@@ -607,16 +566,12 @@ public partial class MainViewModel : ObservableObject, IDisposable
             $"Port block · {port.ServiceHint} · {port.ProcessName}");
 
         FirewallMessage = result.Message;
-        if (!result.Success)
-            MessageBox.Show(result.Message, "Firewall", MessageBoxButton.OK, MessageBoxImage.Warning);
-        else
-            MessageBox.Show(result.Message, "Firewall", MessageBoxButton.OK, MessageBoxImage.Information);
-
+        await DialogService.ShowInfoAsync(result.Message, "Firewall");
         RefreshFirewallRules();
     }
 
     [RelayCommand]
-    private void BlockManualIp()
+    private async Task BlockManualIp()
     {
         if (string.IsNullOrWhiteSpace(ManualBlockIp))
         {
@@ -624,12 +579,12 @@ public partial class MainViewModel : ObservableObject, IDisposable
             return;
         }
 
-        if (BlockIpInternal(ManualBlockIp.Trim(), "Manual block from Firewall tab"))
+        if (await BlockIpInternal(ManualBlockIp.Trim(), "Manual block from Firewall tab"))
             ManualBlockIp = "";
     }
 
     [RelayCommand]
-    private void UnblockManualIp()
+    private async Task UnblockManualIp()
     {
         if (string.IsNullOrWhiteSpace(ManualBlockIp))
         {
@@ -637,11 +592,11 @@ public partial class MainViewModel : ObservableObject, IDisposable
             return;
         }
 
-        UnblockIpInternal(ManualBlockIp.Trim());
+        await UnblockIpInternal(ManualBlockIp.Trim());
     }
 
     [RelayCommand]
-    private void BlockManualPort()
+    private async Task BlockManualPort()
     {
         if (!int.TryParse(ManualBlockPort, out var port))
         {
@@ -651,7 +606,7 @@ public partial class MainViewModel : ObservableObject, IDisposable
 
         if (!IsAdmin)
         {
-            PromptElevation();
+            await PromptElevation();
             return;
         }
 
@@ -659,12 +614,12 @@ public partial class MainViewModel : ObservableObject, IDisposable
         var result = _firewall.BlockPort(port, ManualBlockProtocol, direction, "Manual port block from Firewall tab");
         FirewallMessage = result.Message;
         if (!result.Success)
-            MessageBox.Show(result.Message, "Firewall", MessageBoxButton.OK, MessageBoxImage.Warning);
+            await DialogService.ShowWarningAsync(result.Message, "Firewall");
         RefreshFirewallRules();
     }
 
     [RelayCommand]
-    private void RemoveSelectedRule(FirewallRuleInfo? rule = null)
+    private async Task RemoveSelectedRule(FirewallRuleInfo? rule = null)
     {
         rule ??= SelectedFirewallRule;
         if (rule == null)
@@ -675,17 +630,13 @@ public partial class MainViewModel : ObservableObject, IDisposable
 
         if (!IsAdmin)
         {
-            PromptElevation();
+            await PromptElevation();
             return;
         }
 
         var name = rule.Name;
-        var answer = MessageBox.Show(
-            $"Remove firewall rule?\n\n{name}",
-            "Remove rule",
-            MessageBoxButton.YesNo,
-            MessageBoxImage.Question);
-        if (answer != MessageBoxResult.Yes) return;
+        var answer = await DialogService.ConfirmAsync($"Remove firewall rule?\n\n{name}", "Remove rule");
+        if (!answer) return;
 
         var result = _firewall.RemoveRule(name);
         FirewallMessage = result.Message;
@@ -695,20 +646,18 @@ public partial class MainViewModel : ObservableObject, IDisposable
     }
 
     [RelayCommand]
-    private void RemoveAllManagedRules()
+    private async Task RemoveAllManagedRules()
     {
         if (!IsAdmin)
         {
-            PromptElevation();
+            await PromptElevation();
             return;
         }
 
-        var answer = MessageBox.Show(
-            "Remove ALL Network Sentinel firewall rules from Windows Defender Firewall?\n\nThis cannot be undone (you can re-block later).",
-            "Remove all managed rules",
-            MessageBoxButton.YesNo,
-            MessageBoxImage.Warning);
-        if (answer != MessageBoxResult.Yes) return;
+        var answer = await DialogService.ConfirmAsync(
+            "Remove ALL Network Sentinel firewall rules from the host firewall?\n\nThis cannot be undone (you can re-block later).",
+            "Remove all managed rules");
+        if (!answer) return;
 
         var result = _firewall.RemoveAllManagedRules();
         FirewallMessage = result.Message;
@@ -739,7 +688,7 @@ public partial class MainViewModel : ObservableObject, IDisposable
     }
 
     [RelayCommand]
-    private void AddAllowlistEntry()
+    private async Task AddAllowlistEntry()
     {
         var input = AllowlistInput.Trim();
         if (string.IsNullOrWhiteSpace(input))
@@ -771,12 +720,12 @@ public partial class MainViewModel : ObservableObject, IDisposable
         }
         else
         {
-            MessageBox.Show(message, "Allowlist", MessageBoxButton.OK, MessageBoxImage.Information);
+            await DialogService.ShowInfoAsync(message, "Allowlist");
         }
     }
 
     [RelayCommand]
-    private void RemoveAllowlistEntry()
+    private async Task RemoveAllowlistEntry()
     {
         if (SelectedAllowlistEntry == null)
         {
@@ -786,17 +735,15 @@ public partial class MainViewModel : ObservableObject, IDisposable
 
         if (SelectedAllowlistEntry.Kind == "Resolved")
         {
-            MessageBox.Show(
+            await DialogService.ShowInfoAsync(
                 "Resolved IPs come from domain DNS. Remove the Domain entry instead, or wait for the next refresh.",
-                "Allowlist",
-                MessageBoxButton.OK,
-                MessageBoxImage.Information);
+                "Allowlist");
             return;
         }
 
         if (!_allowlist.TryRemove(SelectedAllowlistEntry.Value, SelectedAllowlistEntry.Kind, out var message))
         {
-            MessageBox.Show(message, "Allowlist", MessageBoxButton.OK, MessageBoxImage.Information);
+            await DialogService.ShowInfoAsync(message, "Allowlist");
             return;
         }
 
@@ -806,30 +753,29 @@ public partial class MainViewModel : ObservableObject, IDisposable
     }
 
     [RelayCommand]
-    private void RestoreAllowlisted()
+    private async Task RestoreAllowlisted()
     {
         if (!IsAdmin)
         {
-            PromptElevation();
+            await PromptElevation();
             return;
         }
 
         var result = _firewall.UnblockAllowlistedAddresses();
         FirewallMessage = result.Message;
-        MessageBox.Show(result.Message, "Restore allowlisted", MessageBoxButton.OK,
-            result.Success ? MessageBoxImage.Information : MessageBoxImage.Warning);
+        await DialogService.ShowInfoAsync(result.Message, "Restore allowlisted");
         RefreshFirewallRules();
         RefreshCollections();
     }
 
     [RelayCommand]
-    private void OpenAllowlistFolder()
+    private async Task OpenAllowlistFolder()
     {
         try
         {
             _allowlist.EnsureUserDatabaseExists();
-            var dir = System.IO.Path.GetDirectoryName(_allowlist.LocalDatabasePath)!;
-            System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo
+            var dir = Path.GetDirectoryName(_allowlist.LocalDatabasePath)!;
+            Process.Start(new ProcessStartInfo
             {
                 FileName = dir,
                 UseShellExecute = true
@@ -837,45 +783,41 @@ public partial class MainViewModel : ObservableObject, IDisposable
         }
         catch (Exception ex)
         {
-            MessageBox.Show(ex.Message, "Open allowlist folder", MessageBoxButton.OK, MessageBoxImage.Warning);
+            await DialogService.ShowWarningAsync(ex.Message, "Open allowlist folder");
         }
     }
 
-    private bool BlockIpInternal(string ip, string reason)
+    private async Task<bool> BlockIpInternal(string ip, string reason)
     {
         if (!IsAdmin)
         {
-            PromptElevation();
+            await PromptElevation();
             return false;
         }
 
         if (!FirewallService.TryNormalizeIp(ip, out var normalized, out var error))
         {
             FirewallMessage = error;
-            MessageBox.Show(error, "Block IP", MessageBoxButton.OK, MessageBoxImage.Warning);
+            await DialogService.ShowWarningAsync(error, "Block IP");
             return false;
         }
 
         if (FirewallService.IsPrivateOrLocal(normalized))
         {
             FirewallMessage = "Private/local addresses are not blocked by default (would break LAN).";
-            MessageBox.Show(FirewallMessage, "Block IP", MessageBoxButton.OK, MessageBoxImage.Information);
+            await DialogService.ShowInfoAsync(FirewallMessage, "Block IP");
             return false;
         }
 
-        // Allowlisted IPs get a confirmed manual override instead of a hard
-        // refusal — shared cloud IPs can host hostile traffic too.
         bool overrideAllowlist = false;
         if (_allowlist.IsAllowed(normalized, out var allowReason))
         {
-            var overrideAnswer = MessageBox.Show(
+            var overrideAnswer = await DialogService.ConfirmAsync(
                 $"{normalized} is protected by the allowlist ({allowReason}).\n\n" +
                 "Blocking it may break trusted services (GitHub, Microsoft, DNS, …).\n\nBlock it anyway?",
-                "Allowlist protection",
-                MessageBoxButton.YesNo,
-                MessageBoxImage.Warning);
+                "Allowlist protection");
 
-            if (overrideAnswer != MessageBoxResult.Yes)
+            if (!overrideAnswer)
             {
                 FirewallMessage = $"Protected by allowlist — not blocked: {normalized} ({allowReason}).";
                 return false;
@@ -885,31 +827,26 @@ public partial class MainViewModel : ObservableObject, IDisposable
         }
 
         var direction = ResolveDirection();
-        var answer = MessageBox.Show(
-            $"Create Windows Firewall BLOCK rules for:\n\n{normalized}\nDirection: {direction}\n\n{reason}\n\nInbound blocks stop them reaching you; outbound stops this PC talking back.",
-            "Block IP in Windows Firewall",
-            MessageBoxButton.YesNo,
-            MessageBoxImage.Warning);
+        var answer = await DialogService.ConfirmAsync(
+            $"Create host firewall DROP rules for:\n\n{normalized}\nDirection: {direction}\n\n{reason}\n\nInbound blocks stop them reaching you; outbound stops this PC talking back.",
+            "Block IP in host firewall");
 
-        if (answer != MessageBoxResult.Yes) return false;
+        if (!answer) return false;
 
         var result = _firewall.BlockIp(normalized, direction, reason, overrideAllowlist);
         FirewallMessage = result.Message;
-        if (!result.Success)
-            MessageBox.Show(result.Message, "Firewall", MessageBoxButton.OK, MessageBoxImage.Warning);
-        else
-            MessageBox.Show(result.Message, "Firewall", MessageBoxButton.OK, MessageBoxImage.Information);
+        await DialogService.ShowInfoAsync(result.Message, "Firewall");
 
         RefreshFirewallRules();
         RefreshCollections();
         return result.Success;
     }
 
-    private void UnblockIpInternal(string ip)
+    private async Task UnblockIpInternal(string ip)
     {
         if (!IsAdmin)
         {
-            PromptElevation();
+            await PromptElevation();
             return;
         }
 
@@ -923,10 +860,7 @@ public partial class MainViewModel : ObservableObject, IDisposable
             }
         }
         FirewallMessage = result.Message;
-        if (!result.Success)
-            MessageBox.Show(result.Message, "Firewall", MessageBoxButton.OK, MessageBoxImage.Warning);
-        else
-            MessageBox.Show(result.Message, "Firewall", MessageBoxButton.OK, MessageBoxImage.Information);
+        await DialogService.ShowInfoAsync(result.Message, "Firewall");
 
         RefreshFirewallRules();
         RefreshCollections();
@@ -939,16 +873,15 @@ public partial class MainViewModel : ObservableObject, IDisposable
         return FirewallDirection.Inbound;
     }
 
-    private void PromptElevation()
+    private async Task PromptElevation()
     {
-        FirewallMessage = "Administrator rights required for firewall changes.";
-        var answer = MessageBox.Show(
-            "Changing Windows Firewall rules requires Administrator rights.\n\nRestart Network Sentinel elevated now?",
-            "Elevation required",
-            MessageBoxButton.YesNo,
-            MessageBoxImage.Information);
-        if (answer == MessageBoxResult.Yes)
-            RunAsAdmin();
+        FirewallMessage = "Admin rights required for firewall changes (pkexec password dialog).";
+        var answer = await DialogService.ConfirmAsync(
+            "Changing host firewall rules needs admin rights.\n\n" +
+            "The app will ask for your password via pkexec — it will NOT restart as root.\n\nAuthorize now?",
+            "Elevation required");
+        if (answer)
+            await RunAsAdmin();
     }
 
     private static string FormatAppVersion()
@@ -964,7 +897,7 @@ public partial class MainViewModel : ObservableObject, IDisposable
         }
 
         var version = asm.GetName().Version;
-        return version is null ? "v0.1.0" : $"v{version.Major}.{version.Minor}.{version.Build}";
+        return version is null ? "v0.2.0" : $"v{version.Major}.{version.Minor}.{version.Build}";
     }
 
     public void Dispose()

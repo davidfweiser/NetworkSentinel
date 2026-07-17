@@ -1,43 +1,54 @@
 using System.Diagnostics;
 using System.Net;
 using System.Runtime.InteropServices;
-using System.Security.Principal;
+using System.Text.Json;
 using System.Text.RegularExpressions;
 using NetworkSentinel.Models;
 
 namespace NetworkSentinel.Services;
 
 /// <summary>
-/// Manages Windows Defender Firewall rules owned by Network Sentinel.
-/// Requires administrator privileges to add/remove rules.
+/// Manages host firewall rules owned by Network Sentinel on Linux via nftables
+/// (preferred) or iptables. The GUI always runs as the normal user; privileged
+/// commands are elevated per-call with pkexec/sudo so Wayland/X11 never has to
+/// run Avalonia as root (which fails with XOpenDisplay).
 /// </summary>
 public sealed class FirewallService
 {
     public const string RulePrefix = "NetworkSentinel";
+    private const string NftTable = "inet networksentinel";
+    private static readonly JsonSerializerOptions JsonOptions = new() { WriteIndented = true };
 
-    /// <summary>Optional allowlist — when set, known-good IPs cannot be blocked.</summary>
     public AllowlistService? Allowlist { get; set; }
 
-    public bool IsAdministrator
+    /// <summary>True when euid is root (rare; GUI should not run as root on Wayland).</summary>
+    public bool IsRoot
     {
         get
         {
-            try
-            {
-                using var identity = WindowsIdentity.GetCurrent();
-                var principal = new WindowsPrincipal(identity);
-                return principal.IsInRole(WindowsBuiltInRole.Administrator);
-            }
-            catch
-            {
-                return false;
-            }
+            try { return geteuid() == 0; }
+            catch { return false; }
         }
     }
 
-    public string PrivilegeText => IsAdministrator
-        ? "Running as Administrator — firewall rules can be applied."
-        : "Not elevated — use “Run as Admin” to add or remove firewall rules.";
+    /// <summary>True when firewall changes can be attempted (root or elevatable via pkexec/sudo).</summary>
+    public bool IsAdministrator => IsRoot || CanElevate;
+
+    public bool CanElevate => CommandExists("pkexec") || CommandExists("sudo");
+
+    public string PrivilegeText
+    {
+        get
+        {
+            if (IsRoot)
+                return "Running as root — firewall rules can be applied directly.";
+            if (CommandExists("pkexec"))
+                return "Running as your user. Firewall changes will ask for your password (polkit/pkexec).";
+            if (CommandExists("sudo"))
+                return "Running as your user. Firewall changes use sudo (may prompt for a password in a terminal).";
+            return "No elevation helper found (install pkexec or sudo) — firewall rules cannot be applied.";
+        }
+    }
 
     public FirewallOperationResult BlockIp(string ip, FirewallDirection direction = FirewallDirection.Both, string? reason = null, bool overrideAllowlist = false)
     {
@@ -47,14 +58,13 @@ public sealed class FirewallService
         if (IsPrivateOrLocal(normalized))
             return FirewallOperationResult.Fail("Refusing to block private/local addresses (LAN, loopback, link-local).");
 
-        // overrideAllowlist is only set from an explicit, confirmed user action —
-        // auto-block never bypasses the allowlist.
         if (!overrideAllowlist && Allowlist != null && Allowlist.IsAllowed(normalized, out var allowReason))
             return FirewallOperationResult.Fail($"Refusing to block allowlisted address {normalized} ({allowReason}).");
 
         if (!IsAdministrator)
-            return FirewallOperationResult.Fail("Administrator rights are required to modify the Windows Firewall.");
+            return FirewallOperationResult.Fail("No way to elevate (need pkexec or sudo) to modify the host firewall.");
 
+        EnsureBackendReady();
         var results = new List<string>();
         var ok = true;
 
@@ -83,7 +93,7 @@ public sealed class FirewallService
             return FirewallOperationResult.Fail(error);
 
         if (!IsAdministrator)
-            return FirewallOperationResult.Fail("Administrator rights are required to modify the Windows Firewall.");
+            return FirewallOperationResult.Fail("No way to elevate (need pkexec or sudo) to modify the host firewall.");
 
         var inName = IpRuleName(normalized, true);
         var outName = IpRuleName(normalized, false);
@@ -106,9 +116,9 @@ public sealed class FirewallService
             return FirewallOperationResult.Fail("Protocol must be TCP or UDP.");
 
         if (!IsAdministrator)
-            return FirewallOperationResult.Fail("Administrator rights are required to modify the Windows Firewall.");
+            return FirewallOperationResult.Fail("No way to elevate (need pkexec or sudo) to modify the host firewall.");
 
-        // Safety: never silently block essential local services without user intent — still allow but warn for DNS etc.
+        EnsureBackendReady();
         var results = new List<string>();
         var ok = true;
 
@@ -135,7 +145,7 @@ public sealed class FirewallService
     {
         protocol = (protocol ?? "TCP").Trim().ToUpperInvariant();
         if (!IsAdministrator)
-            return FirewallOperationResult.Fail("Administrator rights are required to modify the Windows Firewall.");
+            return FirewallOperationResult.Fail("No way to elevate (need pkexec or sudo) to modify the host firewall.");
 
         var r1 = RemoveRuleByName(PortRuleName(port, protocol, true));
         var r2 = RemoveRuleByName(PortRuleName(port, protocol, false));
@@ -151,7 +161,7 @@ public sealed class FirewallService
             return FirewallOperationResult.Fail("Only Network Sentinel managed rules can be removed here.");
 
         if (!IsAdministrator)
-            return FirewallOperationResult.Fail("Administrator rights are required to modify the Windows Firewall.");
+            return FirewallOperationResult.Fail("No way to elevate (need pkexec or sudo) to modify the host firewall.");
 
         return RemoveRuleByName(ruleName);
     }
@@ -159,9 +169,9 @@ public sealed class FirewallService
     public FirewallOperationResult RemoveAllManagedRules()
     {
         if (!IsAdministrator)
-            return FirewallOperationResult.Fail("Administrator rights are required to modify the Windows Firewall.");
+            return FirewallOperationResult.Fail("No way to elevate (need pkexec or sudo) to modify the host firewall.");
 
-        var rules = GetManagedRules();
+        var rules = GetManagedRules().ToList();
         int removed = 0;
         foreach (var rule in rules)
         {
@@ -169,20 +179,20 @@ public sealed class FirewallService
                 removed++;
         }
 
+        if (BackendIsNft())
+            RunPrivileged("nft", $"flush table {NftTable}");
+
+        SaveLedger(new List<FirewallRuleInfo>());
         return FirewallOperationResult.Ok($"Removed {removed} Network Sentinel firewall rule(s).");
     }
 
-    /// <summary>
-    /// Removes any Network Sentinel IP-block rules that target allowlisted addresses
-    /// (recovery if GitHub/Grok/etc. were blocked before the allowlist existed).
-    /// </summary>
     public FirewallOperationResult UnblockAllowlistedAddresses()
     {
         if (Allowlist == null)
             return FirewallOperationResult.Fail("Allowlist is not available.");
 
         if (!IsAdministrator)
-            return FirewallOperationResult.Fail("Administrator rights are required to remove firewall rules.");
+            return FirewallOperationResult.Fail("No way to elevate (need pkexec or sudo) to remove firewall rules.");
 
         var rules = GetManagedRules().Where(r => r.Kind == FirewallRuleKind.IpBlock).ToList();
         int removed = 0;
@@ -211,14 +221,13 @@ public sealed class FirewallService
 
     public IReadOnlyList<FirewallRuleInfo> GetManagedRules()
     {
-        try
-        {
-            return GetManagedRulesCom();
-        }
-        catch
-        {
-            return GetManagedRulesNetsh();
-        }
+        var ledger = LoadLedger();
+        return ledger
+            .OrderBy(r => r.Kind)
+            .ThenBy(r => r.RemoteAddresses)
+            .ThenBy(r => r.LocalPorts)
+            .ThenBy(r => r.Direction)
+            .ToList();
     }
 
     public bool IsIpBlocked(string ip)
@@ -226,8 +235,7 @@ public sealed class FirewallService
         if (!TryNormalizeIp(ip, out var normalized, out _))
             return false;
 
-        var rules = GetManagedRules();
-        return rules.Any(r =>
+        return GetManagedRules().Any(r =>
             r.Kind == FirewallRuleKind.IpBlock &&
             string.Equals(r.RemoteAddresses, normalized, StringComparison.OrdinalIgnoreCase));
     }
@@ -243,270 +251,325 @@ public sealed class FirewallService
         return set;
     }
 
+    /// <summary>
+    /// Pre-authorize elevation with a no-op privileged command so the first real
+    /// block does not surprise the user. Does NOT relaunch the GUI as root.
+    /// </summary>
+    public FirewallOperationResult AuthorizeElevation()
+    {
+        if (IsRoot)
+            return FirewallOperationResult.Ok("Already running as root.");
+
+        if (!CanElevate)
+            return FirewallOperationResult.Fail(
+                "No elevation helper found. Install policykit-1 (pkexec) or sudo.");
+
+        // Touch a harmless privileged read — triggers polkit/sudo password once.
+        var probe = BackendIsNft()
+            ? RunPrivileged("nft", "list tables")
+            : RunPrivileged("iptables", "-L -n");
+
+        if (probe.Success)
+            return FirewallOperationResult.Ok(
+                "Authorization OK. Firewall changes can proceed (you may be prompted again after a while).");
+
+        return FirewallOperationResult.Fail(
+            "Elevation failed or was cancelled. " + probe.Message +
+            "\n\nDo not run the whole app with sudo on Wayland — that breaks the display " +
+            "(XOpenDisplay). Run as your user and let pkexec prompt for password.");
+    }
+
+    [Obsolete("GUI must not restart as root on Wayland. Use AuthorizeElevation() instead.")]
     public void RestartAsAdministrator()
     {
-        var exe = Environment.ProcessPath
-                  ?? Process.GetCurrentProcess().MainModule?.FileName
-                  ?? throw new InvalidOperationException("Could not resolve executable path.");
-
-        var start = new ProcessStartInfo(exe)
-        {
-            UseShellExecute = true,
-            Verb = "runas"
-        };
-
-        Process.Start(start);
+        // Kept for API compatibility — elevates in-place rather than relaunching GUI.
+        var result = AuthorizeElevation();
+        if (!result.Success)
+            throw new InvalidOperationException(result.Message);
     }
 
     private FirewallOperationResult EnsureIpRule(string ip, bool isInbound, string? reason)
     {
         var name = IpRuleName(ip, isInbound);
-        RemoveRuleByName(name); // replace cleanly
+        RemoveRuleByName(name);
 
-        var dir = isInbound ? "in" : "out";
         var description = reason ?? $"Blocked by Network Sentinel at {DateTime.Now:u}";
-        // Prefer COM; fall back to netsh
-        try
+        FirewallOperationResult applied;
+
+        if (BackendIsNft())
         {
-            AddIpRuleCom(name, ip, isInbound, description);
-            return FirewallOperationResult.Ok($"Rule “{name}” applied.");
+            var chain = isInbound ? "input" : "output";
+            var match = isInbound ? $"ip saddr {ip}" : $"ip daddr {ip}";
+            if (IPAddress.TryParse(ip, out var addr) && addr.AddressFamily == System.Net.Sockets.AddressFamily.InterNetworkV6)
+                match = isInbound ? $"ip6 saddr {ip}" : $"ip6 daddr {ip}";
+
+            var r = RunPrivileged("nft",
+                $"add rule {NftTable} {chain} {match} counter drop comment \"{Escape(name)}\"");
+            applied = r.Success
+                ? FirewallOperationResult.Ok($"Rule “{name}” applied (nftables).")
+                : FirewallOperationResult.Fail($"Failed nft add {name}: {r.Message}");
         }
-        catch (Exception ex)
+        else
         {
-            var netsh = RunNetsh(
-                $"advfirewall firewall add rule name=\"{name}\" dir={dir} action=block remoteip={ip} enable=yes profile=any description=\"{Escape(description)}\"");
-            return netsh.Success
-                ? FirewallOperationResult.Ok($"Rule “{name}” applied via netsh.")
-                : FirewallOperationResult.Fail($"Failed to add rule {name}: {ex.Message}; netsh: {netsh.Message}");
+            var table = isInbound ? "INPUT" : "OUTPUT";
+            var flag = isInbound ? "-s" : "-d";
+            var r = RunPrivileged("iptables",
+                $"-A {table} {flag} {ip} -j DROP -m comment --comment \"{Escape(name)}\"");
+            applied = r.Success
+                ? FirewallOperationResult.Ok($"Rule “{name}” applied (iptables).")
+                : FirewallOperationResult.Fail($"Failed iptables add {name}: {r.Message}");
         }
+
+        if (applied.Success)
+        {
+            UpsertLedger(new FirewallRuleInfo
+            {
+                Name = name,
+                Description = description,
+                Enabled = true,
+                IsBlock = true,
+                Direction = isInbound ? FirewallDirection.Inbound : FirewallDirection.Outbound,
+                RemoteAddresses = ip,
+                LocalPorts = "",
+                Protocol = "Any",
+                Kind = FirewallRuleKind.IpBlock
+            });
+        }
+
+        return applied;
     }
 
     private FirewallOperationResult EnsurePortRule(int port, string protocol, bool isInbound, string? reason)
     {
         var name = PortRuleName(port, protocol, isInbound);
         RemoveRuleByName(name);
-
-        var dir = isInbound ? "in" : "out";
         var description = reason ?? $"Port blocked by Network Sentinel at {DateTime.Now:u}";
-        try
-        {
-            AddPortRuleCom(name, port, protocol, isInbound, description);
-            return FirewallOperationResult.Ok($"Rule “{name}” applied.");
-        }
-        catch (Exception ex)
-        {
-            var netsh = RunNetsh(
-                $"advfirewall firewall add rule name=\"{name}\" dir={dir} action=block protocol={protocol} localport={port} enable=yes profile=any description=\"{Escape(description)}\"");
-            return netsh.Success
-                ? FirewallOperationResult.Ok($"Rule “{name}” applied via netsh.")
-                : FirewallOperationResult.Fail($"Failed to add rule {name}: {ex.Message}; netsh: {netsh.Message}");
-        }
-    }
+        var proto = protocol.ToLowerInvariant();
+        FirewallOperationResult applied;
 
-    private static void AddIpRuleCom(string name, string ip, bool isInbound, string description)
-    {
-        dynamic policy = CreateCom("HNetCfg.FwPolicy2");
-        dynamic rule = CreateCom("HNetCfg.FWRule");
-        rule.Name = name;
-        rule.Description = description;
-        rule.Action = 0; // BLOCK
-        rule.Direction = isInbound ? 1 : 2;
-        rule.Enabled = true;
-        rule.Profiles = 0x7FFFFFFF; // all
-        rule.InterfaceTypes = "All";
-        rule.RemoteAddresses = ip;
-        rule.Protocol = 256; // ANY
-        policy.Rules.Add(rule);
-        Marshal.FinalReleaseComObject(rule);
-        Marshal.FinalReleaseComObject(policy);
-    }
+        if (BackendIsNft())
+        {
+            var chain = isInbound ? "input" : "output";
+            var portMatch = isInbound ? $"dport {port}" : $"sport {port}";
+            var r = RunPrivileged("nft",
+                $"add rule {NftTable} {chain} {proto} {portMatch} counter drop comment \"{Escape(name)}\"");
+            applied = r.Success
+                ? FirewallOperationResult.Ok($"Rule “{name}” applied (nftables).")
+                : FirewallOperationResult.Fail($"Failed nft add {name}: {r.Message}");
+        }
+        else
+        {
+            var table = isInbound ? "INPUT" : "OUTPUT";
+            var portFlag = isInbound ? "--dport" : "--sport";
+            var r = RunPrivileged("iptables",
+                $"-A {table} -p {proto} {portFlag} {port} -j DROP -m comment --comment \"{Escape(name)}\"");
+            applied = r.Success
+                ? FirewallOperationResult.Ok($"Rule “{name}” applied (iptables).")
+                : FirewallOperationResult.Fail($"Failed iptables add {name}: {r.Message}");
+        }
 
-    private static void AddPortRuleCom(string name, int port, string protocol, bool isInbound, string description)
-    {
-        dynamic policy = CreateCom("HNetCfg.FwPolicy2");
-        dynamic rule = CreateCom("HNetCfg.FWRule");
-        rule.Name = name;
-        rule.Description = description;
-        rule.Action = 0;
-        rule.Direction = isInbound ? 1 : 2;
-        rule.Enabled = true;
-        rule.Profiles = 0x7FFFFFFF;
-        rule.InterfaceTypes = "All";
-        rule.Protocol = protocol.Equals("UDP", StringComparison.OrdinalIgnoreCase) ? 17 : 6;
-        rule.LocalPorts = port.ToString();
-        policy.Rules.Add(rule);
-        Marshal.FinalReleaseComObject(rule);
-        Marshal.FinalReleaseComObject(policy);
+        if (applied.Success)
+        {
+            UpsertLedger(new FirewallRuleInfo
+            {
+                Name = name,
+                Description = description,
+                Enabled = true,
+                IsBlock = true,
+                Direction = isInbound ? FirewallDirection.Inbound : FirewallDirection.Outbound,
+                RemoteAddresses = "",
+                LocalPorts = port.ToString(),
+                Protocol = protocol.ToUpperInvariant(),
+                Kind = FirewallRuleKind.PortBlock
+            });
+        }
+
+        return applied;
     }
 
     private FirewallOperationResult RemoveRuleByName(string name)
     {
-        dynamic? policy = null;
+        bool removed = false;
+
+        if (BackendIsNft())
+        {
+            var list = RunPrivileged("nft", $"-a list table {NftTable}");
+            if (list.Success)
+            {
+                foreach (var handle in FindNftHandles(list.Message, name))
+                {
+                    if (RunPrivileged("nft", $"delete rule {NftTable} input handle {handle}").Success)
+                        removed = true;
+                    else if (RunPrivileged("nft", $"delete rule {NftTable} output handle {handle}").Success)
+                        removed = true;
+                }
+            }
+        }
+        else
+        {
+            removed |= DeleteIptablesByComment("INPUT", name);
+            removed |= DeleteIptablesByComment("OUTPUT", name);
+        }
+
+        // Ledger is always updated so UI stays consistent even if kernel rule was already gone.
+        var hadLedger = LoadLedger().Any(r => string.Equals(r.Name, name, StringComparison.OrdinalIgnoreCase));
+        RemoveFromLedger(name);
+
+        return removed || hadLedger
+            ? FirewallOperationResult.Ok($"Removed “{name}”.")
+            : FirewallOperationResult.Fail($"No rule named “{name}”.");
+    }
+
+    private bool DeleteIptablesByComment(string table, string name)
+    {
+        var list = RunPrivileged("iptables", $"-L {table} -n --line-numbers");
+        if (!list.Success) return false;
+
+        var lines = list.Message.Split('\n')
+            .Where(l => l.Contains(name, StringComparison.Ordinal))
+            .Select(l => l.Trim().Split(' ', StringSplitOptions.RemoveEmptyEntries).FirstOrDefault())
+            .Where(s => !string.IsNullOrEmpty(s) && int.TryParse(s, out _))
+            .Select(s => int.Parse(s!))
+            .OrderByDescending(n => n)
+            .ToList();
+
+        bool any = false;
+        foreach (var num in lines)
+        {
+            if (RunPrivileged("iptables", $"-D {table} {num}").Success)
+                any = true;
+        }
+        return any;
+    }
+
+    private static IEnumerable<string> FindNftHandles(string dump, string comment)
+    {
+        foreach (var line in dump.Split('\n'))
+        {
+            if (!line.Contains(comment, StringComparison.Ordinal)) continue;
+            var m = Regex.Match(line, @"#\s*handle\s+(\d+)");
+            if (m.Success)
+                yield return m.Groups[1].Value;
+        }
+    }
+
+    private void EnsureBackendReady()
+    {
+        if (!BackendIsNft()) return;
+
+        RunPrivileged("nft", $"add table {NftTable}");
+        RunPrivileged("nft", $"add chain {NftTable} input {{ type filter hook input priority 0; policy accept; }}");
+        RunPrivileged("nft", $"add chain {NftTable} output {{ type filter hook output priority 0; policy accept; }}");
+    }
+
+    private static bool? _backendNft;
+
+    private static bool BackendIsNft()
+    {
+        if (_backendNft.HasValue) return _backendNft.Value;
+        _backendNft = CommandExists("nft");
+        return _backendNft.Value;
+    }
+
+    private static bool CommandExists(string name)
+    {
         try
         {
-            policy = CreateCom("HNetCfg.FwPolicy2");
-
-            // INetFwRules.Remove silently succeeds for a missing name, which
-            // would make "Unblock" report success for rules that never existed —
-            // check existence first so callers get an honest answer.
-            try
+            var psi = new ProcessStartInfo("which", name)
             {
-                dynamic rule = policy.Rules.Item(name);
-                Marshal.FinalReleaseComObject(rule);
-            }
-            catch
-            {
-                return FirewallOperationResult.Fail($"No rule named “{name}”.");
-            }
-
-            policy.Rules.Remove(name);
-            return FirewallOperationResult.Ok($"Removed “{name}”.");
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+                UseShellExecute = false,
+                CreateNoWindow = true
+            };
+            using var p = Process.Start(psi);
+            if (p == null) return false;
+            p.WaitForExit(3000);
+            return p.ExitCode == 0;
         }
         catch
         {
-            var netsh = RunNetsh($"advfirewall firewall delete rule name=\"{name}\"");
-            return netsh.Success
-                ? FirewallOperationResult.Ok($"Removed “{name}”.")
-                : FirewallOperationResult.Fail(netsh.Message);
-        }
-        finally
-        {
-            if (policy != null)
-                Marshal.FinalReleaseComObject(policy);
+            return false;
         }
     }
 
-    private static List<FirewallRuleInfo> GetManagedRulesCom()
+    /// <summary>
+    /// Runs a host-firewall tool, elevating with pkexec (preferred) or sudo when
+    /// not already root. Never relaunches the Avalonia UI as root.
+    /// </summary>
+    private static FirewallOperationResult RunPrivileged(string file, string args)
     {
-        var list = new List<FirewallRuleInfo>();
-        dynamic policy = CreateCom("HNetCfg.FwPolicy2");
+        if (geteuid() == 0)
+            return RunDirect(file, args);
+
+        // Resolve absolute path so pkexec/sudo can find the binary in secure PATH.
+        var resolved = ResolveExecutable(file) ?? file;
+
+        // 1) pkexec — graphical polkit dialog, works under Wayland
+        if (CommandExists("pkexec"))
+        {
+            var r = RunDirect("pkexec", $"{Quote(resolved)} {args}");
+            if (r.Success || !LooksLikeMissingHelper(r.Message))
+                return r;
+        }
+
+        // 2) sudo -n first (passwordless / already cached)
+        if (CommandExists("sudo"))
+        {
+            var cached = RunDirect("sudo", $"-n {Quote(resolved)} {args}");
+            if (cached.Success)
+                return cached;
+
+            // 3) Interactive sudo only if we have a TTY (rare for GUI)
+            if (!string.IsNullOrEmpty(Environment.GetEnvironmentVariable("SUDO_ASKPASS")) ||
+                !Console.IsInputRedirected)
+            {
+                var interactive = RunDirect("sudo", $"{Quote(resolved)} {args}");
+                if (interactive.Success)
+                    return interactive;
+                return interactive;
+            }
+
+            return FirewallOperationResult.Fail(
+                "Need admin rights for firewall changes. Install policykit-1 (pkexec) for a password dialog, " +
+                "or configure passwordless sudo for nft/iptables. Do not start the GUI with plain sudo on Wayland.");
+        }
+
+        return FirewallOperationResult.Fail("No elevation helper (pkexec/sudo) available.");
+    }
+
+    private static bool LooksLikeMissingHelper(string message)
+        => message.Contains("not found", StringComparison.OrdinalIgnoreCase)
+           || message.Contains("No such file", StringComparison.OrdinalIgnoreCase);
+
+    private static string? ResolveExecutable(string name)
+    {
+        if (name.Contains('/')) return name;
         try
         {
-            foreach (dynamic rule in policy.Rules)
+            var psi = new ProcessStartInfo("which", name)
             {
-                string name = rule.Name ?? "";
-                if (!name.StartsWith(RulePrefix, StringComparison.OrdinalIgnoreCase))
-                    continue;
-
-                int action = (int)rule.Action;
-                int direction = (int)rule.Direction;
-                bool enabled = rule.Enabled;
-                string remote = rule.RemoteAddresses?.ToString() ?? "";
-                string localPorts = rule.LocalPorts?.ToString() ?? "";
-                string description = rule.Description?.ToString() ?? "";
-                int protocol = 0;
-                try { protocol = (int)rule.Protocol; } catch { /* any */ }
-
-                list.Add(new FirewallRuleInfo
-                {
-                    Name = name,
-                    Description = description,
-                    Enabled = enabled,
-                    IsBlock = action == 0,
-                    Direction = direction == 1 ? FirewallDirection.Inbound : FirewallDirection.Outbound,
-                    RemoteAddresses = NormalizeRemote(remote),
-                    LocalPorts = localPorts is " *" or "*" ? "" : localPorts.Trim(),
-                    Protocol = ProtocolName(protocol),
-                    Kind = name.Contains("-IP-", StringComparison.OrdinalIgnoreCase)
-                        ? FirewallRuleKind.IpBlock
-                        : FirewallRuleKind.PortBlock
-                });
-            }
+                RedirectStandardOutput = true,
+                UseShellExecute = false,
+                CreateNoWindow = true
+            };
+            using var p = Process.Start(psi);
+            if (p == null) return null;
+            var path = p.StandardOutput.ReadToEnd().Trim();
+            p.WaitForExit(3000);
+            return p.ExitCode == 0 && !string.IsNullOrWhiteSpace(path) ? path : null;
         }
-        finally
+        catch
         {
-            Marshal.FinalReleaseComObject(policy);
+            return null;
         }
-
-        return list
-            .OrderBy(r => r.Kind)
-            .ThenBy(r => r.RemoteAddresses)
-            .ThenBy(r => r.LocalPorts)
-            .ThenBy(r => r.Direction)
-            .ToList();
     }
 
-    private static List<FirewallRuleInfo> GetManagedRulesNetsh()
-    {
-        var list = new List<FirewallRuleInfo>();
-        var result = RunNetsh("advfirewall firewall show rule name=all verbose");
-        if (!result.Success && string.IsNullOrWhiteSpace(result.Message))
-            return list;
-
-        // Parse netsh dump for our prefix
-        string? currentName = null;
-        string enabled = "";
-        string direction = "";
-        string profiles = "";
-        string remoteIp = "";
-        string localPort = "";
-        string protocol = "";
-        string action = "";
-
-        void Flush()
-        {
-            if (string.IsNullOrWhiteSpace(currentName) ||
-                !currentName.StartsWith(RulePrefix, StringComparison.OrdinalIgnoreCase))
-                return;
-
-            list.Add(new FirewallRuleInfo
-            {
-                Name = currentName,
-                Enabled = enabled.Contains("Yes", StringComparison.OrdinalIgnoreCase),
-                IsBlock = action.Contains("Block", StringComparison.OrdinalIgnoreCase),
-                Direction = direction.Contains("Out", StringComparison.OrdinalIgnoreCase)
-                    ? FirewallDirection.Outbound
-                    : FirewallDirection.Inbound,
-                RemoteAddresses = NormalizeRemote(remoteIp),
-                LocalPorts = localPort,
-                Protocol = string.IsNullOrWhiteSpace(protocol) ? "Any" : protocol,
-                Kind = currentName.Contains("-IP-", StringComparison.OrdinalIgnoreCase)
-                    ? FirewallRuleKind.IpBlock
-                    : FirewallRuleKind.PortBlock,
-                Description = profiles
-            });
-        }
-
-        foreach (var raw in result.Message.Split('\n'))
-        {
-            var line = raw.TrimEnd('\r');
-            if (line.StartsWith("Rule Name:", StringComparison.OrdinalIgnoreCase))
-            {
-                Flush();
-                currentName = line["Rule Name:".Length..].Trim();
-                enabled = direction = remoteIp = localPort = protocol = action = profiles = "";
-            }
-            else if (line.StartsWith("Enabled:", StringComparison.OrdinalIgnoreCase))
-                enabled = line["Enabled:".Length..].Trim();
-            else if (line.StartsWith("Direction:", StringComparison.OrdinalIgnoreCase))
-                direction = line["Direction:".Length..].Trim();
-            else if (line.StartsWith("RemoteIP:", StringComparison.OrdinalIgnoreCase))
-                remoteIp = line["RemoteIP:".Length..].Trim();
-            else if (line.StartsWith("LocalPort:", StringComparison.OrdinalIgnoreCase))
-                localPort = line["LocalPort:".Length..].Trim();
-            else if (line.StartsWith("Protocol:", StringComparison.OrdinalIgnoreCase))
-                protocol = line["Protocol:".Length..].Trim();
-            else if (line.StartsWith("Action:", StringComparison.OrdinalIgnoreCase))
-                action = line["Action:".Length..].Trim();
-        }
-
-        Flush();
-        return list;
-    }
-
-    private static object CreateCom(string progId)
-    {
-        var type = Type.GetTypeFromProgID(progId)
-                   ?? throw new InvalidOperationException($"COM type {progId} not available.");
-        return Activator.CreateInstance(type)
-               ?? throw new InvalidOperationException($"Failed to create {progId}.");
-    }
-
-    private static FirewallOperationResult RunNetsh(string args)
+    private static FirewallOperationResult RunDirect(string file, string args)
     {
         try
         {
-            var psi = new ProcessStartInfo("netsh", args)
+            var psi = new ProcessStartInfo(file, args)
             {
                 UseShellExecute = false,
                 RedirectStandardOutput = true,
@@ -515,28 +578,74 @@ public sealed class FirewallService
             };
             using var p = Process.Start(psi);
             if (p == null)
-                return FirewallOperationResult.Fail("Could not start netsh.");
+                return FirewallOperationResult.Fail($"Could not start {file}.");
 
             string stdout = p.StandardOutput.ReadToEnd();
             string stderr = p.StandardError.ReadToEnd();
-            p.WaitForExit(15000);
+            p.WaitForExit(30000);
             string combined = (stdout + "\n" + stderr).Trim();
 
             if (p.ExitCode == 0)
                 return FirewallOperationResult.Ok(combined);
-
-            // delete rule when missing often exits non-zero
-            if (combined.Contains("No rules match", StringComparison.OrdinalIgnoreCase))
-                return FirewallOperationResult.Fail("No matching rule.");
+            if (combined.Contains("File exists", StringComparison.OrdinalIgnoreCase) ||
+                combined.Contains("already exists", StringComparison.OrdinalIgnoreCase))
+                return FirewallOperationResult.Ok(combined);
 
             return FirewallOperationResult.Fail(string.IsNullOrWhiteSpace(combined)
-                ? $"netsh exit code {p.ExitCode}"
+                ? $"{file} exit code {p.ExitCode}"
                 : combined);
         }
         catch (Exception ex)
         {
             return FirewallOperationResult.Fail(ex.Message);
         }
+    }
+
+    // ── Rule ledger (JSON under XDG config) ──────────────────────────────
+
+    private static string LedgerPath
+        => Path.Combine(AppPaths.DataDirectory, "firewall-rules.json");
+
+    private static List<FirewallRuleInfo> LoadLedger()
+    {
+        try
+        {
+            if (!File.Exists(LedgerPath)) return new List<FirewallRuleInfo>();
+            var json = File.ReadAllText(LedgerPath);
+            return JsonSerializer.Deserialize<List<FirewallRuleInfo>>(json, JsonOptions)
+                   ?? new List<FirewallRuleInfo>();
+        }
+        catch
+        {
+            return new List<FirewallRuleInfo>();
+        }
+    }
+
+    private static void SaveLedger(List<FirewallRuleInfo> rules)
+    {
+        try
+        {
+            File.WriteAllText(LedgerPath, JsonSerializer.Serialize(rules, JsonOptions));
+        }
+        catch
+        {
+            // best-effort
+        }
+    }
+
+    private static void UpsertLedger(FirewallRuleInfo rule)
+    {
+        var list = LoadLedger();
+        list.RemoveAll(r => string.Equals(r.Name, rule.Name, StringComparison.OrdinalIgnoreCase));
+        list.Add(rule);
+        SaveLedger(list);
+    }
+
+    private static void RemoveFromLedger(string name)
+    {
+        var list = LoadLedger();
+        list.RemoveAll(r => string.Equals(r.Name, name, StringComparison.OrdinalIgnoreCase));
+        SaveLedger(list);
     }
 
     public static string IpRuleName(string ip, bool inbound)
@@ -551,23 +660,8 @@ public sealed class FirewallService
     private static string Escape(string value)
         => value.Replace("\"", "'");
 
-    private static string ProtocolName(int protocol) => protocol switch
-    {
-        6 => "TCP",
-        17 => "UDP",
-        256 => "Any",
-        0 => "Any",
-        _ => protocol.ToString()
-    };
-
-    private static string NormalizeRemote(string remote)
-    {
-        if (string.IsNullOrWhiteSpace(remote)) return "";
-        // COM sometimes returns "1.2.3.4/255.255.255.255"
-        var first = remote.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries).FirstOrDefault() ?? remote;
-        var slash = first.IndexOf('/');
-        return slash > 0 ? first[..slash] : first.Trim();
-    }
+    private static string Quote(string path)
+        => path.Contains(' ') ? $"\"{path}\"" : path;
 
     public static bool TryNormalizeIp(string? ip, out string normalized, out string error)
     {
@@ -580,7 +674,6 @@ public sealed class FirewallService
         }
 
         ip = ip.Trim();
-        // strip port / brackets if user pasted "ip:port" or "[v6]:port"
         if (ip.StartsWith('['))
         {
             var end = ip.IndexOf(']');
@@ -589,7 +682,6 @@ public sealed class FirewallService
         }
         else if (ip.Contains(':') && IPAddress.TryParse(ip, out _) == false)
         {
-            // could be ipv4:port
             var idx = ip.LastIndexOf(':');
             if (idx > 0 && ip.Count(c => c == ':') == 1)
                 ip = ip[..idx];
@@ -607,6 +699,9 @@ public sealed class FirewallService
 
     public static bool IsPrivateOrLocal(string ip)
         => GeoIpService.IsNonPublic(ip);
+
+    [DllImport("libc")]
+    private static extern uint geteuid();
 }
 
 public enum FirewallDirection

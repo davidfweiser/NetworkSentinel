@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Network Sentinel
+Comment=Live network monitoring, intrusion awareness, and host firewall control
+Exec=NetworkSentinel
+Icon=security-high
+Terminal=false
+Categories=System;Monitor;Security;
+Keywords=network;firewall;ports;security;

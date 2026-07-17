@@ -1,0 +1,130 @@
+<Styles xmlns="https://github.com/avaloniaui"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml">
+
+  <Style Selector="Button.ghost">
+    <Setter Property="Foreground" Value="{DynamicResource TextPrimaryBrush}"/>
+    <Setter Property="Background" Value="#22182A4A"/>
+    <Setter Property="BorderBrush" Value="{DynamicResource StrokeSoftBrush}"/>
+    <Setter Property="BorderThickness" Value="1"/>
+    <Setter Property="Padding" Value="12,8"/>
+    <Setter Property="FontSize" Value="12"/>
+    <Setter Property="FontWeight" Value="SemiBold"/>
+    <Setter Property="CornerRadius" Value="12"/>
+  </Style>
+
+  <Style Selector="Button.primary">
+    <Setter Property="Foreground" Value="#FF041018"/>
+    <Setter Property="Background" Value="{DynamicResource AccentGradient}"/>
+    <Setter Property="BorderThickness" Value="0"/>
+    <Setter Property="Padding" Value="12,8"/>
+    <Setter Property="FontSize" Value="12"/>
+    <Setter Property="FontWeight" Value="Bold"/>
+    <Setter Property="CornerRadius" Value="12"/>
+  </Style>
+
+  <Style Selector="Button.danger">
+    <Setter Property="Foreground" Value="White"/>
+    <Setter Property="Background" Value="{DynamicResource DangerGradient}"/>
+    <Setter Property="BorderThickness" Value="0"/>
+    <Setter Property="Padding" Value="12,8"/>
+    <Setter Property="FontSize" Value="12"/>
+    <Setter Property="FontWeight" Value="SemiBold"/>
+    <Setter Property="CornerRadius" Value="12"/>
+  </Style>
+
+  <Style Selector="Button.mini-danger">
+    <Setter Property="Foreground" Value="White"/>
+    <Setter Property="Background" Value="{DynamicResource DangerGradient}"/>
+    <Setter Property="BorderThickness" Value="0"/>
+    <Setter Property="Padding" Value="10,6"/>
+    <Setter Property="FontSize" Value="11"/>
+    <Setter Property="MinWidth" Value="72"/>
+    <Setter Property="CornerRadius" Value="10"/>
+  </Style>
+
+  <Style Selector="Button.mini-ghost">
+    <Setter Property="Foreground" Value="{DynamicResource TextPrimaryBrush}"/>
+    <Setter Property="Background" Value="#22182A4A"/>
+    <Setter Property="BorderBrush" Value="{DynamicResource StrokeSoftBrush}"/>
+    <Setter Property="BorderThickness" Value="1"/>
+    <Setter Property="Padding" Value="10,6"/>
+    <Setter Property="FontSize" Value="11"/>
+    <Setter Property="MinWidth" Value="72"/>
+    <Setter Property="CornerRadius" Value="10"/>
+  </Style>
+
+  <Style Selector="Border.card">
+    <Setter Property="Background" Value="{DynamicResource BgCardBrush}"/>
+    <Setter Property="BorderBrush" Value="{DynamicResource StrokeSoftBrush}"/>
+    <Setter Property="BorderThickness" Value="1"/>
+    <Setter Property="CornerRadius" Value="18"/>
+    <Setter Property="Padding" Value="18"/>
+  </Style>
+
+  <Style Selector="Border.stat">
+    <Setter Property="Background" Value="{DynamicResource BgCardBrush}"/>
+    <Setter Property="BorderBrush" Value="{DynamicResource StrokeSoftBrush}"/>
+    <Setter Property="BorderThickness" Value="1"/>
+    <Setter Property="CornerRadius" Value="18"/>
+    <Setter Property="Padding" Value="12"/>
+  </Style>
+
+  <Style Selector="TextBox.modern">
+    <Setter Property="Foreground" Value="{DynamicResource TextPrimaryBrush}"/>
+    <Setter Property="Background" Value="#22101828"/>
+    <Setter Property="BorderBrush" Value="{DynamicResource StrokeSoftBrush}"/>
+    <Setter Property="BorderThickness" Value="1"/>
+    <Setter Property="Padding" Value="12,10"/>
+    <Setter Property="FontSize" Value="13"/>
+    <Setter Property="CornerRadius" Value="12"/>
+  </Style>
+
+  <Style Selector="RadioButton.nav">
+    <Setter Property="Foreground" Value="{DynamicResource TextSecondaryBrush}"/>
+    <Setter Property="Background" Value="Transparent"/>
+    <Setter Property="Padding" Value="14,12"/>
+    <Setter Property="FontSize" Value="13.5"/>
+    <Setter Property="FontWeight" Value="SemiBold"/>
+    <Setter Property="Margin" Value="0,3"/>
+  </Style>
+
+  <Style Selector="RadioButton.nav:checked">
+    <Setter Property="Foreground" Value="{DynamicResource TextPrimaryBrush}"/>
+    <Setter Property="Background" Value="#331E3A68"/>
+  </Style>
+
+  <Style Selector="DataGrid">
+    <Setter Property="Background" Value="Transparent"/>
+    <Setter Property="Foreground" Value="{DynamicResource TextPrimaryBrush}"/>
+    <Setter Property="BorderThickness" Value="0"/>
+    <Setter Property="GridLinesVisibility" Value="Horizontal"/>
+    <Setter Property="HorizontalGridLinesBrush" Value="#18A8C5FF"/>
+    <Setter Property="IsReadOnly" Value="True"/>
+    <Setter Property="CanUserReorderColumns" Value="False"/>
+    <Setter Property="CanUserResizeColumns" Value="True"/>
+    <Setter Property="CanUserSortColumns" Value="True"/>
+    <Setter Property="SelectionMode" Value="Single"/>
+    <Setter Property="FontSize" Value="12.5"/>
+  </Style>
+
+  <Style Selector="DataGridColumnHeader">
+    <Setter Property="Background" Value="#22101828"/>
+    <Setter Property="Foreground" Value="{DynamicResource TextSecondaryBrush}"/>
+    <Setter Property="FontWeight" Value="SemiBold"/>
+    <Setter Property="Padding" Value="10,8"/>
+  </Style>
+
+  <Style Selector="CheckBox">
+    <Setter Property="Foreground" Value="{DynamicResource TextPrimaryBrush}"/>
+    <Setter Property="FontSize" Value="12.5"/>
+    <Setter Property="Margin" Value="0,0,14,0"/>
+  </Style>
+
+  <Style Selector="ComboBox">
+    <Setter Property="Foreground" Value="#FFF2F7FF"/>
+    <Setter Property="Background" Value="#FF121C31"/>
+    <Setter Property="BorderBrush" Value="#33A8C5FF"/>
+    <Setter Property="Padding" Value="10,8"/>
+    <Setter Property="MinHeight" Value="36"/>
+  </Style>
+</Styles>

@@ -1,86 +1,91 @@
+using System;
+using System.Collections.Generic;
 using System.Collections.Specialized;
-using System.Windows;
-using System.Windows.Media;
-using System.Windows.Threading;
+using System.Linq;
+using Avalonia;
+using Avalonia.Controls;
+using Avalonia.Media;
+using Avalonia.Threading;
 
 namespace NetworkSentinel.Controls;
 
-public sealed class Sparkline : FrameworkElement
+public sealed class Sparkline : Control
 {
-    public static readonly DependencyProperty ValuesProperty =
-        DependencyProperty.Register(nameof(Values), typeof(IEnumerable<double>), typeof(Sparkline),
-            new FrameworkPropertyMetadata(null, FrameworkPropertyMetadataOptions.AffectsRender, OnValuesChanged));
+    public static readonly StyledProperty<IEnumerable<double>?> ValuesProperty =
+        AvaloniaProperty.Register<Sparkline, IEnumerable<double>?>(nameof(Values));
 
-    public static readonly DependencyProperty StrokeProperty =
-        DependencyProperty.Register(nameof(Stroke), typeof(Brush), typeof(Sparkline),
-            new FrameworkPropertyMetadata(new SolidColorBrush(Color.FromRgb(0x3D, 0xE7, 0xC8)), FrameworkPropertyMetadataOptions.AffectsRender));
+    public static readonly StyledProperty<IBrush?> StrokeProperty =
+        AvaloniaProperty.Register<Sparkline, IBrush?>(nameof(Stroke),
+            new SolidColorBrush(Color.FromRgb(0x3D, 0xE7, 0xC8)));
 
-    public static readonly DependencyProperty FillProperty =
-        DependencyProperty.Register(nameof(Fill), typeof(Brush), typeof(Sparkline),
-            new FrameworkPropertyMetadata(null, FrameworkPropertyMetadataOptions.AffectsRender));
+    public static readonly StyledProperty<IBrush?> FillProperty =
+        AvaloniaProperty.Register<Sparkline, IBrush?>(nameof(Fill));
 
-    public static readonly DependencyProperty StrokeThicknessProperty =
-        DependencyProperty.Register(nameof(StrokeThickness), typeof(double), typeof(Sparkline),
-            new FrameworkPropertyMetadata(2.2, FrameworkPropertyMetadataOptions.AffectsRender));
+    public static readonly StyledProperty<double> StrokeThicknessProperty =
+        AvaloniaProperty.Register<Sparkline, double>(nameof(StrokeThickness), 2.2);
 
     private INotifyCollectionChanged? _subscribed;
 
     public IEnumerable<double>? Values
     {
-        get => (IEnumerable<double>?)GetValue(ValuesProperty);
+        get => GetValue(ValuesProperty);
         set => SetValue(ValuesProperty, value);
     }
 
-    public Brush Stroke
+    public IBrush? Stroke
     {
-        get => (Brush)GetValue(StrokeProperty);
+        get => GetValue(StrokeProperty);
         set => SetValue(StrokeProperty, value);
     }
 
-    public Brush? Fill
+    public IBrush? Fill
     {
-        get => (Brush?)GetValue(FillProperty);
+        get => GetValue(FillProperty);
         set => SetValue(FillProperty, value);
     }
 
     public double StrokeThickness
     {
-        get => (double)GetValue(StrokeThicknessProperty);
+        get => GetValue(StrokeThicknessProperty);
         set => SetValue(StrokeThicknessProperty, value);
     }
 
-    private static void OnValuesChanged(DependencyObject d, DependencyPropertyChangedEventArgs e)
+    static Sparkline()
     {
-        var spark = (Sparkline)d;
-        if (spark._subscribed != null)
-            spark._subscribed.CollectionChanged -= spark.OnCollectionChanged;
+        AffectsRender<Sparkline>(ValuesProperty, StrokeProperty, FillProperty, StrokeThicknessProperty);
+        ValuesProperty.Changed.AddClassHandler<Sparkline>((s, e) => s.OnValuesChanged(e));
+    }
 
-        spark._subscribed = e.NewValue as INotifyCollectionChanged;
-        if (spark._subscribed != null)
-            spark._subscribed.CollectionChanged += spark.OnCollectionChanged;
+    private void OnValuesChanged(AvaloniaPropertyChangedEventArgs e)
+    {
+        if (_subscribed != null)
+            _subscribed.CollectionChanged -= OnCollectionChanged;
 
-        spark.InvalidateVisual();
+        _subscribed = e.NewValue as INotifyCollectionChanged;
+        if (_subscribed != null)
+            _subscribed.CollectionChanged += OnCollectionChanged;
+
+        InvalidateVisual();
     }
 
     private void OnCollectionChanged(object? sender, NotifyCollectionChangedEventArgs e)
     {
-        Dispatcher.BeginInvoke(InvalidateVisual, DispatcherPriority.Render);
+        Dispatcher.UIThread.Post(InvalidateVisual, DispatcherPriority.Render);
     }
 
-    protected override void OnRender(DrawingContext dc)
+    public override void Render(DrawingContext context)
     {
-        base.OnRender(dc);
+        base.Render(context);
         var values = Values?.ToList() ?? new List<double>();
-        double w = ActualWidth;
-        double h = ActualHeight;
+        double w = Bounds.Width;
+        double h = Bounds.Height;
         if (w <= 1 || h <= 1) return;
 
-        // Soft grid
         var gridPen = new Pen(new SolidColorBrush(Color.FromArgb(40, 255, 255, 255)), 1);
         for (int i = 1; i < 4; i++)
         {
             double y = h * i / 4.0;
-            dc.DrawLine(gridPen, new Point(0, y), new Point(w, y));
+            context.DrawLine(gridPen, new Point(0, y), new Point(w, y));
         }
 
         if (values.Count < 2)
@@ -89,11 +94,10 @@ public sealed class Sparkline : FrameworkElement
                 "Collecting samples…",
                 System.Globalization.CultureInfo.CurrentUICulture,
                 FlowDirection.LeftToRight,
-                new Typeface("Segoe UI"),
+                new Typeface("Inter"),
                 12,
-                new SolidColorBrush(Color.FromArgb(140, 200, 220, 255)),
-                VisualTreeHelper.GetDpi(this).PixelsPerDip);
-            dc.DrawText(muted, new Point(12, h / 2 - 8));
+                new SolidColorBrush(Color.FromArgb(140, 200, 220, 255)));
+            context.DrawText(muted, new Point(12, h / 2 - 8));
             return;
         }
 
@@ -112,41 +116,39 @@ public sealed class Sparkline : FrameworkElement
             points[i] = new Point(i * stepX, h - pad - norm * usableH);
         }
 
-        var geo = new StreamGeometry();
-        using (var ctx = geo.Open())
-        {
-            ctx.BeginFigure(points[0], Fill != null, false);
-            for (int i = 1; i < points.Length; i++)
-                ctx.LineTo(points[i], true, false);
-        }
-        geo.Freeze();
-
         if (Fill != null)
         {
             var fillGeo = new StreamGeometry();
             using (var ctx = fillGeo.Open())
             {
-                ctx.BeginFigure(new Point(points[0].X, h), true, true);
-                ctx.LineTo(points[0], true, false);
+                ctx.BeginFigure(new Point(points[0].X, h), true);
+                ctx.LineTo(points[0]);
                 for (int i = 1; i < points.Length; i++)
-                    ctx.LineTo(points[i], true, false);
-                ctx.LineTo(new Point(points[^1].X, h), true, false);
+                    ctx.LineTo(points[i]);
+                ctx.LineTo(new Point(points[^1].X, h));
+                ctx.EndFigure(true);
             }
-            fillGeo.Freeze();
-            dc.DrawGeometry(Fill, null, fillGeo);
+            context.DrawGeometry(Fill, null, fillGeo);
+        }
+
+        var lineGeo = new StreamGeometry();
+        using (var ctx = lineGeo.Open())
+        {
+            ctx.BeginFigure(points[0], false);
+            for (int i = 1; i < points.Length; i++)
+                ctx.LineTo(points[i]);
+            ctx.EndFigure(false);
         }
 
         var pen = new Pen(Stroke, StrokeThickness)
         {
-            StartLineCap = PenLineCap.Round,
-            EndLineCap = PenLineCap.Round,
+            LineCap = PenLineCap.Round,
             LineJoin = PenLineJoin.Round
         };
-        dc.DrawGeometry(null, pen, geo);
+        context.DrawGeometry(null, pen, lineGeo);
 
-        // Glow endpoint
         var last = points[^1];
-        dc.DrawEllipse(Stroke, null, last, 4.5, 4.5);
-        dc.DrawEllipse(Brushes.White, null, last, 2.0, 2.0);
+        context.DrawEllipse(Stroke, null, last, 4.5, 4.5);
+        context.DrawEllipse(Brushes.White, null, last, 2.0, 2.0);
     }
 }

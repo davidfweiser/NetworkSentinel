@@ -10,7 +10,7 @@ public sealed class ProcessResolver
 
     public string Resolve(int pid)
     {
-        if (pid <= 0) return "System";
+        if (pid <= 0) return "Kernel / unknown";
 
         if (_cache.TryGetValue(pid, out var entry) && DateTime.UtcNow - entry.CachedAt < CacheTtl)
             return entry.Name;
@@ -18,12 +18,23 @@ public sealed class ProcessResolver
         string name;
         try
         {
-            using var process = Process.GetProcessById(pid);
-            name = string.IsNullOrWhiteSpace(process.ProcessName) ? $"PID {pid}" : process.ProcessName;
+            // Prefer /proc/pid/comm — works without full Process access
+            var commPath = $"/proc/{pid}/comm";
+            if (File.Exists(commPath))
+            {
+                name = File.ReadAllText(commPath).Trim();
+                if (string.IsNullOrWhiteSpace(name))
+                    name = $"PID {pid}";
+            }
+            else
+            {
+                using var process = Process.GetProcessById(pid);
+                name = string.IsNullOrWhiteSpace(process.ProcessName) ? $"PID {pid}" : process.ProcessName;
+            }
         }
         catch
         {
-            name = pid == 0 || pid == 4 ? "System" : $"PID {pid}";
+            name = pid == 0 ? "Kernel" : $"PID {pid}";
         }
 
         _cache[pid] = (name, DateTime.UtcNow);

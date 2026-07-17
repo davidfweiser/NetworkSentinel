@@ -1,0 +1,504 @@
+<Window xmlns="https://github.com/avaloniaui"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:ctrl="using:NetworkSentinel.Controls"
+        xmlns:vm="using:NetworkSentinel.ViewModels"
+        x:Class="NetworkSentinel.MainWindow"
+        Title="{Binding WindowTitle}"
+        Width="1320" Height="860"
+        MinWidth="980" MinHeight="720"
+        WindowStartupLocation="CenterScreen"
+        Background="{DynamicResource BgDeepBrush}"
+        FontFamily="{DynamicResource AppFont}"
+        Foreground="{DynamicResource TextPrimaryBrush}">
+
+  <Window.DataContext>
+    <vm:MainViewModel/>
+  </Window.DataContext>
+
+  <Grid Margin="18">
+    <Grid.ColumnDefinitions>
+      <ColumnDefinition Width="230" MinWidth="200" MaxWidth="280"/>
+      <ColumnDefinition Width="*"/>
+    </Grid.ColumnDefinitions>
+
+    <!-- Sidebar -->
+    <Border Classes="card" Margin="0,0,14,0" Padding="16">
+      <DockPanel LastChildFill="True">
+        <StackPanel DockPanel.Dock="Top" Margin="4,4,4,18">
+          <Grid ColumnDefinitions="Auto,*">
+            <Border Width="42" Height="42" CornerRadius="21" Margin="0,0,12,0"
+                    Background="{DynamicResource AccentGradient}">
+              <TextBlock Text="🛡" FontSize="18" HorizontalAlignment="Center" VerticalAlignment="Center"/>
+            </Border>
+            <StackPanel Grid.Column="1" VerticalAlignment="Center">
+              <TextBlock Text="Network Sentinel" FontSize="16" FontWeight="Bold"/>
+              <TextBlock Text="Port &amp; intrusion watch" Foreground="{DynamicResource TextMutedBrush}" FontSize="11"/>
+              <TextBlock Text="{Binding AppVersion}" Foreground="{DynamicResource TextMutedBrush}" FontSize="10" Margin="0,2,0,0" Opacity="0.85"/>
+              <TextBlock Text="Linux" Foreground="{DynamicResource AccentCyanBrush}" FontSize="10" Margin="0,2,0,0"/>
+            </StackPanel>
+          </Grid>
+        </StackPanel>
+
+        <StackPanel DockPanel.Dock="Bottom" Margin="0,16,0,0">
+          <Border Background="#180C1A2E" CornerRadius="14" Padding="12"
+                  BorderBrush="{DynamicResource StrokeSoftBrush}" BorderThickness="1">
+            <StackPanel>
+              <TextBlock Text="STATUS" FontSize="10" FontWeight="Bold" Foreground="{DynamicResource TextMutedBrush}"/>
+              <TextBlock Text="{Binding Stats.StatusText}" TextWrapping="Wrap" Margin="0,6,0,0"
+                         Foreground="{DynamicResource TextSecondaryBrush}" FontSize="12"/>
+              <StackPanel Orientation="Horizontal" Margin="0,10,0,0" Spacing="8">
+                <Ellipse Width="8" Height="8" VerticalAlignment="Center"
+                         Fill="{Binding Stats.IsMonitoring, Converter={StaticResource BoolToVis}, ConverterParameter=Invert, FallbackValue=#667794}"/>
+                <TextBlock Text="{Binding Stats.IsMonitoring, Converter={StaticResource MonitorText}}"
+                           FontSize="12" VerticalAlignment="Center"
+                           Foreground="{DynamicResource TextSecondaryBrush}"/>
+              </StackPanel>
+              <Border Margin="0,12,0,0" Padding="10,8" CornerRadius="10"
+                      BorderThickness="1" BorderBrush="{DynamicResource StrokeSoftBrush}" Background="#180C1A2E">
+                <StackPanel>
+                  <TextBlock Text="AUTO-BLOCK" FontSize="10" FontWeight="Bold" Foreground="{DynamicResource TextMutedBrush}"/>
+                  <CheckBox Content="Enable auto-block" IsChecked="{Binding AutoBlockEnabled}" Margin="0,8,0,0"/>
+                </StackPanel>
+              </Border>
+            </StackPanel>
+          </Border>
+        </StackPanel>
+
+        <StackPanel>
+          <TextBlock Text="NAVIGATION" FontSize="10" FontWeight="Bold"
+                     Foreground="{DynamicResource TextMutedBrush}" Margin="8,0,0,8"/>
+          <RadioButton Classes="nav" Content="Dashboard" GroupName="Nav"
+                       IsChecked="{Binding ShowDashboard, Mode=OneWay}"
+                       Command="{Binding NavigateCommand}" CommandParameter="Dashboard"/>
+          <RadioButton Classes="nav" Content="Live Connections" GroupName="Nav"
+                       IsChecked="{Binding ShowConnections, Mode=OneWay}"
+                       Command="{Binding NavigateCommand}" CommandParameter="Connections"/>
+          <RadioButton Classes="nav" Content="Remote Computers" GroupName="Nav"
+                       IsChecked="{Binding ShowHosts, Mode=OneWay}"
+                       Command="{Binding NavigateCommand}" CommandParameter="Hosts"/>
+          <RadioButton Classes="nav" Content="Break-in Attempts" GroupName="Nav"
+                       IsChecked="{Binding ShowThreats, Mode=OneWay}"
+                       Command="{Binding NavigateCommand}" CommandParameter="Threats"/>
+          <RadioButton Classes="nav" Content="Open Ports" GroupName="Nav"
+                       IsChecked="{Binding ShowPorts, Mode=OneWay}"
+                       Command="{Binding NavigateCommand}" CommandParameter="Ports"/>
+          <RadioButton Classes="nav" Content="Firewall &amp; Block" GroupName="Nav"
+                       IsChecked="{Binding ShowFirewall, Mode=OneWay}"
+                       Command="{Binding NavigateCommand}" CommandParameter="Firewall"/>
+        </StackPanel>
+      </DockPanel>
+    </Border>
+
+    <!-- Main -->
+    <Grid Grid.Column="1" RowDefinitions="Auto,*">
+      <StackPanel Margin="0,0,0,14">
+        <TextBlock Text="{Binding ClockText}" Foreground="{DynamicResource TextMutedBrush}" FontSize="12"/>
+        <TextBlock Text="Network Defense Console" FontSize="22" FontWeight="Bold" Margin="0,2,0,0" TextWrapping="Wrap"/>
+        <TextBlock Text="{Binding HeroSubtitle}" Foreground="{DynamicResource TextSecondaryBrush}"
+                   TextWrapping="Wrap" Margin="0,4,0,10" FontSize="12"/>
+        <WrapPanel>
+          <TextBox Classes="modern" Width="180" Watermark="Filter…"
+                   Text="{Binding SearchText}" Margin="0,0,8,8"/>
+          <Button Classes="primary" Content="{Binding Stats.IsMonitoring, Converter={StaticResource MonitorText}}"
+                  Command="{Binding ToggleMonitoringCommand}" Margin="0,0,8,8" MinWidth="110"/>
+          <Button Classes="ghost" Content="Auto-block toggle" Command="{Binding ToggleAutoBlockCommand}"
+                  Margin="0,0,8,8" MinWidth="110" ToolTip.Tip="{Binding AutoBlockStatusText}"/>
+          <Button Classes="ghost" Content="Authorize firewall" Command="{Binding RunAsAdminCommand}"
+                  ToolTip.Tip="{Binding FirewallStatusText}" Margin="0,0,8,8"/>
+          <Button Classes="ghost" Content="Clear Alerts" Command="{Binding ClearThreatsCommand}" Margin="0,0,8,8"/>
+          <Button Classes="ghost" Content="Refresh" Command="{Binding RefreshNowCommand}" Margin="0,0,8,8"/>
+        </WrapPanel>
+      </StackPanel>
+
+      <Grid Grid.Row="1">
+        <!-- DASHBOARD -->
+        <Grid IsVisible="{Binding ShowDashboard}" RowDefinitions="Auto,220,*">
+          <Grid ColumnDefinitions="*,*,*,*,*" Margin="0,0,0,14">
+            <Border Classes="stat" Margin="0,0,8,0">
+              <StackPanel>
+                <TextBlock Text="LISTENING PORTS" FontSize="9" FontWeight="Bold" Foreground="{DynamicResource TextMutedBrush}"/>
+                <TextBlock Text="{Binding Stats.ListeningPorts}" FontSize="26" FontWeight="Bold" Margin="0,4,0,0"
+                           Foreground="{DynamicResource AccentCyanBrush}"/>
+                <TextBlock Text="TCP + UDP open" Foreground="{DynamicResource TextSecondaryBrush}" FontSize="10"/>
+              </StackPanel>
+            </Border>
+            <Border Classes="stat" Grid.Column="1" Margin="0,0,8,0">
+              <StackPanel>
+                <TextBlock Text="ACTIVE SESSIONS" FontSize="9" FontWeight="Bold" Foreground="{DynamicResource TextMutedBrush}"/>
+                <TextBlock Text="{Binding Stats.ActiveConnections}" FontSize="26" FontWeight="Bold" Margin="0,4,0,0"
+                           Foreground="{DynamicResource AccentBlueBrush}"/>
+                <TextBlock Text="TCP connections" Foreground="{DynamicResource TextSecondaryBrush}" FontSize="10"/>
+              </StackPanel>
+            </Border>
+            <Border Classes="stat" Grid.Column="2" Margin="0,0,8,0">
+              <StackPanel>
+                <TextBlock Text="REMOTE COMPUTERS" FontSize="9" FontWeight="Bold" Foreground="{DynamicResource TextMutedBrush}"/>
+                <TextBlock Text="{Binding Stats.RemoteHosts}" FontSize="26" FontWeight="Bold" Margin="0,4,0,0"
+                           Foreground="{DynamicResource AccentVioletBrush}"/>
+                <TextBlock Text="Peers tracked" Foreground="{DynamicResource TextSecondaryBrush}" FontSize="10"/>
+              </StackPanel>
+            </Border>
+            <Border Classes="stat" Grid.Column="3" Margin="0,0,8,0">
+              <StackPanel>
+                <TextBlock Text="THREAT EVENTS" FontSize="9" FontWeight="Bold" Foreground="{DynamicResource TextMutedBrush}"/>
+                <TextBlock Text="{Binding Stats.ThreatsToday}" FontSize="26" FontWeight="Bold" Margin="0,4,0,0"
+                           Foreground="{DynamicResource AccentAmberBrush}"/>
+                <TextBlock Text="Heuristic alerts" Foreground="{DynamicResource TextSecondaryBrush}" FontSize="10"/>
+              </StackPanel>
+            </Border>
+            <Border Classes="stat" Grid.Column="4">
+              <StackPanel>
+                <TextBlock Text="HIGH / CRITICAL" FontSize="9" FontWeight="Bold" Foreground="{DynamicResource TextMutedBrush}"/>
+                <TextBlock Text="{Binding Stats.HighThreats}" FontSize="26" FontWeight="Bold" Margin="0,4,0,0"
+                           Foreground="{DynamicResource DangerBrush}"/>
+                <TextBlock Text="Needs attention" Foreground="{DynamicResource TextSecondaryBrush}" FontSize="10"/>
+              </StackPanel>
+            </Border>
+          </Grid>
+
+          <Grid Grid.Row="1" ColumnDefinitions="2*,*" Margin="0,0,0,14">
+            <Border Classes="card" Margin="0,0,10,0">
+              <Grid RowDefinitions="Auto,*">
+                <DockPanel>
+                  <TextBlock Text="Connection activity" FontWeight="Bold" FontSize="14"/>
+                  <TextBlock DockPanel.Dock="Right" Text="Live samples" Foreground="{DynamicResource TextMutedBrush}"
+                             FontSize="11" HorizontalAlignment="Right" VerticalAlignment="Center"/>
+                </DockPanel>
+                <ctrl:Sparkline Grid.Row="1" Margin="0,12,0,0"
+                                Values="{Binding ActivitySeries}"
+                                Stroke="{DynamicResource AccentCyanBrush}"
+                                Fill="{DynamicResource ChartFill}"
+                                StrokeThickness="2.4"/>
+              </Grid>
+            </Border>
+            <Border Classes="card" Grid.Column="1" Background="{DynamicResource HeroGradient}">
+              <StackPanel VerticalAlignment="Center" HorizontalAlignment="Center">
+                <Border Width="72" Height="72" CornerRadius="36" HorizontalAlignment="Center" Margin="0,0,0,12"
+                        BorderBrush="{DynamicResource AccentCyanBrush}" BorderThickness="2" Background="#2218FFC8">
+                  <TextBlock Text="LIVE" FontWeight="Bold" FontSize="16"
+                             HorizontalAlignment="Center" VerticalAlignment="Center"
+                             Foreground="{DynamicResource AccentCyanBrush}"/>
+                </Border>
+                <TextBlock Text="Threat intensity" FontWeight="Bold" HorizontalAlignment="Center"/>
+                <TextBlock Text="{Binding Stats.HighThreats}" FontSize="28" FontWeight="Bold"
+                           HorizontalAlignment="Center" Margin="0,4,0,0" Foreground="{DynamicResource DangerBrush}"/>
+                <TextBlock Text="high-severity signals" HorizontalAlignment="Center"
+                           Foreground="{DynamicResource TextSecondaryBrush}" FontSize="11"/>
+              </StackPanel>
+            </Border>
+          </Grid>
+
+          <Grid Grid.Row="2" ColumnDefinitions="*,*">
+            <Border Classes="card" Margin="0,0,10,0">
+              <DockPanel>
+                <TextBlock DockPanel.Dock="Top" Text="Latest break-in signals" FontWeight="Bold" FontSize="14" Margin="0,0,0,10"/>
+                <ListBox ItemsSource="{Binding Threats}" Background="Transparent" BorderThickness="0">
+                  <ListBox.ItemTemplate>
+                    <DataTemplate>
+                      <Border Background="#180C1628" CornerRadius="12" Padding="12" Margin="0,0,0,8"
+                              BorderBrush="{DynamicResource StrokeSoftBrush}" BorderThickness="1">
+                        <Grid ColumnDefinitions="6,*">
+                          <Border CornerRadius="3" Background="{Binding Level, Converter={StaticResource ThreatBrush}}"/>
+                          <StackPanel Grid.Column="1" Margin="12,0,0,0">
+                            <TextBlock Text="{Binding Title}" FontWeight="SemiBold" TextWrapping="Wrap"/>
+                            <TextBlock Text="{Binding SourceIp}" Foreground="{DynamicResource AccentCyanBrush}" FontSize="12"/>
+                            <TextBlock Text="{Binding Origin}" Foreground="{DynamicResource TextSecondaryBrush}" FontSize="11" TextWrapping="Wrap"/>
+                            <TextBlock Text="{Binding Method}" Foreground="{DynamicResource TextMutedBrush}" FontSize="11"/>
+                          </StackPanel>
+                        </Grid>
+                      </Border>
+                    </DataTemplate>
+                  </ListBox.ItemTemplate>
+                </ListBox>
+              </DockPanel>
+            </Border>
+            <Border Classes="card" Grid.Column="1">
+              <DockPanel>
+                <TextBlock DockPanel.Dock="Top" Text="Connected / observed computers" FontWeight="Bold" FontSize="14" Margin="0,0,0,10"/>
+                <ListBox ItemsSource="{Binding RemoteHosts}" Background="Transparent" BorderThickness="0">
+                  <ListBox.ItemTemplate>
+                    <DataTemplate>
+                      <Border Background="#180C1628" CornerRadius="12" Padding="12" Margin="0,0,0,8"
+                              BorderBrush="{DynamicResource StrokeSoftBrush}" BorderThickness="1">
+                        <Grid ColumnDefinitions="*,Auto">
+                          <StackPanel>
+                            <TextBlock Text="{Binding DisplayName}" FontWeight="SemiBold" TextWrapping="Wrap"/>
+                            <TextBlock Text="{Binding GeoSummary}" Foreground="{DynamicResource TextSecondaryBrush}" FontSize="11"/>
+                            <TextBlock FontSize="11" Foreground="{DynamicResource TextMutedBrush}"
+                                       Text="{Binding Status}"/>
+                          </StackPanel>
+                          <Border Grid.Column="1" CornerRadius="10" Padding="10,4" VerticalAlignment="Top" Background="#22000000">
+                            <TextBlock Text="{Binding ThreatText}" FontSize="11" FontWeight="Bold"
+                                       Foreground="{Binding ThreatLevel, Converter={StaticResource ThreatBrush}}"/>
+                          </Border>
+                        </Grid>
+                      </Border>
+                    </DataTemplate>
+                  </ListBox.ItemTemplate>
+                </ListBox>
+              </DockPanel>
+            </Border>
+          </Grid>
+        </Grid>
+
+        <!-- CONNECTIONS -->
+        <Border Classes="card" IsVisible="{Binding ShowConnections}">
+          <DockPanel>
+            <StackPanel DockPanel.Dock="Top" Margin="0,0,0,12">
+              <TextBlock Text="Live TCP connections" FontWeight="Bold" FontSize="15"/>
+              <TextBlock Text="Select a row and use Block to create a host firewall rule for that remote IP."
+                         Foreground="{DynamicResource TextSecondaryBrush}" FontSize="12" Margin="0,4,0,0"/>
+            </StackPanel>
+            <DataGrid ItemsSource="{Binding Connections}" SelectedItem="{Binding SelectedConnection}"
+                      AutoGenerateColumns="False">
+              <DataGrid.Columns>
+                <DataGridTextColumn Header="Process" Binding="{Binding ProcessName}" Width="110"/>
+                <DataGridTextColumn Header="Protocol" Binding="{Binding Protocol}" Width="70"/>
+                <DataGridTextColumn Header="Local" Binding="{Binding DisplayLocal}" Width="140"/>
+                <DataGridTextColumn Header="Remote" Binding="{Binding DisplayRemote}" Width="*"/>
+                <DataGridTextColumn Header="State" Binding="{Binding StateText}" Width="90"/>
+                <DataGridTextColumn Header="Origin" Binding="{Binding GeoSummary}" Width="170"/>
+                <DataGridTextColumn Header="PID" Binding="{Binding ProcessId}" Width="60"/>
+                <DataGridTemplateColumn Header="Action" Width="100">
+                  <DataGridTemplateColumn.CellTemplate>
+                    <DataTemplate>
+                      <Button Classes="mini-danger" Content="Block IP"
+                              Command="{Binding $parent[Window].DataContext.BlockConnectionIpCommand}"
+                              CommandParameter="{Binding}"/>
+                    </DataTemplate>
+                  </DataGridTemplateColumn.CellTemplate>
+                </DataGridTemplateColumn>
+              </DataGrid.Columns>
+            </DataGrid>
+          </DockPanel>
+        </Border>
+
+        <!-- HOSTS -->
+        <Border Classes="card" IsVisible="{Binding ShowHosts}">
+          <DockPanel>
+            <StackPanel DockPanel.Dock="Top" Margin="0,0,0,12">
+              <TextBlock Text="Remote computers connected or probing this PC" FontWeight="Bold" FontSize="15"/>
+              <TextBlock Text="Block writes host firewall rules for that IP. Private/LAN addresses are refused for safety."
+                         Foreground="{DynamicResource TextSecondaryBrush}" FontSize="12" Margin="0,4,0,0"/>
+            </StackPanel>
+            <DataGrid ItemsSource="{Binding RemoteHosts}" SelectedItem="{Binding SelectedHost}" AutoGenerateColumns="False">
+              <DataGrid.Columns>
+                <DataGridTextColumn Header="IP Address" Binding="{Binding IpAddress}" Width="120"/>
+                <DataGridTextColumn Header="Host name" Binding="{Binding HostName}" Width="140"/>
+                <DataGridTextColumn Header="Where (origin)" Binding="{Binding GeoSummary}" Width="*"/>
+                <DataGridTextColumn Header="Threat" Binding="{Binding ThreatText}" Width="80"/>
+                <DataGridTextColumn Header="Firewall" Binding="{Binding BlockStatusText}" Width="80"/>
+                <DataGridTextColumn Header="Status" Binding="{Binding Status}" Width="90"/>
+                <DataGridTextColumn Header="Active" Binding="{Binding ActiveConnections}" Width="60"/>
+                <DataGridTextColumn Header="Ports" Binding="{Binding PortsTouched}" Width="60"/>
+                <DataGridTemplateColumn Header="Actions" Width="160">
+                  <DataGridTemplateColumn.CellTemplate>
+                    <DataTemplate>
+                      <StackPanel Orientation="Horizontal" Spacing="6">
+                        <Button Classes="mini-danger" Content="Block"
+                                Command="{Binding $parent[Window].DataContext.BlockHostCommand}"
+                                CommandParameter="{Binding}"
+                                IsVisible="{Binding IsBlocked, Converter={StaticResource InvertBool}}"/>
+                        <Button Classes="mini-ghost" Content="Unblock"
+                                Command="{Binding $parent[Window].DataContext.UnblockHostCommand}"
+                                CommandParameter="{Binding}"
+                                IsVisible="{Binding IsBlocked}"/>
+                      </StackPanel>
+                    </DataTemplate>
+                  </DataGridTemplateColumn.CellTemplate>
+                </DataGridTemplateColumn>
+              </DataGrid.Columns>
+            </DataGrid>
+          </DockPanel>
+        </Border>
+
+        <!-- THREATS -->
+        <Border Classes="card" IsVisible="{Binding ShowThreats}">
+          <DockPanel>
+            <StackPanel DockPanel.Dock="Top" Margin="0,0,0,12">
+              <TextBlock Text="Break-in / intrusion attempt signals" FontWeight="Bold" FontSize="15"/>
+              <TextBlock Text="Heuristics detect port scans, SSH/SMB hammering, sensitive-port probes, and short-lived bursts."
+                         Foreground="{DynamicResource TextSecondaryBrush}" FontSize="12" Margin="0,4,0,0" TextWrapping="Wrap"/>
+            </StackPanel>
+            <DataGrid ItemsSource="{Binding Threats}" SelectedItem="{Binding SelectedThreat}" AutoGenerateColumns="False">
+              <DataGrid.Columns>
+                <DataGridTextColumn Header="Time" Binding="{Binding TimeText}" Width="70"/>
+                <DataGridTextColumn Header="Severity" Binding="{Binding LevelText}" Width="80"/>
+                <DataGridTextColumn Header="Type" Binding="{Binding TypeText}" Width="130"/>
+                <DataGridTextColumn Header="Source IP" Binding="{Binding SourceIp}" Width="120"/>
+                <DataGridTextColumn Header="Coming from" Binding="{Binding Origin}" Width="160"/>
+                <DataGridTextColumn Header="Method" Binding="{Binding Method}" Width="150"/>
+                <DataGridTextColumn Header="Detail" Binding="{Binding Detail}" Width="*"/>
+                <DataGridTemplateColumn Header="Action" Width="100">
+                  <DataGridTemplateColumn.CellTemplate>
+                    <DataTemplate>
+                      <Button Classes="mini-danger" Content="Block IP"
+                              Command="{Binding $parent[Window].DataContext.BlockThreatIpCommand}"
+                              CommandParameter="{Binding}"/>
+                    </DataTemplate>
+                  </DataGridTemplateColumn.CellTemplate>
+                </DataGridTemplateColumn>
+              </DataGrid.Columns>
+            </DataGrid>
+          </DockPanel>
+        </Border>
+
+        <!-- PORTS -->
+        <Border Classes="card" IsVisible="{Binding ShowPorts}">
+          <DockPanel>
+            <StackPanel DockPanel.Dock="Top" Margin="0,0,0,12">
+              <TextBlock Text="Open / listening ports on this computer" FontWeight="Bold" FontSize="15"/>
+              <TextBlock Text="Block Port creates an inbound host firewall rule for that local port (use carefully)."
+                         Foreground="{DynamicResource TextSecondaryBrush}" FontSize="12" Margin="0,4,0,0"/>
+            </StackPanel>
+            <DataGrid ItemsSource="{Binding ListeningPorts}" SelectedItem="{Binding SelectedPort}" AutoGenerateColumns="False">
+              <DataGrid.Columns>
+                <DataGridTextColumn Header="Protocol" Binding="{Binding Protocol}" Width="80"/>
+                <DataGridTextColumn Header="Endpoint" Binding="{Binding DisplayEndpoint}" Width="200"/>
+                <DataGridTextColumn Header="Port" Binding="{Binding Port}" Width="70"/>
+                <DataGridTextColumn Header="Service" Binding="{Binding ServiceHint}" Width="140"/>
+                <DataGridTextColumn Header="Process" Binding="{Binding ProcessName}" Width="140"/>
+                <DataGridTextColumn Header="PID" Binding="{Binding ProcessId}" Width="70"/>
+                <DataGridTemplateColumn Header="Action" Width="110">
+                  <DataGridTemplateColumn.CellTemplate>
+                    <DataTemplate>
+                      <Button Classes="mini-danger" Content="Block Port"
+                              Command="{Binding $parent[Window].DataContext.BlockSelectedPortCommand}"
+                              CommandParameter="{Binding}"/>
+                    </DataTemplate>
+                  </DataGridTemplateColumn.CellTemplate>
+                </DataGridTemplateColumn>
+              </DataGrid.Columns>
+            </DataGrid>
+          </DockPanel>
+        </Border>
+
+        <!-- FIREWALL -->
+        <Grid IsVisible="{Binding ShowFirewall}" RowDefinitions="Auto,*">
+          <StackPanel Margin="0,0,0,12" Spacing="12">
+            <Border Classes="card">
+              <Grid ColumnDefinitions="*,Auto">
+                <StackPanel>
+                  <TextBlock Text="Auto-block" FontWeight="Bold" FontSize="15"/>
+                  <TextBlock Text="{Binding AutoBlockStatusText}" Foreground="{DynamicResource TextSecondaryBrush}"
+                             FontSize="12" Margin="0,6,0,10" TextWrapping="Wrap"/>
+                  <StackPanel Orientation="Horizontal" Spacing="8">
+                    <CheckBox Content="Turn auto-block on" IsChecked="{Binding AutoBlockEnabled}" VerticalAlignment="Center"/>
+                    <TextBlock Text="Minimum severity" FontSize="12" Foreground="{DynamicResource TextMutedBrush}" VerticalAlignment="Center"/>
+                    <ComboBox Width="120" ItemsSource="{Binding AutoBlockLevelOptions}"
+                              SelectedItem="{Binding AutoBlockMinLevel}" IsEnabled="{Binding AutoBlockEnabled}"/>
+                  </StackPanel>
+                </StackPanel>
+                <StackPanel Grid.Column="1" VerticalAlignment="Center" Margin="16,0,0,0" Spacing="8">
+                  <Button Classes="primary" Content="Toggle Auto-block" Command="{Binding ToggleAutoBlockCommand}" MinWidth="150"/>
+                  <Button Classes="ghost" Content="Restore good sites" Command="{Binding RestoreAllowlistedCommand}" MinWidth="150"/>
+                  <Button Classes="ghost" Content="Authorize firewall" Command="{Binding RunAsAdminCommand}" MinWidth="150"/>
+                </StackPanel>
+              </Grid>
+            </Border>
+
+            <Border Classes="card">
+              <DockPanel>
+                <StackPanel DockPanel.Dock="Top" Margin="0,0,0,10">
+                  <TextBlock Text="Known-good allowlist (never block)" FontWeight="Bold" FontSize="15"/>
+                  <TextBlock Text="{Binding AllowlistStatusText}" Foreground="{DynamicResource TextSecondaryBrush}"
+                             FontSize="12" Margin="0,4,0,8" TextWrapping="Wrap"/>
+                  <Grid ColumnDefinitions="*,Auto" Margin="0,10,0,0">
+                    <TextBox Classes="modern" Text="{Binding AllowlistInput}" Watermark="Domain or IP"/>
+                    <StackPanel Grid.Column="1" Orientation="Horizontal" Margin="8,0,0,0" Spacing="6">
+                      <Button Classes="primary" Content="Add" Command="{Binding AddAllowlistEntryCommand}" MinWidth="70"/>
+                      <Button Classes="ghost" Content="Refresh" Command="{Binding RefreshAllowlistCommand}"/>
+                      <Button Classes="ghost" Content="Remove" Command="{Binding RemoveAllowlistEntryCommand}"/>
+                      <Button Classes="ghost" Content="Open folder" Command="{Binding OpenAllowlistFolderCommand}"/>
+                    </StackPanel>
+                  </Grid>
+                </StackPanel>
+                <DataGrid ItemsSource="{Binding AllowlistEntries}" SelectedItem="{Binding SelectedAllowlistEntry}"
+                          AutoGenerateColumns="False" MaxHeight="160">
+                  <DataGrid.Columns>
+                    <DataGridTextColumn Header="Kind" Binding="{Binding Kind}" Width="90"/>
+                    <DataGridTextColumn Header="Value" Binding="{Binding Value}" Width="220"/>
+                    <DataGridTextColumn Header="Detail" Binding="{Binding Detail}" Width="*"/>
+                  </DataGrid.Columns>
+                </DataGrid>
+              </DockPanel>
+            </Border>
+
+            <Grid ColumnDefinitions="*,*" Margin="0">
+              <Border Classes="card" Margin="0,0,10,0">
+                <StackPanel Spacing="8">
+                  <TextBlock Text="Block remote IP" FontWeight="Bold" FontSize="15"/>
+                  <TextBlock Text="{Binding FirewallStatusText}" Foreground="{DynamicResource TextSecondaryBrush}"
+                             FontSize="12" TextWrapping="Wrap"/>
+                  <TextBox Classes="modern" Text="{Binding ManualBlockIp}" Watermark="e.g. 203.0.113.50"/>
+                  <StackPanel Orientation="Horizontal">
+                    <CheckBox Content="Inbound" IsChecked="{Binding BlockInbound}"/>
+                    <CheckBox Content="Outbound" IsChecked="{Binding BlockOutbound}"/>
+                  </StackPanel>
+                  <StackPanel Orientation="Horizontal" Spacing="8">
+                    <Button Classes="danger" Content="Block IP" Command="{Binding BlockManualIpCommand}" MinWidth="110"/>
+                    <Button Classes="ghost" Content="Unblock IP" Command="{Binding UnblockManualIpCommand}" MinWidth="110"/>
+                  </StackPanel>
+                </StackPanel>
+              </Border>
+              <Border Classes="card" Grid.Column="1">
+                <StackPanel Spacing="8">
+                  <TextBlock Text="Block local port" FontWeight="Bold" FontSize="15"/>
+                  <TextBlock Text="Creates a host firewall drop rule for a local TCP/UDP port."
+                             Foreground="{DynamicResource TextSecondaryBrush}" FontSize="12" TextWrapping="Wrap"/>
+                  <Grid ColumnDefinitions="*,120">
+                    <TextBox Classes="modern" Text="{Binding ManualBlockPort}" Watermark="e.g. 22" Margin="0,0,10,0"/>
+                    <ComboBox Grid.Column="1" ItemsSource="{Binding ProtocolOptions}"
+                              SelectedItem="{Binding ManualBlockProtocol}"/>
+                  </Grid>
+                  <StackPanel Orientation="Horizontal" Spacing="8">
+                    <Button Classes="danger" Content="Block Port" Command="{Binding BlockManualPortCommand}" MinWidth="110"/>
+                    <Button Classes="ghost" Content="Refresh Rules" Command="{Binding RefreshFirewallRulesCommand}"/>
+                    <Button Classes="ghost" Content="Remove All" Command="{Binding RemoveAllManagedRulesCommand}" MinWidth="110"/>
+                  </StackPanel>
+                  <TextBlock Text="{Binding FirewallMessage}" TextWrapping="Wrap"
+                             Foreground="{DynamicResource AccentCyanBrush}" FontSize="12"/>
+                </StackPanel>
+              </Border>
+            </Grid>
+          </StackPanel>
+
+          <Border Classes="card" Grid.Row="1">
+            <DockPanel>
+              <DockPanel DockPanel.Dock="Top" Margin="0,0,0,12">
+                <StackPanel>
+                  <TextBlock Text="Network Sentinel firewall rules" FontWeight="Bold" FontSize="15"/>
+                  <TextBlock Text="Only rules created by this app (name prefix NetworkSentinel-*) are listed."
+                             Foreground="{DynamicResource TextSecondaryBrush}" FontSize="12" Margin="0,4,0,0" TextWrapping="Wrap"/>
+                </StackPanel>
+                <Button Classes="danger" DockPanel.Dock="Right" Content="Remove Selected"
+                        Command="{Binding RemoveSelectedRuleCommand}"
+                        HorizontalAlignment="Right" VerticalAlignment="Center" Margin="12,0,0,0"/>
+              </DockPanel>
+              <DataGrid ItemsSource="{Binding FirewallRules}" SelectedItem="{Binding SelectedFirewallRule}" AutoGenerateColumns="False">
+                <DataGrid.Columns>
+                  <DataGridTextColumn Header="Kind" Binding="{Binding KindText}" Width="90"/>
+                  <DataGridTextColumn Header="Action" Binding="{Binding ActionText}" Width="70"/>
+                  <DataGridTextColumn Header="Direction" Binding="{Binding DirectionText}" Width="90"/>
+                  <DataGridTextColumn Header="Target" Binding="{Binding TargetText}" Width="160"/>
+                  <DataGridTextColumn Header="Protocol" Binding="{Binding Protocol}" Width="80"/>
+                  <DataGridTextColumn Header="Enabled" Binding="{Binding EnabledText}" Width="70"/>
+                  <DataGridTextColumn Header="Rule name" Binding="{Binding Name}" Width="*"/>
+                  <DataGridTemplateColumn Header="" Width="100">
+                    <DataGridTemplateColumn.CellTemplate>
+                      <DataTemplate>
+                        <Button Classes="mini-ghost" Content="Remove"
+                                Command="{Binding $parent[Window].DataContext.RemoveSelectedRuleCommand}"
+                                CommandParameter="{Binding}"/>
+                      </DataTemplate>
+                    </DataGridTemplateColumn.CellTemplate>
+                  </DataGridTemplateColumn>
+                </DataGrid.Columns>
+              </DataGrid>
+            </DockPanel>
+          </Border>
+        </Grid>
+      </Grid>
+    </Grid>
+  </Grid>
+</Window>
