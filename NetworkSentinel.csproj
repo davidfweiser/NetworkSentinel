@@ -7,6 +7,7 @@
     <ImplicitUsings>enable</ImplicitUsings>
     <BuiltInComInteropSupport>true</BuiltInComInteropSupport>
     <ApplicationManifest>app.manifest</ApplicationManifest>
+    <ApplicationIcon>Assets\icon.ico</ApplicationIcon>
     <AvaloniaUseCompiledBindingsByDefault>false</AvaloniaUseCompiledBindingsByDefault>
     <AssemblyName>NetworkSentinel</AssemblyName>
     <RootNamespace>NetworkSentinel</RootNamespace>
@@ -33,6 +34,8 @@
 
   <ItemGroup>
     <AvaloniaResource Include="Themes\**" />
+    <AvaloniaResource Include="Assets\icon.png" />
+    <AvaloniaResource Include="Assets\icon.ico" />
   </ItemGroup>
 
 </Project>

@@ -106,7 +106,29 @@ dotnet publish -c Release -r linux-x64 --self-contained true -o bin/publish-sc
 
 When you block an IP/port (or click **Authorize firewall**), only `nft`/`iptables` are elevated via **pkexec** and you get a password dialog. Monitoring works without elevation.
 
-Optional desktop entry is provided as `networksentinel.desktop` (install under `~/.local/share/applications/` and adjust `Exec=` to your binary path).
+### App icon
+
+Assets live in `Assets/`:
+
+| File | Use |
+|------|-----|
+| `Assets/icon.png` | 512×512 primary (window title bar + in-app) |
+| `Assets/icon.ico` | Multi-size Windows-style / embed |
+| `Assets/icons/icon-*.png` | 16–512px for Linux icon themes |
+
+Install the FreeDesktop icon + launcher (adjust `Exec=` if needed):
+
+```bash
+for s in 16 24 32 48 64 128 256 512; do
+  mkdir -p ~/.local/share/icons/hicolor/${s}x${s}/apps
+  cp Assets/icons/icon-${s}.png ~/.local/share/icons/hicolor/${s}x${s}/apps/networksentinel.png
+done
+cp networksentinel.desktop ~/.local/share/applications/
+# edit Exec= in the .desktop file to your published binary path
+update-desktop-database ~/.local/share/applications 2>/dev/null || true
+```
+
+Optional desktop entry is provided as `networksentinel.desktop` (`Icon=networksentinel`).
 
 ---
 

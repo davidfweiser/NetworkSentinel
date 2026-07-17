@@ -4,6 +4,7 @@
         xmlns:vm="using:NetworkSentinel.ViewModels"
         x:Class="NetworkSentinel.MainWindow"
         Title="{Binding WindowTitle}"
+        Icon="/Assets/icon.png"
         Width="1320" Height="860"
         MinWidth="980" MinHeight="720"
         WindowStartupLocation="CenterScreen"
@@ -26,9 +27,8 @@
       <DockPanel LastChildFill="True">
         <StackPanel DockPanel.Dock="Top" Margin="4,4,4,18">
           <Grid ColumnDefinitions="Auto,*">
-            <Border Width="42" Height="42" CornerRadius="21" Margin="0,0,12,0"
-                    Background="{DynamicResource AccentGradient}">
-              <TextBlock Text="🛡" FontSize="18" HorizontalAlignment="Center" VerticalAlignment="Center"/>
+            <Border Width="42" Height="42" CornerRadius="10" Margin="0,0,12,0" ClipToBounds="True">
+              <Image Source="/Assets/icon.png" Width="42" Height="42" Stretch="UniformToFill"/>
             </Border>
             <StackPanel Grid.Column="1" VerticalAlignment="Center">
               <TextBlock Text="Network Sentinel" FontSize="16" FontWeight="Bold"/>
