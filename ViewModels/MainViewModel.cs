@@ -54,8 +54,16 @@ public partial class MainViewModel : ObservableObject, IDisposable
     [ObservableProperty] private NetworkConnection? _selectedConnection;
     [ObservableProperty] private ListeningPort? _selectedPort;
 
+    /// <summary>Live window title shown in the taskbar / top bar when minimized.</summary>
+    [ObservableProperty] private string _windowTitle = "Network Sentinel";
+
+    /// <summary>Multi-line tooltip / tray summary for the system indicator.</summary>
+    [ObservableProperty] private string _trayToolTip = "Network Sentinel — starting…";
+
+    /// <summary>Short one-line status for tray menu header.</summary>
+    [ObservableProperty] private string _trayStatusLine = "Network Sentinel";
+
     public string AppVersion { get; } = FormatAppVersion();
-    public string WindowTitle => $"Network Sentinel  ·  {AppVersion}";
 
     public DashboardStats Stats => _monitor.Stats;
     public ObservableCollection<NetworkConnection> Connections { get; } = new();
@@ -98,8 +106,15 @@ public partial class MainViewModel : ObservableObject, IDisposable
         _ = InitializeAllowlistAsync();
 
         _clockTimer = new DispatcherTimer { Interval = TimeSpan.FromSeconds(1) };
-        _clockTimer.Tick += (_, _) => ClockText = DateTime.Now.ToString("dddd, MMM d  ·  HH:mm:ss");
+        _clockTimer.Tick += (_, _) =>
+        {
+            ClockText = DateTime.Now.ToString("dddd, MMM d  ·  HH:mm:ss");
+            // Keep chrome fresh even between monitor polls (clock second tick).
+            if (DateTime.Now.Second % 2 == 0)
+                UpdateStatusChrome();
+        };
         _clockTimer.Start();
+        UpdateStatusChrome();
     }
 
     private async Task InitializeAllowlistAsync()
@@ -270,6 +285,42 @@ public partial class MainViewModel : ObservableObject, IDisposable
         HeroSubtitle = high > 0
             ? $"{high} high/critical · {blocked} blocked · {auto}"
             : $"{blocked} IPs blocked · {auto}";
+
+        UpdateStatusChrome();
+    }
+
+    /// <summary>
+    /// Refresh window title + tray text so the top bar / task list still show
+    /// live stats when the main window is minimized.
+    /// </summary>
+    public void UpdateStatusChrome()
+    {
+        var sessions = Stats.ActiveConnections;
+        var ports = Stats.ListeningPorts;
+        var hosts = Stats.RemoteHosts;
+        var threats = Stats.ThreatsToday;
+        var high = Stats.HighThreats;
+        var blocked = _blockedIps.Count;
+        var mon = Stats.IsMonitoring ? "Live" : "Paused";
+        var auto = AutoBlockEnabled ? $"auto≥{AutoBlockMinLevel}" : "auto off";
+
+        // Compact title for taskbar / window list (GNOME top bar / dock).
+        WindowTitle = high > 0
+            ? $"NS ⚠{high} · {sessions} sess · {hosts} hosts · {threats} evt"
+            : $"NS · {sessions} sess · {ports} ports · {hosts} hosts · {threats} evt";
+
+        TrayStatusLine = high > 0
+            ? $"Network Sentinel · ⚠ {high} high · {sessions} sessions ({mon})"
+            : $"Network Sentinel · {sessions} sessions · {hosts} remotes ({mon})";
+
+        TrayToolTip =
+            $"Network Sentinel  ·  {AppVersion}  ·  {mon}\n" +
+            $"TCP sessions: {sessions}\n" +
+            $"Listening ports: {ports}\n" +
+            $"Remote hosts: {hosts}\n" +
+            $"Threat events today: {threats}\n" +
+            $"High / critical: {high}\n" +
+            $"Blocked IPs: {blocked}  ·  {auto}";
     }
 
     private void RefreshBlockedIpsInBackground(bool force = false)
