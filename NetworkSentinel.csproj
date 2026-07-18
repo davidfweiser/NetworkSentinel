@@ -8,11 +8,12 @@
     <UseWPF>true</UseWPF>
     <ApplicationIcon>Assets\icon.ico</ApplicationIcon>
     <ApplicationManifest>app.manifest</ApplicationManifest>
+    <StartupObject>NetworkSentinel.Program</StartupObject>
     <AssemblyName>NetworkSentinel</AssemblyName>
     <RootNamespace>NetworkSentinel</RootNamespace>
     <Product>Network Sentinel</Product>
-    <Description>Native Windows network port monitor and intrusion awareness console</Description>
-    <Version>0.1.0</Version>
+    <Description>Native Windows network port monitor with GUI, TUI, and headless web UI</Description>
+    <Version>0.2.0</Version>
     <Company>Network Sentinel</Company>
   </PropertyGroup>
 
@@ -22,6 +23,7 @@
 
   <ItemGroup>
     <PackageReference Include="CommunityToolkit.Mvvm" Version="8.4.0" />
+    <PackageReference Include="Spectre.Console" Version="0.49.1" />
   </ItemGroup>
 
   <ItemGroup>

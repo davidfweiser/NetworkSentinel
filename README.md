@@ -1,8 +1,16 @@
-# Network Sentinel
+# Network Sentinel (Windows)
 
-Native Windows desktop app for **live network monitoring**, **remote peer tracking**, **break-in heuristics**, and **Windows Firewall blocking** — with a modern dark UI.
+Native **Windows** app for **live network monitoring**, **remote peer tracking**, **break-in heuristics**, and **Windows Firewall blocking**.
 
-> **Private repository.** Awareness / monitoring tooling — not a full IDS/IPS replacement.
+Three ways to run it (same idea as the Linux build):
+
+| Mode | When to use |
+|------|-------------|
+| **Desktop GUI** | Interactive workstation (default) |
+| **Terminal UI (`--tui`)** | Server Core, RDP console, SSH-style workflows |
+| **Headless web UI (`-w`)** | Browser dashboard on a server (master-password protected) |
+
+> Awareness / monitoring tooling — not a full IDS/IPS replacement. Version **0.2.0**.
 
 ---
 
@@ -53,8 +61,9 @@ Auto-block never touches allowlisted IPs. A **manual** block of an allowlisted I
 
 ## Requirements
 
-- **Windows 10 or 11**
-- [.NET 8 SDK](https://dotnet.microsoft.com/download) (or a runtime that can build `net8.0-windows`)
+- **Windows 10, 11, or Windows Server** (2019/2022+)
+- [.NET 8 Desktop Runtime](https://dotnet.microsoft.com/download) on the target machine (framework-dependent publish)
+- [.NET 8 SDK](https://dotnet.microsoft.com/download) to build
 - **Administrator** rights to create or delete Windows Defender Firewall rules
 
 ---
@@ -64,7 +73,48 @@ Auto-block never touches allowlisted IPs. A **manual** block of an allowlisted I
 ```powershell
 git clone https://github.com/davidfweiser/NetworkSentinel.git
 cd NetworkSentinel
+git checkout windows   # Windows WPF + TUI + web tree
 dotnet run
+```
+
+### Modes
+
+```powershell
+# Desktop GUI (default)
+dotnet run -c Release
+
+# Terminal UI
+dotnet run -c Release -- --tui
+
+# Headless web UI (browser) — auto-picks a free high port, or set one
+dotnet run -c Release -- -w
+dotnet run -c Release -- -w 18765
+```
+
+Environment variables: `NETWORKSENTINEL_TUI=1`, `NETWORKSENTINEL_WEB=1`.
+
+### Server web service (startup task)
+
+Elevated PowerShell from the repo:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\install-web-service.ps1
+# optional port:
+powershell -ExecutionPolicy Bypass -File .\scripts\install-web-service.ps1 -Port 18765
+```
+
+This publishes the app to `%ProgramData%\NetworkSentinel\`, opens the firewall port, reserves a URL ACL, and registers a **Scheduled Task** (`NetworkSentinel-Web`) that runs elevated at startup:
+
+```text
+NetworkSentinel.exe -w 18765
+```
+
+Then open `http://localhost:18765/` (or `http://<server-ip>:18765/`). **First browser visit creates a master password.**
+
+Uninstall:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\uninstall-web-service.ps1
 ```
 
 ### Install (Start Menu + Desktop shortcut)
@@ -118,7 +168,13 @@ Publish (framework-dependent):
 dotnet publish -c Release -r win-x64 --self-contained false
 ```
 
-The app **requires Administrator** (UAC) so Windows Firewall rules can be created and removed. The installer marks Start Menu / Desktop shortcuts as **Run as administrator**, and `app.manifest` requests elevation for every launch.
+The app starts **without** forcing UAC (so TUI/web work on servers). Desktop install shortcuts are still marked **Run as administrator**. TUI key **`u`** and the web **Authorize** button relaunch elevated via UAC when firewall changes need it. The web scheduled-task installer runs as **SYSTEM** (already elevated).
+
+### Web UI security
+- First browser visit **creates a master password** (min. 8 characters)
+- Later visits require that password
+- Hash stored as PBKDF2-SHA256 in `%LocalAppData%\NetworkSentinel\web-master.json`
+- Session cookie until sign-out, browser close, or 12 hours idle
 
 ---
 

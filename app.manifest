@@ -2,11 +2,12 @@
 <assembly manifestVersion="1.0" xmlns="urn:schemas-microsoft-com:asm.v1">
   <assemblyIdentity version="0.1.0.0" name="NetworkSentinel.app"/>
 
-  <!-- Always elevate so Windows Firewall rules can be created/removed. -->
+  <!-- asInvoker: GUI/TUI/web start without UAC. Firewall changes need elevation
+       (desktop shortcuts mark "Run as administrator"; TUI "u" / web Authorize relaunch). -->
   <trustInfo xmlns="urn:schemas-microsoft-com:asm.v2">
     <security>
       <requestedPrivileges xmlns="urn:schemas-microsoft-com:asm.v3">
-        <requestedExecutionLevel level="requireAdministrator" uiAccess="false" />
+        <requestedExecutionLevel level="asInvoker" uiAccess="false" />
       </requestedPrivileges>
     </security>
   </trustInfo>

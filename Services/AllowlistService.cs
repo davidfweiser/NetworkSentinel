@@ -49,11 +49,7 @@ public sealed class AllowlistService : IDisposable
 
     public AllowlistService()
     {
-        var dir = Path.Combine(
-            Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
-            "NetworkSentinel");
-        Directory.CreateDirectory(dir);
-        LocalDatabasePath = Path.Combine(dir, "allowlist.json");
+        LocalDatabasePath = Path.Combine(AppPaths.DataDirectory, "allowlist.json");
         _http.DefaultRequestHeaders.UserAgent.ParseAdd("NetworkSentinel/1.0 (allowlist)");
     }
 

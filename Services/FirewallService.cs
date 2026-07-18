@@ -35,9 +35,32 @@ public sealed class FirewallService
         }
     }
 
+    /// <summary>Windows has no separate root; true when elevated (matches Linux API for TUI/Web).</summary>
+    public bool IsRoot => IsAdministrator;
+
     public string PrivilegeText => IsAdministrator
         ? "Running as Administrator — firewall rules can be applied."
-        : "Not elevated — use “Run as Admin” to add or remove firewall rules.";
+        : "Not elevated — use “Run as Admin” / authorize (UAC) to add or remove firewall rules.";
+
+    /// <summary>
+    /// TUI/Web “Authorize” action. On Windows this relaunches the process elevated (UAC).
+    /// </summary>
+    public FirewallOperationResult AuthorizeElevation()
+    {
+        if (IsAdministrator)
+            return FirewallOperationResult.Ok("Already running as Administrator. Firewall rules can be applied.");
+
+        try
+        {
+            RestartAsAdministrator();
+            return FirewallOperationResult.Ok(
+                "Relaunching elevated — approve the UAC prompt, then continue in the new window.");
+        }
+        catch (Exception ex)
+        {
+            return FirewallOperationResult.Fail($"Could not relaunch as Administrator: {ex.Message}");
+        }
+    }
 
     public FirewallOperationResult BlockIp(string ip, FirewallDirection direction = FirewallDirection.Both, string? reason = null, bool overrideAllowlist = false)
     {
@@ -243,16 +266,25 @@ public sealed class FirewallService
         return set;
     }
 
-    public void RestartAsAdministrator()
+    public void RestartAsAdministrator(string? arguments = null)
     {
         var exe = Environment.ProcessPath
                   ?? Process.GetCurrentProcess().MainModule?.FileName
                   ?? throw new InvalidOperationException("Could not resolve executable path.");
 
+        // Preserve --tui / -w so server modes come back elevated.
+        if (arguments == null)
+        {
+            var args = Environment.GetCommandLineArgs().Skip(1)
+                .Select(a => a.Contains(' ') ? $"\"{a}\"" : a);
+            arguments = string.Join(" ", args);
+        }
+
         var start = new ProcessStartInfo(exe)
         {
             UseShellExecute = true,
-            Verb = "runas"
+            Verb = "runas",
+            Arguments = arguments
         };
 
         Process.Start(start);

@@ -5,10 +5,8 @@ namespace NetworkSentinel;
 
 public partial class App : Application
 {
-    protected override void OnStartup(StartupEventArgs e)
+    private void Application_Startup(object sender, StartupEventArgs e)
     {
-        base.OnStartup(e);
-
         DispatcherUnhandledException += (_, args) =>
         {
             LogError(args.Exception);
@@ -28,6 +26,10 @@ public partial class App : Application
 
         AppDomain.CurrentDomain.UnhandledException += (_, args) =>
             LogError(args.ExceptionObject as Exception);
+
+        // MainWindow is opened here so Program.Main can choose GUI vs --tui / -w.
+        var window = new MainWindow();
+        window.Show();
     }
 
     private static void LogError(Exception? ex)
