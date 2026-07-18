@@ -91,6 +91,16 @@ Build on a machine with the .NET SDK; install on the server **without** .NET:
 | `dist/networksentinel-*-linux-x64.tar.gz` | Classic tarball |
 | `dist/*.sha256` | Checksums |
 
+### Installer flags vs app flags
+
+| Flag | Used with | Meaning |
+|------|-----------|---------|
+| `--web-service` | **Installer only** (`*.install.sh` / `install.sh`) | Install app **and** enable systemd auto-start |
+| `-w` / `--web` | **App** (`networksentinel`) | Run headless web UI in the foreground |
+| `--tui` | **App** | Terminal UI |
+
+`--web-service` is **not** a runtime flag for `networksentinel`. If install prints `Unknown option: --web-service`, your package is too old — rebuild with `./scripts/package.sh` and copy the new installer, or use [manual auto-start](#auto-start-on-boot-systemd) below.
+
 ### Install web UI + systemd (typical server)
 
 ```bash
@@ -102,16 +112,25 @@ chmod +x networksentinel-0.2.0-linux-x64.install.sh
 sudo ./networksentinel-0.2.0-linux-x64.install.sh --web-service
 ```
 
-- Installs under `/usr/local`
-- Enables `networksentinel-web.service`
-- Listens on **port 18765**
-- Runs as your user (`SUDO_USER`), not as root
+Confirm the installer is current before using root:
+
+```bash
+./networksentinel-0.2.0-linux-x64.install.sh --help
+# Should list: --web-service
+```
+
+What you get:
+
+- App under `/usr/local`
+- systemd unit `networksentinel-web.service` (starts on boot)
+- Port **18765** (configurable)
+- Process runs as **your user** (`SUDO_USER`), not as root — **do not** launch daily with `sudo`
 
 ```text
 http://YOUR_SERVER_IP:18765/
 ```
 
-First visit: create master password · later visits: enter it.
+First browser visit: create a **master password**. Every later visit: enter it.
 
 ```bash
 systemctl status networksentinel-web
@@ -137,11 +156,64 @@ cd networksentinel-0.2.0-linux-x64
 sudo ./install.sh --web-service
 ```
 
+### Auto-start on boot (systemd)
+
+**Preferred:** install with `--web-service` (new package). That runs `systemctl enable --now networksentinel-web` for you.
+
+**If the app is already installed** (or the installer is too old and rejects `--web-service`), enable auto-start by hand:
+
+```bash
+# Config (port)
+sudo mkdir -p /etc/networksentinel
+echo 'WEB_PORT=18765' | sudo tee /etc/networksentinel/web.env
+
+# Replace YOUR_USER with the account that should own data (~/.local/share/NetworkSentinel)
+sudo tee /etc/systemd/system/networksentinel-web.service <<'EOF'
+[Unit]
+Description=Network Sentinel headless web console
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=YOUR_USER
+Group=YOUR_USER
+EnvironmentFile=-/etc/networksentinel/web.env
+WorkingDirectory=/usr/local/lib/networksentinel
+ExecStart=/usr/local/bin/networksentinel -w ${WEB_PORT}
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+sudo systemctl daemon-reload
+sudo systemctl enable --now networksentinel-web
+systemctl status networksentinel-web
+```
+
+User install (no root for the service) after `./install.sh --user --web-service`:
+
+```bash
+systemctl --user enable --now networksentinel-web
+# keep running after logout on a server:
+sudo loginctl enable-linger "$USER"
+```
+
+### Daily commands (no sudo)
+
 ```bash
 networksentinel --tui       # terminal UI over SSH
-networksentinel -w          # web UI (auto free port)
+networksentinel -w          # web UI in foreground (auto free port)
 networksentinel-web         # web UI on configured port (default 18765)
 networksentinel --help
+systemctl status networksentinel-web
+```
+
+`sudo` is only needed for **install**, **uninstall**, editing `/etc/…`, or restarting the **system** service — not for normal use of the app.
+
+```bash
 sudo networksentinel-uninstall
 ```
 
@@ -150,6 +222,7 @@ sudo networksentinel-uninstall
 | `/usr/local/lib/networksentinel/` | App files (system install) |
 | `/usr/local/bin/networksentinel` | Launcher |
 | `/usr/local/bin/networksentinel-web` | Web UI helper |
+| `/etc/systemd/system/networksentinel-web.service` | Auto-start unit |
 | `/etc/networksentinel/web.env` | `WEB_PORT` for systemd |
 | `~/.local/share/NetworkSentinel/` | Settings, allowlist, master-password hash |
 
