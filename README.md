@@ -1,6 +1,14 @@
 # Network Sentinel (Linux)
 
-Native **Linux** desktop app for **live network monitoring**, **remote peer tracking**, **break-in heuristics**, and **host firewall blocking** — with a modern dark Avalonia UI.
+Native **Linux** app for **live network monitoring**, **remote peer tracking**, **break-in heuristics**, and **host firewall blocking**.
+
+Three ways to run it:
+
+| Mode | When to use |
+|------|-------------|
+| **Avalonia GUI** | Desktop with a display |
+| **Terminal UI (`--tui`)** | SSH / keyboard-first |
+| **Headless web UI (`-w`)** | Browser on a server (master-password protected) |
 
 > Awareness / monitoring tooling — not a full IDS/IPS replacement.
 
@@ -16,7 +24,7 @@ Linux port of the original Windows WPF Network Sentinel. Platform layers use `/p
 | **Open ports** | TCP listeners and UDP endpoints via `/proc/net/tcp{,6}` and `/proc/net/udp{,6}` |
 | **Live connections** | Process name (via `/proc/*/fd` inode map), local/remote endpoints, TCP state, origin summary |
 | **Remote computers** | Peers observed talking to this PC, reverse DNS, geo/ISP when public |
-| **Activity chart** | Live sparkline of connection samples |
+| **Activity chart** | Live sparkline of connection samples (GUI) |
 
 ### Threat awareness
 Heuristics flag patterns such as:
@@ -48,19 +56,112 @@ Trusted sites are protected so auto-block (and manual block) will not cut off ev
 
 Domains are DNS-resolved to current IPs. Auto-block never touches allowlisted IPs. **Restore good sites** removes Network Sentinel blocks that hit allowlisted addresses.
 
+### Web UI security
+- First browser visit **creates a master password** (min. 8 characters)
+- Every later visit **requires that password**
+- Hash stored as PBKDF2-SHA256 in `~/.local/share/NetworkSentinel/web-master.json`
+- Session cookie until sign-out, browser close, or 12 hours idle
+
 ---
 
 ## Requirements
 
 - **Linux** (kernel `/proc` networking; tested on Pop!_OS / Ubuntu-class systems)
-- [.NET 8 SDK or runtime](https://dotnet.microsoft.com/download)
-- Desktop libraries for Avalonia (usual X11/Wayland desktop install)
+- For **dev / `dotnet run`**: [.NET 8 SDK](https://dotnet.microsoft.com/download)
+- For **server package**: nothing on the target — self-contained binary (no .NET install)
+- Desktop libraries for Avalonia GUI (usual X11/Wayland desktop)
 - **policykit-1** (`pkexec`) recommended for firewall password prompts
 - `nft` (nftables) or `iptables` for host firewall changes
+- **systemd** optional (used by `--web-service` installer)
 
 ---
 
-## Quick start
+## Server installer (recommended for production)
+
+Build on a machine with the .NET SDK; install on the server **without** .NET:
+
+```bash
+./scripts/package.sh              # linux-x64 → dist/
+./scripts/package.sh linux-arm64  # ARM / Raspberry Pi
+```
+
+| Artifact | Purpose |
+|----------|---------|
+| `dist/networksentinel-*-linux-x64.install.sh` | **One-file installer** (copy + run) |
+| `dist/networksentinel-*-linux-x64.tar.gz` | Classic tarball |
+| `dist/*.sha256` | Checksums |
+
+### Install web UI + systemd (typical server)
+
+```bash
+# build machine
+scp dist/networksentinel-0.2.0-linux-x64.install.sh user@server:
+
+# server
+chmod +x networksentinel-0.2.0-linux-x64.install.sh
+sudo ./networksentinel-0.2.0-linux-x64.install.sh --web-service
+```
+
+- Installs under `/usr/local`
+- Enables `networksentinel-web.service`
+- Listens on **port 18765**
+- Runs as your user (`SUDO_USER`), not as root
+
+```text
+http://YOUR_SERVER_IP:18765/
+```
+
+First visit: create master password · later visits: enter it.
+
+```bash
+systemctl status networksentinel-web
+journalctl -u networksentinel-web -f
+sudo systemctl restart networksentinel-web
+
+# change port
+sudoedit /etc/networksentinel/web.env   # WEB_PORT=…
+sudo systemctl restart networksentinel-web
+```
+
+### Other install options
+
+```bash
+sudo ./….install.sh                         # app only (no systemd)
+sudo ./….install.sh --web-service --port 18765
+./….install.sh --user                       # ~/.local (no root)
+./….install.sh --user --web-service         # user systemd unit
+
+# classic tarball
+tar xzf networksentinel-0.2.0-linux-x64.tar.gz
+cd networksentinel-0.2.0-linux-x64
+sudo ./install.sh --web-service
+```
+
+```bash
+networksentinel --tui       # terminal UI over SSH
+networksentinel -w          # web UI (auto free port)
+networksentinel-web         # web UI on configured port (default 18765)
+networksentinel --help
+sudo networksentinel-uninstall
+```
+
+| Path | Role |
+|------|------|
+| `/usr/local/lib/networksentinel/` | App files (system install) |
+| `/usr/local/bin/networksentinel` | Launcher |
+| `/usr/local/bin/networksentinel-web` | Web UI helper |
+| `/etc/networksentinel/web.env` | `WEB_PORT` for systemd |
+| `~/.local/share/NetworkSentinel/` | Settings, allowlist, master-password hash |
+
+Reset web master password:
+
+```bash
+rm ~/.local/share/NetworkSentinel/web-master.json
+```
+
+---
+
+## Quick start (from source)
 
 ```bash
 git clone https://github.com/davidfweiser/NetworkSentinel.git
@@ -68,14 +169,23 @@ cd NetworkSentinel
 dotnet run -c Release
 ```
 
+If the .NET SDK was installed with the official install script:
+
+```bash
+export PATH="$HOME/.dotnet:$PATH"
+export DOTNET_ROOT="$HOME/.dotnet"
+dotnet run -c Release
+```
+
 ### Terminal UI (TUI)
 
-Same monitoring / firewall stack, in the terminal (SSH, headless, or prefer keyboard):
+Same monitoring / firewall stack, in the terminal (SSH, headless, or keyboard-first):
 
 ```bash
 dotnet run -c Release -- --tui
-# or after publish:
+# or after publish / install:
 ./NetworkSentinel --tui
+networksentinel --tui
 # or:  NETWORKSENTINEL_TUI=1 ./NetworkSentinel
 ```
 
@@ -99,65 +209,39 @@ If there is **no** `DISPLAY` / `WAYLAND_DISPLAY` (typical SSH session), the app 
 | `h` / `F1` | Help |
 | `q` | Quit |
 
-If the .NET SDK was installed with the install script:
+### Headless web UI (`-w`)
 
 ```bash
-export PATH="$HOME/.dotnet:$PATH"
-export DOTNET_ROOT="$HOME/.dotnet"
-dotnet run -c Release
+dotnet run -c Release -- -w
+./NetworkSentinel -w
+./NetworkSentinel -w 18765          # explicit port
+NETWORKSENTINEL_WEB=1 ./NetworkSentinel
 ```
 
-### Release build
+The console prints the URL (e.g. `http://127.0.0.1:18765/`). Open it in a browser. Press **Ctrl+C** to stop.
+
+Without an explicit port, the process prefers free high ports (**18765**, then nearby alternatives) that common services almost never use.
+
+### Release build (developers)
 
 ```bash
 dotnet build -c Release
 dotnet publish -c Release -r linux-x64 --self-contained false -o bin/publish
-./bin/publish/NetworkSentinel
-# TUI: ./bin/publish/NetworkSentinel --tui
+./bin/publish/NetworkSentinel --tui
 ```
 
-Self-contained (no system .NET runtime needed):
+Self-contained (no system .NET runtime):
 
 ```bash
 dotnet publish -c Release -r linux-x64 --self-contained true -o bin/publish-sc
-./bin/publish-sc/NetworkSentinel
+./bin/publish-sc/NetworkSentinel -w
 ```
 
-### Server / portable package (recommended)
+Prefer `./scripts/package.sh` when shipping to a server — it builds the installer and tarball.
 
-Build a **self-contained tarball** (no .NET on the target machine):
+---
 
-```bash
-./scripts/package.sh              # linux-x64 → dist/networksentinel-VERSION-linux-x64.tar.gz
-./scripts/package.sh linux-arm64  # ARM servers / Raspberry Pi
-```
-
-Install on the server:
-
-```bash
-# from your build machine
-scp dist/networksentinel-0.2.0-linux-x64.tar.gz user@server:
-
-# on the server
-tar xzf networksentinel-0.2.0-linux-x64.tar.gz
-cd networksentinel-0.2.0-linux-x64
-sudo ./install.sh          # → /usr/local/bin/networksentinel
-# or without root:
-# ./install.sh --user      # → ~/.local/bin/networksentinel
-
-networksentinel --tui
-networksentinel --help
-```
-
-Uninstall: `sudo networksentinel-uninstall` (or `networksentinel-uninstall` for a user install).
-
-| Artifact | Location |
-|----------|----------|
-| Tarball | `dist/networksentinel-*-linux-x64.tar.gz` (~46 MB self-contained) |
-| Checksum | `dist/*.tar.gz.sha256` |
-| App files | `/usr/local/lib/networksentinel/` (system) or `~/.local/lib/networksentinel/` (user) |
-
-### Firewall / auto-block (important on Wayland)
+## Firewall / auto-block (important on Wayland)
 
 **Do not** run the GUI with `sudo` on Wayland — root cannot open your display (`XOpenDisplay failed`).
 
@@ -172,7 +256,9 @@ Uninstall: `sudo networksentinel-uninstall` (or `networksentinel-uninstall` for 
 
 When you block an IP/port (or click **Authorize firewall**), only `nft`/`iptables` are elevated via **pkexec** and you get a password dialog. Monitoring works without elevation.
 
-### App icon
+---
+
+## App icon
 
 Assets live in `Assets/`:
 
@@ -194,7 +280,7 @@ cp networksentinel.desktop ~/.local/share/applications/
 update-desktop-database ~/.local/share/applications 2>/dev/null || true
 ```
 
-Optional desktop entry is provided as `networksentinel.desktop` (`Icon=networksentinel`).
+Optional desktop entry is provided as `networksentinel.desktop` (`Icon=networksentinel`). The server installer can install it under the chosen prefix.
 
 ---
 
@@ -208,6 +294,7 @@ Optional desktop entry is provided as `networksentinel.desktop` (`Icon=networkse
 | **Break-in Attempts** | Heuristic alerts with origin and method |
 | **Open Ports** | Listening TCP/UDP; optional inbound port block |
 | **Firewall & Block** | Manual IP/port rules, auto-block, allowlist, managed rule list |
+| **Allowlist** | Domains/IPs that are never blocked |
 
 ### Auto-block
 1. Click **Authorize firewall** (or allow the first pkexec prompt when blocking).
@@ -233,10 +320,10 @@ Optional desktop entry is provided as `networksentinel.desktop` (`Icon=networkse
                                        │ (heuristics)         │
                                        └──────────┬───────────┘
                                                   │
-                    ┌─────────────────────────────┼─────────────────────────────┐
-                    ▼                             ▼                             ▼
-           Geo / DNS lookup         Avalonia UI  or  TUI          FirewallService
-           (origin details)         (MVVM / Spectre)              pkexec → nft/iptables
+          ┌───────────────────────────────────────┼───────────────────────────┐
+          ▼                                       ▼                           ▼
+   Geo / DNS lookup              Avalonia · TUI · Web UI           FirewallService
+   (origin details)              (master password on web)          pkexec → nft/iptables
 ```
 
 ---
@@ -255,9 +342,14 @@ Optional desktop entry is provided as `networksentinel.desktop` (`Icon=networkse
 | `ViewModels/MainViewModel.cs` | UI state, commands, auto-block wiring |
 | `MainWindow.axaml` | Avalonia dashboard UI |
 | `Tui/TuiApp.cs` | Spectre.Console terminal UI (`--tui`) |
+| `Web/WebApp.cs` | Headless browser UI (`-w` / `--web`) |
+| `Web/WebAuthStore.cs` | Master password hash + session tokens |
+| `scripts/package.sh` | Build self-contained tarball + `.install.sh` |
+| `scripts/install-from-package.sh` | Server/desktop installer (shipped as `install.sh`) |
+| `scripts/systemd/` | `networksentinel-web` unit + `web.env` example |
 | `Themes/` | Colors and control styles |
 | `Controls/Sparkline.cs` | Live activity chart |
-| `Program.cs` | Entry point; GUI / TUI routing; refuses GUI-as-root on Wayland |
+| `Program.cs` | Entry point; GUI / TUI / web routing; refuses GUI-as-root on Wayland |
 
 ---
 
@@ -281,13 +373,14 @@ Optional desktop entry is provided as `networksentinel.desktop` (`Icon=networkse
 - Set `"AllowlistUseRemoteFeed": false` to skip the GitHub allowlist feed and use only built-in/local lists.
 - Non-root runs still monitor connections for processes you can see; other users’ sockets may show as `Kernel / unknown`.
 - Existing TCP sessions may remain until they reconnect after a block; new matching traffic is stopped by the firewall.
+- The web UI binds all interfaces when started with `-w`; protect it with the master password and host firewall if exposed.
 - Override (rare): `NETWORKSENTINEL_ALLOW_ROOT_GUI=1` forces allowing a root GUI (only useful on some X11 setups with `xhost`).
 
 ---
 
 ## Status while minimized (top bar / tray)
 
-While the app is running (including minimized):
+While the GUI is running (including minimized):
 
 | Where | What you see |
 |-------|----------------|
@@ -303,11 +396,14 @@ On GNOME / Pop!_OS the indicator appears in the top bar (StatusNotifier / AppInd
 
 | Problem | What to do |
 |---------|------------|
-| `XOpenDisplay failed` after `sudo` | Run **without** sudo. Use **Authorize firewall** / pkexec for rules only. |
+| `XOpenDisplay failed` after `sudo` | Run **without** sudo. Use **Authorize firewall** / pkexec for rules only. Or use `--tui` / `-w`. |
 | No password dialog for block | Install `policykit-1` (`pkexec`). |
-| `.NET location: Not found` | Set `DOTNET_ROOT` / `PATH` to your .NET install, or use a self-contained publish. |
+| `.NET location: Not found` | Use the **server installer** / self-contained package, or set `DOTNET_ROOT` / `PATH`. |
 | Process names missing | Expected for other users’ sockets without root; monitoring still works. |
 | No tray icon | DE must support StatusNotifier/AppIndicator; window title still updates when minimized. |
+| Web UI asks for password every time | Expected after sign-out, browser close, or 12h idle. Reset: delete `web-master.json`. |
+| `networksentinel-web` won’t start | `journalctl -u networksentinel-web -e`; check port in `/etc/networksentinel/web.env`. |
+| Port already in use | Change `WEB_PORT` or run `networksentinel -w` to auto-pick a free high port. |
 
 ---
 

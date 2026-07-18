@@ -4,6 +4,7 @@ using System.Linq;
 using System.Runtime.InteropServices;
 using Avalonia;
 using NetworkSentinel.Tui;
+using NetworkSentinel.Web;
 
 namespace NetworkSentinel;
 
@@ -18,6 +19,12 @@ internal static class Program
         if (WantsHelp(args))
         {
             PrintUsage();
+            return;
+        }
+
+        if (WantsWeb(args, out var webPort))
+        {
+            RunWeb(webPort);
             return;
         }
 
@@ -107,8 +114,87 @@ internal static class Program
         }
     }
 
+    private static void RunWeb(int? port)
+    {
+        try
+        {
+            using var app = new WebApp(port);
+            app.RunAsync().GetAwaiter().GetResult();
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine("Network Sentinel web UI failed:");
+            Console.Error.WriteLine(ex.Message);
+            if (ex.InnerException != null)
+                Console.Error.WriteLine(ex.InnerException.Message);
+            Environment.Exit(1);
+        }
+    }
+
     private static bool WantsHelp(string[] args)
         => args.Any(a => a is "-h" or "--help" or "-?" or "help");
+
+    /// <summary>
+    /// Headless browser UI when: -w / --web, optional port as -w PORT, -w=PORT, --web=PORT, or --port PORT.
+    /// </summary>
+    private static bool WantsWeb(string[] args, out int? port)
+    {
+        port = null;
+        for (var i = 0; i < args.Length; i++)
+        {
+            var a = args[i];
+
+            if (a is "-w" or "--web" or "web")
+            {
+                if (i + 1 < args.Length && int.TryParse(args[i + 1], out var p) && p is >= 1 and <= 65535)
+                    port = p;
+                return true;
+            }
+
+            if (a.StartsWith("-w=", StringComparison.Ordinal) ||
+                a.StartsWith("--web=", StringComparison.Ordinal))
+            {
+                var value = a[(a.IndexOf('=') + 1)..];
+                if (int.TryParse(value, out var p) && p is >= 1 and <= 65535)
+                    port = p;
+                else
+                {
+                    Console.Error.WriteLine($"Invalid web port in '{a}'. Use e.g. -w=18765");
+                    Environment.Exit(2);
+                }
+                return true;
+            }
+
+            // -w18765 (no space / equals)
+            if (a.Length > 2 && a.StartsWith("-w", StringComparison.Ordinal) &&
+                int.TryParse(a.AsSpan(2), out var glued) && glued is >= 1 and <= 65535)
+            {
+                port = glued;
+                return true;
+            }
+        }
+
+        // --port only counts when web mode is also requested elsewhere — ignore alone.
+        // NETWORKSENTINEL_WEB=1 forces web mode.
+        var env = Environment.GetEnvironmentVariable("NETWORKSENTINEL_WEB");
+        if (string.Equals(env, "1", StringComparison.OrdinalIgnoreCase) ||
+            string.Equals(env, "true", StringComparison.OrdinalIgnoreCase) ||
+            string.Equals(env, "yes", StringComparison.OrdinalIgnoreCase))
+        {
+            for (var i = 0; i < args.Length; i++)
+            {
+                if ((args[i] is "--port" or "-p") && i + 1 < args.Length &&
+                    int.TryParse(args[i + 1], out var p) && p is >= 1 and <= 65535)
+                {
+                    port = p;
+                    break;
+                }
+            }
+            return true;
+        }
+
+        return false;
+    }
 
     /// <summary>
     /// TUI when: --tui / -t / tui arg, NETWORKSENTINEL_TUI=1, or no graphical display
@@ -148,10 +234,13 @@ internal static class Program
               (default)          Avalonia GUI (requires display)
               --tui, -t, tui     Terminal UI (Spectre.Console)
               --console          Same as --tui
+              -w, --web [PORT]   Headless web UI (browser). Auto-picks a free high port
+                                 if PORT is omitted (prefers 18765, then nearby alternatives)
               -h, --help         Show this help
 
             Environment:
               NETWORKSENTINEL_TUI=1              Force TUI
+              NETWORKSENTINEL_WEB=1              Force headless web UI
               NETWORKSENTINEL_GUI=1              Force GUI even without DISPLAY
               NETWORKSENTINEL_ALLOW_ROOT_GUI=1   Allow root GUI (rare; X11 only)
 
@@ -162,7 +251,10 @@ internal static class Program
             Examples:
               dotnet run -c Release
               dotnet run -c Release -- --tui
+              dotnet run -c Release -- -w
               ./NetworkSentinel --tui
+              ./NetworkSentinel -w
+              ./NetworkSentinel -w 18765
             """);
     }
 

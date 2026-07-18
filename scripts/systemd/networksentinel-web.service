@@ -1,0 +1,24 @@
+[Unit]
+Description=Network Sentinel headless web console
+Documentation=https://github.com/davidfweiser/NetworkSentinel
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=REPLACE_USER
+Group=REPLACE_GROUP
+EnvironmentFile=-REPLACE_ENV_FILE
+WorkingDirectory=REPLACE_LIBDIR
+ExecStart=REPLACE_BINDIR/networksentinel -w ${WEB_PORT}
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=20
+# Connection tables come from /proc; firewall elevation uses pkexec/sudo when needed.
+PrivateTmp=true
+
+# Allow writing settings / master-password hash for this user.
+ReadWritePaths=REPLACE_DATA_DIR
+
+[Install]
+WantedBy=multi-user.target
