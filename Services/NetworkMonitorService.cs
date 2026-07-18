@@ -114,6 +114,7 @@ public sealed class NetworkMonitorService : IDisposable
         var liveConnectionKeys = new HashSet<string>();
         var liveListenerKeys = new HashSet<string>();
         var activeByIp = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+        var geoIps = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         var newThreats = new List<ThreatEvent>();
         var listeningTcpPorts = new HashSet<int>();
 
@@ -153,31 +154,42 @@ public sealed class NetworkMonitorService : IDisposable
                 _listeners.Remove(key);
 
             // Active non-listen TCP
-            foreach (var c in tcp.Where(x => x.State != TcpConnectionState.Listen))
+            foreach (var polled in tcp.Where(x => x.State != TcpConnectionState.Listen))
             {
-                c.ProcessName = _processes.Resolve(c.ProcessId);
-                liveConnectionKeys.Add(c.Key);
+                polled.ProcessName = _processes.Resolve(polled.ProcessId);
+                liveConnectionKeys.Add(polled.Key);
 
+                NetworkConnection tracked;
                 bool isNewConnection;
-                if (_connections.TryGetValue(c.Key, out var existing))
+                if (_connections.TryGetValue(polled.Key, out var existing))
                 {
                     existing.LastSeen = now;
-                    existing.ProcessName = c.ProcessName;
+                    existing.ProcessName = polled.ProcessName;
+                    tracked = existing;
                     isNewConnection = false;
                 }
                 else
                 {
-                    c.LastSeen = now;
-                    _connections[c.Key] = c;
+                    polled.LastSeen = now;
+                    // Seed host/geo from a peer we already resolved so Live view
+                    // does not sit on "Looking up…" until the next async pass.
+                    ApplyKnownGeo(polled);
+                    _connections[polled.Key] = polled;
+                    tracked = polled;
                     isNewConnection = true;
                 }
 
-                if (IsTrackableRemote(c.RemoteAddress))
+                if (IsTrackableRemote(tracked.RemoteAddress))
                 {
-                    activeByIp.TryGetValue(c.RemoteAddress, out var n);
-                    activeByIp[c.RemoteAddress] = n + 1;
-                    UpsertHost(c, now, isNewConnection);
+                    activeByIp.TryGetValue(tracked.RemoteAddress, out var n);
+                    activeByIp[tracked.RemoteAddress] = n + 1;
+                    UpsertHost(tracked, now, isNewConnection);
                 }
+
+                // Queue reverse-DNS / geo for every concrete remote, including
+                // loopback and LAN — remote hosts table still uses IsTrackableRemote.
+                if (ShouldResolveRemote(tracked.RemoteAddress))
+                    geoIps.Add(tracked.RemoteAddress);
             }
 
             foreach (var key in _connections.Keys.Where(k => !liveConnectionKeys.Contains(k)).ToList())
@@ -230,8 +242,8 @@ public sealed class NetworkMonitorService : IDisposable
             _firstPass = false;
         }
 
-        // Geo lookups off the lock
-        foreach (var ip in activeByIp.Keys)
+        // Geo + reverse-DNS off the lock (LAN/loopback included for Live "source"/host names)
+        foreach (var ip in geoIps)
             QueueGeo(ip);
 
         foreach (var t in newThreats)
@@ -337,6 +349,26 @@ public sealed class NetworkMonitorService : IDisposable
         if (string.IsNullOrWhiteSpace(ip)) return false;
         if (ip is "0.0.0.0" or "::" or "127.0.0.1" or "::1") return false;
         return true;
+    }
+
+    /// <summary>Any remote address we can reverse-DNS / label in Live Connections.</summary>
+    private static bool ShouldResolveRemote(string ip)
+    {
+        if (string.IsNullOrWhiteSpace(ip)) return false;
+        return ip is not ("0.0.0.0" or "::");
+    }
+
+    private void ApplyKnownGeo(NetworkConnection c)
+    {
+        if (!_hosts.TryGetValue(c.RemoteAddress, out var host))
+            return;
+        if (string.IsNullOrWhiteSpace(host.GeoSummary) ||
+            host.GeoSummary is "Resolving…" or "Looking up…")
+            return;
+
+        if (!string.IsNullOrWhiteSpace(host.HostName))
+            c.RemoteHostName = host.HostName;
+        c.GeoSummary = host.GeoSummary;
     }
 
     private void CountThreat(ThreatEvent t)

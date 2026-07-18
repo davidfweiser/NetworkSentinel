@@ -32,17 +32,9 @@ public sealed class GeoIpService : IDisposable
 
     public async Task<GeoResult> LookupAsync(string ip, CancellationToken ct = default)
     {
-        if (string.IsNullOrWhiteSpace(ip) || IsNonPublic(ip))
+        if (string.IsNullOrWhiteSpace(ip))
         {
-            return new GeoResult
-            {
-                Ip = ip,
-                HostName = IsLoopback(ip) ? "localhost" : "Private / local network",
-                Country = IsLoopback(ip) ? "Localhost" : "LAN",
-                City = "",
-                Isp = "Private address space",
-                Summary = IsLoopback(ip) ? "This computer" : "Private / local network"
-            };
+            return new GeoResult { Ip = ip ?? "", Summary = "Unknown" };
         }
 
         if (_cache.TryGetValue(ip, out var cached))
@@ -74,6 +66,18 @@ public sealed class GeoIpService : IDisposable
 
         try
         {
+            // Private / loopback / link-local: still reverse-DNS so Live view
+            // can show the real peer name (LAN printers, NAS, other PCs).
+            // Never invent a fake HostName like "Private / local network" —
+            // that was rendering as the remote "source" and hiding real names.
+            if (IsNonPublic(ip))
+            {
+                string localName = await ResolveHostNameAsync(ip, ct);
+                var local = BuildNonPublicResult(ip, localName);
+                _cache[ip] = local;
+                return local;
+            }
+
             string hostName = await ResolveHostNameAsync(ip, ct);
 
             if (!LookupsEnabled)
@@ -110,6 +114,13 @@ public sealed class GeoIpService : IDisposable
         catch
         {
             string hostName = await ResolveHostNameAsync(ip, ct);
+            if (IsNonPublic(ip))
+            {
+                var local = BuildNonPublicResult(ip, hostName);
+                _cache[ip] = local;
+                return local;
+            }
+
             var fallback = new GeoResult
             {
                 Ip = ip,
@@ -126,6 +137,35 @@ public sealed class GeoIpService : IDisposable
         {
             _inFlight.TryRemove(ip, out _);
         }
+    }
+
+    private static GeoResult BuildNonPublicResult(string ip, string hostName)
+    {
+        if (IsLoopback(ip))
+        {
+            return new GeoResult
+            {
+                Ip = ip,
+                HostName = string.IsNullOrWhiteSpace(hostName) ? "localhost" : hostName,
+                Country = "Localhost",
+                City = "",
+                Isp = "Loopback",
+                Summary = "This computer"
+            };
+        }
+
+        return new GeoResult
+        {
+            Ip = ip,
+            // Real reverse-DNS only — empty when the LAN peer has no PTR/NetBIOS name.
+            HostName = hostName,
+            Country = "LAN",
+            City = "",
+            Isp = "Private address space",
+            Summary = string.IsNullOrWhiteSpace(hostName)
+                ? "Private / local network"
+                : $"LAN · {hostName}"
+        };
     }
 
     private async Task<(string Country, string City, string Isp, double Lat, double Lon)> QueryIpApiAsync(

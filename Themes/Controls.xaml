@@ -24,7 +24,8 @@
                             <ScaleTransform x:Name="scale" ScaleX="1" ScaleY="1"/>
                         </Border.RenderTransform>
                         <ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center"
-                                          RecognizesAccessKey="True"/>
+                                          RecognizesAccessKey="True"
+                                          TextElement.Foreground="{TemplateBinding Foreground}"/>
                     </Border>
                     <ControlTemplate.Triggers>
                         <Trigger Property="IsMouseOver" Value="True">
@@ -54,14 +55,19 @@
                         <Trigger Property="IsPressed" Value="True">
                             <Setter TargetName="bd" Property="Background" Value="#44243F6E"/>
                         </Trigger>
+                        <Trigger Property="IsEnabled" Value="False">
+                            <Setter Property="Foreground" Value="{StaticResource TextMutedBrush}"/>
+                            <Setter TargetName="bd" Property="Opacity" Value="0.55"/>
+                        </Trigger>
                     </ControlTemplate.Triggers>
                 </ControlTemplate>
             </Setter.Value>
         </Setter>
     </Style>
 
+    <!-- Light label on saturated gradient — dark text was hard to read on blue/violet. -->
     <Style x:Key="PrimaryButton" TargetType="Button" BasedOn="{StaticResource GhostButton}">
-        <Setter Property="Foreground" Value="#FF041018"/>
+        <Setter Property="Foreground" Value="#FFF7FBFF"/>
         <Setter Property="Background" Value="{StaticResource AccentGradient}"/>
         <Setter Property="BorderThickness" Value="0"/>
         <Setter Property="FontWeight" Value="Bold"/>
@@ -289,7 +295,8 @@
                             </Grid.ColumnDefinitions>
                             <Border x:Name="indicator" Width="4" Height="18" CornerRadius="2"
                                     Background="Transparent" Margin="0,0,12,0" VerticalAlignment="Center"/>
-                            <ContentPresenter Grid.Column="1" VerticalAlignment="Center"/>
+                            <ContentPresenter Grid.Column="1" VerticalAlignment="Center"
+                                              TextElement.Foreground="{TemplateBinding Foreground}"/>
                         </Grid>
                     </Border>
                     <ControlTemplate.Triggers>
@@ -382,6 +389,14 @@
         <Setter Property="FontSize" Value="12.5"/>
     </Style>
 
+    <!-- Applied via ElementStyle on DataGridTextColumns so cell text stays
+         light on the dark theme (default TextBlock is near-black). -->
+    <Style x:Key="DataGridTextElement" TargetType="TextBlock">
+        <Setter Property="Foreground" Value="{StaticResource TextPrimaryBrush}"/>
+        <Setter Property="VerticalAlignment" Value="Center"/>
+        <Setter Property="TextTrimming" Value="CharacterEllipsis"/>
+    </Style>
+
     <Style TargetType="DataGridColumnHeader">
         <Setter Property="Background" Value="#22101828"/>
         <Setter Property="Foreground" Value="{StaticResource TextSecondaryBrush}"/>
@@ -395,10 +410,13 @@
     <Style TargetType="DataGridCell">
         <Setter Property="BorderThickness" Value="0"/>
         <Setter Property="Padding" Value="8,0"/>
+        <Setter Property="Foreground" Value="{StaticResource TextPrimaryBrush}"/>
         <Setter Property="Template">
             <Setter.Value>
                 <ControlTemplate TargetType="DataGridCell">
-                    <Border Padding="{TemplateBinding Padding}" Background="Transparent">
+                    <Border Padding="{TemplateBinding Padding}"
+                            Background="{TemplateBinding Background}"
+                            TextElement.Foreground="{TemplateBinding Foreground}">
                         <ContentPresenter VerticalAlignment="Center"/>
                     </Border>
                 </ControlTemplate>

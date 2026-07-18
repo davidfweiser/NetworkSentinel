@@ -6,13 +6,19 @@
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
     <UseWPF>true</UseWPF>
-    <ApplicationIcon />
+    <ApplicationIcon>Assets\icon.ico</ApplicationIcon>
+    <ApplicationManifest>app.manifest</ApplicationManifest>
     <AssemblyName>NetworkSentinel</AssemblyName>
     <RootNamespace>NetworkSentinel</RootNamespace>
     <Product>Network Sentinel</Product>
     <Description>Native Windows network port monitor and intrusion awareness console</Description>
     <Version>0.1.0</Version>
+    <Company>Network Sentinel</Company>
   </PropertyGroup>
+
+  <ItemGroup>
+    <Resource Include="Assets\icon.ico" />
+  </ItemGroup>
 
   <ItemGroup>
     <PackageReference Include="CommunityToolkit.Mvvm" Version="8.4.0" />

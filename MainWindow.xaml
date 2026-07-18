@@ -415,6 +415,7 @@
                                                                            Foreground="{StaticResource TextMutedBrush}" FontSize="11"
                                                                            Margin="8,0,0,0" VerticalAlignment="Top"/>
                                                                 <TextBlock Text="{Binding Title}" FontWeight="SemiBold"
+                                                                           Foreground="{StaticResource TextPrimaryBrush}"
                                                                            TextWrapping="Wrap"/>
                                                             </DockPanel>
                                                             <TextBlock Text="{Binding SourceIp}" Foreground="{StaticResource AccentCyanBrush}"
@@ -461,6 +462,7 @@
                                                         </Grid.ColumnDefinitions>
                                                         <StackPanel Margin="0,0,8,0">
                                                             <TextBlock Text="{Binding DisplayName}" FontWeight="SemiBold"
+                                                                       Foreground="{StaticResource TextPrimaryBrush}"
                                                                        TextWrapping="Wrap"/>
                                                             <TextBlock Text="{Binding GeoSummary}" Foreground="{StaticResource TextSecondaryBrush}"
                                                                        FontSize="11" Margin="0,2,0,0" TextWrapping="Wrap"/>
@@ -498,13 +500,13 @@
                             <DataGrid ItemsSource="{Binding Connections}" Style="{StaticResource ModernDataGrid}"
                                       SelectedItem="{Binding SelectedConnection}">
                                 <DataGrid.Columns>
-                                    <DataGridTextColumn Header="Process" Binding="{Binding ProcessName}" Width="110"/>
-                                    <DataGridTextColumn Header="Protocol" Binding="{Binding Protocol}" Width="70"/>
-                                    <DataGridTextColumn Header="Local" Binding="{Binding DisplayLocal}" Width="140"/>
-                                    <DataGridTextColumn Header="Remote" Binding="{Binding DisplayRemote}" Width="*"/>
-                                    <DataGridTextColumn Header="State" Binding="{Binding StateText}" Width="90"/>
-                                    <DataGridTextColumn Header="Origin" Binding="{Binding GeoSummary}" Width="170"/>
-                                    <DataGridTextColumn Header="PID" Binding="{Binding ProcessId}" Width="60"/>
+                                    <DataGridTextColumn ElementStyle="{StaticResource DataGridTextElement}" Header="Process" Binding="{Binding ProcessName}" Width="110"/>
+                                    <DataGridTextColumn ElementStyle="{StaticResource DataGridTextElement}" Header="Protocol" Binding="{Binding Protocol}" Width="70"/>
+                                    <DataGridTextColumn ElementStyle="{StaticResource DataGridTextElement}" Header="Local" Binding="{Binding DisplayLocal}" Width="140"/>
+                                    <DataGridTextColumn ElementStyle="{StaticResource DataGridTextElement}" Header="Remote" Binding="{Binding DisplayRemote}" Width="*"/>
+                                    <DataGridTextColumn ElementStyle="{StaticResource DataGridTextElement}" Header="State" Binding="{Binding StateText}" Width="90"/>
+                                    <DataGridTextColumn ElementStyle="{StaticResource DataGridTextElement}" Header="Origin" Binding="{Binding GeoSummary}" Width="170"/>
+                                    <DataGridTextColumn ElementStyle="{StaticResource DataGridTextElement}" Header="PID" Binding="{Binding ProcessId}" Width="60"/>
                                     <DataGridTemplateColumn Header="Action" Width="90">
                                         <DataGridTemplateColumn.CellTemplate>
                                             <DataTemplate>
@@ -530,14 +532,14 @@
                             <DataGrid ItemsSource="{Binding RemoteHosts}" Style="{StaticResource ModernDataGrid}"
                                       SelectedItem="{Binding SelectedHost}">
                                 <DataGrid.Columns>
-                                    <DataGridTextColumn Header="IP Address" Binding="{Binding IpAddress}" Width="120"/>
-                                    <DataGridTextColumn Header="Host name" Binding="{Binding HostName}" Width="140"/>
-                                    <DataGridTextColumn Header="Where (origin)" Binding="{Binding GeoSummary}" Width="*"/>
-                                    <DataGridTextColumn Header="Threat" Binding="{Binding ThreatText}" Width="80"/>
-                                    <DataGridTextColumn Header="Firewall" Binding="{Binding BlockStatusText}" Width="80"/>
-                                    <DataGridTextColumn Header="Status" Binding="{Binding Status}" Width="90"/>
-                                    <DataGridTextColumn Header="Active" Binding="{Binding ActiveConnections}" Width="60"/>
-                                    <DataGridTextColumn Header="Ports" Binding="{Binding PortsTouched}" Width="60"/>
+                                    <DataGridTextColumn ElementStyle="{StaticResource DataGridTextElement}" Header="IP Address" Binding="{Binding IpAddress}" Width="120"/>
+                                    <DataGridTextColumn ElementStyle="{StaticResource DataGridTextElement}" Header="Host name" Binding="{Binding HostName}" Width="140"/>
+                                    <DataGridTextColumn ElementStyle="{StaticResource DataGridTextElement}" Header="Where (origin)" Binding="{Binding GeoSummary}" Width="*"/>
+                                    <DataGridTextColumn ElementStyle="{StaticResource DataGridTextElement}" Header="Threat" Binding="{Binding ThreatText}" Width="80"/>
+                                    <DataGridTextColumn ElementStyle="{StaticResource DataGridTextElement}" Header="Firewall" Binding="{Binding BlockStatusText}" Width="80"/>
+                                    <DataGridTextColumn ElementStyle="{StaticResource DataGridTextElement}" Header="Status" Binding="{Binding Status}" Width="90"/>
+                                    <DataGridTextColumn ElementStyle="{StaticResource DataGridTextElement}" Header="Active" Binding="{Binding ActiveConnections}" Width="60"/>
+                                    <DataGridTextColumn ElementStyle="{StaticResource DataGridTextElement}" Header="Ports" Binding="{Binding PortsTouched}" Width="60"/>
                                     <DataGridTemplateColumn Header="Actions" Width="160">
                                         <DataGridTemplateColumn.CellTemplate>
                                             <DataTemplate>
@@ -570,13 +572,13 @@
                             <DataGrid ItemsSource="{Binding Threats}" Style="{StaticResource ModernDataGrid}"
                                       SelectedItem="{Binding SelectedThreat}">
                                 <DataGrid.Columns>
-                                    <DataGridTextColumn Header="Time" Binding="{Binding TimeText}" Width="70"/>
-                                    <DataGridTextColumn Header="Severity" Binding="{Binding LevelText}" Width="80"/>
-                                    <DataGridTextColumn Header="Type" Binding="{Binding TypeText}" Width="130"/>
-                                    <DataGridTextColumn Header="Source IP" Binding="{Binding SourceIp}" Width="120"/>
-                                    <DataGridTextColumn Header="Coming from" Binding="{Binding Origin}" Width="160"/>
-                                    <DataGridTextColumn Header="Method" Binding="{Binding Method}" Width="150"/>
-                                    <DataGridTextColumn Header="Detail" Binding="{Binding Detail}" Width="*"/>
+                                    <DataGridTextColumn ElementStyle="{StaticResource DataGridTextElement}" Header="Time" Binding="{Binding TimeText}" Width="70"/>
+                                    <DataGridTextColumn ElementStyle="{StaticResource DataGridTextElement}" Header="Severity" Binding="{Binding LevelText}" Width="80"/>
+                                    <DataGridTextColumn ElementStyle="{StaticResource DataGridTextElement}" Header="Type" Binding="{Binding TypeText}" Width="130"/>
+                                    <DataGridTextColumn ElementStyle="{StaticResource DataGridTextElement}" Header="Source IP" Binding="{Binding SourceIp}" Width="120"/>
+                                    <DataGridTextColumn ElementStyle="{StaticResource DataGridTextElement}" Header="Coming from" Binding="{Binding Origin}" Width="160"/>
+                                    <DataGridTextColumn ElementStyle="{StaticResource DataGridTextElement}" Header="Method" Binding="{Binding Method}" Width="150"/>
+                                    <DataGridTextColumn ElementStyle="{StaticResource DataGridTextElement}" Header="Detail" Binding="{Binding Detail}" Width="*"/>
                                     <DataGridTemplateColumn Header="Action" Width="100">
                                         <DataGridTemplateColumn.CellTemplate>
                                             <DataTemplate>
@@ -602,12 +604,12 @@
                             <DataGrid ItemsSource="{Binding ListeningPorts}" Style="{StaticResource ModernDataGrid}"
                                       SelectedItem="{Binding SelectedPort}">
                                 <DataGrid.Columns>
-                                    <DataGridTextColumn Header="Protocol" Binding="{Binding Protocol}" Width="80"/>
-                                    <DataGridTextColumn Header="Endpoint" Binding="{Binding DisplayEndpoint}" Width="200"/>
-                                    <DataGridTextColumn Header="Port" Binding="{Binding Port}" Width="70"/>
-                                    <DataGridTextColumn Header="Service" Binding="{Binding ServiceHint}" Width="140"/>
-                                    <DataGridTextColumn Header="Process" Binding="{Binding ProcessName}" Width="140"/>
-                                    <DataGridTextColumn Header="PID" Binding="{Binding ProcessId}" Width="70"/>
+                                    <DataGridTextColumn ElementStyle="{StaticResource DataGridTextElement}" Header="Protocol" Binding="{Binding Protocol}" Width="80"/>
+                                    <DataGridTextColumn ElementStyle="{StaticResource DataGridTextElement}" Header="Endpoint" Binding="{Binding DisplayEndpoint}" Width="200"/>
+                                    <DataGridTextColumn ElementStyle="{StaticResource DataGridTextElement}" Header="Port" Binding="{Binding Port}" Width="70"/>
+                                    <DataGridTextColumn ElementStyle="{StaticResource DataGridTextElement}" Header="Service" Binding="{Binding ServiceHint}" Width="140"/>
+                                    <DataGridTextColumn ElementStyle="{StaticResource DataGridTextElement}" Header="Process" Binding="{Binding ProcessName}" Width="140"/>
+                                    <DataGridTextColumn ElementStyle="{StaticResource DataGridTextElement}" Header="PID" Binding="{Binding ProcessId}" Width="70"/>
                                     <DataGridTemplateColumn Header="Action" Width="110">
                                         <DataGridTemplateColumn.CellTemplate>
                                             <DataTemplate>
@@ -708,6 +710,7 @@
                                                     <Style.Triggers>
                                                         <DataTrigger Binding="{Binding AutoBlockEnabled}" Value="True">
                                                             <Setter Property="Background" Value="{StaticResource DangerGradient}"/>
+                                                            <Setter Property="Foreground" Value="White"/>
                                                             <Setter Property="Content" Value="Turn Auto-block Off"/>
                                                         </DataTrigger>
                                                         <DataTrigger Binding="{Binding AutoBlockEnabled}" Value="False">
@@ -761,9 +764,9 @@
                                               SelectedItem="{Binding SelectedAllowlistEntry}"
                                               MaxHeight="180">
                                         <DataGrid.Columns>
-                                            <DataGridTextColumn Header="Kind" Binding="{Binding Kind}" Width="90"/>
-                                            <DataGridTextColumn Header="Value" Binding="{Binding Value}" Width="220"/>
-                                            <DataGridTextColumn Header="Detail" Binding="{Binding Detail}" Width="*"/>
+                                            <DataGridTextColumn ElementStyle="{StaticResource DataGridTextElement}" Header="Kind" Binding="{Binding Kind}" Width="90"/>
+                                            <DataGridTextColumn ElementStyle="{StaticResource DataGridTextElement}" Header="Value" Binding="{Binding Value}" Width="220"/>
+                                            <DataGridTextColumn ElementStyle="{StaticResource DataGridTextElement}" Header="Detail" Binding="{Binding Detail}" Width="*"/>
                                         </DataGrid.Columns>
                                     </DataGrid>
                                 </DockPanel>
@@ -848,13 +851,13 @@
                                 <DataGrid ItemsSource="{Binding FirewallRules}" Style="{StaticResource ModernDataGrid}"
                                           SelectedItem="{Binding SelectedFirewallRule}">
                                     <DataGrid.Columns>
-                                        <DataGridTextColumn Header="Kind" Binding="{Binding KindText}" Width="90"/>
-                                        <DataGridTextColumn Header="Action" Binding="{Binding ActionText}" Width="70"/>
-                                        <DataGridTextColumn Header="Direction" Binding="{Binding DirectionText}" Width="90"/>
-                                        <DataGridTextColumn Header="Target" Binding="{Binding TargetText}" Width="160"/>
-                                        <DataGridTextColumn Header="Protocol" Binding="{Binding Protocol}" Width="80"/>
-                                        <DataGridTextColumn Header="Enabled" Binding="{Binding EnabledText}" Width="70"/>
-                                        <DataGridTextColumn Header="Rule name" Binding="{Binding Name}" Width="*"/>
+                                        <DataGridTextColumn ElementStyle="{StaticResource DataGridTextElement}" Header="Kind" Binding="{Binding KindText}" Width="90"/>
+                                        <DataGridTextColumn ElementStyle="{StaticResource DataGridTextElement}" Header="Action" Binding="{Binding ActionText}" Width="70"/>
+                                        <DataGridTextColumn ElementStyle="{StaticResource DataGridTextElement}" Header="Direction" Binding="{Binding DirectionText}" Width="90"/>
+                                        <DataGridTextColumn ElementStyle="{StaticResource DataGridTextElement}" Header="Target" Binding="{Binding TargetText}" Width="160"/>
+                                        <DataGridTextColumn ElementStyle="{StaticResource DataGridTextElement}" Header="Protocol" Binding="{Binding Protocol}" Width="80"/>
+                                        <DataGridTextColumn ElementStyle="{StaticResource DataGridTextElement}" Header="Enabled" Binding="{Binding EnabledText}" Width="70"/>
+                                        <DataGridTextColumn ElementStyle="{StaticResource DataGridTextElement}" Header="Rule name" Binding="{Binding Name}" Width="*"/>
                                         <DataGridTemplateColumn Header="" Width="100">
                                             <DataGridTemplateColumn.CellTemplate>
                                                 <DataTemplate>

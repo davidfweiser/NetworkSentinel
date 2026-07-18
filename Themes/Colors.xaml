@@ -41,10 +41,11 @@
         <GradientStop Color="#FF1A1840" Offset="1"/>
     </LinearGradientBrush>
 
+    <!-- Slightly deeper stops so light button labels keep contrast across cyan → blue → violet. -->
     <LinearGradientBrush x:Key="AccentGradient" StartPoint="0,0" EndPoint="1,1">
-        <GradientStop Color="#FF3DE7C8" Offset="0"/>
-        <GradientStop Color="#FF4C8DFF" Offset="0.55"/>
-        <GradientStop Color="#FF9B7BFF" Offset="1"/>
+        <GradientStop Color="#FF1FB8A0" Offset="0"/>
+        <GradientStop Color="#FF3A72E8" Offset="0.55"/>
+        <GradientStop Color="#FF7A5AE8" Offset="1"/>
     </LinearGradientBrush>
 
     <LinearGradientBrush x:Key="DangerGradient" StartPoint="0,0" EndPoint="1,0">

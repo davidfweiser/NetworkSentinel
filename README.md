@@ -67,6 +67,39 @@ cd NetworkSentinel
 dotnet run
 ```
 
+### Install (Start Menu + Desktop shortcut)
+
+From the repo root (requires [.NET 8 SDK](https://dotnet.microsoft.com/download)):
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\install.ps1
+```
+
+Optional flags:
+
+```powershell
+# Start Menu only (no desktop icon)
+powershell -ExecutionPolicy Bypass -File .\scripts\install.ps1 -SkipDesktop
+
+# Install and launch
+powershell -ExecutionPolicy Bypass -File .\scripts\install.ps1 -Launch
+```
+
+This publishes the app to `%LocalAppData%\Programs\NetworkSentinel\` and creates:
+
+| Shortcut | Location |
+|----------|----------|
+| **Start Menu** | Start → type **Network Sentinel** |
+| **Desktop** | `Network Sentinel` icon on your desktop |
+
+Uninstall shortcuts + install folder:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\uninstall.ps1
+```
+
+Settings remain in `%LocalAppData%\NetworkSentinel\` until you delete that folder yourself.
+
 ### Release build
 
 ```powershell
@@ -85,7 +118,7 @@ Publish (framework-dependent):
 dotnet publish -c Release -r win-x64 --self-contained false
 ```
 
-For firewall / auto-block, start the app **as administrator** (or use **Run as Admin** in the UI).
+The app **requires Administrator** (UAC) so Windows Firewall rules can be created and removed. The installer marks Start Menu / Desktop shortcuts as **Run as administrator**, and `app.manifest` requests elevation for every launch.
 
 ---
 
