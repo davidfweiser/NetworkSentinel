@@ -469,14 +469,17 @@ On GNOME / Pop!_OS the indicator appears in the top bar (StatusNotifier / AppInd
 
 | Problem | What to do |
 |---------|------------|
+| `Unknown option: --web-service` | That flag is for the **installer**, and only in packages built after the web-service update. Rebuild with `./scripts/package.sh`, copy the new `*.install.sh`, and check `./….install.sh --help`. Or set up systemd [manually](#auto-start-on-boot-systemd). |
 | `XOpenDisplay failed` after `sudo` | Run **without** sudo. Use **Authorize firewall** / pkexec for rules only. Or use `--tui` / `-w`. |
+| Do I need `sudo` to launch? | **No.** Install with sudo if system-wide; run as your normal user. The web service also runs as your user. |
 | No password dialog for block | Install `policykit-1` (`pkexec`). |
 | `.NET location: Not found` | Use the **server installer** / self-contained package, or set `DOTNET_ROOT` / `PATH`. |
 | Process names missing | Expected for other users’ sockets without root; monitoring still works. |
 | No tray icon | DE must support StatusNotifier/AppIndicator; window title still updates when minimized. |
 | Web UI asks for password every time | Expected after sign-out, browser close, or 12h idle. Reset: delete `web-master.json`. |
-| `networksentinel-web` won’t start | `journalctl -u networksentinel-web -e`; check port in `/etc/networksentinel/web.env`. |
+| `networksentinel-web` won’t start | `journalctl -u networksentinel-web -e`; check port in `/etc/networksentinel/web.env`; confirm binary exists at `/usr/local/bin/networksentinel`. |
 | Port already in use | Change `WEB_PORT` or run `networksentinel -w` to auto-pick a free high port. |
+| Service dies after logout (user unit) | `sudo loginctl enable-linger "$USER"` |
 
 ---
 
