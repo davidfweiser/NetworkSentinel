@@ -68,6 +68,37 @@ cd NetworkSentinel
 dotnet run -c Release
 ```
 
+### Terminal UI (TUI)
+
+Same monitoring / firewall stack, in the terminal (SSH, headless, or prefer keyboard):
+
+```bash
+dotnet run -c Release -- --tui
+# or after publish:
+./NetworkSentinel --tui
+# or:  NETWORKSENTINEL_TUI=1 ./NetworkSentinel
+```
+
+If there is **no** `DISPLAY` / `WAYLAND_DISPLAY` (typical SSH session), the app **auto-starts in TUI** mode. Force the GUI with `NETWORKSENTINEL_GUI=1`.
+
+| Key | Action |
+|-----|--------|
+| `1`–`7` / `Tab` | Dashboard · Connections · Hosts · Threats · Ports · Firewall · **Allowlist** |
+| `↑` `↓` / `j` `k` | Move selection |
+| `/` or `f` | Filter |
+| `p` | Pause / resume monitoring |
+| `a` | Toggle auto-block |
+| `m` | Cycle auto-block minimum severity |
+| `b` / `x` | Block / unblock selected IP (or prompt) |
+| `n` / `+` | **Add domain or IP to allowlist** (never block) |
+| `d` | Remove selected allowlist Domain/IP (on Allowlist view) |
+| `g` | Restore good sites (unblock allowlisted IPs) |
+| `u` | Authorize firewall elevation (pkexec) |
+| `c` | Clear threat alerts |
+| `r` | Refresh firewall · on Allowlist: refresh DNS/feed |
+| `h` / `F1` | Help |
+| `q` | Quit |
+
 If the .NET SDK was installed with the install script:
 
 ```bash
@@ -82,6 +113,7 @@ dotnet run -c Release
 dotnet build -c Release
 dotnet publish -c Release -r linux-x64 --self-contained false -o bin/publish
 ./bin/publish/NetworkSentinel
+# TUI: ./bin/publish/NetworkSentinel --tui
 ```
 
 Self-contained (no system .NET runtime needed):
@@ -90,6 +122,40 @@ Self-contained (no system .NET runtime needed):
 dotnet publish -c Release -r linux-x64 --self-contained true -o bin/publish-sc
 ./bin/publish-sc/NetworkSentinel
 ```
+
+### Server / portable package (recommended)
+
+Build a **self-contained tarball** (no .NET on the target machine):
+
+```bash
+./scripts/package.sh              # linux-x64 → dist/networksentinel-VERSION-linux-x64.tar.gz
+./scripts/package.sh linux-arm64  # ARM servers / Raspberry Pi
+```
+
+Install on the server:
+
+```bash
+# from your build machine
+scp dist/networksentinel-0.2.0-linux-x64.tar.gz user@server:
+
+# on the server
+tar xzf networksentinel-0.2.0-linux-x64.tar.gz
+cd networksentinel-0.2.0-linux-x64
+sudo ./install.sh          # → /usr/local/bin/networksentinel
+# or without root:
+# ./install.sh --user      # → ~/.local/bin/networksentinel
+
+networksentinel --tui
+networksentinel --help
+```
+
+Uninstall: `sudo networksentinel-uninstall` (or `networksentinel-uninstall` for a user install).
+
+| Artifact | Location |
+|----------|----------|
+| Tarball | `dist/networksentinel-*-linux-x64.tar.gz` (~46 MB self-contained) |
+| Checksum | `dist/*.tar.gz.sha256` |
+| App files | `/usr/local/lib/networksentinel/` (system) or `~/.local/lib/networksentinel/` (user) |
 
 ### Firewall / auto-block (important on Wayland)
 
@@ -169,8 +235,8 @@ Optional desktop entry is provided as `networksentinel.desktop` (`Icon=networkse
                                                   │
                     ┌─────────────────────────────┼─────────────────────────────┐
                     ▼                             ▼                             ▼
-           Geo / DNS lookup              Avalonia UI                   FirewallService
-           (origin details)              (MVVM + charts)               pkexec → nft/iptables
+           Geo / DNS lookup         Avalonia UI  or  TUI          FirewallService
+           (origin details)         (MVVM / Spectre)              pkexec → nft/iptables
 ```
 
 ---
@@ -188,9 +254,10 @@ Optional desktop entry is provided as `networksentinel.desktop` (`Icon=networkse
 | `Services/DialogService.cs` | Avalonia confirm/info dialogs |
 | `ViewModels/MainViewModel.cs` | UI state, commands, auto-block wiring |
 | `MainWindow.axaml` | Avalonia dashboard UI |
+| `Tui/TuiApp.cs` | Spectre.Console terminal UI (`--tui`) |
 | `Themes/` | Colors and control styles |
 | `Controls/Sparkline.cs` | Live activity chart |
-| `Program.cs` | Entry point; refuses GUI-as-root on Wayland |
+| `Program.cs` | Entry point; GUI / TUI routing; refuses GUI-as-root on Wayland |
 
 ---
 
