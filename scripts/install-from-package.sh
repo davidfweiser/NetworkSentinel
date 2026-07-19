@@ -15,10 +15,12 @@ PKG_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 APP_SRC="${PKG_ROOT}/app"
 SYSTEMD_SRC="${PKG_ROOT}/systemd"
 
-if [[ ! -x "${APP_SRC}/NetworkSentinel" ]]; then
+if [[ ! -f "${APP_SRC}/NetworkSentinel" ]]; then
   echo "error: missing app/NetworkSentinel — extract the tarball and run install.sh from inside it." >&2
   exit 1
 fi
+# Packages built on a Windows checkout can lose the exec bit — restore it.
+chmod +x "${APP_SRC}/NetworkSentinel" 2>/dev/null || true
 
 MODE="system"
 PREFIX=""

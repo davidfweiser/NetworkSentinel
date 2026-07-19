@@ -139,7 +139,9 @@ EOF
 
 echo "==> Creating tarball…"
 mkdir -p "$DIST_DIR"
-tar -C "$DIST_DIR" -czf "$OUT_TGZ" "$NAME"
+# --mode: force sane exec bits into the archive — chmod is a no-op when this
+# script runs on a Windows checkout (Git Bash/NTFS), which shipped a 644 binary.
+tar -C "$DIST_DIR" --mode='u+rwx,go+rx' -czf "$OUT_TGZ" "$NAME"
 
 # Convenience checksum for the archive
 (
