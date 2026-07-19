@@ -233,21 +233,31 @@ public sealed class FirewallService
         }
     }
 
-    public FirewallOperationResult RemoveAllManagedRules()
+    /// <param name="skip">Rules to leave in place (e.g. the web console's own allow rule).</param>
+    public FirewallOperationResult RemoveAllManagedRules(Func<FirewallRuleInfo, bool>? skip = null)
     {
         if (!IsAdministrator)
             return FirewallOperationResult.Fail("Administrator rights are required to modify the Windows Firewall.");
 
         var rules = GetManagedRules();
         int removed = 0;
+        int kept = 0;
         foreach (var rule in rules)
         {
+            if (skip != null && skip(rule))
+            {
+                kept++;
+                continue;
+            }
             if (RemoveRuleByName(rule.Name).Success)
                 removed++;
         }
 
         InvalidateRuleCache();
-        return FirewallOperationResult.Ok($"Removed {removed} Network Sentinel firewall rule(s).");
+        var msg = $"Removed {removed} Network Sentinel firewall rule(s).";
+        if (kept > 0)
+            msg += $" Kept {kept} (web console access).";
+        return FirewallOperationResult.Ok(msg);
     }
 
     /// <summary>

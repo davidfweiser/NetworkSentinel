@@ -529,6 +529,98 @@ public sealed class WebApp : IDisposable
                     _statusMessage = "Threat alerts cleared.";
                     return ActionResultDto.Success(_statusMessage);
 
+                case "set_setting":
+                {
+                    var key = (req.Name ?? "").Trim();
+                    var raw = (req.Value ?? "").Trim();
+                    var on = raw.Equals("true", StringComparison.OrdinalIgnoreCase) || raw == "1";
+                    string label;
+                    switch (key)
+                    {
+                        case "autoBlockEnabled":
+                            _autoBlockEnabled = on;
+                            _settings.AutoBlockEnabled = on;
+                            label = on ? $"Auto-block ON (≥ {_autoBlockMinLevel})" : "Auto-block OFF";
+                            break;
+                        case "blockInbound":
+                            _blockInbound = on;
+                            _settings.AutoBlockInbound = on;
+                            label = $"Block inbound: {(on ? "on" : "off")}";
+                            break;
+                        case "blockOutbound":
+                            _blockOutbound = on;
+                            _settings.AutoBlockOutbound = on;
+                            label = $"Block outbound: {(on ? "on" : "off")}";
+                            break;
+                        case "geoLookupEnabled":
+                            _monitor.GeoLookupsEnabled = on;
+                            _settings.GeoLookupEnabled = on;
+                            label = $"Geo lookups: {(on ? "on" : "off")}";
+                            break;
+                        case "allowlistUseRemoteFeed":
+                            _allowlist.UseRemoteFeed = on;
+                            _settings.AllowlistUseRemoteFeed = on;
+                            label = $"Allowlist remote feed: {(on ? "on" : "off")}";
+                            break;
+                        default:
+                            return ActionResultDto.Fail($"Unknown setting: {key}");
+                    }
+                    _settings.Save();
+                    _statusMessage = label;
+                    return ActionResultDto.Success(label);
+                }
+
+                case "block_port":
+                {
+                    if (!int.TryParse((req.Value ?? "").Trim(), out var port) || port is < 1 or > 65535)
+                        return ActionResultDto.Fail("Enter a valid port number (1–65535).");
+                    if (port == _port)
+                        return ActionResultDto.Fail(
+                            $"Port {port} serves this web console — blocking it would cut off this page. Choose another port.");
+                    if (!_firewall.IsAdministrator)
+                        return ActionResultDto.Fail("Cannot block — run Network Sentinel elevated (Admin / service as SYSTEM).");
+
+                    var proto = (req.Kind ?? "TCP").Trim().ToUpperInvariant();
+                    var dir = (req.Direction ?? "Inbound").Trim() switch
+                    {
+                        "Outbound" => FirewallDirection.Outbound,
+                        "Both" => FirewallDirection.Both,
+                        _ => FirewallDirection.Inbound
+                    };
+                    var r = _firewall.BlockPort(port, proto, dir, $"Web UI port block · {proto}/{port}");
+                    _statusMessage = r.Message;
+                    return r.Success ? ActionResultDto.Success(r.Message) : ActionResultDto.Fail(r.Message);
+                }
+
+                case "unblock_port":
+                {
+                    if (!int.TryParse((req.Value ?? "").Trim(), out var port) || port is < 1 or > 65535)
+                        return ActionResultDto.Fail("Enter a valid port number (1–65535).");
+                    if (!_firewall.IsAdministrator)
+                        return ActionResultDto.Fail("Cannot unblock — run Network Sentinel elevated (Admin / service as SYSTEM).");
+                    var r = _firewall.UnblockPort(port, (req.Kind ?? "TCP").Trim());
+                    _statusMessage = r.Message;
+                    return r.Success ? ActionResultDto.Success(r.Message) : ActionResultDto.Fail(r.Message);
+                }
+
+                case "remove_all_rules":
+                {
+                    if (!_firewall.IsAdministrator)
+                        return ActionResultDto.Fail("Cannot remove rules — run Network Sentinel elevated (Admin / service as SYSTEM).");
+
+                    // Suppress auto-block for every removed IP so nothing "comes back".
+                    var blockedBefore = _firewall.GetBlockedIps();
+                    var r = _firewall.RemoveAllManagedRules(rule => IsOwnWebRule(rule.Name));
+                    if (r.Success)
+                    {
+                        foreach (var ip in blockedBefore)
+                            SuppressAutoBlock(ip);
+                        RefreshBlockedIps(force: true);
+                    }
+                    _statusMessage = r.Message;
+                    return r.Success ? ActionResultDto.Success(r.Message) : ActionResultDto.Fail(r.Message);
+                }
+
                 case "authorize":
                 {
                     var r = _firewall.AuthorizeElevation();
@@ -704,6 +796,8 @@ public sealed class WebApp : IDisposable
                 autoBlockMinLevel = _autoBlockMinLevel,
                 blockInbound = _blockInbound,
                 blockOutbound = _blockOutbound,
+                geoLookupEnabled = _settings.GeoLookupEnabled,
+                allowlistUseRemoteFeed = _settings.AllowlistUseRemoteFeed,
                 isMonitoring = stats.IsMonitoring
             },
             stats = new
@@ -1050,6 +1144,7 @@ public sealed class WebApp : IDisposable
         public string? Value { get; set; }
         public string? Name { get; set; }
         public string? Kind { get; set; }
+        public string? Direction { get; set; }
     }
 
     private sealed class AuthBody
@@ -1119,12 +1214,12 @@ public sealed class WebApp : IDisposable
   .brand .sub { color: var(--text2); font-size: .78rem; }
   .clock { color: var(--muted); font-size: .85rem; font-family: var(--mono); }
   nav { display: flex; flex-wrap: wrap; gap: 6px; flex: 1; }
-  nav button, .actions button, .row-actions button {
+  nav button, .actions button, .row-actions button, .toolbar button {
     appearance: none; border: 1px solid var(--stroke); background: var(--bg-card);
     color: var(--text2); border-radius: 8px; padding: 7px 12px; cursor: pointer;
     font: inherit; font-size: .82rem; transition: .15s ease;
   }
-  nav button:hover, .actions button:hover, .row-actions button:hover {
+  nav button:hover, .actions button:hover, .row-actions button:hover, .toolbar button:hover {
     background: var(--bg-hover); color: var(--text); border-color: var(--stroke-strong);
   }
   nav button.active {
@@ -1193,9 +1288,49 @@ public sealed class WebApp : IDisposable
     font-size: .72rem; font-weight: 600;
     background: rgba(76,141,255,.16); color: #9ec0ff; border: 1px solid rgba(76,141,255,.25);
   }
-  .row-actions button.rm { border-color: rgba(255,77,109,.4); color: #ffb0bd; }
-  .row-actions button.rm:hover { background: rgba(255,77,109,.12); border-color: rgba(255,77,109,.65); color: #ffd3db; }
+  .row-actions button.rm, .toolbar button.rm, button.rm-lg {
+    border-color: rgba(255,77,109,.4); color: #ffb0bd;
+  }
+  .row-actions button.rm:hover, .toolbar button.rm:hover, button.rm-lg:hover {
+    background: rgba(255,77,109,.12); border-color: rgba(255,77,109,.65); color: #ffd3db;
+  }
   .row-actions button:disabled { opacity: .55; cursor: wait; }
+  button.rm-lg {
+    appearance: none; font: inherit; font-size: .85rem; cursor: pointer;
+    padding: 8px 14px; border-radius: 8px; background: var(--bg-card);
+    border: 1px solid rgba(255,77,109,.4); transition: .15s ease; flex-shrink: 0;
+  }
+  .setting-row {
+    display: flex; align-items: center; justify-content: space-between; gap: 16px;
+    padding: 14px 16px; background: var(--bg-card); border: 1px solid var(--stroke);
+    border-radius: 12px; margin-bottom: 10px; max-width: 760px;
+  }
+  .setting-row .info h4 { margin: 0 0 3px; font-size: .92rem; font-weight: 600; }
+  .setting-row .info p { margin: 0; color: var(--muted); font-size: .8rem; line-height: 1.45; }
+  .setting-row select {
+    background: var(--bg-deep); border: 1px solid var(--stroke); color: var(--text);
+    border-radius: 8px; padding: 7px 10px; font: inherit; font-size: .85rem;
+  }
+  .settings-group h3 {
+    margin: 22px 0 10px; font-size: .8rem; color: var(--muted);
+    text-transform: uppercase; letter-spacing: .07em;
+  }
+  .settings-group:first-child h3 { margin-top: 0; }
+  .switch { position: relative; display: inline-block; width: 44px; height: 24px; flex-shrink: 0; }
+  .switch input { opacity: 0; width: 0; height: 0; }
+  .switch .slider {
+    position: absolute; inset: 0; cursor: pointer; border-radius: 999px;
+    background: var(--bg-hover); border: 1px solid var(--stroke); transition: .2s ease;
+  }
+  .switch .slider:before {
+    content: ""; position: absolute; height: 18px; width: 18px; left: 2px; top: 2px;
+    background: var(--muted); border-radius: 50%; transition: .2s ease;
+  }
+  .switch input:checked + .slider {
+    background: linear-gradient(135deg, rgba(61,231,200,.5), rgba(76,141,255,.55));
+    border-color: transparent;
+  }
+  .switch input:checked + .slider:before { transform: translateX(20px); background: #fff; }
   .mono { font-family: var(--mono); font-size: .8rem; }
   .badge {
     display: inline-block; padding: 2px 8px; border-radius: 999px;
@@ -1324,6 +1459,7 @@ public sealed class WebApp : IDisposable
     <button data-tab="ports">Ports</button>
     <button data-tab="firewall">Firewall</button>
     <button data-tab="allowlist">Allowlist</button>
+    <button data-tab="settings">Settings</button>
     <button data-tab="help">Help</button>
   </nav>
   <div class="actions">
@@ -1379,6 +1515,11 @@ public sealed class WebApp : IDisposable
 
   <section id="tab-firewall" class="hidden">
     <div class="toolbar">
+      <input id="fwIp" placeholder="IP to block" class="mono" style="min-width:160px" />
+      <button id="btnFwBlockIp">Block IP</button>
+      <input id="fwPort" placeholder="Port" class="mono" style="min-width:80px;max-width:100px" />
+      <select id="fwProto"><option>TCP</option><option>UDP</option></select>
+      <button id="btnFwBlockPort">Block port</button>
       <button id="btnRestore">Restore allowlisted</button>
       <button id="btnRefreshFw">Refresh list</button>
     </div>
@@ -1397,16 +1538,22 @@ public sealed class WebApp : IDisposable
     <div id="tbl-allowlist"></div>
   </section>
 
+  <section id="tab-settings" class="hidden">
+    <div id="settingsPanel"></div>
+  </section>
+
   <section id="tab-help" class="hidden">
     <div class="help">
       <p><strong>Network Sentinel</strong> headless web UI — same monitoring and firewall stack as the desktop and TUI apps.</p>
       <p>Start with <code>NetworkSentinel -w</code> (optional port: <code>-w 18765</code>). The process picks a free high port when you omit one.</p>
       <ul>
         <li><strong>Dashboard</strong> — live counters and recent threats</li>
+        <li><strong>Connections / Threats</strong> — live traffic with per-row Block buttons</li>
         <li><strong>Hosts</strong> — remote peers; block/unblock IPs</li>
-        <li><strong>Auto-block</strong> — automatically block new threats at the chosen minimum severity</li>
-        <li><strong>Authorize</strong> — prepare Administrator / UAC elevation for firewall changes</li>
+        <li><strong>Ports</strong> — local listeners; block a port with one click</li>
+        <li><strong>Firewall</strong> — managed rules, manual IP/port blocking, remove rules</li>
         <li><strong>Allowlist</strong> — domains/IPs that are never blocked</li>
+        <li><strong>Settings</strong> — auto-block behavior, block direction, geo lookups, refresh speed</li>
       </ul>
       <p class="muted">Firewall actions need Administrator. Prefer running the service elevated once rather than elevating per action.</p>
       <p class="muted">Web access is gated by a master password (set on first visit). Sign out or close the browser to require it again.</p>
@@ -1510,10 +1657,15 @@ public sealed class WebApp : IDisposable
   }
 
   let statusHoldUntil = 0;
-  // Allowlist + Firewall tabs freeze live redraw so you can scroll and act on rows.
-  // Dashboard/connections/etc. keep the 2s poll.
+  // Allowlist / Firewall / Settings tabs freeze live redraw so you can scroll and act
+  // on rows. Dashboard/connections/etc. keep the periodic poll.
   function isFrozenTab() {
-    return tab === 'allowlist' || tab === 'firewall';
+    return tab === 'allowlist' || tab === 'firewall' || tab === 'settings';
+  }
+
+  function getRefreshMs() {
+    const v = parseInt(localStorage.getItem('ns-refresh') || '2500', 10);
+    return Number.isFinite(v) && v >= 1000 ? v : 2500;
   }
 
   async function fetchState() {
@@ -1579,7 +1731,7 @@ public sealed class WebApp : IDisposable
     stopPolling();
     if (!isFrozenTab()) {
       refresh();
-      pollTimer = setInterval(refresh, 2500);
+      pollTimer = setInterval(refresh, getRefreshMs());
     } else {
       refreshFrozenTab();
     }
@@ -1651,8 +1803,9 @@ public sealed class WebApp : IDisposable
     );
 
     const fq = $('filterConn').value.trim();
+    const blockable = (ip) => ip && ip !== '0.0.0.0' && ip !== '::' && ip !== '*';
     $('tbl-connections').innerHTML = table(
-      ['Proto', 'Local', 'Remote', 'State', 'Process', 'Geo', 'Last'],
+      ['Proto', 'Local', 'Remote', 'State', 'Process', 'Geo', 'Last', ''],
       (state.connections || []).filter(c => matchFilter(fq, c.protocol, c.local, c.remote, c.state, c.process, c.geo))
         .map(c => `<tr>
           <td>${esc(c.protocol)}</td>
@@ -1662,6 +1815,8 @@ public sealed class WebApp : IDisposable
           <td>${esc(c.process)} <span class="muted">#${esc(c.pid)}</span></td>
           <td class="muted">${esc(c.geo)}</td>
           <td class="mono">${esc(c.lastSeen)}</td>
+          <td class="row-actions">${blockable(c.remoteAddress)
+            ? `<button data-block="${esc(c.remoteAddress)}">Block</button>` : ''}</td>
         </tr>`).join('')
     );
 
@@ -1687,7 +1842,7 @@ public sealed class WebApp : IDisposable
 
     const tq = $('filterThreats').value.trim();
     $('tbl-threats').innerHTML = table(
-      ['Time', 'Level', 'Type', 'Source', 'Title', 'Detail', 'Origin'],
+      ['Time', 'Level', 'Type', 'Source', 'Title', 'Detail', 'Origin', ''],
       (state.threats || []).filter(t => matchFilter(tq, t.level, t.type, t.sourceIp, t.title, t.detail, t.origin))
         .map(t => `<tr>
           <td class="mono">${esc(t.time)}</td>
@@ -1697,16 +1852,21 @@ public sealed class WebApp : IDisposable
           <td>${esc(t.title)}</td>
           <td class="muted">${esc(t.detail)}</td>
           <td class="muted">${esc(t.origin)}</td>
+          <td class="row-actions">${blockable(t.sourceIp)
+            ? `<button data-block="${esc(t.sourceIp)}">Block</button>` : ''}</td>
         </tr>`).join('')
     );
 
     $('tbl-ports').innerHTML = table(
-      ['Proto', 'Endpoint', 'Process', 'Hint'],
+      ['Proto', 'Endpoint', 'Process', 'Hint', ''],
       (state.ports || []).map(p => `<tr>
         <td>${esc(p.protocol)}</td>
         <td class="mono">${esc(p.endpoint)}</td>
         <td>${esc(p.process)} <span class="muted">#${esc(p.pid)}</span></td>
         <td class="muted">${esc(p.hint)}</td>
+        <td class="row-actions">
+          <button class="rm" data-block-port="${esc(p.port)}" data-proto="${esc(p.protocol)}">Block port</button>
+        </td>
       </tr>`).join('')
     );
 
@@ -1769,7 +1929,44 @@ public sealed class WebApp : IDisposable
 
       restoreScroll('tbl-firewall', fwScroll);
       restoreScroll('tbl-allowlist', alScroll);
+      renderSettings();
     }
+  }
+
+  function renderSettings() {
+    const s = state.settings || {};
+    const row = (label, desc, control) => `
+      <div class="setting-row">
+        <div class="info"><h4>${esc(label)}</h4><p>${esc(desc)}</p></div>
+        ${control}
+      </div>`;
+    const sw = (key, checked) =>
+      `<label class="switch"><input type="checkbox" data-setting="${key}" ${checked ? 'checked' : ''}/><span class="slider"></span></label>`;
+    const levelSel = `<select data-set-level>${['Medium', 'High', 'Critical']
+      .map(l => `<option ${s.autoBlockMinLevel === l ? 'selected' : ''}>${l}</option>`).join('')}</select>`;
+    const refreshSel = `<select data-set-refresh>${[['1000', '1 second'], ['2500', '2.5 seconds'], ['5000', '5 seconds'], ['10000', '10 seconds']]
+      .map(([v, l]) => `<option value="${v}" ${String(getRefreshMs()) === v ? 'selected' : ''}>${l}</option>`).join('')}</select>`;
+
+    $('settingsPanel').innerHTML = `
+      <div class="settings-group"><h3>Monitoring</h3>
+        ${row('Live monitoring', 'Watch connections, listening ports, and threats in real time.', sw('monitoring', s.isMonitoring))}
+        ${row('Page refresh speed', 'How often live tabs (Dashboard, Connections, Hosts…) update in this browser.', refreshSel)}
+        ${row('Geo lookups', 'Resolve country and city for remote IPs (uses ip-api.com over plain HTTP).', sw('geoLookupEnabled', s.geoLookupEnabled))}
+      </div>
+      <div class="settings-group"><h3>Auto-block</h3>
+        ${row('Auto-block threats', 'Automatically create firewall rules when threats are detected.', sw('autoBlockEnabled', s.autoBlockEnabled))}
+        ${row('Minimum severity', 'Only auto-block threats at or above this level.', levelSel)}
+        ${row('Block inbound', 'New block rules stop traffic coming in to this machine.', sw('blockInbound', s.blockInbound))}
+        ${row('Block outbound', 'New block rules stop traffic going out from this machine.', sw('blockOutbound', s.blockOutbound))}
+      </div>
+      <div class="settings-group"><h3>Allowlist</h3>
+        ${row('Remote allowlist feed', 'Refresh the known-good domain/IP list from the online feed.', sw('allowlistUseRemoteFeed', s.allowlistUseRemoteFeed))}
+      </div>
+      <div class="settings-group"><h3>Danger zone</h3>
+        ${row('Remove all firewall rules',
+             'Deletes every Network Sentinel block rule (the access rule for this console is kept) and stops auto-block from re-adding them for 24h.',
+             '<button type="button" class="rm-lg" data-remove-all>Remove all rules</button>')}
+      </div>`;
   }
 
   document.getElementById('nav').addEventListener('click', (e) => {
@@ -1832,6 +2029,50 @@ public sealed class WebApp : IDisposable
   };
   $('btnRefreshFw').onclick = () => refreshFrozenTab();
   $('btnRestore').onclick = () => apiAction('restore_allowlisted');
+  $('btnFwBlockIp').onclick = () => {
+    const ip = $('fwIp').value.trim();
+    if (ip) apiAction('block', { ip }).then(r => { if (r.ok) $('fwIp').value = ''; });
+  };
+  $('btnFwBlockPort').onclick = () => {
+    const port = $('fwPort').value.trim();
+    if (!port) { setStatus('Enter a port number to block.', true); return; }
+    apiAction('block_port', { value: port, kind: $('fwProto').value })
+      .then(r => { if (r.ok) $('fwPort').value = ''; });
+  };
+  $('fwIp').addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') { e.preventDefault(); $('btnFwBlockIp').click(); }
+  });
+  $('fwPort').addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') { e.preventDefault(); $('btnFwBlockPort').click(); }
+  });
+
+  $('settingsPanel').addEventListener('change', (e) => {
+    const t = e.target;
+    if (t.matches('[data-setting]')) {
+      const key = t.dataset.setting;
+      if (key === 'monitoring') apiAction('toggle_monitor');
+      else apiAction('set_setting', { name: key, value: t.checked ? 'true' : 'false' });
+      return;
+    }
+    if (t.matches('[data-set-level]')) { apiAction('set_min_level', { value: t.value }); return; }
+    if (t.matches('[data-set-refresh]')) {
+      localStorage.setItem('ns-refresh', t.value);
+      setStatus('Page refresh speed set to ' + (parseInt(t.value, 10) / 1000) + 's.', false, true);
+      statusHoldUntil = Date.now() + 5000;
+      if (!isFrozenTab()) startPolling();
+    }
+  });
+  $('settingsPanel').addEventListener('click', (e) => {
+    const btn = e.target.closest('[data-remove-all]');
+    if (!btn) return;
+    if (confirm('Remove ALL Network Sentinel firewall rules?\n\nEvery IP and port block will be deleted (the web console access rule is kept). Auto-block will not re-add them for 24 hours.')) {
+      btn.disabled = true;
+      btn.textContent = 'Removing…';
+      apiAction('remove_all_rules').finally(() => {
+        if (btn.isConnected) { btn.disabled = false; btn.textContent = 'Remove all rules'; }
+      });
+    }
+  });
   $('allowInput').addEventListener('keydown', (e) => {
     if (e.key === 'Enter') { e.preventDefault(); $('btnAddAllow').click(); }
   });
@@ -1844,6 +2085,14 @@ public sealed class WebApp : IDisposable
     const r = e.target.closest('[data-rm-allow]');
     if (r) {
       apiAction('remove_allowlist', { value: r.dataset.rmAllow, kind: r.dataset.kind });
+      return;
+    }
+    const bp = e.target.closest('[data-block-port]');
+    if (bp) {
+      const port = bp.dataset.blockPort;
+      const proto = bp.dataset.proto || 'TCP';
+      if (confirm(`Block inbound ${proto} port ${port}?\n\nThis firewalls the local service listening on that port for everyone, including LAN clients.`))
+        apiAction('block_port', { value: port, kind: proto, direction: 'Inbound' });
       return;
     }
     const fr = e.target.closest('[data-rm-rule]');
