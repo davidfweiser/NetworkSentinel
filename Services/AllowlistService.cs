@@ -153,6 +153,8 @@ public sealed class AllowlistService : IDisposable
         }
 
         SaveUserDatabase();
+        // Rebuild immediately so the web/TUI list shows the domain before DNS finishes.
+        RebuildEntryViews();
         _ = ResolveDomainsAsync(force: true);
         message = $"Added {domain} to the allowlist.";
         return true;
@@ -188,6 +190,7 @@ public sealed class AllowlistService : IDisposable
                 if (_domains.Remove(NormalizeDomain(value)))
                 {
                     SaveUserDatabase();
+                    RebuildEntryViews();
                     // drop resolved IPs that only cited this domain — full re-resolve
                     message = $"Removed domain {value}.";
                 }

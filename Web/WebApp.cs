@@ -610,6 +610,32 @@ public sealed class WebApp : IDisposable
                     return r.Success ? ActionResultDto.Success(r.Message) : ActionResultDto.Fail(r.Message);
                 }
 
+                case "remove_rule":
+                {
+                    // Decode HTML entities if the browser sent an attribute-escaped name.
+                    var name = System.Net.WebUtility.HtmlDecode((req.Value ?? req.Name ?? "").Trim());
+                    if (string.IsNullOrEmpty(name))
+                        return ActionResultDto.Fail("Rule name required.");
+                    if (!_firewall.IsAdministrator)
+                        return ActionResultDto.Fail("Cannot remove rules — run Network Sentinel elevated (Admin / service as SYSTEM).");
+                    try
+                    {
+                        var r = _firewall.RemoveRule(name);
+                        _statusMessage = r.Message;
+                        if (r.Success)
+                        {
+                            try { RefreshBlockedIps(force: true); }
+                            catch { /* listing must not undo a successful delete */ }
+                        }
+                        return r.Success ? ActionResultDto.Success(r.Message) : ActionResultDto.Fail(r.Message);
+                    }
+                    catch (Exception ex)
+                    {
+                        _statusMessage = $"Remove failed: {ex.Message}";
+                        return ActionResultDto.Fail(_statusMessage);
+                    }
+                }
+
                 default:
                     return ActionResultDto.Fail($"Unknown action: {req.Action}");
             }
@@ -711,7 +737,10 @@ public sealed class WebApp : IDisposable
             {
                 name = r.Name,
                 kind = r.KindText,
+                // Explicit address field so the UI always has an IP column even if target is a port.
+                address = string.IsNullOrWhiteSpace(r.AddressText) ? r.TargetText : r.AddressText,
                 target = r.TargetText,
+                ports = r.LocalPorts,
                 direction = r.DirectionText,
                 protocol = r.Protocol,
                 enabled = r.Enabled,
@@ -931,6 +960,7 @@ public sealed class WebApp : IDisposable
         public string Action { get; set; } = "";
         public string? Ip { get; set; }
         public string? Value { get; set; }
+        public string? Name { get; set; }
         public string? Kind { get; set; }
     }
 
@@ -1247,17 +1277,20 @@ public sealed class WebApp : IDisposable
   <section id="tab-firewall" class="hidden">
     <div class="toolbar">
       <button id="btnRestore">Restore allowlisted</button>
+      <button id="btnRefreshFw">Refresh list</button>
     </div>
+    <p class="muted" id="fwHint" style="margin:0 0 10px;font-size:.85rem">Live UI refresh is off on this tab so you can scroll and remove rules. Click Refresh list to update. Requires Administrator to remove.</p>
     <div id="tbl-firewall"></div>
   </section>
 
   <section id="tab-allowlist" class="hidden">
     <div class="toolbar">
-      <input id="allowInput" placeholder="Domain or IP to allowlist" />
+      <input id="allowInput" placeholder="Domain or IP to allowlist" autocomplete="off" />
       <button id="btnAddAllow">Add</button>
-      <button id="btnRefreshAllow">Refresh feed</button>
+      <button id="btnRefreshAllow">Refresh feed + list</button>
     </div>
     <p class="muted" id="allowStatus" style="margin:0 0 10px;font-size:.85rem"></p>
+    <p class="muted" id="allowHint" style="margin:0 0 10px;font-size:.85rem">Live UI refresh is off on this tab so you can scroll the full list. Click Refresh feed + list to update.</p>
     <div id="tbl-allowlist"></div>
   </section>
 
@@ -1346,7 +1379,7 @@ public sealed class WebApp : IDisposable
 
   function table(headers, rowsHtml) {
     if (!rowsHtml) return `<div class="empty">No rows.</div>`;
-    return `<div style="overflow:auto;max-height:calc(100vh - 220px)"><table>
+    return `<div data-scroll style="overflow:auto;max-height:calc(100vh - 220px)"><table>
       <thead><tr>${headers.map(h => `<th>${esc(h)}</th>`).join('')}</tr></thead>
       <tbody>${rowsHtml}</tbody>
     </table></div>`;
@@ -1372,6 +1405,27 @@ public sealed class WebApp : IDisposable
     }
   }
 
+  let statusHoldUntil = 0;
+  // Allowlist + Firewall tabs freeze live redraw so you can scroll and act on rows.
+  // Dashboard/connections/etc. keep the 2s poll.
+  function isFrozenTab() {
+    return tab === 'allowlist' || tab === 'firewall';
+  }
+
+  async function fetchState() {
+    const res = await fetch('/api/state', { cache: 'no-store', credentials: 'same-origin' });
+    if (res.status === 401) {
+      stopPolling();
+      const body = await res.json().catch(() => ({}));
+      showAuth(body.configured === false ? 'setup' : 'login', 'Sign in required.');
+      return false;
+    }
+    if (!res.ok) throw new Error('HTTP ' + res.status);
+    state = await res.json();
+    lastError = '';
+    return true;
+  }
+
   async function apiAction(action, extra = {}) {
     const res = await fetch('/api/action', {
       method: 'POST',
@@ -1385,45 +1439,74 @@ public sealed class WebApp : IDisposable
       return { ok: false, message: 'Authentication required.' };
     }
     const data = await res.json().catch(() => ({ ok: false, message: 'Bad response' }));
-    if (data.message) setStatus(data.message, !data.ok);
-    await refresh();
+    if (data.message) {
+      statusHoldUntil = Date.now() + 12000;
+      setStatus(data.message, !data.ok);
+    }
+    // Always pull once after an action so Add/Remove show up even on frozen tabs.
+    try {
+      if (await fetchState()) render({ forceLists: true });
+    } catch { /* ignore */ }
     return data;
   }
 
   async function refresh() {
+    // Frozen tabs: do not auto-redraw (scroll position + readability).
+    if (isFrozenTab()) return;
     try {
-      const res = await fetch('/api/state', { cache: 'no-store', credentials: 'same-origin' });
-      if (res.status === 401) {
-        stopPolling();
-        const body = await res.json().catch(() => ({}));
-        showAuth(body.configured === false ? 'setup' : 'login', 'Sign in required.');
-        return;
-      }
-      if (!res.ok) throw new Error('HTTP ' + res.status);
-      state = await res.json();
-      lastError = '';
-      render();
+      if (await fetchState()) render({ forceLists: true });
     } catch (e) {
       lastError = e.message || String(e);
       setStatus('Lost connection to Network Sentinel: ' + lastError, true);
     }
   }
 
+  async function refreshFrozenTab() {
+    try {
+      if (await fetchState()) render({ forceLists: true });
+      setStatus('List updated.', false);
+      statusHoldUntil = Date.now() + 4000;
+    } catch (e) {
+      setStatus('Refresh failed: ' + (e.message || e), true);
+    }
+  }
+
   function startPolling() {
     stopPolling();
-    refresh();
-    pollTimer = setInterval(refresh, 2000);
+    if (!isFrozenTab()) {
+      refresh();
+      pollTimer = setInterval(refresh, 2500);
+    } else {
+      refreshFrozenTab();
+    }
   }
 
   function stopPolling() {
     if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
   }
 
-  function render() {
+  function saveScroll(id) {
+    const el = document.getElementById(id);
+    if (!el) return 0;
+    const sc = el.querySelector('[data-scroll]');
+    return sc ? sc.scrollTop : 0;
+  }
+  function restoreScroll(id, top) {
+    const el = document.getElementById(id);
+    if (!el) return;
+    const sc = el.querySelector('[data-scroll]');
+    if (sc) sc.scrollTop = top || 0;
+  }
+
+  function render(opts) {
+    opts = opts || {};
     if (!state) return;
+    const forceLists = !!opts.forceLists;
     $('ver').textContent = 'v' + (state.version || '?');
     $('clock').textContent = state.clock || '';
-    if (state.statusMessage) setStatus(state.statusMessage, false);
+    // Don't overwrite a recent action result (add/remove/block) with the generic status.
+    if (state.statusMessage && Date.now() > statusHoldUntil)
+      setStatus(state.statusMessage, false);
 
     const mon = !!(state.settings && state.settings.isMonitoring);
     $('btnMonitor').textContent = mon ? 'Pause' : 'Resume';
@@ -1523,29 +1606,53 @@ public sealed class WebApp : IDisposable
       </tr>`).join('')
     );
 
-    $('tbl-firewall').innerHTML = table(
-      ['Name', 'Kind', 'Target', 'Dir', 'Proto', 'Action', 'Enabled'],
-      (state.firewallRules || []).map(r => `<tr>
-        <td class="mono">${esc(r.name)}</td>
-        <td>${esc(r.kind)}</td>
-        <td class="mono">${esc(r.target)}</td>
-        <td>${esc(r.direction)}</td>
-        <td>${esc(r.protocol)}</td>
-        <td>${esc(r.action)}</td>
-        <td>${r.enabled ? 'On' : 'Off'}</td>
-      </tr>`).join('')
-    );
+    // Heavy lists: only redraw when forced (tab open, action, manual refresh).
+    // Auto-poll never redraws allowlist/firewall — that was resetting scroll every 2s.
+    if (forceLists || !isFrozenTab()) {
+      const fwScroll = saveScroll('tbl-firewall');
+      const alScroll = saveScroll('tbl-allowlist');
 
-    $('allowStatus').textContent = state.allowlistStatus || '';
-    $('tbl-allowlist').innerHTML = table(
-      ['Kind', 'Value', 'Detail', ''],
-      (state.allowlist || []).map(e => `<tr>
-        <td>${esc(e.kind)}</td>
-        <td class="mono">${esc(e.value)}</td>
-        <td class="muted">${esc(e.detail)}</td>
-        <td class="row-actions"><button data-rm-allow="${esc(e.value)}" data-kind="${esc(e.kind)}">Remove</button></td>
-      </tr>`).join('')
-    );
+      const rules = state.firewallRules || [];
+      $('tbl-firewall').innerHTML = table(
+        ['Address / target', 'Kind', 'Dir', 'Proto', 'Action', 'Enabled', 'Rule name', ''],
+        rules.map(r => {
+          const addr = r.address || r.target || '';
+          const name = r.name || '';
+          return `<tr>
+            <td class="mono"><strong>${esc(addr)}</strong></td>
+            <td>${esc(r.kind || '')}</td>
+            <td>${esc(r.direction || '')}</td>
+            <td>${esc(r.protocol || '')}</td>
+            <td>${esc(r.action || '')}</td>
+            <td>${r.enabled ? 'On' : 'Off'}</td>
+            <td class="mono muted" style="font-size:.8rem">${esc(name)}</td>
+            <td class="row-actions"><button type="button" data-rm-rule="${esc(name)}">Remove</button></td>
+          </tr>`;
+        }).join('') || '<tr><td colspan="8" class="muted">No managed IP/port rules yet.</td></tr>'
+      );
+
+      $('allowStatus').textContent = state.allowlistStatus || '';
+      const allowRows = (state.allowlist || []).slice().sort((a, b) => {
+        const rank = k => k === 'Domain' || k === 'IP' ? 0 : k === 'CIDR' ? 1 : 2;
+        return rank(a.kind) - rank(b.kind) || String(a.value).localeCompare(String(b.value));
+      });
+      $('tbl-allowlist').innerHTML = table(
+        ['Kind', 'Value', 'Detail', ''],
+        allowRows.map(e => `<tr>
+          <td>${esc(e.kind || '')}</td>
+          <td class="mono">${esc(e.value || '')}</td>
+          <td class="muted">${esc(e.detail || '')}</td>
+          <td class="row-actions">${
+            (e.kind === 'Domain' || e.kind === 'IP')
+              ? `<button type="button" data-rm-allow="${esc(e.value || '')}" data-kind="${esc(e.kind || '')}">Remove</button>`
+              : '<span class="muted">built-in</span>'
+          }</td>
+        </tr>`).join('') || '<tr><td colspan="4" class="muted">No allowlist entries loaded.</td></tr>'
+      );
+
+      restoreScroll('tbl-firewall', fwScroll);
+      restoreScroll('tbl-allowlist', alScroll);
+    }
   }
 
   document.getElementById('nav').addEventListener('click', (e) => {
@@ -1556,9 +1663,26 @@ public sealed class WebApp : IDisposable
     document.querySelectorAll('main > section').forEach(sec => {
       sec.classList.toggle('hidden', sec.id !== 'tab-' + tab);
     });
+    // Freeze live poll on allowlist/firewall so lists stay readable.
+    if (isFrozenTab()) {
+      stopPolling();
+      refreshFrozenTab();
+    } else if (!pollTimer) {
+      startPolling();
+    }
   });
 
-  $('btnMonitor').onclick = () => apiAction('toggle_monitor');
+  $('btnMonitor').onclick = async () => {
+    await apiAction('toggle_monitor');
+    // Monitor Pause also stops background UI polling (user expectation).
+    if (state && state.settings && !state.settings.isMonitoring) {
+      stopPolling();
+      setStatus('Monitoring and live UI refresh paused. Open a tab or Resume to update.', false);
+      statusHoldUntil = Date.now() + 8000;
+    } else if (!isFrozenTab()) {
+      startPolling();
+    }
+  };
   $('btnAuto').onclick = () => apiAction('toggle_autoblock');
   $('btnLevel').onclick = () => apiAction('cycle_min_level');
   $('btnAuth').onclick = () => apiAction('authorize');
@@ -1586,8 +1710,14 @@ public sealed class WebApp : IDisposable
     const value = $('allowInput').value.trim();
     if (value) apiAction('add_allowlist', { value }).then(r => { if (r.ok) $('allowInput').value = ''; });
   };
-  $('btnRefreshAllow').onclick = () => apiAction('refresh_allowlist');
+  $('btnRefreshAllow').onclick = async () => {
+    await apiAction('refresh_allowlist');
+  };
+  $('btnRefreshFw').onclick = () => refreshFrozenTab();
   $('btnRestore').onclick = () => apiAction('restore_allowlisted');
+  $('allowInput').addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') { e.preventDefault(); $('btnAddAllow').click(); }
+  });
 
   document.body.addEventListener('click', (e) => {
     const b = e.target.closest('[data-block]');
@@ -1595,11 +1725,27 @@ public sealed class WebApp : IDisposable
     const u = e.target.closest('[data-unblock]');
     if (u) { apiAction('unblock', { ip: u.dataset.unblock }); return; }
     const r = e.target.closest('[data-rm-allow]');
-    if (r) apiAction('remove_allowlist', { value: r.dataset.rmAllow, kind: r.dataset.kind });
+    if (r) {
+      apiAction('remove_allowlist', { value: r.dataset.rmAllow, kind: r.dataset.kind });
+      return;
+    }
+    const fr = e.target.closest('[data-rm-rule]');
+    if (fr) {
+      // Prefer dataset (decoded) over getAttribute (may still contain entities).
+      const name = (fr.dataset.rmRule || fr.getAttribute('data-rm-rule') || '').trim();
+      if (!name) {
+        setStatus('Could not read rule name from the row.', true);
+        return;
+      }
+      if (confirm('Remove firewall rule?\n\n' + name + '\n\n(Requires Administrator)'))
+        apiAction('remove_rule', { value: name, name: name });
+    }
   });
 
   ['filterConn', 'filterHosts', 'filterThreats'].forEach(id => {
-    $(id).addEventListener('input', () => { if (state) render(); });
+    $(id).addEventListener('input', () => {
+      if (state && !isFrozenTab()) render({ forceLists: true });
+    });
   });
 
   $('authForm').addEventListener('submit', async (e) => {

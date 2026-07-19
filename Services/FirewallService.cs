@@ -170,13 +170,21 @@ public sealed class FirewallService
 
     public FirewallOperationResult RemoveRule(string ruleName)
     {
-        if (string.IsNullOrWhiteSpace(ruleName) || !ruleName.StartsWith(RulePrefix, StringComparison.OrdinalIgnoreCase))
-            return FirewallOperationResult.Fail("Only Network Sentinel managed rules can be removed here.");
+        try
+        {
+            if (string.IsNullOrWhiteSpace(ruleName) || !IsManagedRuleName(ruleName))
+                return FirewallOperationResult.Fail("Only Network Sentinel managed rules (IP/Port/Web) can be removed here.");
 
-        if (!IsAdministrator)
-            return FirewallOperationResult.Fail("Administrator rights are required to modify the Windows Firewall.");
+            if (!IsAdministrator)
+                return FirewallOperationResult.Fail("Administrator rights are required to modify the Windows Firewall.");
 
-        return RemoveRuleByName(ruleName);
+            return RemoveRuleByName(ruleName.Trim());
+        }
+        catch (Exception ex)
+        {
+            // Never let firewall COM/netsh failures tear down the web host process.
+            return FirewallOperationResult.Fail($"Remove failed: {ex.Message}");
+        }
     }
 
     public FirewallOperationResult RemoveAllManagedRules()
@@ -234,13 +242,26 @@ public sealed class FirewallService
 
     public IReadOnlyList<FirewallRuleInfo> GetManagedRules()
     {
+        // Prefer netsh. HNetCfg COM enumeration has been observed to AccessViolation
+        // (process kill) under some Windows builds / when hosted in the web service.
+        try
+        {
+            var viaNetsh = GetManagedRulesNetsh();
+            if (viaNetsh.Count > 0)
+                return viaNetsh;
+        }
+        catch
+        {
+            // fall through to COM
+        }
+
         try
         {
             return GetManagedRulesCom();
         }
         catch
         {
-            return GetManagedRulesNetsh();
+            return Array.Empty<FirewallRuleInfo>();
         }
     }
 
@@ -373,81 +394,110 @@ public sealed class FirewallService
 
     private FirewallOperationResult RemoveRuleByName(string name)
     {
-        dynamic? policy = null;
+        // Prefer netsh only. COM INetFwPolicy2.Rules.Remove has crashed the process
+        // (AccessViolation) on some hosts when called from the web UI — never use it
+        // for delete in the server path.
+        var safeName = name.Replace("\"", "").Trim();
+        if (string.IsNullOrEmpty(safeName))
+            return FirewallOperationResult.Fail("Rule name is empty.");
+
+        var netsh = RunNetsh($"advfirewall firewall delete rule name=\"{safeName}\"");
+        if (netsh.Success)
+            return FirewallOperationResult.Ok($"Removed \"{safeName}\".");
+
+        // netsh often returns a non-zero exit with "No rules match the specified criteria"
+        // when the rule is already gone — treat as soft success for UI idempotency.
+        if (netsh.Message.Contains("No rules match", StringComparison.OrdinalIgnoreCase) ||
+            netsh.Message.Contains("cannot find", StringComparison.OrdinalIgnoreCase))
+        {
+            return FirewallOperationResult.Fail($"No rule named \"{safeName}\" (it may already be gone).");
+        }
+
+        // Last resort: COM remove, isolated so failures stay as results not process kills.
         try
         {
-            policy = CreateCom("HNetCfg.FwPolicy2");
-
-            // INetFwRules.Remove silently succeeds for a missing name, which
-            // would make "Unblock" report success for rules that never existed —
-            // check existence first so callers get an honest answer.
+            dynamic policy = CreateCom("HNetCfg.FwPolicy2");
             try
             {
-                dynamic rule = policy.Rules.Item(name);
-                Marshal.FinalReleaseComObject(rule);
-            }
-            catch
-            {
-                return FirewallOperationResult.Fail($"No rule named “{name}”.");
-            }
+                try
+                {
+                    dynamic existing = policy.Rules.Item(safeName);
+                    Marshal.FinalReleaseComObject(existing);
+                }
+                catch
+                {
+                    return FirewallOperationResult.Fail($"No rule named \"{safeName}\".");
+                }
 
-            policy.Rules.Remove(name);
-            return FirewallOperationResult.Ok($"Removed “{name}”.");
-        }
-        catch
-        {
-            var netsh = RunNetsh($"advfirewall firewall delete rule name=\"{name}\"");
-            return netsh.Success
-                ? FirewallOperationResult.Ok($"Removed “{name}”.")
-                : FirewallOperationResult.Fail(netsh.Message);
-        }
-        finally
-        {
-            if (policy != null)
+                policy.Rules.Remove(safeName);
+                return FirewallOperationResult.Ok($"Removed \"{safeName}\".");
+            }
+            finally
+            {
                 Marshal.FinalReleaseComObject(policy);
+            }
+        }
+        catch (Exception ex)
+        {
+            return FirewallOperationResult.Fail(
+                string.IsNullOrWhiteSpace(netsh.Message)
+                    ? $"Failed to remove \"{safeName}\": {ex.Message}"
+                    : netsh.Message);
         }
     }
 
     private static List<FirewallRuleInfo> GetManagedRulesCom()
     {
         var list = new List<FirewallRuleInfo>();
-        dynamic policy = CreateCom("HNetCfg.FwPolicy2");
+        dynamic? policy = null;
         try
         {
+            policy = CreateCom("HNetCfg.FwPolicy2");
             foreach (dynamic rule in policy.Rules)
             {
-                string name = rule.Name ?? "";
-                if (!name.StartsWith(RulePrefix, StringComparison.OrdinalIgnoreCase))
-                    continue;
-
-                int action = (int)rule.Action;
-                int direction = (int)rule.Direction;
-                bool enabled = rule.Enabled;
-                string remote = rule.RemoteAddresses?.ToString() ?? "";
-                string localPorts = rule.LocalPorts?.ToString() ?? "";
-                string description = rule.Description?.ToString() ?? "";
-                int protocol = 0;
-                try { protocol = (int)rule.Protocol; } catch { /* any */ }
-
-                list.Add(new FirewallRuleInfo
+                try
                 {
-                    Name = name,
-                    Description = description,
-                    Enabled = enabled,
-                    IsBlock = action == 0,
-                    Direction = direction == 1 ? FirewallDirection.Inbound : FirewallDirection.Outbound,
-                    RemoteAddresses = NormalizeRemote(remote),
-                    LocalPorts = localPorts is " *" or "*" ? "" : localPorts.Trim(),
-                    Protocol = ProtocolName(protocol),
-                    Kind = name.Contains("-IP-", StringComparison.OrdinalIgnoreCase)
-                        ? FirewallRuleKind.IpBlock
-                        : FirewallRuleKind.PortBlock
-                });
+                    string name = rule.Name ?? "";
+                    // Only our explicit rule names — do not match unrelated rules like "networksentinel.exe".
+                    if (!IsManagedRuleName(name))
+                        continue;
+
+                    int action = (int)rule.Action;
+                    int direction = (int)rule.Direction;
+                    bool enabled = rule.Enabled;
+                    string remote = rule.RemoteAddresses?.ToString() ?? "";
+                    string localPorts = rule.LocalPorts?.ToString() ?? "";
+                    string description = rule.Description?.ToString() ?? "";
+                    int protocol = 0;
+                    try { protocol = (int)rule.Protocol; } catch { /* any */ }
+
+                    var remoteNorm = NormalizeRemote(remote);
+                    var portsNorm = localPorts is " *" or "*" or "" ? "" : localPorts.Trim();
+                    list.Add(new FirewallRuleInfo
+                    {
+                        Name = name,
+                        Description = description,
+                        Enabled = enabled,
+                        IsBlock = action == 0,
+                        Direction = direction == 1 ? FirewallDirection.Inbound : FirewallDirection.Outbound,
+                        RemoteAddresses = remoteNorm,
+                        LocalPorts = portsNorm,
+                        Protocol = ProtocolName(protocol),
+                        Kind = ClassifyRuleKind(name, remoteNorm, portsNorm)
+                    });
+                }
+                catch
+                {
+                    // Skip bad COM rows instead of aborting the whole enumeration.
+                }
             }
         }
         finally
         {
-            Marshal.FinalReleaseComObject(policy);
+            if (policy != null)
+            {
+                try { Marshal.FinalReleaseComObject(policy); } catch { /* ignore */ }
+            }
         }
 
         return list
@@ -456,6 +506,36 @@ public sealed class FirewallService
             .ThenBy(r => r.LocalPorts)
             .ThenBy(r => r.Direction)
             .ToList();
+    }
+
+    /// <summary>
+    /// True only for rules this app creates (IP block / port block / web UI allow).
+    /// Avoids matching Windows "networksentinel.exe" program rules that share the prefix.
+    /// </summary>
+    public static bool IsManagedRuleName(string name)
+    {
+        if (string.IsNullOrWhiteSpace(name)) return false;
+        return name.StartsWith(RulePrefix + "-IP-", StringComparison.OrdinalIgnoreCase)
+               || name.StartsWith(RulePrefix + "-Port-", StringComparison.OrdinalIgnoreCase)
+               || name.StartsWith(RulePrefix + "-Web-", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static FirewallRuleKind ClassifyRuleKind(string name, string remote, string localPorts)
+    {
+        if (name.StartsWith(RulePrefix + "-IP-", StringComparison.OrdinalIgnoreCase)
+            || name.Contains("-IP-", StringComparison.OrdinalIgnoreCase))
+            return FirewallRuleKind.IpBlock;
+        if (name.StartsWith(RulePrefix + "-Port-", StringComparison.OrdinalIgnoreCase)
+            || name.Contains("-Port-", StringComparison.OrdinalIgnoreCase))
+            return FirewallRuleKind.PortBlock;
+        // Web installer allow rules: NetworkSentinel-Web-18765
+        if (name.StartsWith(RulePrefix + "-Web-", StringComparison.OrdinalIgnoreCase))
+            return FirewallRuleKind.Other;
+        if (!string.IsNullOrWhiteSpace(remote) && remote is not ("Any" or "*"))
+            return FirewallRuleKind.IpBlock;
+        if (!string.IsNullOrWhiteSpace(localPorts))
+            return FirewallRuleKind.PortBlock;
+        return FirewallRuleKind.Other;
     }
 
     private static List<FirewallRuleInfo> GetManagedRulesNetsh()
@@ -477,10 +557,12 @@ public sealed class FirewallService
 
         void Flush()
         {
-            if (string.IsNullOrWhiteSpace(currentName) ||
-                !currentName.StartsWith(RulePrefix, StringComparison.OrdinalIgnoreCase))
+            if (string.IsNullOrWhiteSpace(currentName) || !IsManagedRuleName(currentName))
                 return;
 
+            var remoteNorm = NormalizeRemote(remoteIp);
+            var portsNorm = string.IsNullOrWhiteSpace(localPort) || localPort is "*" ? "" : localPort.Trim();
+            var protoNorm = string.IsNullOrWhiteSpace(protocol) ? "Any" : protocol;
             list.Add(new FirewallRuleInfo
             {
                 Name = currentName,
@@ -489,12 +571,10 @@ public sealed class FirewallService
                 Direction = direction.Contains("Out", StringComparison.OrdinalIgnoreCase)
                     ? FirewallDirection.Outbound
                     : FirewallDirection.Inbound,
-                RemoteAddresses = NormalizeRemote(remoteIp),
-                LocalPorts = localPort,
-                Protocol = string.IsNullOrWhiteSpace(protocol) ? "Any" : protocol,
-                Kind = currentName.Contains("-IP-", StringComparison.OrdinalIgnoreCase)
-                    ? FirewallRuleKind.IpBlock
-                    : FirewallRuleKind.PortBlock,
+                RemoteAddresses = remoteNorm,
+                LocalPorts = portsNorm,
+                Protocol = protoNorm,
+                Kind = ClassifyRuleKind(currentName, remoteNorm, portsNorm),
                 Description = profiles
             });
         }
@@ -672,11 +752,45 @@ public sealed class FirewallRuleInfo
     {
         FirewallRuleKind.IpBlock => "IP block",
         FirewallRuleKind.PortBlock => "Port block",
-        _ => "Rule"
+        _ when Name.Contains("-Web-", StringComparison.OrdinalIgnoreCase) => "Web UI",
+        _ => IsBlock ? "Block rule" : "Allow rule"
     };
-    public string TargetText => Kind == FirewallRuleKind.IpBlock
-        ? (string.IsNullOrWhiteSpace(RemoteAddresses) ? "—" : RemoteAddresses)
-        : $"{Protocol}/{LocalPorts}";
+    /// <summary>Best-effort IP or port target for display (COM sometimes omits RemoteAddresses).</summary>
+    public string AddressText
+    {
+        get
+        {
+            if (!string.IsNullOrWhiteSpace(RemoteAddresses) && RemoteAddresses is not ("Any" or "*"))
+                return RemoteAddresses;
+            // NetworkSentinel-IP-1.2.3.4-In  or  NetworkSentinel-IP-2001_db8__1-Out
+            var ipMatch = System.Text.RegularExpressions.Regex.Match(
+                Name,
+                @"^NetworkSentinel-IP-(.+)-(In|Out)$",
+                System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+            if (ipMatch.Success)
+                return ipMatch.Groups[1].Value.Replace('_', ':'); // reverse Sanitize for IPv6-ish
+            return "";
+        }
+    }
+
+    public string TargetText
+    {
+        get
+        {
+            var addr = AddressText;
+            if (!string.IsNullOrWhiteSpace(addr))
+                return addr;
+            if (!string.IsNullOrWhiteSpace(LocalPorts))
+                return $"{Protocol}/{LocalPorts}";
+            // e.g. NetworkSentinel-Web-18765 → show port from the name
+            var parts = Name.Split('-', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+            if (parts.Length > 0 && int.TryParse(parts[^1], out var portFromName) && portFromName is > 0 and <= 65535)
+                return $"{Protocol}/{portFromName}";
+            if (!string.IsNullOrWhiteSpace(Description))
+                return Description;
+            return "—";
+        }
+    }
     public string EnabledText => Enabled ? "On" : "Off";
     public string ActionText => IsBlock ? "Block" : "Allow";
 }
