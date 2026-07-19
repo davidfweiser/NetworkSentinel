@@ -1,3 +1,4 @@
+using System.IO;
 using System.Net;
 using System.Net.NetworkInformation;
 using System.Net.Sockets;
@@ -39,10 +40,17 @@ public sealed class WebApp : IDisposable
     private readonly AppSettings _settings;
     private readonly object _autoBlockGate = new();
     private readonly Dictionary<string, DateTime> _autoBlockAttempted = new(StringComparer.OrdinalIgnoreCase);
+    /// <summary>
+    /// IPs the user explicitly unblocked/removed. Auto-block must not recreate rules for these
+    /// until the user manually blocks again (or the suppress window expires).
+    /// </summary>
+    private readonly Dictionary<string, DateTime> _autoBlockSuppressedUntil = new(StringComparer.OrdinalIgnoreCase);
     private static readonly TimeSpan AutoBlockRetryAfter = TimeSpan.FromMinutes(10);
+    private static readonly TimeSpan ManualUnblockSuppressFor = TimeSpan.FromHours(24);
 
     private readonly int _port;
     private readonly bool _bindAll;
+    private bool _listeningLocalOnly;
     private HttpListener? _listener;
     private CancellationTokenSource? _cts;
     private string _statusMessage = "Web UI ready — monitoring started.";
@@ -99,23 +107,53 @@ public sealed class WebApp : IDisposable
             Console.Error.WriteLine(_statusMessage);
         }
 
+        LoadPersistedAutoBlockSuppressions();
         RefreshBlockedIps(force: true);
         _monitor.Start();
 
         _listener = new HttpListener();
-        // HttpListener prefixes must end with '/'. On Linux, "*" binds all interfaces.
-        var host = _bindAll ? "*" : "127.0.0.1";
-        var prefix = $"http://{host}:{_port}/";
-        _listener.Prefixes.Add(prefix);
+        // HttpListener prefixes must end with '/'.
+        // Windows: "+" (all interfaces) needs URL ACL or admin; fall back to localhost.
+        // Linux: "*" binds all interfaces.
+        var candidates = _bindAll
+            ? (OperatingSystem.IsWindows()
+                ? new[] { $"http://+:{_port}/", $"http://*:{_port}/", $"http://127.0.0.1:{_port}/" }
+                : new[] { $"http://*:{_port}/", $"http://127.0.0.1:{_port}/" })
+            : new[] { $"http://127.0.0.1:{_port}/" };
 
-        try
+        Exception? lastBindError = null;
+        string? boundPrefix = null;
+        foreach (var prefix in candidates)
         {
-            _listener.Start();
+            try
+            {
+                _listener.Prefixes.Clear();
+                _listener.Prefixes.Add(prefix);
+                _listener.Start();
+                boundPrefix = prefix;
+                break;
+            }
+            catch (Exception ex)
+            {
+                lastBindError = ex;
+                try { _listener.Close(); } catch { /* ignore */ }
+                _listener = new HttpListener();
+            }
         }
-        catch (Exception ex)
+
+        if (boundPrefix == null)
         {
             throw new InvalidOperationException(
-                $"Failed to bind web UI on {prefix}. Try another port with -w PORT. Detail: {ex.Message}", ex);
+                "Failed to bind web UI. Try another port with -w PORT " +
+                $"(ports below 1024 need root). Detail: {lastBindError?.Message}", lastBindError);
+        }
+
+        _listeningLocalOnly = boundPrefix.Contains("127.0.0.1", StringComparison.Ordinal);
+        if (_listeningLocalOnly && _bindAll)
+        {
+            Console.WriteLine(
+                "Note: bound to localhost only (URL ACL / elevation required for all-interfaces). " +
+                "Use SSH tunnel or add a URL ACL to expose the LAN.");
         }
 
         PrintListenBanner();
@@ -133,13 +171,20 @@ public sealed class WebApp : IDisposable
                 {
                     break;
                 }
-                catch (HttpListenerException) when (_cts.IsCancellationRequested)
-                {
-                    break;
-                }
                 catch (ObjectDisposedException)
                 {
                     break;
+                }
+                catch (Exception ex)
+                {
+                    // A reset/aborted connection can surface here as HttpListenerException.
+                    // That must never end the accept loop — Program.RunWeb treats an escape
+                    // as fatal and exits the whole server process.
+                    if (_cts.IsCancellationRequested)
+                        break;
+                    Console.Error.WriteLine($"Accept error (continuing): {ex.Message}");
+                    await Task.Delay(100, CancellationToken.None);
+                    continue;
                 }
 
                 // Handle each request without blocking the accept loop for long polls.
@@ -157,9 +202,10 @@ public sealed class WebApp : IDisposable
     private void PrintListenBanner()
     {
         Console.WriteLine();
-        Console.WriteLine($"  Listening on port {_port}  ({(_bindAll ? "all interfaces" : "localhost only")})");
+        var scope = _listeningLocalOnly ? "localhost only" : (_bindAll ? "all interfaces" : "localhost only");
+        Console.WriteLine($"  Listening on port {_port}  ({scope})");
         Console.WriteLine($"  Local:   http://127.0.0.1:{_port}/");
-        if (_bindAll)
+        if (_bindAll && !_listeningLocalOnly)
         {
             foreach (var ip in GetLanIpv4Addresses().Take(4))
                 Console.WriteLine($"  Network: http://{ip}:{_port}/");
@@ -448,7 +494,7 @@ public sealed class WebApp : IDisposable
                     _settings.Save();
                     _statusMessage = _autoBlockEnabled
                         ? $"Auto-block ON (≥ {_autoBlockMinLevel})" +
-                          (_firewall.IsAdministrator ? "" : " — need pkexec for firewall changes")
+                          (_firewall.IsAdministrator ? "" : " — need pkexec/sudo for firewall changes")
                         : "Auto-block OFF";
                     return ActionResultDto.Success(_statusMessage);
 
@@ -481,6 +527,98 @@ public sealed class WebApp : IDisposable
                     _statusMessage = "Threat alerts cleared.";
                     return ActionResultDto.Success(_statusMessage);
 
+                case "set_setting":
+                {
+                    var key = (req.Name ?? "").Trim();
+                    var raw = (req.Value ?? "").Trim();
+                    var on = raw.Equals("true", StringComparison.OrdinalIgnoreCase) || raw == "1";
+                    string label;
+                    switch (key)
+                    {
+                        case "autoBlockEnabled":
+                            _autoBlockEnabled = on;
+                            _settings.AutoBlockEnabled = on;
+                            label = on ? $"Auto-block ON (≥ {_autoBlockMinLevel})" : "Auto-block OFF";
+                            break;
+                        case "blockInbound":
+                            _blockInbound = on;
+                            _settings.AutoBlockInbound = on;
+                            label = $"Block inbound: {(on ? "on" : "off")}";
+                            break;
+                        case "blockOutbound":
+                            _blockOutbound = on;
+                            _settings.AutoBlockOutbound = on;
+                            label = $"Block outbound: {(on ? "on" : "off")}";
+                            break;
+                        case "geoLookupEnabled":
+                            _monitor.GeoLookupsEnabled = on;
+                            _settings.GeoLookupEnabled = on;
+                            label = $"Geo lookups: {(on ? "on" : "off")}";
+                            break;
+                        case "allowlistUseRemoteFeed":
+                            _allowlist.UseRemoteFeed = on;
+                            _settings.AllowlistUseRemoteFeed = on;
+                            label = $"Allowlist remote feed: {(on ? "on" : "off")}";
+                            break;
+                        default:
+                            return ActionResultDto.Fail($"Unknown setting: {key}");
+                    }
+                    _settings.Save();
+                    _statusMessage = label;
+                    return ActionResultDto.Success(label);
+                }
+
+                case "block_port":
+                {
+                    if (!int.TryParse((req.Value ?? "").Trim(), out var port) || port is < 1 or > 65535)
+                        return ActionResultDto.Fail("Enter a valid port number (1–65535).");
+                    if (port == _port)
+                        return ActionResultDto.Fail(
+                            $"Port {port} serves this web console — blocking it would cut off this page. Choose another port.");
+                    if (!_firewall.IsAdministrator)
+                        return ActionResultDto.Fail("Cannot block — run the web service as root or install pkexec/sudo.");
+
+                    var proto = (req.Kind ?? "TCP").Trim().ToUpperInvariant();
+                    var dir = (req.Direction ?? "Inbound").Trim() switch
+                    {
+                        "Outbound" => FirewallDirection.Outbound,
+                        "Both" => FirewallDirection.Both,
+                        _ => FirewallDirection.Inbound
+                    };
+                    var r = _firewall.BlockPort(port, proto, dir, $"Web UI port block · {proto}/{port}");
+                    _statusMessage = r.Message;
+                    return r.Success ? ActionResultDto.Success(r.Message) : ActionResultDto.Fail(r.Message);
+                }
+
+                case "unblock_port":
+                {
+                    if (!int.TryParse((req.Value ?? "").Trim(), out var port) || port is < 1 or > 65535)
+                        return ActionResultDto.Fail("Enter a valid port number (1–65535).");
+                    if (!_firewall.IsAdministrator)
+                        return ActionResultDto.Fail("Cannot unblock — run the web service as root or install pkexec/sudo.");
+                    var r = _firewall.UnblockPort(port, (req.Kind ?? "TCP").Trim());
+                    _statusMessage = r.Message;
+                    return r.Success ? ActionResultDto.Success(r.Message) : ActionResultDto.Fail(r.Message);
+                }
+
+                case "remove_all_rules":
+                {
+                    if (!_firewall.IsAdministrator)
+                        return ActionResultDto.Fail("Cannot remove rules — run the web service as root or install pkexec/sudo.");
+
+                    // Suppress auto-block for every removed IP so nothing "comes back".
+                    var blockedBefore = _firewall.GetBlockedIps();
+                    var r = _firewall.RemoveAllManagedRules(rule => IsOwnWebRule(rule.Name));
+                    if (r.Success)
+                    {
+                        foreach (var ip in blockedBefore)
+                            SuppressAutoBlock(ip);
+                        RefreshBlockedIps(force: true);
+                    }
+                    _statusMessage = r.Message;
+                    return r.Success ? ActionResultDto.Success(r.Message) : ActionResultDto.Fail(r.Message);
+                }
+
                 case "authorize":
                 {
                     var r = _firewall.AuthorizeElevation();
@@ -494,11 +632,13 @@ public sealed class WebApp : IDisposable
                     if (string.IsNullOrEmpty(ip))
                         return ActionResultDto.Fail("IP required.");
                     if (!_firewall.IsAdministrator)
-                        return ActionResultDto.Fail("Cannot block — install pkexec/sudo or use authorize first.");
+                        return ActionResultDto.Fail("Cannot block — need root or pkexec/sudo (use authorize first).");
                     var r = _firewall.BlockIp(ip, ResolveDirection(), $"Web UI block · {ip}");
                     if (r.Success)
                     {
-                        lock (_autoBlockGate) _blockedIps.Add(ip);
+                        var key = FirewallService.TryNormalizeIp(ip, out var normalized, out _) ? normalized : ip;
+                        ClearAutoBlockSuppress(key);
+                        lock (_autoBlockGate) _blockedIps.Add(key);
                         RefreshBlockedIps(force: true);
                     }
                     _statusMessage = r.Message;
@@ -511,11 +651,15 @@ public sealed class WebApp : IDisposable
                     if (string.IsNullOrEmpty(ip))
                         return ActionResultDto.Fail("IP required.");
                     if (!_firewall.IsAdministrator)
-                        return ActionResultDto.Fail("Cannot unblock — install pkexec/sudo or use authorize first.");
+                        return ActionResultDto.Fail("Cannot unblock — need root or pkexec/sudo (use authorize first).");
                     var r = _firewall.UnblockIp(ip);
                     if (r.Success)
                     {
-                        lock (_autoBlockGate) _blockedIps.Remove(ip);
+                        if (FirewallService.TryNormalizeIp(ip, out var normalized, out _))
+                        {
+                            SuppressAutoBlock(normalized);
+                            lock (_autoBlockGate) _blockedIps.Remove(normalized);
+                        }
                         RefreshBlockedIps(force: true);
                     }
                     _statusMessage = r.Message;
@@ -576,6 +720,44 @@ public sealed class WebApp : IDisposable
                     return r.Success ? ActionResultDto.Success(r.Message) : ActionResultDto.Fail(r.Message);
                 }
 
+                case "remove_rule":
+                {
+                    // Decode HTML entities if the browser sent an attribute-escaped name.
+                    var name = System.Net.WebUtility.HtmlDecode((req.Value ?? req.Name ?? "").Trim());
+                    if (string.IsNullOrEmpty(name))
+                        return ActionResultDto.Fail("Rule name required.");
+                    if (IsOwnWebRule(name))
+                        return ActionResultDto.Fail(
+                            $"\"{name}\" is the allow rule that lets your browser reach this console — " +
+                            "removing it from here would instantly cut off this page (it looks like a crash). " +
+                            "To remove web access, stop or uninstall the web service on the server.");
+                    if (!_firewall.IsAdministrator)
+                        return ActionResultDto.Fail("Cannot remove rules — run the web service as root or install pkexec/sudo.");
+
+                    FirewallOperationResult r;
+                    try
+                    {
+                        r = _firewall.RemoveRule(name);
+                    }
+                    catch (Exception ex)
+                    {
+                        _statusMessage = $"Remove failed: {ex.Message}";
+                        return ActionResultDto.Fail(_statusMessage);
+                    }
+
+                    _statusMessage = r.Message;
+                    if (r.Success)
+                    {
+                        // Keep auto-block from immediately recreating the same IP block.
+                        if (FirewallService.TryExtractIpFromManagedRule(name, null, out var removedIp))
+                            SuppressAutoBlock(removedIp);
+
+                        try { RefreshBlockedIps(force: true); }
+                        catch { /* ignore */ }
+                    }
+                    return r.Success ? ActionResultDto.Success(r.Message) : ActionResultDto.Fail(r.Message);
+                }
+
                 default:
                     return ActionResultDto.Fail($"Unknown action: {req.Action}");
             }
@@ -611,6 +793,8 @@ public sealed class WebApp : IDisposable
                 autoBlockMinLevel = _autoBlockMinLevel,
                 blockInbound = _blockInbound,
                 blockOutbound = _blockOutbound,
+                geoLookupEnabled = _settings.GeoLookupEnabled,
+                allowlistUseRemoteFeed = _settings.AllowlistUseRemoteFeed,
                 isMonitoring = stats.IsMonitoring
             },
             stats = new
@@ -676,8 +860,12 @@ public sealed class WebApp : IDisposable
             firewallRules = _firewall.GetManagedRules().Select(r => new
             {
                 name = r.Name,
+                isProtected = IsOwnWebRule(r.Name),
                 kind = r.KindText,
+                // Explicit address field so the UI always has an IP column even if target is a port.
+                address = string.IsNullOrWhiteSpace(r.AddressText) ? r.TargetText : r.AddressText,
                 target = r.TargetText,
+                ports = r.LocalPorts,
                 direction = r.DirectionText,
                 protocol = r.Protocol,
                 enabled = r.Enabled,
@@ -699,6 +887,13 @@ public sealed class WebApp : IDisposable
             })
         };
     }
+
+    /// <summary>
+    /// The inbound allow rule for THIS console's port. Removing it over the web kills the
+    /// user's own browser connection mid-request — indistinguishable from a server crash.
+    /// </summary>
+    private bool IsOwnWebRule(string name)
+        => string.Equals(name, $"{FirewallService.RulePrefix}-Web-{_port}", StringComparison.OrdinalIgnoreCase);
 
     private FirewallDirection ResolveDirection()
     {
@@ -729,7 +924,7 @@ public sealed class WebApp : IDisposable
 
         if (!_firewall.IsAdministrator)
         {
-            _statusMessage = "Auto-block ON, but no elevation helper (install pkexec).";
+            _statusMessage = "Auto-block ON, but no elevation available — need root or pkexec/sudo.";
             return;
         }
 
@@ -755,6 +950,8 @@ public sealed class WebApp : IDisposable
             lock (_autoBlockGate)
             {
                 if (_blockedIps.Contains(ip))
+                    continue;
+                if (_autoBlockSuppressedUntil.TryGetValue(ip, out var until) && DateTime.UtcNow < until)
                     continue;
                 if (_autoBlockAttempted.TryGetValue(ip, out var lastAttempt) &&
                     DateTime.UtcNow - lastAttempt < AutoBlockRetryAfter)
@@ -810,6 +1007,51 @@ public sealed class WebApp : IDisposable
                 _blockedIpsRefreshInFlight = false;
             }
         });
+    }
+
+    private void SuppressAutoBlock(string ip)
+    {
+        var until = DateTime.UtcNow.Add(ManualUnblockSuppressFor);
+        lock (_autoBlockGate)
+        {
+            _blockedIps.Remove(ip);
+            // Leave a long cooldown marker so concurrent threat handlers also skip briefly.
+            _autoBlockAttempted[ip] = DateTime.UtcNow;
+            _autoBlockSuppressedUntil[ip] = until;
+        }
+
+        _settings.AutoBlockSuppressedUntil[ip] = until;
+        PruneExpiredSuppressions(_settings.AutoBlockSuppressedUntil);
+        _settings.Save();
+    }
+
+    private void ClearAutoBlockSuppress(string ip)
+    {
+        lock (_autoBlockGate)
+            _autoBlockSuppressedUntil.Remove(ip);
+
+        if (_settings.AutoBlockSuppressedUntil.Remove(ip))
+            _settings.Save();
+    }
+
+    private void LoadPersistedAutoBlockSuppressions()
+    {
+        lock (_autoBlockGate)
+        {
+            _autoBlockSuppressedUntil.Clear();
+            foreach (var kv in _settings.AutoBlockSuppressedUntil)
+            {
+                if (kv.Value > DateTime.UtcNow)
+                    _autoBlockSuppressedUntil[kv.Key] = kv.Value;
+            }
+        }
+    }
+
+    private static void PruneExpiredSuppressions(Dictionary<string, DateTime> map)
+    {
+        var now = DateTime.UtcNow;
+        foreach (var key in map.Where(kv => kv.Value <= now).Select(kv => kv.Key).ToList())
+            map.Remove(key);
     }
 
     /// <summary>
@@ -897,7 +1139,9 @@ public sealed class WebApp : IDisposable
         public string Action { get; set; } = "";
         public string? Ip { get; set; }
         public string? Value { get; set; }
+        public string? Name { get; set; }
         public string? Kind { get; set; }
+        public string? Direction { get; set; }
     }
 
     private sealed class AuthBody
@@ -967,12 +1211,12 @@ public sealed class WebApp : IDisposable
   .brand .sub { color: var(--text2); font-size: .78rem; }
   .clock { color: var(--muted); font-size: .85rem; font-family: var(--mono); }
   nav { display: flex; flex-wrap: wrap; gap: 6px; flex: 1; }
-  nav button, .actions button, .row-actions button {
+  nav button, .actions button, .row-actions button, .toolbar button {
     appearance: none; border: 1px solid var(--stroke); background: var(--bg-card);
     color: var(--text2); border-radius: 8px; padding: 7px 12px; cursor: pointer;
     font: inherit; font-size: .82rem; transition: .15s ease;
   }
-  nav button:hover, .actions button:hover, .row-actions button:hover {
+  nav button:hover, .actions button:hover, .row-actions button:hover, .toolbar button:hover {
     background: var(--bg-hover); color: var(--text); border-color: var(--stroke-strong);
   }
   nav button.active {
@@ -993,6 +1237,7 @@ public sealed class WebApp : IDisposable
     color: var(--text2); font-size: .88rem;
   }
   .status.err { border-color: rgba(255,77,109,.45); color: #ffb0bd; }
+  .status.good { border-color: rgba(61,220,151,.4); color: #9fe8c8; }
   .cards {
     display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
     gap: 10px; margin-bottom: 16px;
@@ -1027,8 +1272,62 @@ public sealed class WebApp : IDisposable
     text-transform: uppercase; letter-spacing: .05em; background: #0c1426;
     position: sticky; top: 0;
   }
+  tbody tr:nth-child(even) td { background: rgba(255,255,255,.02); }
   tr:hover td { background: rgba(24,36,63,.55); }
   tr:last-child td { border-bottom: none; }
+  [data-scroll] { scrollbar-width: thin; scrollbar-color: rgba(124,249,255,.25) transparent; }
+  [data-scroll]::-webkit-scrollbar { width: 9px; height: 9px; }
+  [data-scroll]::-webkit-scrollbar-thumb { background: rgba(124,249,255,.2); border-radius: 6px; }
+  [data-scroll]::-webkit-scrollbar-thumb:hover { background: rgba(124,249,255,.35); }
+  [data-scroll]::-webkit-scrollbar-track { background: transparent; }
+  .chip {
+    display: inline-block; padding: 1px 8px; border-radius: 999px; margin-right: 4px;
+    font-size: .72rem; font-weight: 600;
+    background: rgba(76,141,255,.16); color: #9ec0ff; border: 1px solid rgba(76,141,255,.25);
+  }
+  .row-actions button.rm, .toolbar button.rm, button.rm-lg {
+    border-color: rgba(255,77,109,.4); color: #ffb0bd;
+  }
+  .row-actions button.rm:hover, .toolbar button.rm:hover, button.rm-lg:hover {
+    background: rgba(255,77,109,.12); border-color: rgba(255,77,109,.65); color: #ffd3db;
+  }
+  .row-actions button:disabled { opacity: .55; cursor: wait; }
+  button.rm-lg {
+    appearance: none; font: inherit; font-size: .85rem; cursor: pointer;
+    padding: 8px 14px; border-radius: 8px; background: var(--bg-card);
+    border: 1px solid rgba(255,77,109,.4); transition: .15s ease; flex-shrink: 0;
+  }
+  .setting-row {
+    display: flex; align-items: center; justify-content: space-between; gap: 16px;
+    padding: 14px 16px; background: var(--bg-card); border: 1px solid var(--stroke);
+    border-radius: 12px; margin-bottom: 10px; max-width: 760px;
+  }
+  .setting-row .info h4 { margin: 0 0 3px; font-size: .92rem; font-weight: 600; }
+  .setting-row .info p { margin: 0; color: var(--muted); font-size: .8rem; line-height: 1.45; }
+  .setting-row select {
+    background: var(--bg-deep); border: 1px solid var(--stroke); color: var(--text);
+    border-radius: 8px; padding: 7px 10px; font: inherit; font-size: .85rem;
+  }
+  .settings-group h3 {
+    margin: 22px 0 10px; font-size: .8rem; color: var(--muted);
+    text-transform: uppercase; letter-spacing: .07em;
+  }
+  .settings-group:first-child h3 { margin-top: 0; }
+  .switch { position: relative; display: inline-block; width: 44px; height: 24px; flex-shrink: 0; }
+  .switch input { opacity: 0; width: 0; height: 0; }
+  .switch .slider {
+    position: absolute; inset: 0; cursor: pointer; border-radius: 999px;
+    background: var(--bg-hover); border: 1px solid var(--stroke); transition: .2s ease;
+  }
+  .switch .slider:before {
+    content: ""; position: absolute; height: 18px; width: 18px; left: 2px; top: 2px;
+    background: var(--muted); border-radius: 50%; transition: .2s ease;
+  }
+  .switch input:checked + .slider {
+    background: linear-gradient(135deg, rgba(61,231,200,.5), rgba(76,141,255,.55));
+    border-color: transparent;
+  }
+  .switch input:checked + .slider:before { transform: translateX(20px); background: #fff; }
   .mono { font-family: var(--mono); font-size: .8rem; }
   .badge {
     display: inline-block; padding: 2px 8px; border-radius: 999px;
@@ -1157,6 +1456,7 @@ public sealed class WebApp : IDisposable
     <button data-tab="ports">Ports</button>
     <button data-tab="firewall">Firewall</button>
     <button data-tab="allowlist">Allowlist</button>
+    <button data-tab="settings">Settings</button>
     <button data-tab="help">Help</button>
   </nav>
   <div class="actions">
@@ -1212,19 +1512,31 @@ public sealed class WebApp : IDisposable
 
   <section id="tab-firewall" class="hidden">
     <div class="toolbar">
+      <input id="fwIp" placeholder="IP to block" class="mono" style="min-width:160px" />
+      <button id="btnFwBlockIp">Block IP</button>
+      <input id="fwPort" placeholder="Port" class="mono" style="min-width:80px;max-width:100px" />
+      <select id="fwProto"><option>TCP</option><option>UDP</option></select>
+      <button id="btnFwBlockPort">Block port</button>
       <button id="btnRestore">Restore allowlisted</button>
+      <button id="btnRefreshFw">Refresh list</button>
     </div>
+    <p class="muted" id="fwHint" style="margin:0 0 10px;font-size:.85rem">Each row is one block — Remove deletes its inbound and outbound rules together and keeps auto-block from re-adding it for 24h. Live refresh is off on this tab; click Refresh list to update. Requires root or pkexec/sudo.</p>
     <div id="tbl-firewall"></div>
   </section>
 
   <section id="tab-allowlist" class="hidden">
     <div class="toolbar">
-      <input id="allowInput" placeholder="Domain or IP to allowlist" />
+      <input id="allowInput" placeholder="Domain or IP to allowlist" autocomplete="off" />
       <button id="btnAddAllow">Add</button>
-      <button id="btnRefreshAllow">Refresh feed</button>
+      <button id="btnRefreshAllow">Refresh feed + list</button>
     </div>
     <p class="muted" id="allowStatus" style="margin:0 0 10px;font-size:.85rem"></p>
+    <p class="muted" id="allowHint" style="margin:0 0 10px;font-size:.85rem">Live UI refresh is off on this tab so you can scroll the full list. Click Refresh feed + list to update.</p>
     <div id="tbl-allowlist"></div>
+  </section>
+
+  <section id="tab-settings" class="hidden">
+    <div id="settingsPanel"></div>
   </section>
 
   <section id="tab-help" class="hidden">
@@ -1233,12 +1545,14 @@ public sealed class WebApp : IDisposable
       <p>Start with <code>NetworkSentinel -w</code> (optional port: <code>-w 18765</code>). The process picks a free high port when you omit one.</p>
       <ul>
         <li><strong>Dashboard</strong> — live counters and recent threats</li>
+        <li><strong>Connections / Threats</strong> — live traffic with per-row Block buttons</li>
         <li><strong>Hosts</strong> — remote peers; block/unblock IPs</li>
-        <li><strong>Auto-block</strong> — automatically block new threats at the chosen minimum severity</li>
-        <li><strong>Authorize</strong> — prepare pkexec/sudo elevation for firewall changes</li>
+        <li><strong>Ports</strong> — local listeners; block a port with one click</li>
+        <li><strong>Firewall</strong> — managed rules, manual IP/port blocking, remove rules</li>
         <li><strong>Allowlist</strong> — domains/IPs that are never blocked</li>
+        <li><strong>Settings</strong> — auto-block behavior, block direction, geo lookups, refresh speed</li>
       </ul>
-      <p class="muted">Firewall actions still need elevation (pkexec). Prefer running as your normal user, not root.</p>
+      <p class="muted">Firewall actions need root or an elevation helper (pkexec/sudo). Prefer running the web service as root once rather than elevating per action.</p>
       <p class="muted">Web access is gated by a master password (set on first visit). Sign out or close the browser to require it again.</p>
     </div>
   </section>
@@ -1258,10 +1572,11 @@ public sealed class WebApp : IDisposable
     { '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;' }[c]
   ));
 
-  function setStatus(msg, err) {
+  function setStatus(msg, err, good) {
     const el = $('status');
     el.textContent = msg || '';
     el.classList.toggle('err', !!err);
+    el.classList.toggle('good', !err && !!good);
   }
 
   function showAuth(mode, message) {
@@ -1312,7 +1627,7 @@ public sealed class WebApp : IDisposable
 
   function table(headers, rowsHtml) {
     if (!rowsHtml) return `<div class="empty">No rows.</div>`;
-    return `<div style="overflow:auto;max-height:calc(100vh - 220px)"><table>
+    return `<div data-scroll style="overflow:auto;max-height:calc(100vh - 220px)"><table>
       <thead><tr>${headers.map(h => `<th>${esc(h)}</th>`).join('')}</tr></thead>
       <tbody>${rowsHtml}</tbody>
     </table></div>`;
@@ -1338,6 +1653,32 @@ public sealed class WebApp : IDisposable
     }
   }
 
+  let statusHoldUntil = 0;
+  // Allowlist / Firewall / Settings tabs freeze live redraw so you can scroll and act
+  // on rows. Dashboard/connections/etc. keep the periodic poll.
+  function isFrozenTab() {
+    return tab === 'allowlist' || tab === 'firewall' || tab === 'settings';
+  }
+
+  function getRefreshMs() {
+    const v = parseInt(localStorage.getItem('ns-refresh') || '2500', 10);
+    return Number.isFinite(v) && v >= 1000 ? v : 2500;
+  }
+
+  async function fetchState() {
+    const res = await fetch('/api/state', { cache: 'no-store', credentials: 'same-origin' });
+    if (res.status === 401) {
+      stopPolling();
+      const body = await res.json().catch(() => ({}));
+      showAuth(body.configured === false ? 'setup' : 'login', 'Sign in required.');
+      return false;
+    }
+    if (!res.ok) throw new Error('HTTP ' + res.status);
+    state = await res.json();
+    lastError = '';
+    return true;
+  }
+
   async function apiAction(action, extra = {}) {
     const res = await fetch('/api/action', {
       method: 'POST',
@@ -1351,45 +1692,74 @@ public sealed class WebApp : IDisposable
       return { ok: false, message: 'Authentication required.' };
     }
     const data = await res.json().catch(() => ({ ok: false, message: 'Bad response' }));
-    if (data.message) setStatus(data.message, !data.ok);
-    await refresh();
+    if (data.message) {
+      statusHoldUntil = Date.now() + 12000;
+      setStatus(data.message, !data.ok, data.ok);
+    }
+    // Always pull once after an action so Add/Remove show up even on frozen tabs.
+    try {
+      if (await fetchState()) render({ forceLists: true });
+    } catch { /* ignore */ }
     return data;
   }
 
   async function refresh() {
+    // Frozen tabs: do not auto-redraw (scroll position + readability).
+    if (isFrozenTab()) return;
     try {
-      const res = await fetch('/api/state', { cache: 'no-store', credentials: 'same-origin' });
-      if (res.status === 401) {
-        stopPolling();
-        const body = await res.json().catch(() => ({}));
-        showAuth(body.configured === false ? 'setup' : 'login', 'Sign in required.');
-        return;
-      }
-      if (!res.ok) throw new Error('HTTP ' + res.status);
-      state = await res.json();
-      lastError = '';
-      render();
+      if (await fetchState()) render({ forceLists: true });
     } catch (e) {
       lastError = e.message || String(e);
       setStatus('Lost connection to Network Sentinel: ' + lastError, true);
     }
   }
 
+  async function refreshFrozenTab() {
+    try {
+      if (await fetchState()) render({ forceLists: true });
+      setStatus('List updated.', false);
+      statusHoldUntil = Date.now() + 4000;
+    } catch (e) {
+      setStatus('Refresh failed: ' + (e.message || e), true);
+    }
+  }
+
   function startPolling() {
     stopPolling();
-    refresh();
-    pollTimer = setInterval(refresh, 2000);
+    if (!isFrozenTab()) {
+      refresh();
+      pollTimer = setInterval(refresh, getRefreshMs());
+    } else {
+      refreshFrozenTab();
+    }
   }
 
   function stopPolling() {
     if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
   }
 
-  function render() {
+  function saveScroll(id) {
+    const el = document.getElementById(id);
+    if (!el) return 0;
+    const sc = el.querySelector('[data-scroll]');
+    return sc ? sc.scrollTop : 0;
+  }
+  function restoreScroll(id, top) {
+    const el = document.getElementById(id);
+    if (!el) return;
+    const sc = el.querySelector('[data-scroll]');
+    if (sc) sc.scrollTop = top || 0;
+  }
+
+  function render(opts) {
+    opts = opts || {};
     if (!state) return;
+    const forceLists = !!opts.forceLists;
     $('ver').textContent = 'v' + (state.version || '?');
     $('clock').textContent = state.clock || '';
-    if (state.statusMessage) setStatus(state.statusMessage, false);
+    // Don't overwrite a recent action result (add/remove/block) with the generic status.
+    if (state.statusMessage && Date.now() > statusHoldUntil)
+      setStatus(state.statusMessage, false);
 
     const mon = !!(state.settings && state.settings.isMonitoring);
     $('btnMonitor').textContent = mon ? 'Pause' : 'Resume';
@@ -1430,8 +1800,9 @@ public sealed class WebApp : IDisposable
     );
 
     const fq = $('filterConn').value.trim();
+    const blockable = (ip) => ip && ip !== '0.0.0.0' && ip !== '::' && ip !== '*';
     $('tbl-connections').innerHTML = table(
-      ['Proto', 'Local', 'Remote', 'State', 'Process', 'Geo', 'Last'],
+      ['Proto', 'Local', 'Remote', 'State', 'Process', 'Geo', 'Last', ''],
       (state.connections || []).filter(c => matchFilter(fq, c.protocol, c.local, c.remote, c.state, c.process, c.geo))
         .map(c => `<tr>
           <td>${esc(c.protocol)}</td>
@@ -1441,6 +1812,8 @@ public sealed class WebApp : IDisposable
           <td>${esc(c.process)} <span class="muted">#${esc(c.pid)}</span></td>
           <td class="muted">${esc(c.geo)}</td>
           <td class="mono">${esc(c.lastSeen)}</td>
+          <td class="row-actions">${blockable(c.remoteAddress)
+            ? `<button data-block="${esc(c.remoteAddress)}">Block</button>` : ''}</td>
         </tr>`).join('')
     );
 
@@ -1466,7 +1839,7 @@ public sealed class WebApp : IDisposable
 
     const tq = $('filterThreats').value.trim();
     $('tbl-threats').innerHTML = table(
-      ['Time', 'Level', 'Type', 'Source', 'Title', 'Detail', 'Origin'],
+      ['Time', 'Level', 'Type', 'Source', 'Title', 'Detail', 'Origin', ''],
       (state.threats || []).filter(t => matchFilter(tq, t.level, t.type, t.sourceIp, t.title, t.detail, t.origin))
         .map(t => `<tr>
           <td class="mono">${esc(t.time)}</td>
@@ -1476,42 +1849,121 @@ public sealed class WebApp : IDisposable
           <td>${esc(t.title)}</td>
           <td class="muted">${esc(t.detail)}</td>
           <td class="muted">${esc(t.origin)}</td>
+          <td class="row-actions">${blockable(t.sourceIp)
+            ? `<button data-block="${esc(t.sourceIp)}">Block</button>` : ''}</td>
         </tr>`).join('')
     );
 
     $('tbl-ports').innerHTML = table(
-      ['Proto', 'Endpoint', 'Process', 'Hint'],
+      ['Proto', 'Endpoint', 'Process', 'Hint', ''],
       (state.ports || []).map(p => `<tr>
         <td>${esc(p.protocol)}</td>
         <td class="mono">${esc(p.endpoint)}</td>
         <td>${esc(p.process)} <span class="muted">#${esc(p.pid)}</span></td>
         <td class="muted">${esc(p.hint)}</td>
+        <td class="row-actions">
+          <button class="rm" data-block-port="${esc(p.port)}" data-proto="${esc(p.protocol)}">Block port</button>
+        </td>
       </tr>`).join('')
     );
 
-    $('tbl-firewall').innerHTML = table(
-      ['Name', 'Kind', 'Target', 'Dir', 'Proto', 'Action', 'Enabled'],
-      (state.firewallRules || []).map(r => `<tr>
-        <td class="mono">${esc(r.name)}</td>
-        <td>${esc(r.kind)}</td>
-        <td class="mono">${esc(r.target)}</td>
-        <td>${esc(r.direction)}</td>
-        <td>${esc(r.protocol)}</td>
-        <td>${esc(r.action)}</td>
-        <td>${r.enabled ? 'On' : 'Off'}</td>
-      </tr>`).join('')
-    );
+    // Heavy lists: only redraw when forced (tab open, action, manual refresh).
+    // Auto-poll never redraws allowlist/firewall — that was resetting scroll every 2s.
+    if (forceLists || !isFrozenTab()) {
+      const fwScroll = saveScroll('tbl-firewall');
+      const alScroll = saveScroll('tbl-allowlist');
 
-    $('allowStatus').textContent = state.allowlistStatus || '';
-    $('tbl-allowlist').innerHTML = table(
-      ['Kind', 'Value', 'Detail', ''],
-      (state.allowlist || []).map(e => `<tr>
-        <td>${esc(e.kind)}</td>
-        <td class="mono">${esc(e.value)}</td>
-        <td class="muted">${esc(e.detail)}</td>
-        <td class="row-actions"><button data-rm-allow="${esc(e.value)}" data-kind="${esc(e.kind)}">Remove</button></td>
-      </tr>`).join('')
-    );
+      // One row per block: -In/-Out siblings are grouped, and Remove deletes the pair.
+      const rules = state.firewallRules || [];
+      const groups = new Map();
+      rules.forEach((r, i) => {
+        const m = /^(.*)-(In|Out)$/i.exec(r.name || '');
+        const key = m ? m[1] : (r.name || 'rule-' + i);
+        if (!groups.has(key)) groups.set(key, []);
+        groups.get(key).push(r);
+      });
+      $('tbl-firewall').innerHTML = table(
+        ['Address / target', 'Kind', 'Directions', 'Proto', 'Action', 'Enabled', 'Rule', ''],
+        [...groups.values()].map(pair => {
+          const r = pair[0];
+          const addr = r.address || r.target || '';
+          const dirs = pair.map(x => `<span class="chip">${esc(x.direction || '?')}</span>`).join('');
+          const baseName = (r.name || '').replace(/-(In|Out)$/i, '');
+          const action = pair.some(x => x.isProtected)
+            ? `<span class="chip" title="This rule lets your browser reach this console. Removing it would cut off this page. Stop or uninstall the web service instead.">this console</span>`
+            : `<button type="button" class="rm" data-rm-rule="${esc(r.name || '')}">Remove</button>`;
+          return `<tr>
+            <td class="mono"><strong>${esc(addr)}</strong></td>
+            <td>${esc(r.kind || '')}</td>
+            <td>${dirs}</td>
+            <td>${esc(r.protocol || '')}</td>
+            <td>${esc(r.action || '')}</td>
+            <td>${pair.some(x => x.enabled) ? 'On' : 'Off'}</td>
+            <td class="mono muted" style="font-size:.8rem">${esc(baseName)}</td>
+            <td class="row-actions">${action}</td>
+          </tr>`;
+        }).join('') || '<tr><td colspan="8" class="muted">No managed IP/port rules yet.</td></tr>'
+      );
+
+      $('allowStatus').textContent = state.allowlistStatus || '';
+      const allowRows = (state.allowlist || []).slice().sort((a, b) => {
+        const rank = k => k === 'Domain' || k === 'IP' ? 0 : k === 'CIDR' ? 1 : 2;
+        return rank(a.kind) - rank(b.kind) || String(a.value).localeCompare(String(b.value));
+      });
+      $('tbl-allowlist').innerHTML = table(
+        ['Kind', 'Value', 'Detail', ''],
+        allowRows.map(e => `<tr>
+          <td>${esc(e.kind || '')}</td>
+          <td class="mono">${esc(e.value || '')}</td>
+          <td class="muted">${esc(e.detail || '')}</td>
+          <td class="row-actions">${
+            (e.kind === 'Domain' || e.kind === 'IP')
+              ? `<button type="button" class="rm" data-rm-allow="${esc(e.value || '')}" data-kind="${esc(e.kind || '')}">Remove</button>`
+              : '<span class="muted">built-in</span>'
+          }</td>
+        </tr>`).join('') || '<tr><td colspan="4" class="muted">No allowlist entries loaded.</td></tr>'
+      );
+
+      restoreScroll('tbl-firewall', fwScroll);
+      restoreScroll('tbl-allowlist', alScroll);
+      renderSettings();
+    }
+  }
+
+  function renderSettings() {
+    const s = state.settings || {};
+    const row = (label, desc, control) => `
+      <div class="setting-row">
+        <div class="info"><h4>${esc(label)}</h4><p>${esc(desc)}</p></div>
+        ${control}
+      </div>`;
+    const sw = (key, checked) =>
+      `<label class="switch"><input type="checkbox" data-setting="${key}" ${checked ? 'checked' : ''}/><span class="slider"></span></label>`;
+    const levelSel = `<select data-set-level>${['Medium', 'High', 'Critical']
+      .map(l => `<option ${s.autoBlockMinLevel === l ? 'selected' : ''}>${l}</option>`).join('')}</select>`;
+    const refreshSel = `<select data-set-refresh>${[['1000', '1 second'], ['2500', '2.5 seconds'], ['5000', '5 seconds'], ['10000', '10 seconds']]
+      .map(([v, l]) => `<option value="${v}" ${String(getRefreshMs()) === v ? 'selected' : ''}>${l}</option>`).join('')}</select>`;
+
+    $('settingsPanel').innerHTML = `
+      <div class="settings-group"><h3>Monitoring</h3>
+        ${row('Live monitoring', 'Watch connections, listening ports, and threats in real time.', sw('monitoring', s.isMonitoring))}
+        ${row('Page refresh speed', 'How often live tabs (Dashboard, Connections, Hosts…) update in this browser.', refreshSel)}
+        ${row('Geo lookups', 'Resolve country and city for remote IPs (uses ip-api.com over plain HTTP).', sw('geoLookupEnabled', s.geoLookupEnabled))}
+      </div>
+      <div class="settings-group"><h3>Auto-block</h3>
+        ${row('Auto-block threats', 'Automatically create firewall rules when threats are detected.', sw('autoBlockEnabled', s.autoBlockEnabled))}
+        ${row('Minimum severity', 'Only auto-block threats at or above this level.', levelSel)}
+        ${row('Block inbound', 'New block rules stop traffic coming in to this machine.', sw('blockInbound', s.blockInbound))}
+        ${row('Block outbound', 'New block rules stop traffic going out from this machine.', sw('blockOutbound', s.blockOutbound))}
+      </div>
+      <div class="settings-group"><h3>Allowlist</h3>
+        ${row('Remote allowlist feed', 'Refresh the known-good domain/IP list from the online feed.', sw('allowlistUseRemoteFeed', s.allowlistUseRemoteFeed))}
+      </div>
+      <div class="settings-group"><h3>Danger zone</h3>
+        ${row('Remove all firewall rules',
+             'Deletes every Network Sentinel block rule (the access rule for this console is kept) and stops auto-block from re-adding them for 24h.',
+             '<button type="button" class="rm-lg" data-remove-all>Remove all rules</button>')}
+      </div>`;
   }
 
   document.getElementById('nav').addEventListener('click', (e) => {
@@ -1522,9 +1974,26 @@ public sealed class WebApp : IDisposable
     document.querySelectorAll('main > section').forEach(sec => {
       sec.classList.toggle('hidden', sec.id !== 'tab-' + tab);
     });
+    // Freeze live poll on allowlist/firewall so lists stay readable.
+    if (isFrozenTab()) {
+      stopPolling();
+      refreshFrozenTab();
+    } else if (!pollTimer) {
+      startPolling();
+    }
   });
 
-  $('btnMonitor').onclick = () => apiAction('toggle_monitor');
+  $('btnMonitor').onclick = async () => {
+    await apiAction('toggle_monitor');
+    // Monitor Pause also stops background UI polling (user expectation).
+    if (state && state.settings && !state.settings.isMonitoring) {
+      stopPolling();
+      setStatus('Monitoring and live UI refresh paused. Open a tab or Resume to update.', false);
+      statusHoldUntil = Date.now() + 8000;
+    } else if (!isFrozenTab()) {
+      startPolling();
+    }
+  };
   $('btnAuto').onclick = () => apiAction('toggle_autoblock');
   $('btnLevel').onclick = () => apiAction('cycle_min_level');
   $('btnAuth').onclick = () => apiAction('authorize');
@@ -1552,8 +2021,58 @@ public sealed class WebApp : IDisposable
     const value = $('allowInput').value.trim();
     if (value) apiAction('add_allowlist', { value }).then(r => { if (r.ok) $('allowInput').value = ''; });
   };
-  $('btnRefreshAllow').onclick = () => apiAction('refresh_allowlist');
+  $('btnRefreshAllow').onclick = async () => {
+    await apiAction('refresh_allowlist');
+  };
+  $('btnRefreshFw').onclick = () => refreshFrozenTab();
   $('btnRestore').onclick = () => apiAction('restore_allowlisted');
+  $('btnFwBlockIp').onclick = () => {
+    const ip = $('fwIp').value.trim();
+    if (ip) apiAction('block', { ip }).then(r => { if (r.ok) $('fwIp').value = ''; });
+  };
+  $('btnFwBlockPort').onclick = () => {
+    const port = $('fwPort').value.trim();
+    if (!port) { setStatus('Enter a port number to block.', true); return; }
+    apiAction('block_port', { value: port, kind: $('fwProto').value })
+      .then(r => { if (r.ok) $('fwPort').value = ''; });
+  };
+  $('fwIp').addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') { e.preventDefault(); $('btnFwBlockIp').click(); }
+  });
+  $('fwPort').addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') { e.preventDefault(); $('btnFwBlockPort').click(); }
+  });
+
+  $('settingsPanel').addEventListener('change', (e) => {
+    const t = e.target;
+    if (t.matches('[data-setting]')) {
+      const key = t.dataset.setting;
+      if (key === 'monitoring') apiAction('toggle_monitor');
+      else apiAction('set_setting', { name: key, value: t.checked ? 'true' : 'false' });
+      return;
+    }
+    if (t.matches('[data-set-level]')) { apiAction('set_min_level', { value: t.value }); return; }
+    if (t.matches('[data-set-refresh]')) {
+      localStorage.setItem('ns-refresh', t.value);
+      setStatus('Page refresh speed set to ' + (parseInt(t.value, 10) / 1000) + 's.', false, true);
+      statusHoldUntil = Date.now() + 5000;
+      if (!isFrozenTab()) startPolling();
+    }
+  });
+  $('settingsPanel').addEventListener('click', (e) => {
+    const btn = e.target.closest('[data-remove-all]');
+    if (!btn) return;
+    if (confirm('Remove ALL Network Sentinel firewall rules?\n\nEvery IP and port block will be deleted (the web console access rule is kept). Auto-block will not re-add them for 24 hours.')) {
+      btn.disabled = true;
+      btn.textContent = 'Removing…';
+      apiAction('remove_all_rules').finally(() => {
+        if (btn.isConnected) { btn.disabled = false; btn.textContent = 'Remove all rules'; }
+      });
+    }
+  });
+  $('allowInput').addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') { e.preventDefault(); $('btnAddAllow').click(); }
+  });
 
   document.body.addEventListener('click', (e) => {
     const b = e.target.closest('[data-block]');
@@ -1561,11 +2080,42 @@ public sealed class WebApp : IDisposable
     const u = e.target.closest('[data-unblock]');
     if (u) { apiAction('unblock', { ip: u.dataset.unblock }); return; }
     const r = e.target.closest('[data-rm-allow]');
-    if (r) apiAction('remove_allowlist', { value: r.dataset.rmAllow, kind: r.dataset.kind });
+    if (r) {
+      apiAction('remove_allowlist', { value: r.dataset.rmAllow, kind: r.dataset.kind });
+      return;
+    }
+    const bp = e.target.closest('[data-block-port]');
+    if (bp) {
+      const port = bp.dataset.blockPort;
+      const proto = bp.dataset.proto || 'TCP';
+      if (confirm(`Block inbound ${proto} port ${port}?\n\nThis firewalls the local service listening on that port for everyone, including LAN clients.`))
+        apiAction('block_port', { value: port, kind: proto, direction: 'Inbound' });
+      return;
+    }
+    const fr = e.target.closest('[data-rm-rule]');
+    if (fr) {
+      // Prefer dataset (decoded) over getAttribute (may still contain entities).
+      const name = (fr.dataset.rmRule || fr.getAttribute('data-rm-rule') || '').trim();
+      if (!name) {
+        setStatus('Could not read rule name from the row.', true);
+        return;
+      }
+      const base = name.replace(/-(In|Out)$/i, '');
+      if (confirm('Remove this block (inbound + outbound)?\n\n' + base + '\n\n(Requires root or pkexec/sudo)')) {
+        fr.disabled = true;
+        fr.textContent = 'Removing…';
+        apiAction('remove_rule', { value: name, name: name }).finally(() => {
+          // Re-render usually replaced the button; restore it if the row survived (failure).
+          if (fr.isConnected) { fr.disabled = false; fr.textContent = 'Remove'; }
+        });
+      }
+    }
   });
 
   ['filterConn', 'filterHosts', 'filterThreats'].forEach(id => {
-    $(id).addEventListener('input', () => { if (state) render(); });
+    $(id).addEventListener('input', () => {
+      if (state && !isFrozenTab()) render({ forceLists: true });
+    });
   });
 
   $('authForm').addEventListener('submit', async (e) => {

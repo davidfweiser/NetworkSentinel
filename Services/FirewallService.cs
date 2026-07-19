@@ -157,33 +157,104 @@ public sealed class FirewallService
 
     public FirewallOperationResult RemoveRule(string ruleName)
     {
-        if (string.IsNullOrWhiteSpace(ruleName) || !ruleName.StartsWith(RulePrefix, StringComparison.OrdinalIgnoreCase))
-            return FirewallOperationResult.Fail("Only Network Sentinel managed rules can be removed here.");
+        try
+        {
+            if (string.IsNullOrWhiteSpace(ruleName) || !ruleName.StartsWith(RulePrefix, StringComparison.OrdinalIgnoreCase))
+                return FirewallOperationResult.Fail("Only Network Sentinel managed rules can be removed here.");
 
-        if (!IsAdministrator)
-            return FirewallOperationResult.Fail("No way to elevate (need pkexec or sudo) to modify the host firewall.");
+            if (!IsAdministrator)
+                return FirewallOperationResult.Fail("No way to elevate (need pkexec or sudo) to modify the host firewall.");
 
-        return RemoveRuleByName(ruleName);
+            var name = ruleName.Trim();
+
+            // Blocks are created as an -In/-Out pair. Removing only the clicked row left
+            // the sibling active, so the IP stayed blocked and remove "didn't work".
+            var siblings = new List<string> { name };
+            if (name.EndsWith("-In", StringComparison.OrdinalIgnoreCase))
+                siblings.Add(name[..^"-In".Length] + "-Out");
+            else if (name.EndsWith("-Out", StringComparison.OrdinalIgnoreCase))
+                siblings.Add(name[..^"-Out".Length] + "-In");
+
+            var removed = new List<string>();
+            string? firstError = null;
+            foreach (var sibling in siblings)
+            {
+                var r = RemoveRuleByName(sibling);
+                if (r.Success)
+                    removed.Add(sibling);
+                else if (sibling == name)
+                    firstError = r.Message;
+            }
+
+            if (removed.Count == 0)
+                return FirewallOperationResult.Fail(firstError ?? $"No rule named \"{name}\".");
+
+            return FirewallOperationResult.Ok(removed.Count > 1
+                ? $"Removed inbound + outbound rules ({removed[0]} and its pair)."
+                : $"Removed \"{removed[0]}\".");
+        }
+        catch (Exception ex)
+        {
+            // Never let firewall backend failures tear down the web host process.
+            return FirewallOperationResult.Fail($"Remove failed: {ex.Message}");
+        }
     }
 
-    public FirewallOperationResult RemoveAllManagedRules()
+    /// <param name="skip">Rules to leave in place (kept for API parity with the Windows build).</param>
+    public FirewallOperationResult RemoveAllManagedRules(Func<FirewallRuleInfo, bool>? skip = null)
     {
         if (!IsAdministrator)
             return FirewallOperationResult.Fail("No way to elevate (need pkexec or sudo) to modify the host firewall.");
 
         var rules = GetManagedRules().ToList();
         int removed = 0;
+        int kept = 0;
         foreach (var rule in rules)
         {
+            if (skip != null && skip(rule))
+            {
+                kept++;
+                continue;
+            }
             if (RemoveRuleByName(rule.Name).Success)
                 removed++;
         }
 
-        if (BackendIsNft())
-            RunPrivileged("nft", $"flush table {NftTable}");
+        if (kept == 0)
+        {
+            if (BackendIsNft())
+                RunPrivileged("nft", $"flush table {NftTable}");
+            SaveLedger(new List<FirewallRuleInfo>());
+        }
 
-        SaveLedger(new List<FirewallRuleInfo>());
-        return FirewallOperationResult.Ok($"Removed {removed} Network Sentinel firewall rule(s).");
+        var msg = $"Removed {removed} Network Sentinel firewall rule(s).";
+        if (kept > 0)
+            msg += $" Kept {kept}.";
+        return FirewallOperationResult.Ok(msg);
+    }
+
+    /// <summary>
+    /// Best-effort IP from a managed rule name or remote field (for auto-block suppress after Remove).
+    /// </summary>
+    public static bool TryExtractIpFromManagedRule(string? ruleName, string? remoteAddresses, out string ip)
+    {
+        ip = "";
+        if (!string.IsNullOrWhiteSpace(remoteAddresses) &&
+            TryNormalizeIp(remoteAddresses.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries).FirstOrDefault(), out ip, out _))
+            return true;
+
+        if (string.IsNullOrWhiteSpace(ruleName))
+            return false;
+
+        // NetworkSentinel-IP-1.2.3.4-In  or  NetworkSentinel-IP-2001_db8__1-Out
+        var m = Regex.Match(ruleName.Trim(),
+            @"^NetworkSentinel-IP-(.+)-(In|Out)$",
+            RegexOptions.IgnoreCase);
+        if (!m.Success)
+            return false;
+
+        var raw = m.Groups[1].Value.Replace('_', ':');
+        return TryNormalizeIp(raw, out ip, out _);
     }
 
     public FirewallOperationResult UnblockAllowlistedAddresses()
@@ -737,6 +808,23 @@ public sealed class FirewallRuleInfo
         FirewallRuleKind.PortBlock => "Port block",
         _ => "Rule"
     };
+    /// <summary>Best-effort IP target for display (falls back to parsing the rule name).</summary>
+    public string AddressText
+    {
+        get
+        {
+            if (!string.IsNullOrWhiteSpace(RemoteAddresses) && RemoteAddresses is not ("Any" or "*"))
+                return RemoteAddresses;
+            var ipMatch = Regex.Match(
+                Name,
+                @"^NetworkSentinel-IP-(.+)-(In|Out)$",
+                RegexOptions.IgnoreCase);
+            if (ipMatch.Success)
+                return ipMatch.Groups[1].Value.Replace('_', ':');
+            return "";
+        }
+    }
+
     public string TargetText => Kind == FirewallRuleKind.IpBlock
         ? (string.IsNullOrWhiteSpace(RemoteAddresses) ? "—" : RemoteAddresses)
         : $"{Protocol}/{LocalPorts}";
