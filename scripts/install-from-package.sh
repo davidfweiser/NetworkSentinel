@@ -337,7 +337,9 @@ EOF
 
   if [[ "$MODE" == "user" ]]; then
     systemctl --user daemon-reload
-    systemctl --user enable --now networksentinel-web.service
+    systemctl --user enable networksentinel-web.service
+    # restart (not enable --now): an already-running old version must be replaced
+    systemctl --user restart networksentinel-web.service
     echo
     echo "User web service started."
     echo "  systemctl --user status networksentinel-web"
@@ -352,7 +354,9 @@ EOF
     fi
   else
     systemctl daemon-reload
-    systemctl enable --now networksentinel-web.service
+    systemctl enable networksentinel-web.service
+    # restart (not enable --now): an already-running old version must be replaced
+    systemctl restart networksentinel-web.service
     echo
     echo "Web service started."
     echo "  systemctl status networksentinel-web"
@@ -362,6 +366,20 @@ EOF
 
 if [[ "$WEB_SERVICE" -eq 1 ]]; then
   install_web_service
+else
+  # Upgrade path without --web-service: a previously installed web service is
+  # still running the OLD binary from memory — restart it onto the new files.
+  if [[ "$MODE" == "user" ]]; then
+    if systemctl --user is-active networksentinel-web.service &>/dev/null; then
+      systemctl --user restart networksentinel-web.service || true
+      echo "Restarted running networksentinel-web (user) with the new version."
+    fi
+  else
+    if systemctl is-active networksentinel-web.service &>/dev/null; then
+      systemctl restart networksentinel-web.service || true
+      echo "Restarted running networksentinel-web with the new version."
+    fi
+  fi
 fi
 
 echo
