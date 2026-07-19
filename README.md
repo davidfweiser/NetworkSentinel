@@ -12,7 +12,7 @@ Three ways to run it:
 
 > Awareness / monitoring tooling — not a full IDS/IPS replacement.
 
-Linux port of the original Windows WPF Network Sentinel. Platform layers use `/proc/net`, `nftables`/`iptables` (elevated via **pkexec**), and XDG data paths. Version **0.2.0**.
+Linux port of the original Windows WPF Network Sentinel. Platform layers use `/proc/net`, `nftables`/`iptables` (elevated via **pkexec**), and XDG data paths. Version **0.3.1**.
 
 ---
 
@@ -41,7 +41,10 @@ Each alert includes **source IP**, **method**, and **where it’s coming from** 
 - **Block local ports** (TCP/UDP)
 - Dedicated **nftables** table `inet networksentinel` when `nft` is available; otherwise **iptables** with `NetworkSentinel-*` comments
 - Only manages rules owned by this app; other firewall rules are left alone
+- Block rules are created as an `-In`/`-Out` pair and **removed together** in one click
 - **Auto-block** on/off with minimum severity (`Medium` / `High` / `Critical`)
+- Removing/unblocking a rule **suppresses auto-block for that IP for 24 h** (persisted), so removed rules stay gone across restarts
+- The web console **refuses to block its own port** — that would cut off your browser mid-request and look like a crash
 - Settings in `~/.local/share/NetworkSentinel/settings.json` (or `$XDG_DATA_HOME/NetworkSentinel`)
 - **Authorize firewall** — elevates only `nft`/`iptables` via **pkexec** (password dialog). The GUI always runs as your user
 
@@ -55,6 +58,20 @@ Trusted sites are protected so auto-block (and manual block) will not cut off ev
 | **Remote feed** | Optional refresh from this repo’s `allowlist-default.json` on GitHub |
 
 Domains are DNS-resolved to current IPs. Auto-block never touches allowlisted IPs. **Restore good sites** removes Network Sentinel blocks that hit allowlisted addresses.
+
+### Web console tabs
+
+| Tab | What you can do |
+|-----|-----------------|
+| **Dashboard** | Live counters, monitoring/firewall status, recent threats |
+| **Connections / Threats** | Live traffic with a **Block** button on every row |
+| **Hosts** | Remote peers; block / unblock by row or by typed IP |
+| **Ports** | Local listeners; one-click **Block port** |
+| **Firewall** | Managed rules grouped as In/Out pairs; manual IP and port blocking; **Restore allowlisted** |
+| **Allowlist** | Add/remove trusted domains and IPs; refresh the feed |
+| **Settings** | Monitoring on/off, page refresh speed, geo lookups, auto-block + minimum severity, block direction (in/out), allowlist feed, **Remove all rules** |
+
+The page header shows the running version (e.g. `v0.3.1`) — check it after an upgrade to confirm the new build is live.
 
 ### Web UI security
 - First browser visit **creates a master password** (min. 8 characters)
@@ -105,17 +122,17 @@ Build on a machine with the .NET SDK; install on the server **without** .NET:
 
 ```bash
 # build machine
-scp dist/networksentinel-0.2.0-linux-x64.install.sh user@server:
+scp dist/networksentinel-0.3.1-linux-x64.install.sh user@server:
 
 # server
-chmod +x networksentinel-0.2.0-linux-x64.install.sh
-sudo ./networksentinel-0.2.0-linux-x64.install.sh --web-service
+chmod +x networksentinel-0.3.1-linux-x64.install.sh
+sudo ./networksentinel-0.3.1-linux-x64.install.sh --web-service
 ```
 
 Confirm the installer is current before using root:
 
 ```bash
-./networksentinel-0.2.0-linux-x64.install.sh --help
+./networksentinel-0.3.1-linux-x64.install.sh --help
 # Should list: --web-service
 ```
 
@@ -151,14 +168,14 @@ sudo ./….install.sh --web-service --port 18765
 ./….install.sh --user --web-service         # user systemd unit
 
 # classic tarball
-tar xzf networksentinel-0.2.0-linux-x64.tar.gz
-cd networksentinel-0.2.0-linux-x64
+tar xzf networksentinel-0.3.1-linux-x64.tar.gz
+cd networksentinel-0.3.1-linux-x64
 sudo ./install.sh --web-service
 ```
 
 ### Auto-start on boot (systemd)
 
-**Preferred:** install with `--web-service` (new package). That runs `systemctl enable --now networksentinel-web` for you.
+**Preferred:** install with `--web-service` (new package). That enables the unit and **(re)starts** it — re-running the installer upgrades in place and restarts the service so the new binary actually runs (older installers used `enable --now`, which silently left an already-running old version in memory).
 
 **If the app is already installed** (or the installer is too old and rejects `--web-service`), enable auto-start by hand:
 
@@ -442,8 +459,9 @@ Optional desktop entry is provided as `networksentinel.desktop` (`Icon=networkse
 
 - This is an **awareness console**, not a substitute for enterprise IDS, EDR, or carefully tuned host firewall policy.
 - Threat heuristics count **new inbound connections to ports this PC is listening on** — long-lived sessions and ordinary outbound client traffic are never treated as probing.
-- Public IP geolocation uses the free `ip-api.com` endpoint (rate-limited, best-effort, **plain HTTP**). Set `"GeoLookupEnabled": false` in settings to disable it; reverse DNS still runs.
-- Set `"AllowlistUseRemoteFeed": false` to skip the GitHub allowlist feed and use only built-in/local lists.
+- Public IP geolocation uses the free `ip-api.com` endpoint (rate-limited, best-effort, **plain HTTP**). Toggle it off in the web console's **Settings** tab, or set `"GeoLookupEnabled": false` in settings; reverse DNS still runs.
+- The allowlist remote feed can likewise be toggled in **Settings** or via `"AllowlistUseRemoteFeed": false`.
+- If the app ever exits unexpectedly, check `~/.local/share/NetworkSentinel/logs/crash.log` — unhandled errors are logged there with a stack trace.
 - Non-root runs still monitor connections for processes you can see; other users’ sockets may show as `Kernel / unknown`.
 - Existing TCP sessions may remain until they reconnect after a block; new matching traffic is stopped by the firewall.
 - The web UI binds all interfaces when started with `-w`; protect it with the master password and host firewall if exposed.
