@@ -173,13 +173,20 @@ public sealed class WebApp : IDisposable
                 {
                     break;
                 }
-                catch (HttpListenerException) when (_cts.IsCancellationRequested)
-                {
-                    break;
-                }
                 catch (ObjectDisposedException)
                 {
                     break;
+                }
+                catch (Exception ex)
+                {
+                    // A reset/aborted connection can surface here as HttpListenerException.
+                    // That must never end the accept loop — Program.RunWeb treats an escape
+                    // as fatal and exits the whole server process.
+                    if (_cts.IsCancellationRequested)
+                        break;
+                    Console.Error.WriteLine($"Accept error (continuing): {ex.Message}");
+                    await Task.Delay(100, CancellationToken.None);
+                    continue;
                 }
 
                 // Handle each request without blocking the accept loop for long polls.
@@ -629,6 +636,11 @@ public sealed class WebApp : IDisposable
                     var name = System.Net.WebUtility.HtmlDecode((req.Value ?? req.Name ?? "").Trim());
                     if (string.IsNullOrEmpty(name))
                         return ActionResultDto.Fail("Rule name required.");
+                    if (IsOwnWebRule(name))
+                        return ActionResultDto.Fail(
+                            $"\"{name}\" is the allow rule that lets your browser reach this console — " +
+                            "removing it from here would instantly cut off this page (it looks like a crash). " +
+                            "To remove web access, use the desktop app or run uninstall-web-service.ps1 on the server.");
                     if (!_firewall.IsAdministrator)
                         return ActionResultDto.Fail("Cannot remove rules — run Network Sentinel elevated (Admin / service as SYSTEM).");
 
@@ -757,6 +769,7 @@ public sealed class WebApp : IDisposable
             firewallRules = _firewall.GetManagedRules().Select(r => new
             {
                 name = r.Name,
+                isProtected = IsOwnWebRule(r.Name),
                 kind = r.KindText,
                 // Explicit address field so the UI always has an IP column even if target is a port.
                 address = string.IsNullOrWhiteSpace(r.AddressText) ? r.TargetText : r.AddressText,
@@ -783,6 +796,13 @@ public sealed class WebApp : IDisposable
             })
         };
     }
+
+    /// <summary>
+    /// The inbound allow rule for THIS console's port. Removing it over the web kills the
+    /// user's own browser connection mid-request — indistinguishable from a server crash.
+    /// </summary>
+    private bool IsOwnWebRule(string name)
+        => string.Equals(name, $"{FirewallService.RulePrefix}-Web-{_port}", StringComparison.OrdinalIgnoreCase);
 
     private FirewallDirection ResolveDirection()
     {
@@ -1125,6 +1145,7 @@ public sealed class WebApp : IDisposable
     color: var(--text2); font-size: .88rem;
   }
   .status.err { border-color: rgba(255,77,109,.45); color: #ffb0bd; }
+  .status.good { border-color: rgba(61,220,151,.4); color: #9fe8c8; }
   .cards {
     display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
     gap: 10px; margin-bottom: 16px;
@@ -1159,8 +1180,22 @@ public sealed class WebApp : IDisposable
     text-transform: uppercase; letter-spacing: .05em; background: #0c1426;
     position: sticky; top: 0;
   }
+  tbody tr:nth-child(even) td { background: rgba(255,255,255,.02); }
   tr:hover td { background: rgba(24,36,63,.55); }
   tr:last-child td { border-bottom: none; }
+  [data-scroll] { scrollbar-width: thin; scrollbar-color: rgba(124,249,255,.25) transparent; }
+  [data-scroll]::-webkit-scrollbar { width: 9px; height: 9px; }
+  [data-scroll]::-webkit-scrollbar-thumb { background: rgba(124,249,255,.2); border-radius: 6px; }
+  [data-scroll]::-webkit-scrollbar-thumb:hover { background: rgba(124,249,255,.35); }
+  [data-scroll]::-webkit-scrollbar-track { background: transparent; }
+  .chip {
+    display: inline-block; padding: 1px 8px; border-radius: 999px; margin-right: 4px;
+    font-size: .72rem; font-weight: 600;
+    background: rgba(76,141,255,.16); color: #9ec0ff; border: 1px solid rgba(76,141,255,.25);
+  }
+  .row-actions button.rm { border-color: rgba(255,77,109,.4); color: #ffb0bd; }
+  .row-actions button.rm:hover { background: rgba(255,77,109,.12); border-color: rgba(255,77,109,.65); color: #ffd3db; }
+  .row-actions button:disabled { opacity: .55; cursor: wait; }
   .mono { font-family: var(--mono); font-size: .8rem; }
   .badge {
     display: inline-block; padding: 2px 8px; border-radius: 999px;
@@ -1347,7 +1382,7 @@ public sealed class WebApp : IDisposable
       <button id="btnRestore">Restore allowlisted</button>
       <button id="btnRefreshFw">Refresh list</button>
     </div>
-    <p class="muted" id="fwHint" style="margin:0 0 10px;font-size:.85rem">Live UI refresh is off on this tab so you can scroll and remove rules. Click Refresh list to update. Requires Administrator to remove.</p>
+    <p class="muted" id="fwHint" style="margin:0 0 10px;font-size:.85rem">Each row is one block — Remove deletes its inbound and outbound rules together and keeps auto-block from re-adding it for 24h. Live refresh is off on this tab; click Refresh list to update. Requires Administrator.</p>
     <div id="tbl-firewall"></div>
   </section>
 
@@ -1393,10 +1428,11 @@ public sealed class WebApp : IDisposable
     { '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;' }[c]
   ));
 
-  function setStatus(msg, err) {
+  function setStatus(msg, err, good) {
     const el = $('status');
     el.textContent = msg || '';
     el.classList.toggle('err', !!err);
+    el.classList.toggle('good', !err && !!good);
   }
 
   function showAuth(mode, message) {
@@ -1509,7 +1545,7 @@ public sealed class WebApp : IDisposable
     const data = await res.json().catch(() => ({ ok: false, message: 'Bad response' }));
     if (data.message) {
       statusHoldUntil = Date.now() + 12000;
-      setStatus(data.message, !data.ok);
+      setStatus(data.message, !data.ok, data.ok);
     }
     // Always pull once after an action so Add/Remove show up even on frozen tabs.
     try {
@@ -1680,21 +1716,34 @@ public sealed class WebApp : IDisposable
       const fwScroll = saveScroll('tbl-firewall');
       const alScroll = saveScroll('tbl-allowlist');
 
+      // One row per block: -In/-Out siblings are grouped, and Remove deletes the pair.
       const rules = state.firewallRules || [];
+      const groups = new Map();
+      rules.forEach((r, i) => {
+        const m = /^(.*)-(In|Out)$/i.exec(r.name || '');
+        const key = m ? m[1] : (r.name || 'rule-' + i);
+        if (!groups.has(key)) groups.set(key, []);
+        groups.get(key).push(r);
+      });
       $('tbl-firewall').innerHTML = table(
-        ['Address / target', 'Kind', 'Dir', 'Proto', 'Action', 'Enabled', 'Rule name', ''],
-        rules.map(r => {
+        ['Address / target', 'Kind', 'Directions', 'Proto', 'Action', 'Enabled', 'Rule', ''],
+        [...groups.values()].map(pair => {
+          const r = pair[0];
           const addr = r.address || r.target || '';
-          const name = r.name || '';
+          const dirs = pair.map(x => `<span class="chip">${esc(x.direction || '?')}</span>`).join('');
+          const baseName = (r.name || '').replace(/-(In|Out)$/i, '');
+          const action = pair.some(x => x.isProtected)
+            ? `<span class="chip" title="This rule lets your browser reach this console. Removing it would cut off this page. Use the desktop app or uninstall-web-service.ps1 instead.">this console</span>`
+            : `<button type="button" class="rm" data-rm-rule="${esc(r.name || '')}">Remove</button>`;
           return `<tr>
             <td class="mono"><strong>${esc(addr)}</strong></td>
             <td>${esc(r.kind || '')}</td>
-            <td>${esc(r.direction || '')}</td>
+            <td>${dirs}</td>
             <td>${esc(r.protocol || '')}</td>
             <td>${esc(r.action || '')}</td>
-            <td>${r.enabled ? 'On' : 'Off'}</td>
-            <td class="mono muted" style="font-size:.8rem">${esc(name)}</td>
-            <td class="row-actions"><button type="button" data-rm-rule="${esc(name)}">Remove</button></td>
+            <td>${pair.some(x => x.enabled) ? 'On' : 'Off'}</td>
+            <td class="mono muted" style="font-size:.8rem">${esc(baseName)}</td>
+            <td class="row-actions">${action}</td>
           </tr>`;
         }).join('') || '<tr><td colspan="8" class="muted">No managed IP/port rules yet.</td></tr>'
       );
@@ -1712,7 +1761,7 @@ public sealed class WebApp : IDisposable
           <td class="muted">${esc(e.detail || '')}</td>
           <td class="row-actions">${
             (e.kind === 'Domain' || e.kind === 'IP')
-              ? `<button type="button" data-rm-allow="${esc(e.value || '')}" data-kind="${esc(e.kind || '')}">Remove</button>`
+              ? `<button type="button" class="rm" data-rm-allow="${esc(e.value || '')}" data-kind="${esc(e.kind || '')}">Remove</button>`
               : '<span class="muted">built-in</span>'
           }</td>
         </tr>`).join('') || '<tr><td colspan="4" class="muted">No allowlist entries loaded.</td></tr>'
@@ -1805,8 +1854,15 @@ public sealed class WebApp : IDisposable
         setStatus('Could not read rule name from the row.', true);
         return;
       }
-      if (confirm('Remove firewall rule?\n\n' + name + '\n\n(Requires Administrator)'))
-        apiAction('remove_rule', { value: name, name: name });
+      const base = name.replace(/-(In|Out)$/i, '');
+      if (confirm('Remove this block (inbound + outbound)?\n\n' + base + '\n\n(Requires Administrator)')) {
+        fr.disabled = true;
+        fr.textContent = 'Removing…';
+        apiAction('remove_rule', { value: name, name: name }).finally(() => {
+          // Re-render usually replaced the button; restore it if the row survived (failure).
+          if (fr.isConnected) { fr.disabled = false; fr.textContent = 'Remove'; }
+        });
+      }
     }
   });
 

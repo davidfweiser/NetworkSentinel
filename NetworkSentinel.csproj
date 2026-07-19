@@ -13,7 +13,7 @@
     <RootNamespace>NetworkSentinel</RootNamespace>
     <Product>Network Sentinel</Product>
     <Description>Native Windows network port monitor with GUI, TUI, and headless web UI</Description>
-    <Version>0.2.0</Version>
+    <Version>0.2.2</Version>
     <Company>Network Sentinel</Company>
   </PropertyGroup>
 

@@ -19,6 +19,19 @@ public sealed class FirewallService
     /// <summary>Optional allowlist — when set, known-good IPs cannot be blocked.</summary>
     public AllowlistService? Allowlist { get; set; }
 
+    // Cached managed-rule list. Enumerating rules means spawning netsh and parsing the
+    // full system rule dump — seconds on a busy server. The web UI polls state every
+    // couple of seconds; without a cache those netsh processes pile up until the host
+    // stops responding. Single-flight: only one dump runs at a time, callers get the
+    // last known list meanwhile.
+    private static readonly TimeSpan RuleCacheTtl = TimeSpan.FromSeconds(10);
+    private readonly object _ruleCacheGate = new();
+    private readonly object _ruleLoadLock = new();
+    private IReadOnlyList<FirewallRuleInfo> _ruleCache = Array.Empty<FirewallRuleInfo>();
+    private DateTime _ruleCacheAt = DateTime.MinValue;
+    private bool _ruleRefreshInFlight;
+    private int _ruleCacheGeneration;
+
     public bool IsAdministrator
     {
         get
@@ -96,6 +109,7 @@ public sealed class FirewallService
             results.Add(r.Message);
         }
 
+        InvalidateRuleCache();
         return ok
             ? FirewallOperationResult.Ok($"Blocked {normalized} ({direction}). " + string.Join(" ", results))
             : FirewallOperationResult.Fail(string.Join(" ", results));
@@ -113,6 +127,7 @@ public sealed class FirewallService
         var outName = IpRuleName(normalized, false);
         var r1 = RemoveRuleByName(inName);
         var r2 = RemoveRuleByName(outName);
+        InvalidateRuleCache();
 
         if (!r1.Success && !r2.Success)
             return FirewallOperationResult.Fail($"No Network Sentinel block rules found for {normalized}.");
@@ -150,6 +165,7 @@ public sealed class FirewallService
             results.Add(r.Message);
         }
 
+        InvalidateRuleCache();
         return ok
             ? FirewallOperationResult.Ok($"Port {protocol}/{port} blocked ({direction}). " + string.Join(" ", results))
             : FirewallOperationResult.Fail(string.Join(" ", results));
@@ -163,6 +179,7 @@ public sealed class FirewallService
 
         var r1 = RemoveRuleByName(PortRuleName(port, protocol, true));
         var r2 = RemoveRuleByName(PortRuleName(port, protocol, false));
+        InvalidateRuleCache();
         if (!r1.Success && !r2.Success)
             return FirewallOperationResult.Fail($"No managed port rules for {protocol}/{port}.");
 
@@ -179,7 +196,35 @@ public sealed class FirewallService
             if (!IsAdministrator)
                 return FirewallOperationResult.Fail("Administrator rights are required to modify the Windows Firewall.");
 
-            return RemoveRuleByName(ruleName.Trim());
+            var name = ruleName.Trim();
+
+            // Blocks are created as an -In/-Out pair. Removing only the clicked row left
+            // the sibling active, so the IP stayed blocked and remove "didn't work".
+            var siblings = new List<string> { name };
+            if (name.EndsWith("-In", StringComparison.OrdinalIgnoreCase))
+                siblings.Add(name[..^"-In".Length] + "-Out");
+            else if (name.EndsWith("-Out", StringComparison.OrdinalIgnoreCase))
+                siblings.Add(name[..^"-Out".Length] + "-In");
+
+            var removed = new List<string>();
+            string? firstError = null;
+            foreach (var sibling in siblings)
+            {
+                var r = RemoveRuleByName(sibling);
+                if (r.Success)
+                    removed.Add(sibling);
+                else if (sibling == name)
+                    firstError = r.Message;
+            }
+
+            InvalidateRuleCache();
+
+            if (removed.Count == 0)
+                return FirewallOperationResult.Fail(firstError ?? $"No rule named \"{name}\".");
+
+            return FirewallOperationResult.Ok(removed.Count > 1
+                ? $"Removed inbound + outbound rules ({removed[0]} and its pair)."
+                : $"Removed \"{removed[0]}\".");
         }
         catch (Exception ex)
         {
@@ -201,6 +246,7 @@ public sealed class FirewallService
                 removed++;
         }
 
+        InvalidateRuleCache();
         return FirewallOperationResult.Ok($"Removed {removed} Network Sentinel firewall rule(s).");
     }
 
@@ -233,6 +279,7 @@ public sealed class FirewallService
             }
         }
 
+        InvalidateRuleCache();
         if (removed == 0)
             return FirewallOperationResult.Ok("No allowlisted IPs were blocked by Network Sentinel rules.");
 
@@ -247,13 +294,80 @@ public sealed class FirewallService
         // - COM is not MTA-safe (HttpListener handlers run on thread-pool MTA)
         // - AccessViolation from COM kills the entire process (looks like a "crash on Remove")
         // - Falling back to COM when the list is empty was the remove-after-delete crash path
-        try
+        bool startBackgroundRefresh = false;
+        lock (_ruleCacheGate)
         {
-            return GetManagedRulesNetsh();
+            var haveData = _ruleCacheAt != DateTime.MinValue;
+            var fresh = haveData && DateTime.UtcNow - _ruleCacheAt < RuleCacheTtl;
+            if (fresh || (haveData && _ruleRefreshInFlight))
+                return _ruleCache;
+
+            if (haveData)
+            {
+                // Stale but usable: serve it now, refresh off the request path.
+                _ruleRefreshInFlight = true;
+                startBackgroundRefresh = true;
+            }
         }
-        catch
+
+        if (startBackgroundRefresh)
         {
-            return Array.Empty<FirewallRuleInfo>();
+            var snapshot = _ruleCache;
+            _ = Task.Run(() =>
+            {
+                try { LoadRulesBlocking(); }
+                finally { lock (_ruleCacheGate) _ruleRefreshInFlight = false; }
+            });
+            return snapshot;
+        }
+
+        // No data yet (first call, or cache invalidated after a mutation): load now so
+        // the caller sees the post-change rule list.
+        return LoadRulesBlocking();
+    }
+
+    /// <summary>Force the next GetManagedRules to re-enumerate (call after add/remove).</summary>
+    public void InvalidateRuleCache()
+    {
+        lock (_ruleCacheGate)
+        {
+            _ruleCacheAt = DateTime.MinValue;
+            _ruleCacheGeneration++;
+        }
+    }
+
+    private IReadOnlyList<FirewallRuleInfo> LoadRulesBlocking()
+    {
+        // One netsh dump at a time — a stampede of these is what made the web UI hang.
+        lock (_ruleLoadLock)
+        {
+            int generation;
+            lock (_ruleCacheGate)
+            {
+                if (_ruleCacheAt != DateTime.MinValue && DateTime.UtcNow - _ruleCacheAt < RuleCacheTtl)
+                    return _ruleCache;
+                generation = _ruleCacheGeneration;
+            }
+
+            try
+            {
+                var list = GetManagedRulesNetsh();
+                lock (_ruleCacheGate)
+                {
+                    // A rule was added/removed while this dump ran — don't publish stale
+                    // data (a just-removed rule would reappear in the UI for one TTL).
+                    if (generation == _ruleCacheGeneration)
+                    {
+                        _ruleCache = list;
+                        _ruleCacheAt = DateTime.UtcNow;
+                    }
+                }
+                return list;
+            }
+            catch
+            {
+                return _ruleCache;
+            }
         }
     }
 
@@ -389,7 +503,9 @@ public sealed class FirewallService
     private static List<FirewallRuleInfo> GetManagedRulesNetsh()
     {
         var list = new List<FirewallRuleInfo>();
-        var result = RunNetsh("advfirewall firewall show rule name=all verbose");
+        // Non-verbose still includes every field we parse (name, enabled, direction,
+        // remote IP, local port, protocol, action) at a fraction of the output size.
+        var result = RunNetsh("advfirewall firewall show rule name=all");
         if (!result.Success && string.IsNullOrWhiteSpace(result.Message))
             return list;
 

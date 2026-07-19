@@ -26,6 +26,15 @@ internal static class Program
     [STAThread]
     public static void Main(string[] args)
     {
+        // Any fatal error must leave evidence: %ProgramData%\NetworkSentinel\logs\crash.log
+        AppDomain.CurrentDomain.UnhandledException += (_, e) =>
+            LogCrash("unhandled", e.ExceptionObject as Exception);
+        TaskScheduler.UnobservedTaskException += (_, e) =>
+        {
+            LogCrash("unobserved-task", e.Exception);
+            e.SetObserved();
+        };
+
         if (WantsHelp(args))
         {
             EnsureConsole();
@@ -53,6 +62,22 @@ internal static class Program
         app.Run();
     }
 
+    private static void LogCrash(string kind, Exception? ex)
+    {
+        try
+        {
+            var dir = Path.Combine(Services.AppPaths.DataDirectory, "logs");
+            Directory.CreateDirectory(dir);
+            File.AppendAllText(
+                Path.Combine(dir, "crash.log"),
+                $"[{DateTime.Now:yyyy-MM-dd HH:mm:ss}] {kind}:{Environment.NewLine}{ex}{Environment.NewLine}{Environment.NewLine}");
+        }
+        catch
+        {
+            // never let crash logging crash
+        }
+    }
+
     private static void RunTui()
     {
         try
@@ -77,6 +102,7 @@ internal static class Program
         }
         catch (Exception ex)
         {
+            LogCrash("web-host", ex);
             Console.Error.WriteLine("Network Sentinel web UI failed:");
             Console.Error.WriteLine(ex.Message);
             if (ex.InnerException != null)
