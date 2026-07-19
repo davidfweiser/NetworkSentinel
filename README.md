@@ -93,28 +93,53 @@ dotnet run -c Release -- -w 18765
 
 Environment variables: `NETWORKSENTINEL_TUI=1`, `NETWORKSENTINEL_WEB=1`.
 
-### Server web service (startup task)
+### Server package (no compile on the server)
 
-Elevated PowerShell from the repo:
+Build the zip **on a dev PC** that has the .NET 8 SDK:
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File .\scripts\install-web-service.ps1
-# optional port:
-powershell -ExecutionPolicy Bypass -File .\scripts\install-web-service.ps1 -Port 18765
+git checkout windows
+powershell -ExecutionPolicy Bypass -File .\scripts\package-server.ps1
 ```
 
-This publishes the app to `%ProgramData%\NetworkSentinel\`, opens the firewall port, reserves a URL ACL, and registers a **Scheduled Task** (`NetworkSentinel-Web`) that runs elevated at startup:
+Output:
+
+```text
+dist\NetworkSentinel-windows-server-x64-<version>.zip
+```
+
+Self-contained by default — the server does **not** need the .NET SDK or a compiler (runtime is inside the zip).
+
+**On the server (Administrator PowerShell):**
+
+```powershell
+# 1) Copy the zip, unzip it
+# 2) From the unzipped folder:
+powershell -ExecutionPolicy Bypass -File .\install-from-package.ps1
+# optional port:
+powershell -ExecutionPolicy Bypass -File .\install-from-package.ps1 -Port 18765
+```
+
+That copies files to `%ProgramData%\NetworkSentinel\`, opens the firewall port, reserves a URL ACL, and registers **Scheduled Task** `NetworkSentinel-Web` at startup:
 
 ```text
 NetworkSentinel.exe -w 18765
 ```
 
-Then open `http://localhost:18765/` (or `http://<server-ip>:18765/`). **First browser visit creates a master password.**
+Open `http://localhost:18765/` (or `http://<server-ip>:18765/`). **First browser visit creates a master password.**
 
-Uninstall:
+Uninstall (Admin):
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File .\scripts\uninstall-web-service.ps1
+powershell -ExecutionPolicy Bypass -File .\uninstall-web-service.ps1
+```
+
+### Server install from source (dev machine only)
+
+If the machine **can** compile:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\install-web-service.ps1
 ```
 
 ### Install (Start Menu + Desktop shortcut)

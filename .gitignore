@@ -53,3 +53,7 @@ TestResults/
 ## Screenshots (local only)
 Screenshot*.png
 screenshot*.png
+
+## Packaged installers
+dist/
+
