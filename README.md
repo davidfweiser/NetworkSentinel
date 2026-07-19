@@ -10,7 +10,7 @@ Three ways to run it (same idea as the Linux build):
 | **Terminal UI (`--tui`)** | Server Core, RDP console, SSH-style workflows |
 | **Headless web UI (`-w`)** | Browser dashboard on a server (master-password protected) |
 
-> Awareness / monitoring tooling — not a full IDS/IPS replacement. Version **0.2.0**.
+> Awareness / monitoring tooling — not a full IDS/IPS replacement. Version **0.3.1**.
 
 ---
 
@@ -35,11 +35,13 @@ Heuristics flag patterns such as:
 Each alert includes **source IP**, **method**, and **where it’s coming from** (DNS + best-effort geo).
 
 ### Firewall & block
-- **Block / unblock** remote IPs (inbound, outbound, or both)
+- **Block / unblock** remote IPs (inbound, outbound, or both) — rules are created as an `-In`/`-Out` pair and removed together
 - **Block local ports** (TCP/UDP)
 - Only manages rules named `NetworkSentinel-*` so other firewall rules are left alone
+- All firewall changes go through **`netsh` in a separate process** (never firewall COM — COM from web/thread-pool threads can crash the host)
 - **Auto-block** on/off with minimum severity (`Medium` / `High` / `Critical`)
-- Settings stored in `%LocalAppData%\NetworkSentinel\settings.json`
+- Removing/unblocking a rule **suppresses auto-block for that IP for 24 h** (persisted), so removed rules stay gone across restarts
+- Settings stored machine-wide in `%ProgramData%\NetworkSentinel\settings.json` — shared by the GUI, TUI, and the web service (which runs as SYSTEM); falls back to `%LocalAppData%` if ProgramData is not writable
 - **Run as Admin** when elevation is required
 
 ### Known-good allowlist (never block)
@@ -48,7 +50,7 @@ Trusted sites are protected so auto-block (and manual block) will not cut off ev
 | Source | Location |
 |--------|----------|
 | **Built-in defaults** | `Data/allowlist-default.json` (GitHub, xAI/Grok, Microsoft, Google, Cloudflare DNS, NuGet, …) |
-| **Your additions** | `%LocalAppData%\NetworkSentinel\allowlist.json` |
+| **Your additions** | `%ProgramData%\NetworkSentinel\allowlist.json` |
 | **Remote feed** | Optional refresh from this repo’s `allowlist-default.json` on GitHub |
 
 Domains are **DNS-resolved** to current IPs (cloud addresses change often); if a DNS pass fails, the previously resolved IPs are kept so an outage never strips protection. `cidrs` entries (e.g. `"140.82.112.0/20"`) in any allowlist file protect whole address ranges. On startup, **Restore good sites** removes any Network Sentinel blocks that hit allowlisted IPs (recovery if GitHub/Grok were blocked earlier).
@@ -128,6 +130,22 @@ NetworkSentinel.exe -w 18765
 
 Open `http://localhost:18765/` (or `http://<server-ip>:18765/`). **First browser visit creates a master password.**
 
+Re-running the installer **upgrades in place**: it stops the running task, replaces the files, and restarts. The web page header shows the running version (e.g. `v0.3.1`) — check it after an upgrade to confirm the new build is live.
+
+#### Web console tabs
+
+| Tab | What you can do |
+|-----|-----------------|
+| **Dashboard** | Live counters, monitoring/firewall status, recent threats |
+| **Connections / Threats** | Live traffic with a **Block** button on every row |
+| **Hosts** | Remote peers; block / unblock by row or by typed IP |
+| **Ports** | Local listeners; one-click **Block port** |
+| **Firewall** | Managed rules grouped as In/Out pairs; manual IP and port blocking; **Restore allowlisted** |
+| **Allowlist** | Add/remove trusted domains and IPs; refresh the feed |
+| **Settings** | Monitoring on/off, page refresh speed, geo lookups, auto-block + minimum severity, block direction (in/out), allowlist feed, **Remove all rules** |
+
+The console protects itself: it refuses to remove its own firewall access rule or block its own port (doing so would cut off your browser mid-request and look exactly like a crash).
+
 Uninstall (Admin):
 
 ```powershell
@@ -173,7 +191,7 @@ Uninstall shortcuts + install folder:
 powershell -ExecutionPolicy Bypass -File .\scripts\uninstall.ps1
 ```
 
-Settings remain in `%LocalAppData%\NetworkSentinel\` until you delete that folder yourself.
+Settings remain in `%ProgramData%\NetworkSentinel\` until you delete that folder yourself.
 
 ### Release build
 
@@ -198,7 +216,7 @@ The app starts **without** forcing UAC (so TUI/web work on servers). Desktop ins
 ### Web UI security
 - First browser visit **creates a master password** (min. 8 characters)
 - Later visits require that password
-- Hash stored as PBKDF2-SHA256 in `%LocalAppData%\NetworkSentinel\web-master.json`
+- Hash stored as PBKDF2-SHA256 in `%ProgramData%\NetworkSentinel\web-master.json`
 - Session cookie until sign-out, browser close, or 12 hours idle
 
 ---
@@ -239,7 +257,7 @@ The app starts **without** forcing UAC (so TUI/web work on servers). Desktop ins
                     ┌─────────────────────────────┼─────────────────────────────┐
                     ▼                             ▼                             ▼
            Geo / DNS lookup              WPF dashboard UI              FirewallService
-           (origin details)              (MVVM + charts)               (COM / netsh)
+           (origin details)              (MVVM + charts)               (netsh, cached)
 ```
 
 ---
@@ -252,9 +270,12 @@ The app starts **without** forcing UAC (so TUI/web work on servers). Desktop ins
 | `Services/NetworkMonitorService.cs` | Polling loop, host tracking, stats |
 | `Services/IntrusionDetector.cs` | Heuristic threat engine |
 | `Services/GeoIpService.cs` | Reverse DNS + public geo lookup |
-| `Services/FirewallService.cs` | Windows Firewall rule create/list/remove |
-| `Services/AppSettings.cs` | Auto-block preferences (JSON on disk) |
+| `Services/FirewallService.cs` | Windows Firewall rule create/list/remove (netsh, cached rule list) |
+| `Services/AppSettings.cs` | Auto-block preferences + suppress list (JSON on disk) |
 | `ViewModels/MainViewModel.cs` | UI state, commands, auto-block wiring |
+| `Web/WebApp.cs` | Headless web console (HTTP server + embedded single-page UI) |
+| `Web/WebAuthStore.cs` | Master password hash + session tokens |
+| `Tui/TuiApp.cs` | Terminal UI (Spectre.Console) |
 | `MainWindow.xaml` | Dashboard UI |
 | `Themes/` | Colors and control styles |
 | `Controls/Sparkline.cs` | Live activity chart |
@@ -265,8 +286,9 @@ The app starts **without** forcing UAC (so TUI/web work on servers). Desktop ins
 
 - This is an **awareness console**, not a substitute for enterprise IDS, EDR, or carefully tuned host firewall policy.
 - Threat heuristics count **new inbound connections to ports this PC is listening on** — long-lived sessions and ordinary outbound client traffic are never treated as probing.
-- Public IP geolocation uses the free `ip-api.com` endpoint (rate-limited, best-effort, **plain HTTP** — remote IPs you talk to are visible on the wire). Set `"GeoLookupEnabled": false` in `%LocalAppData%\NetworkSentinel\settings.json` to disable it; reverse DNS still runs. LAN/private addresses are labeled as local.
-- Set `"AllowlistUseRemoteFeed": false` in the same file to skip the GitHub allowlist feed and use only built-in/local lists.
+- Public IP geolocation uses the free `ip-api.com` endpoint (rate-limited, best-effort, **plain HTTP** — remote IPs you talk to are visible on the wire). Toggle it off in the web console's **Settings** tab, or set `"GeoLookupEnabled": false` in `%ProgramData%\NetworkSentinel\settings.json`; reverse DNS still runs. LAN/private addresses are labeled as local.
+- The allowlist remote feed can likewise be toggled in **Settings** or via `"AllowlistUseRemoteFeed": false` in the same file.
+- If the app ever exits unexpectedly, check `%ProgramData%\NetworkSentinel\logs\crash.log` — unhandled errors are logged there with a stack trace.
 - Some system sockets may show as `System` or `PID n` depending on permissions.
 - Existing TCP sessions may remain until they reconnect after a block; new matching traffic is stopped by the firewall.
 - For host hardening, also review Windows Security event **4625** (failed logons) and enable Firewall logging when needed.
