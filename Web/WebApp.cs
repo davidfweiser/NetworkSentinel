@@ -1233,7 +1233,7 @@ public sealed class WebApp : IDisposable
     border: none;
   }
   .actions button.danger { border-color: rgba(255,77,109,.4); color: #ffb0bd; }
-  main { padding: 18px 22px 40px; max-width: 1400px; margin: 0 auto; }
+  main { padding: 18px 22px 40px; max-width: 1720px; margin: 0 auto; }
   .status {
     margin-bottom: 14px; padding: 10px 14px; border-radius: 10px;
     background: var(--bg-panel); border: 1px solid var(--stroke);
@@ -1283,6 +1283,18 @@ public sealed class WebApp : IDisposable
   [data-scroll]::-webkit-scrollbar-thumb { background: rgba(124,249,255,.2); border-radius: 6px; }
   [data-scroll]::-webkit-scrollbar-thumb:hover { background: rgba(124,249,255,.35); }
   [data-scroll]::-webkit-scrollbar-track { background: transparent; }
+  /* Keep the actions column visible when wide tables scroll horizontally. */
+  td.row-actions {
+    position: sticky; right: 0; background: var(--bg-panel);
+    white-space: nowrap; box-shadow: -10px 0 12px -10px rgba(0,0,0,.7);
+  }
+  table:has(td.row-actions) th:last-child {
+    position: sticky; right: 0; z-index: 2;
+    box-shadow: -10px 0 12px -10px rgba(0,0,0,.7);
+  }
+  tbody tr:nth-child(even) td.row-actions { background: #101a2f; }
+  tr:hover td.row-actions { background: var(--bg-hover); }
+  td.mono { overflow-wrap: anywhere; }
   .chip {
     display: inline-block; padding: 1px 8px; border-radius: 999px; margin-right: 4px;
     font-size: .72rem; font-weight: 600;
