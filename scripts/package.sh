@@ -64,6 +64,12 @@ if [[ -f "$ROOT/networksentinel.desktop" ]]; then
   cp "$ROOT/networksentinel.desktop" "$STAGE/"
 fi
 
+# Normalize line endings — a Windows checkout ships CRLF, which breaks
+# shebangs ("/usr/bin/env: bash\r") and systemd unit parsing on the server.
+find "$STAGE" -maxdepth 2 -type f \
+  \( -name '*.sh' -o -name '*.service' -o -name '*.desktop' -o -name '*.env.example' -o -name 'README-INSTALL.txt' \) \
+  -exec sed -i 's/\r$//' {} +
+
 # Short README for operators
 cat > "$STAGE/README-INSTALL.txt" <<EOF
 Network Sentinel ${VERSION} (${RID})

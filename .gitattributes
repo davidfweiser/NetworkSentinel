@@ -1,0 +1,6 @@
+# Shell scripts and Linux config files must keep LF endings even when the
+# repo is checked out on Windows — CRLF breaks shebangs ("bash\r") and systemd.
+*.sh text eol=lf
+*.service text eol=lf
+*.desktop text eol=lf
+scripts/systemd/* text eol=lf
