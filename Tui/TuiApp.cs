@@ -53,7 +53,9 @@ public sealed class TuiApp : IDisposable
     private readonly AppSettings _settings;
     private readonly object _autoBlockGate = new();
     private readonly Dictionary<string, DateTime> _autoBlockAttempted = new(StringComparer.OrdinalIgnoreCase);
+    private readonly Dictionary<string, DateTime> _autoBlockSuppressedUntil = new(StringComparer.OrdinalIgnoreCase);
     private static readonly TimeSpan AutoBlockRetryAfter = TimeSpan.FromMinutes(10);
+    private static readonly TimeSpan ManualUnblockSuppressFor = TimeSpan.FromHours(24);
 
     private View _view = View.Dashboard;
     private string _filter = "";
@@ -84,6 +86,7 @@ public sealed class TuiApp : IDisposable
         _firewall.Allowlist = _allowlist;
         _monitor.GeoLookupsEnabled = _settings.GeoLookupEnabled;
         _allowlist.UseRemoteFeed = _settings.AllowlistUseRemoteFeed;
+        LoadPersistedAutoBlockSuppressions();
         _monitor.Updated += OnMonitorUpdated;
         _monitor.ThreatsDetected += OnThreatsDetected;
     }
@@ -229,6 +232,8 @@ public sealed class TuiApp : IDisposable
             lock (_autoBlockGate)
             {
                 if (_blockedIps.Contains(ip))
+                    continue;
+                if (_autoBlockSuppressedUntil.TryGetValue(ip, out var until) && DateTime.UtcNow < until)
                     continue;
                 if (_autoBlockAttempted.TryGetValue(ip, out var lastAttempt) &&
                     DateTime.UtcNow - lastAttempt < AutoBlockRetryAfter)
@@ -653,7 +658,9 @@ public sealed class TuiApp : IDisposable
         _statusMessage = result.Message;
         if (result.Success)
         {
-            _blockedIps.Add(ip.Trim());
+            var key = FirewallService.TryNormalizeIp(ip.Trim(), out var n, out _) ? n : ip.Trim();
+            ClearAutoBlockSuppress(key);
+            lock (_autoBlockGate) _blockedIps.Add(key);
             RefreshBlockedIps(force: true);
         }
     }
@@ -681,7 +688,53 @@ public sealed class TuiApp : IDisposable
 
         var result = _firewall.UnblockIp(ip.Trim());
         _statusMessage = result.Message;
+        if (result.Success && FirewallService.TryNormalizeIp(ip.Trim(), out var normalized, out _))
+            SuppressAutoBlock(normalized);
         RefreshBlockedIps(force: true);
+    }
+
+    private void SuppressAutoBlock(string ip)
+    {
+        var until = DateTime.UtcNow.Add(ManualUnblockSuppressFor);
+        lock (_autoBlockGate)
+        {
+            _blockedIps.Remove(ip);
+            _autoBlockAttempted[ip] = DateTime.UtcNow;
+            _autoBlockSuppressedUntil[ip] = until;
+        }
+
+        _settings.AutoBlockSuppressedUntil[ip] = until;
+        PruneExpiredSuppressions(_settings.AutoBlockSuppressedUntil);
+        _settings.Save();
+    }
+
+    private void ClearAutoBlockSuppress(string ip)
+    {
+        lock (_autoBlockGate)
+            _autoBlockSuppressedUntil.Remove(ip);
+
+        if (_settings.AutoBlockSuppressedUntil.Remove(ip))
+            _settings.Save();
+    }
+
+    private void LoadPersistedAutoBlockSuppressions()
+    {
+        lock (_autoBlockGate)
+        {
+            _autoBlockSuppressedUntil.Clear();
+            foreach (var kv in _settings.AutoBlockSuppressedUntil)
+            {
+                if (kv.Value > DateTime.UtcNow)
+                    _autoBlockSuppressedUntil[kv.Key] = kv.Value;
+            }
+        }
+    }
+
+    private static void PruneExpiredSuppressions(Dictionary<string, DateTime> map)
+    {
+        var now = DateTime.UtcNow;
+        foreach (var key in map.Where(kv => kv.Value <= now).Select(kv => kv.Key).ToList())
+            map.Remove(key);
     }
 
     private string? TryGetSelectedIp()

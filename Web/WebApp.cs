@@ -40,7 +40,13 @@ public sealed class WebApp : IDisposable
     private readonly AppSettings _settings;
     private readonly object _autoBlockGate = new();
     private readonly Dictionary<string, DateTime> _autoBlockAttempted = new(StringComparer.OrdinalIgnoreCase);
+    /// <summary>
+    /// IPs the user explicitly unblocked/removed. Auto-block must not recreate rules for these
+    /// until the user manually blocks again (or the suppress window expires).
+    /// </summary>
+    private readonly Dictionary<string, DateTime> _autoBlockSuppressedUntil = new(StringComparer.OrdinalIgnoreCase);
     private static readonly TimeSpan AutoBlockRetryAfter = TimeSpan.FromMinutes(10);
+    private static readonly TimeSpan ManualUnblockSuppressFor = TimeSpan.FromHours(24);
 
     private readonly int _port;
     private readonly bool _bindAll;
@@ -101,6 +107,7 @@ public sealed class WebApp : IDisposable
             Console.Error.WriteLine(_statusMessage);
         }
 
+        LoadPersistedAutoBlockSuppressions();
         RefreshBlockedIps(force: true);
         _monitor.Start();
 
@@ -532,7 +539,9 @@ public sealed class WebApp : IDisposable
                     var r = _firewall.BlockIp(ip, ResolveDirection(), $"Web UI block · {ip}");
                     if (r.Success)
                     {
-                        lock (_autoBlockGate) _blockedIps.Add(ip);
+                        var key = FirewallService.TryNormalizeIp(ip, out var normalized, out _) ? normalized : ip;
+                        ClearAutoBlockSuppress(key);
+                        lock (_autoBlockGate) _blockedIps.Add(key);
                         RefreshBlockedIps(force: true);
                     }
                     _statusMessage = r.Message;
@@ -549,7 +558,11 @@ public sealed class WebApp : IDisposable
                     var r = _firewall.UnblockIp(ip);
                     if (r.Success)
                     {
-                        lock (_autoBlockGate) _blockedIps.Remove(ip);
+                        if (FirewallService.TryNormalizeIp(ip, out var normalized, out _))
+                        {
+                            SuppressAutoBlock(normalized);
+                            lock (_autoBlockGate) _blockedIps.Remove(normalized);
+                        }
                         RefreshBlockedIps(force: true);
                     }
                     _statusMessage = r.Message;
@@ -618,22 +631,30 @@ public sealed class WebApp : IDisposable
                         return ActionResultDto.Fail("Rule name required.");
                     if (!_firewall.IsAdministrator)
                         return ActionResultDto.Fail("Cannot remove rules — run Network Sentinel elevated (Admin / service as SYSTEM).");
+
+                    // netsh-only delete; never HNetCfg COM (MTA AccessViolation kills the host).
+                    FirewallOperationResult r;
                     try
                     {
-                        var r = _firewall.RemoveRule(name);
-                        _statusMessage = r.Message;
-                        if (r.Success)
-                        {
-                            try { RefreshBlockedIps(force: true); }
-                            catch { /* listing must not undo a successful delete */ }
-                        }
-                        return r.Success ? ActionResultDto.Success(r.Message) : ActionResultDto.Fail(r.Message);
+                        r = _firewall.RemoveRule(name);
                     }
                     catch (Exception ex)
                     {
                         _statusMessage = $"Remove failed: {ex.Message}";
                         return ActionResultDto.Fail(_statusMessage);
                     }
+
+                    _statusMessage = r.Message;
+                    if (r.Success)
+                    {
+                        // Keep auto-block from immediately recreating the same IP block.
+                        if (FirewallService.TryExtractIpFromManagedRule(name, null, out var removedIp))
+                            SuppressAutoBlock(removedIp);
+
+                        try { RefreshBlockedIps(force: true); }
+                        catch { /* ignore */ }
+                    }
+                    return r.Success ? ActionResultDto.Success(r.Message) : ActionResultDto.Fail(r.Message);
                 }
 
                 default:
@@ -819,6 +840,8 @@ public sealed class WebApp : IDisposable
             {
                 if (_blockedIps.Contains(ip))
                     continue;
+                if (_autoBlockSuppressedUntil.TryGetValue(ip, out var until) && DateTime.UtcNow < until)
+                    continue;
                 if (_autoBlockAttempted.TryGetValue(ip, out var lastAttempt) &&
                     DateTime.UtcNow - lastAttempt < AutoBlockRetryAfter)
                     continue;
@@ -873,6 +896,51 @@ public sealed class WebApp : IDisposable
                 _blockedIpsRefreshInFlight = false;
             }
         });
+    }
+
+    private void SuppressAutoBlock(string ip)
+    {
+        var until = DateTime.UtcNow.Add(ManualUnblockSuppressFor);
+        lock (_autoBlockGate)
+        {
+            _blockedIps.Remove(ip);
+            // Leave a long cooldown marker so concurrent threat handlers also skip briefly.
+            _autoBlockAttempted[ip] = DateTime.UtcNow;
+            _autoBlockSuppressedUntil[ip] = until;
+        }
+
+        _settings.AutoBlockSuppressedUntil[ip] = until;
+        PruneExpiredSuppressions(_settings.AutoBlockSuppressedUntil);
+        _settings.Save();
+    }
+
+    private void ClearAutoBlockSuppress(string ip)
+    {
+        lock (_autoBlockGate)
+            _autoBlockSuppressedUntil.Remove(ip);
+
+        if (_settings.AutoBlockSuppressedUntil.Remove(ip))
+            _settings.Save();
+    }
+
+    private void LoadPersistedAutoBlockSuppressions()
+    {
+        lock (_autoBlockGate)
+        {
+            _autoBlockSuppressedUntil.Clear();
+            foreach (var kv in _settings.AutoBlockSuppressedUntil)
+            {
+                if (kv.Value > DateTime.UtcNow)
+                    _autoBlockSuppressedUntil[kv.Key] = kv.Value;
+            }
+        }
+    }
+
+    private static void PruneExpiredSuppressions(Dictionary<string, DateTime> map)
+    {
+        var now = DateTime.UtcNow;
+        foreach (var key in map.Where(kv => kv.Value <= now).Select(kv => kv.Key).ToList())
+            map.Remove(key);
     }
 
     /// <summary>

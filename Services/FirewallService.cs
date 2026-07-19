@@ -1,7 +1,8 @@
 using System.Diagnostics;
+using System.IO;
 using System.Net;
-using System.Runtime.InteropServices;
 using System.Security.Principal;
+using System.Text;
 using System.Text.RegularExpressions;
 using NetworkSentinel.Models;
 
@@ -242,22 +243,13 @@ public sealed class FirewallService
 
     public IReadOnlyList<FirewallRuleInfo> GetManagedRules()
     {
-        // Prefer netsh. HNetCfg COM enumeration has been observed to AccessViolation
-        // (process kill) under some Windows builds / when hosted in the web service.
+        // netsh ONLY. Never call HNetCfg COM from the web host:
+        // - COM is not MTA-safe (HttpListener handlers run on thread-pool MTA)
+        // - AccessViolation from COM kills the entire process (looks like a "crash on Remove")
+        // - Falling back to COM when the list is empty was the remove-after-delete crash path
         try
         {
-            var viaNetsh = GetManagedRulesNetsh();
-            if (viaNetsh.Count > 0)
-                return viaNetsh;
-        }
-        catch
-        {
-            // fall through to COM
-        }
-
-        try
-        {
-            return GetManagedRulesCom();
+            return GetManagedRulesNetsh();
         }
         catch
         {
@@ -318,20 +310,12 @@ public sealed class FirewallService
 
         var dir = isInbound ? "in" : "out";
         var description = reason ?? $"Blocked by Network Sentinel at {DateTime.Now:u}";
-        // Prefer COM; fall back to netsh
-        try
-        {
-            AddIpRuleCom(name, ip, isInbound, description);
-            return FirewallOperationResult.Ok($"Rule “{name}” applied.");
-        }
-        catch (Exception ex)
-        {
-            var netsh = RunNetsh(
-                $"advfirewall firewall add rule name=\"{name}\" dir={dir} action=block remoteip={ip} enable=yes profile=any description=\"{Escape(description)}\"");
-            return netsh.Success
-                ? FirewallOperationResult.Ok($"Rule “{name}” applied via netsh.")
-                : FirewallOperationResult.Fail($"Failed to add rule {name}: {ex.Message}; netsh: {netsh.Message}");
-        }
+        // netsh ONLY — HNetCfg COM from web/thread-pool (MTA) can AccessViolation and kill the process.
+        var netsh = RunNetsh(
+            $"advfirewall firewall add rule name=\"{name}\" dir={dir} action=block remoteip={ip} enable=yes profile=any description=\"{Escape(description)}\"");
+        return netsh.Success
+            ? FirewallOperationResult.Ok($"Rule \"{name}\" applied.")
+            : FirewallOperationResult.Fail($"Failed to add rule {name}: {netsh.Message}");
     }
 
     private FirewallOperationResult EnsurePortRule(int port, string protocol, bool isInbound, string? reason)
@@ -341,62 +325,17 @@ public sealed class FirewallService
 
         var dir = isInbound ? "in" : "out";
         var description = reason ?? $"Port blocked by Network Sentinel at {DateTime.Now:u}";
-        try
-        {
-            AddPortRuleCom(name, port, protocol, isInbound, description);
-            return FirewallOperationResult.Ok($"Rule “{name}” applied.");
-        }
-        catch (Exception ex)
-        {
-            var netsh = RunNetsh(
-                $"advfirewall firewall add rule name=\"{name}\" dir={dir} action=block protocol={protocol} localport={port} enable=yes profile=any description=\"{Escape(description)}\"");
-            return netsh.Success
-                ? FirewallOperationResult.Ok($"Rule “{name}” applied via netsh.")
-                : FirewallOperationResult.Fail($"Failed to add rule {name}: {ex.Message}; netsh: {netsh.Message}");
-        }
-    }
-
-    private static void AddIpRuleCom(string name, string ip, bool isInbound, string description)
-    {
-        dynamic policy = CreateCom("HNetCfg.FwPolicy2");
-        dynamic rule = CreateCom("HNetCfg.FWRule");
-        rule.Name = name;
-        rule.Description = description;
-        rule.Action = 0; // BLOCK
-        rule.Direction = isInbound ? 1 : 2;
-        rule.Enabled = true;
-        rule.Profiles = 0x7FFFFFFF; // all
-        rule.InterfaceTypes = "All";
-        rule.RemoteAddresses = ip;
-        rule.Protocol = 256; // ANY
-        policy.Rules.Add(rule);
-        Marshal.FinalReleaseComObject(rule);
-        Marshal.FinalReleaseComObject(policy);
-    }
-
-    private static void AddPortRuleCom(string name, int port, string protocol, bool isInbound, string description)
-    {
-        dynamic policy = CreateCom("HNetCfg.FwPolicy2");
-        dynamic rule = CreateCom("HNetCfg.FWRule");
-        rule.Name = name;
-        rule.Description = description;
-        rule.Action = 0;
-        rule.Direction = isInbound ? 1 : 2;
-        rule.Enabled = true;
-        rule.Profiles = 0x7FFFFFFF;
-        rule.InterfaceTypes = "All";
-        rule.Protocol = protocol.Equals("UDP", StringComparison.OrdinalIgnoreCase) ? 17 : 6;
-        rule.LocalPorts = port.ToString();
-        policy.Rules.Add(rule);
-        Marshal.FinalReleaseComObject(rule);
-        Marshal.FinalReleaseComObject(policy);
+        var netsh = RunNetsh(
+            $"advfirewall firewall add rule name=\"{name}\" dir={dir} action=block protocol={protocol} localport={port} enable=yes profile=any description=\"{Escape(description)}\"");
+        return netsh.Success
+            ? FirewallOperationResult.Ok($"Rule \"{name}\" applied.")
+            : FirewallOperationResult.Fail($"Failed to add rule {name}: {netsh.Message}");
     }
 
     private FirewallOperationResult RemoveRuleByName(string name)
     {
-        // Prefer netsh only. COM INetFwPolicy2.Rules.Remove has crashed the process
-        // (AccessViolation) on some hosts when called from the web UI — never use it
-        // for delete in the server path.
+        // netsh ONLY — never HNetCfg COM. COM remove/enumerate from MTA thread-pool
+        // workers (web UI) can AccessViolation and kill NetworkSentinel.exe.
         var safeName = name.Replace("\"", "").Trim();
         if (string.IsNullOrEmpty(safeName))
             return FirewallOperationResult.Fail("Rule name is empty.");
@@ -405,107 +344,16 @@ public sealed class FirewallService
         if (netsh.Success)
             return FirewallOperationResult.Ok($"Removed \"{safeName}\".");
 
-        // netsh often returns a non-zero exit with "No rules match the specified criteria"
-        // when the rule is already gone — treat as soft success for UI idempotency.
         if (netsh.Message.Contains("No rules match", StringComparison.OrdinalIgnoreCase) ||
             netsh.Message.Contains("cannot find", StringComparison.OrdinalIgnoreCase))
         {
             return FirewallOperationResult.Fail($"No rule named \"{safeName}\" (it may already be gone).");
         }
 
-        // Last resort: COM remove, isolated so failures stay as results not process kills.
-        try
-        {
-            dynamic policy = CreateCom("HNetCfg.FwPolicy2");
-            try
-            {
-                try
-                {
-                    dynamic existing = policy.Rules.Item(safeName);
-                    Marshal.FinalReleaseComObject(existing);
-                }
-                catch
-                {
-                    return FirewallOperationResult.Fail($"No rule named \"{safeName}\".");
-                }
-
-                policy.Rules.Remove(safeName);
-                return FirewallOperationResult.Ok($"Removed \"{safeName}\".");
-            }
-            finally
-            {
-                Marshal.FinalReleaseComObject(policy);
-            }
-        }
-        catch (Exception ex)
-        {
-            return FirewallOperationResult.Fail(
-                string.IsNullOrWhiteSpace(netsh.Message)
-                    ? $"Failed to remove \"{safeName}\": {ex.Message}"
-                    : netsh.Message);
-        }
-    }
-
-    private static List<FirewallRuleInfo> GetManagedRulesCom()
-    {
-        var list = new List<FirewallRuleInfo>();
-        dynamic? policy = null;
-        try
-        {
-            policy = CreateCom("HNetCfg.FwPolicy2");
-            foreach (dynamic rule in policy.Rules)
-            {
-                try
-                {
-                    string name = rule.Name ?? "";
-                    // Only our explicit rule names — do not match unrelated rules like "networksentinel.exe".
-                    if (!IsManagedRuleName(name))
-                        continue;
-
-                    int action = (int)rule.Action;
-                    int direction = (int)rule.Direction;
-                    bool enabled = rule.Enabled;
-                    string remote = rule.RemoteAddresses?.ToString() ?? "";
-                    string localPorts = rule.LocalPorts?.ToString() ?? "";
-                    string description = rule.Description?.ToString() ?? "";
-                    int protocol = 0;
-                    try { protocol = (int)rule.Protocol; } catch { /* any */ }
-
-                    var remoteNorm = NormalizeRemote(remote);
-                    var portsNorm = localPorts is " *" or "*" or "" ? "" : localPorts.Trim();
-                    list.Add(new FirewallRuleInfo
-                    {
-                        Name = name,
-                        Description = description,
-                        Enabled = enabled,
-                        IsBlock = action == 0,
-                        Direction = direction == 1 ? FirewallDirection.Inbound : FirewallDirection.Outbound,
-                        RemoteAddresses = remoteNorm,
-                        LocalPorts = portsNorm,
-                        Protocol = ProtocolName(protocol),
-                        Kind = ClassifyRuleKind(name, remoteNorm, portsNorm)
-                    });
-                }
-                catch
-                {
-                    // Skip bad COM rows instead of aborting the whole enumeration.
-                }
-            }
-        }
-        finally
-        {
-            if (policy != null)
-            {
-                try { Marshal.FinalReleaseComObject(policy); } catch { /* ignore */ }
-            }
-        }
-
-        return list
-            .OrderBy(r => r.Kind)
-            .ThenBy(r => r.RemoteAddresses)
-            .ThenBy(r => r.LocalPorts)
-            .ThenBy(r => r.Direction)
-            .ToList();
+        return FirewallOperationResult.Fail(
+            string.IsNullOrWhiteSpace(netsh.Message)
+                ? $"Failed to remove \"{safeName}\" (netsh error)."
+                : netsh.Message);
     }
 
     /// <summary>
@@ -606,32 +454,69 @@ public sealed class FirewallService
         return list;
     }
 
-    private static object CreateCom(string progId)
+    /// <summary>
+    /// Best-effort IP from a managed rule name or remote field (for auto-block suppress after Remove).
+    /// </summary>
+    public static bool TryExtractIpFromManagedRule(string? ruleName, string? remoteAddresses, out string ip)
     {
-        var type = Type.GetTypeFromProgID(progId)
-                   ?? throw new InvalidOperationException($"COM type {progId} not available.");
-        return Activator.CreateInstance(type)
-               ?? throw new InvalidOperationException($"Failed to create {progId}.");
+        ip = "";
+        if (!string.IsNullOrWhiteSpace(remoteAddresses) &&
+            TryNormalizeIp(remoteAddresses.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries).FirstOrDefault(), out ip, out _))
+            return true;
+
+        if (string.IsNullOrWhiteSpace(ruleName))
+            return false;
+
+        // NetworkSentinel-IP-1.2.3.4-In  or  NetworkSentinel-IP-2001_db8__1-Out
+        var m = Regex.Match(ruleName.Trim(),
+            @"^NetworkSentinel-IP-(.+)-(In|Out)$",
+            RegexOptions.IgnoreCase);
+        if (!m.Success)
+            return false;
+
+        var raw = m.Groups[1].Value.Replace('_', ':');
+        return TryNormalizeIp(raw, out ip, out _);
     }
 
     private static FirewallOperationResult RunNetsh(string args)
     {
         try
         {
-            var psi = new ProcessStartInfo("netsh", args)
+            // Use full path + separate process. Never load firewall COM into this process
+            // for delete/list when called from the web UI.
+            var netshExe = Path.Combine(
+                Environment.GetFolderPath(Environment.SpecialFolder.System),
+                "netsh.exe");
+            if (!File.Exists(netshExe))
+                netshExe = "netsh";
+
+            var psi = new ProcessStartInfo
             {
+                FileName = netshExe,
+                Arguments = args,
                 UseShellExecute = false,
                 RedirectStandardOutput = true,
                 RedirectStandardError = true,
-                CreateNoWindow = true
+                CreateNoWindow = true,
+                // Avoid inheriting weird console encodings that break parsing.
+                StandardOutputEncoding = Encoding.UTF8,
+                StandardErrorEncoding = Encoding.UTF8
             };
             using var p = Process.Start(psi);
             if (p == null)
                 return FirewallOperationResult.Fail("Could not start netsh.");
 
-            string stdout = p.StandardOutput.ReadToEnd();
-            string stderr = p.StandardError.ReadToEnd();
-            p.WaitForExit(15000);
+            // Async read prevents deadlock if buffers fill on large "show rule name=all".
+            var stdoutTask = p.StandardOutput.ReadToEndAsync();
+            var stderrTask = p.StandardError.ReadToEndAsync();
+            if (!p.WaitForExit(60000))
+            {
+                try { p.Kill(entireProcessTree: true); } catch { /* ignore */ }
+                return FirewallOperationResult.Fail("netsh timed out.");
+            }
+
+            string stdout = stdoutTask.GetAwaiter().GetResult();
+            string stderr = stderrTask.GetAwaiter().GetResult();
             string combined = (stdout + "\n" + stderr).Trim();
 
             if (p.ExitCode == 0)
@@ -662,15 +547,6 @@ public sealed class FirewallService
 
     private static string Escape(string value)
         => value.Replace("\"", "'");
-
-    private static string ProtocolName(int protocol) => protocol switch
-    {
-        6 => "TCP",
-        17 => "UDP",
-        256 => "Any",
-        0 => "Any",
-        _ => protocol.ToString()
-    };
 
     private static string NormalizeRemote(string remote)
     {

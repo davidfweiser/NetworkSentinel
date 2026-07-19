@@ -22,6 +22,12 @@ public sealed class AppSettings
     /// <summary>Refresh the allowlist from this repo's GitHub feed; set false to use only local/built-in lists.</summary>
     public bool AllowlistUseRemoteFeed { get; set; } = true;
 
+    /// <summary>
+    /// IPs the user manually unblocked/removed. Auto-block will not recreate rules for these
+    /// until the UTC expiry (or the user blocks the IP again). Shared across GUI / TUI / web.
+    /// </summary>
+    public Dictionary<string, DateTime> AutoBlockSuppressedUntil { get; set; } = new(StringComparer.OrdinalIgnoreCase);
+
     public ThreatLevel GetMinLevel()
     {
         return Enum.TryParse<ThreatLevel>(AutoBlockMinLevel, true, out var level)
@@ -43,7 +49,9 @@ public sealed class AppSettings
                 return new AppSettings();
 
             var json = File.ReadAllText(path);
-            return JsonSerializer.Deserialize<AppSettings>(json, JsonOptions) ?? new AppSettings();
+            var settings = JsonSerializer.Deserialize<AppSettings>(json, JsonOptions) ?? new AppSettings();
+            settings.AutoBlockSuppressedUntil ??= new Dictionary<string, DateTime>(StringComparer.OrdinalIgnoreCase);
+            return settings;
         }
         catch
         {

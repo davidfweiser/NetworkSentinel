@@ -17,10 +17,12 @@ public partial class MainViewModel : ObservableObject, IDisposable
     private readonly AppSettings _settings;
     private readonly DispatcherTimer _clockTimer;
     private readonly object _autoBlockGate = new();
-    // Attempt markers expire so a manually unblocked IP can be auto-blocked
-    // again later instead of being ignored until app restart.
+    // Attempt markers expire so a failed auto-block can be retried later.
     private readonly Dictionary<string, DateTime> _autoBlockAttempted = new(StringComparer.OrdinalIgnoreCase);
+    // After the user removes/unblocks a rule, do not auto-recreate it for a while.
+    private readonly Dictionary<string, DateTime> _autoBlockSuppressedUntil = new(StringComparer.OrdinalIgnoreCase);
     private static readonly TimeSpan AutoBlockRetryAfter = TimeSpan.FromMinutes(10);
+    private static readonly TimeSpan ManualUnblockSuppressFor = TimeSpan.FromHours(24);
     private HashSet<string> _blockedIps = new(StringComparer.OrdinalIgnoreCase);
     private DateTime _blockedIpsRefreshedAt = DateTime.MinValue;
     private bool _blockedIpsRefreshInFlight;
@@ -89,6 +91,7 @@ public partial class MainViewModel : ObservableObject, IDisposable
         _firewall.Allowlist = _allowlist;
         _monitor.GeoLookupsEnabled = _settings.GeoLookupEnabled;
         _allowlist.UseRemoteFeed = _settings.AllowlistUseRemoteFeed;
+        LoadPersistedAutoBlockSuppressions();
         _monitor.Updated += OnMonitorUpdated;
         _monitor.ThreatsDetected += OnThreatsDetected;
         _monitor.Start();
@@ -231,6 +234,8 @@ public partial class MainViewModel : ObservableObject, IDisposable
                 // Use the cached blocked set — enumerating firewall rules per
                 // threat (IsIpBlocked) is far too slow for this path.
                 if (_blockedIps.Contains(ip))
+                    continue;
+                if (_autoBlockSuppressedUntil.TryGetValue(ip, out var until) && DateTime.UtcNow < until)
                     continue;
                 if (_autoBlockAttempted.TryGetValue(ip, out var lastAttempt) &&
                     DateTime.UtcNow - lastAttempt < AutoBlockRetryAfter)
@@ -689,6 +694,12 @@ public partial class MainViewModel : ObservableObject, IDisposable
 
         var result = _firewall.RemoveRule(name);
         FirewallMessage = result.Message;
+        if (result.Success)
+        {
+            var remote = rule.RemoteAddresses;
+            if (FirewallService.TryExtractIpFromManagedRule(name, remote, out var removedIp))
+                SuppressAutoBlock(removedIp);
+        }
         SelectedFirewallRule = null;
         RefreshFirewallRules();
         RefreshCollections();
@@ -898,11 +909,59 @@ public partial class MainViewModel : ObservableObject, IDisposable
         if (!result.Success)
             MessageBox.Show(result.Message, "Firewall", MessageBoxButton.OK, MessageBoxImage.Warning);
         else
+        {
+            ClearAutoBlockSuppress(normalized);
+            lock (_autoBlockGate) _blockedIps.Add(normalized);
             MessageBox.Show(result.Message, "Firewall", MessageBoxButton.OK, MessageBoxImage.Information);
+        }
 
         RefreshFirewallRules();
         RefreshCollections();
         return result.Success;
+    }
+
+    private void SuppressAutoBlock(string ip)
+    {
+        var until = DateTime.UtcNow.Add(ManualUnblockSuppressFor);
+        lock (_autoBlockGate)
+        {
+            _blockedIps.Remove(ip);
+            _autoBlockAttempted[ip] = DateTime.UtcNow;
+            _autoBlockSuppressedUntil[ip] = until;
+        }
+
+        _settings.AutoBlockSuppressedUntil[ip] = until;
+        PruneExpiredSuppressions(_settings.AutoBlockSuppressedUntil);
+        _settings.Save();
+    }
+
+    private void ClearAutoBlockSuppress(string ip)
+    {
+        lock (_autoBlockGate)
+            _autoBlockSuppressedUntil.Remove(ip);
+
+        if (_settings.AutoBlockSuppressedUntil.Remove(ip))
+            _settings.Save();
+    }
+
+    private void LoadPersistedAutoBlockSuppressions()
+    {
+        lock (_autoBlockGate)
+        {
+            _autoBlockSuppressedUntil.Clear();
+            foreach (var kv in _settings.AutoBlockSuppressedUntil)
+            {
+                if (kv.Value > DateTime.UtcNow)
+                    _autoBlockSuppressedUntil[kv.Key] = kv.Value;
+            }
+        }
+    }
+
+    private static void PruneExpiredSuppressions(Dictionary<string, DateTime> map)
+    {
+        var now = DateTime.UtcNow;
+        foreach (var key in map.Where(kv => kv.Value <= now).Select(kv => kv.Key).ToList())
+            map.Remove(key);
     }
 
     private void UnblockIpInternal(string ip)
@@ -915,13 +974,7 @@ public partial class MainViewModel : ObservableObject, IDisposable
 
         var result = _firewall.UnblockIp(ip);
         if (result.Success && FirewallService.TryNormalizeIp(ip, out var normalized, out _))
-        {
-            lock (_autoBlockGate)
-            {
-                _blockedIps.Remove(normalized);
-                _autoBlockAttempted.Remove(normalized);
-            }
-        }
+            SuppressAutoBlock(normalized);
         FirewallMessage = result.Message;
         if (!result.Success)
             MessageBox.Show(result.Message, "Firewall", MessageBoxButton.OK, MessageBoxImage.Warning);
