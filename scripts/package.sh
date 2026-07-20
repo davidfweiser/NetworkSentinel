@@ -21,7 +21,7 @@ case "$RID" in
     ;;
 esac
 
-VERSION="$(grep -oP '(?<=<Version>)[^<]+' NetworkSentinel.csproj | head -1)"
+VERSION="$(sed -n 's/.*<Version>\([^<]*\)<\/Version>.*/\1/p' NetworkSentinel.csproj | head -1)"
 VERSION="${VERSION:-0.0.0}"
 NAME="networksentinel-${VERSION}-${RID}"
 DIST_DIR="${ROOT}/dist"

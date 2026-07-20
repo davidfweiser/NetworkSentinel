@@ -371,6 +371,32 @@ public sealed class WebApp : IDisposable
             return;
         }
 
+        if (req.HttpMethod == "POST" && path == "/api/auth/change-password")
+        {
+            var body = ReadBody(req);
+            var authReq = DeserializeAuth(body);
+            if (authReq == null)
+            {
+                WriteJson(res, 400, new { ok = false, message = "Invalid JSON body." });
+                return;
+            }
+
+            var current = authReq.CurrentPassword ?? authReq.Password ?? "";
+            var next = authReq.NewPassword ?? "";
+            var confirm = authReq.Confirm ?? "";
+            var session = GetSessionToken(req);
+
+            if (!_auth.TryChangePassword(current, next, confirm, session, out var changeMsg))
+            {
+                Thread.Sleep(600);
+                WriteJson(res, 400, new { ok = false, message = changeMsg });
+                return;
+            }
+
+            WriteJson(res, 200, new { ok = true, message = changeMsg });
+            return;
+        }
+
         if (req.HttpMethod == "GET" && path == "/api/state")
         {
             WriteJson(res, 200, BuildState());
@@ -1147,6 +1173,8 @@ public sealed class WebApp : IDisposable
     private sealed class AuthBody
     {
         public string? Password { get; set; }
+        public string? CurrentPassword { get; set; }
+        public string? NewPassword { get; set; }
         public string? Confirm { get; set; }
     }
 
@@ -1325,6 +1353,36 @@ public sealed class WebApp : IDisposable
     text-transform: uppercase; letter-spacing: .07em;
   }
   .settings-group:first-child h3 { margin-top: 0; }
+  .pw-change {
+    max-width: 760px; padding: 16px; background: var(--bg-card);
+    border: 1px solid var(--stroke); border-radius: 12px;
+  }
+  .pw-change p.desc {
+    margin: 0 0 14px; color: var(--muted); font-size: .82rem; line-height: 1.45;
+  }
+  .pw-change label {
+    display: block; color: var(--muted); font-size: .75rem;
+    text-transform: uppercase; letter-spacing: .05em; margin: 0 0 6px;
+  }
+  .pw-change input[type="password"] {
+    width: 100%; max-width: 360px; background: var(--bg-deep);
+    border: 1px solid var(--stroke); color: var(--text);
+    border-radius: 8px; padding: 10px 12px; font: inherit; font-size: .92rem;
+    margin-bottom: 12px;
+  }
+  .pw-change input[type="password"]:focus {
+    outline: 1px solid var(--blue); border-color: var(--blue);
+  }
+  .pw-change .pw-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 12px; margin-top: 4px; }
+  .pw-change button[type="submit"] {
+    appearance: none; font: inherit; font-size: .85rem; font-weight: 600; cursor: pointer;
+    padding: 9px 16px; border-radius: 8px; border: none; color: var(--bg-deep);
+    background: linear-gradient(135deg, var(--cyan), var(--blue));
+  }
+  .pw-change button[type="submit"]:disabled { opacity: .55; cursor: wait; }
+  .pw-change .pw-msg { font-size: .85rem; min-height: 1.2em; margin: 0; }
+  .pw-change .pw-msg.err { color: #ffb0bd; }
+  .pw-change .pw-msg.ok { color: var(--success); }
   .switch { position: relative; display: inline-block; width: 44px; height: 24px; flex-shrink: 0; }
   .switch input { opacity: 0; width: 0; height: 0; }
   .switch .slider {
@@ -1549,6 +1607,22 @@ public sealed class WebApp : IDisposable
 
   <section id="tab-settings" class="hidden">
     <div id="settingsPanel"></div>
+    <div class="settings-group">
+      <h3>Master password</h3>
+      <form id="changePasswordForm" class="pw-change" autocomplete="off">
+        <p class="desc">Change the password required to open this web console. It is stored only as a one-way PBKDF2-SHA256 hash with a random salt on this machine — never as plain text.</p>
+        <label for="pwCurrent">Current master password</label>
+        <input id="pwCurrent" type="password" name="current" autocomplete="current-password" required minlength="8" />
+        <label for="pwNew">New master password</label>
+        <input id="pwNew" type="password" name="new" autocomplete="new-password" required minlength="8" />
+        <label for="pwNewConfirm">Confirm new password</label>
+        <input id="pwNewConfirm" type="password" name="confirm" autocomplete="new-password" required minlength="8" />
+        <div class="pw-actions">
+          <button type="submit" id="btnChangePassword">Update password</button>
+          <p class="pw-msg" id="pwChangeMsg" aria-live="polite"></p>
+        </div>
+      </form>
+    </div>
   </section>
 
   <section id="tab-help" class="hidden">
@@ -1562,10 +1636,10 @@ public sealed class WebApp : IDisposable
         <li><strong>Ports</strong> — local listeners; block a port with one click</li>
         <li><strong>Firewall</strong> — managed rules, manual IP/port blocking, remove rules</li>
         <li><strong>Allowlist</strong> — domains/IPs that are never blocked</li>
-        <li><strong>Settings</strong> — auto-block behavior, block direction, geo lookups, refresh speed</li>
+        <li><strong>Settings</strong> — auto-block behavior, block direction, geo lookups, refresh speed, and master password</li>
       </ul>
       <p class="muted">Firewall actions need root or an elevation helper (pkexec/sudo). Prefer running the web service as root once rather than elevating per action.</p>
-      <p class="muted">Web access is gated by a master password (set on first visit). Sign out or close the browser to require it again.</p>
+      <p class="muted">Web access is gated by a master password (set on first visit; change it anytime under Settings). The password is stored only as a salted one-way hash. Sign out or close the browser to require it again.</p>
     </div>
   </section>
 </main>
@@ -2082,6 +2156,60 @@ public sealed class WebApp : IDisposable
       });
     }
   });
+
+  $('changePasswordForm').addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const currentPassword = $('pwCurrent').value;
+    const newPassword = $('pwNew').value;
+    const confirm = $('pwNewConfirm').value;
+    const msg = $('pwChangeMsg');
+    const btn = $('btnChangePassword');
+    msg.textContent = '';
+    msg.classList.remove('err', 'ok');
+    if (newPassword !== confirm) {
+      msg.textContent = 'New passwords do not match.';
+      msg.classList.add('err');
+      return;
+    }
+    if (newPassword.length < 8) {
+      msg.textContent = 'New password must be at least 8 characters.';
+      msg.classList.add('err');
+      return;
+    }
+    btn.disabled = true;
+    try {
+      const res = await fetch('/api/auth/change-password', {
+        method: 'POST',
+        credentials: 'same-origin',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ currentPassword, newPassword, confirm })
+      });
+      if (res.status === 401) {
+        stopPolling();
+        showAuth('login', 'Session expired. Sign in again.');
+        return;
+      }
+      const data = await res.json().catch(() => ({ ok: false, message: 'Bad response' }));
+      if (!res.ok || !data.ok) {
+        msg.textContent = data.message || 'Could not update password.';
+        msg.classList.add('err');
+        return;
+      }
+      $('pwCurrent').value = '';
+      $('pwNew').value = '';
+      $('pwNewConfirm').value = '';
+      msg.textContent = data.message || 'Master password updated.';
+      msg.classList.add('ok');
+      statusHoldUntil = Date.now() + 10000;
+      setStatus(data.message || 'Master password updated.', false, true);
+    } catch (err) {
+      msg.textContent = err.message || String(err);
+      msg.classList.add('err');
+    } finally {
+      btn.disabled = false;
+    }
+  });
+
   $('allowInput').addEventListener('keydown', (e) => {
     if (e.key === 'Enter') { e.preventDefault(); $('btnAddAllow').click(); }
   });

@@ -69,14 +69,14 @@ Domains are DNS-resolved to current IPs. Auto-block never touches allowlisted IP
 | **Ports** | Local listeners; one-click **Block port** |
 | **Firewall** | Managed rules grouped as In/Out pairs; manual IP and port blocking; **Restore allowlisted** |
 | **Allowlist** | Add/remove trusted domains and IPs; refresh the feed |
-| **Settings** | Monitoring on/off, page refresh speed, geo lookups, auto-block + minimum severity, block direction (in/out), allowlist feed, **Remove all rules** |
+| **Settings** | Monitoring on/off, page refresh speed, geo lookups, auto-block + minimum severity, block direction (in/out), allowlist feed, **change master password**, **Remove all rules** |
 
 The page header shows the running version (e.g. `v0.3.1`) — check it after an upgrade to confirm the new build is live.
 
 ### Web UI security
 - First browser visit **creates a master password** (min. 8 characters)
-- Every later visit **requires that password**
-- Hash stored as PBKDF2-SHA256 in `~/.local/share/NetworkSentinel/web-master.json`
+- Every later visit **requires that password**; change it under **Settings → Master password**
+- Hash stored as PBKDF2-SHA256 (random salt, 200k iterations) in `~/.local/share/NetworkSentinel/web-master.json` — never plain text
 - Session cookie until sign-out, browser close, or 12 hours idle
 
 ---
