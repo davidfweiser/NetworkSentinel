@@ -105,6 +105,68 @@ public sealed class WebAuthStore
         return CryptographicOperations.FixedTimeEquals(actual, expected);
     }
 
+    /// <summary>
+    /// Replace the master password after verifying the current one.
+    /// Stores only a new PBKDF2-SHA256 hash + random salt (never plaintext).
+    /// Other sessions are revoked so only the caller's session remains valid.
+    /// </summary>
+    public bool TryChangePassword(string currentPassword, string newPassword, string confirm, string? keepSessionToken, out string message)
+    {
+        if (!IsConfigured)
+        {
+            message = "Master password is not set yet.";
+            return false;
+        }
+
+        if (!VerifyPassword(currentPassword))
+        {
+            message = "Current master password is incorrect.";
+            return false;
+        }
+
+        if (!ValidateNewPassword(newPassword, confirm, out message))
+            return false;
+
+        if (string.Equals(currentPassword, newPassword, StringComparison.Ordinal))
+        {
+            message = "New password must be different from the current password.";
+            return false;
+        }
+
+        var salt = RandomNumberGenerator.GetBytes(SaltSize);
+        var hash = HashPassword(newPassword, salt, Iterations);
+
+        lock (_fileGate)
+        {
+            if (_auth == null)
+            {
+                message = "Master password is not set yet.";
+                return false;
+            }
+
+            _auth = new AuthFile
+            {
+                Version = 1,
+                Salt = Convert.ToBase64String(salt),
+                Hash = Convert.ToBase64String(hash),
+                Iterations = Iterations,
+                CreatedUtc = _auth.CreatedUtc,
+                ChangedUtc = DateTime.UtcNow
+            };
+            SaveUnlocked();
+        }
+
+        // Invalidate other browser sessions after a password change.
+        foreach (var key in _sessions.Keys)
+        {
+            if (!string.Equals(key, keepSessionToken, StringComparison.Ordinal))
+                _sessions.TryRemove(key, out _);
+        }
+
+        message = "Master password updated.";
+        return true;
+    }
+
     public string CreateSession()
     {
         var token = Convert.ToBase64String(RandomNumberGenerator.GetBytes(32))
@@ -221,5 +283,6 @@ public sealed class WebAuthStore
         public string Hash { get; set; } = "";
         public int Iterations { get; set; } = 200_000;
         public DateTime CreatedUtc { get; set; }
+        public DateTime? ChangedUtc { get; set; }
     }
 }

@@ -135,11 +135,28 @@ Start-Sleep -Milliseconds 400
 
 Write-Host "Copying files..." -ForegroundColor Yellow
 New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null
+
+# Keep operator data across upgrades (master password hash, settings, allowlist, logs).
+$preserveNames = @(
+    "logs",
+    "settings.json",
+    "web-master.json",
+    "allowlist.json",
+    "allowlist-resolved.json",
+    "auto-block-suppress.json"
+)
 Get-ChildItem $InstallDir -Force -ErrorAction SilentlyContinue |
-    Where-Object { $_.Name -notin @("logs") } |
+    Where-Object { $preserveNames -notcontains $_.Name } |
     Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
 
-Copy-Item -Path (Join-Path $SourceDir "*") -Destination $InstallDir -Recurse -Force
+# Copy package bits; do not overwrite preserved data files if the package also ships defaults.
+Get-ChildItem -Path $SourceDir -Force | ForEach-Object {
+    $dest = Join-Path $InstallDir $_.Name
+    if ($preserveNames -contains $_.Name -and (Test-Path $dest)) {
+        return
+    }
+    Copy-Item -Path $_.FullName -Destination $dest -Recurse -Force
+}
 
 $Exe = Join-Path $InstallDir $ExeName
 if (-not (Test-Path $Exe)) {

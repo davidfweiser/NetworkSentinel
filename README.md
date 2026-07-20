@@ -68,6 +68,9 @@ Auto-block never touches allowlisted IPs. A **manual** block of an allowlisted I
 - [.NET 8 SDK](https://dotnet.microsoft.com/download) to build
 - **Administrator** rights to create or delete Windows Defender Firewall rules
 
+> **Linux servers:** use the `linux` branch and `./scripts/package.sh` → one-file installer
+> `networksentinel-*-linux-x64.install.sh` with `sudo ./….install.sh --web-service`.
+
 ---
 
 ## Quick start
@@ -97,7 +100,7 @@ Environment variables: `NETWORKSENTINEL_TUI=1`, `NETWORKSENTINEL_WEB=1`.
 
 ### Server package (no compile on the server)
 
-Build the zip **on a dev PC** that has the .NET 8 SDK:
+Build artifacts **on a dev PC** that has the .NET 8 SDK:
 
 ```powershell
 git checkout windows
@@ -108,17 +111,26 @@ Output:
 
 ```text
 dist\NetworkSentinel-windows-server-x64-<version>.zip
+dist\NetworkSentinel-windows-server-x64-<version>.install.ps1   ← one-file installer
+dist\*.sha256
 ```
 
-Self-contained by default — the server does **not** need the .NET SDK or a compiler (runtime is inside the zip).
+Self-contained by default — the server does **not** need the .NET SDK or a compiler (runtime is inside the package).
 
-**On the server (Administrator PowerShell):**
+**On the Windows server (Administrator PowerShell) — one-file installer (recommended):**
 
 ```powershell
-# 1) Copy the zip, unzip it
-# 2) From the unzipped folder:
-powershell -ExecutionPolicy Bypass -File .\install-from-package.ps1
+# Copy the .install.ps1 to the server, then:
+powershell -ExecutionPolicy Bypass -File .\NetworkSentinel-windows-server-x64-0.3.1.install.ps1
 # optional port:
+powershell -ExecutionPolicy Bypass -File .\NetworkSentinel-windows-server-x64-0.3.1.install.ps1 -Port 18765
+```
+
+**Or classic zip:**
+
+```powershell
+# Unzip, then either double-click INSTALL.cmd or:
+powershell -ExecutionPolicy Bypass -File .\install-from-package.ps1
 powershell -ExecutionPolicy Bypass -File .\install-from-package.ps1 -Port 18765
 ```
 
@@ -128,9 +140,9 @@ That copies files to `%ProgramData%\NetworkSentinel\`, opens the firewall port, 
 NetworkSentinel.exe -w 18765
 ```
 
-Open `http://localhost:18765/` (or `http://<server-ip>:18765/`). **First browser visit creates a master password.**
+Open `http://localhost:18765/` (or `http://<server-ip>:18765/`). **First browser visit creates a master password.** Change it anytime under **Settings → Master password**.
 
-Re-running the installer **upgrades in place**: it stops the running task, replaces the files, and restarts. The web page header shows the running version (e.g. `v0.3.1`) — check it after an upgrade to confirm the new build is live.
+Re-running the installer **upgrades in place**: it stops the running task, replaces the binaries, and restarts. Master password, settings, and allowlist are **preserved**. The web page header shows the running version (e.g. `v0.3.1`) — check it after an upgrade to confirm the new build is live.
 
 #### Web console tabs
 
@@ -142,7 +154,7 @@ Re-running the installer **upgrades in place**: it stops the running task, repla
 | **Ports** | Local listeners; one-click **Block port** |
 | **Firewall** | Managed rules grouped as In/Out pairs; manual IP and port blocking; **Restore allowlisted** |
 | **Allowlist** | Add/remove trusted domains and IPs; refresh the feed |
-| **Settings** | Monitoring on/off, page refresh speed, geo lookups, auto-block + minimum severity, block direction (in/out), allowlist feed, **Remove all rules** |
+| **Settings** | Monitoring on/off, page refresh speed, geo lookups, auto-block + minimum severity, block direction (in/out), allowlist feed, **change master password**, **Remove all rules** |
 
 The console protects itself: it refuses to remove its own firewall access rule or block its own port (doing so would cut off your browser mid-request and look exactly like a crash).
 
@@ -215,8 +227,8 @@ The app starts **without** forcing UAC (so TUI/web work on servers). Desktop ins
 
 ### Web UI security
 - First browser visit **creates a master password** (min. 8 characters)
-- Later visits require that password
-- Hash stored as PBKDF2-SHA256 in `%ProgramData%\NetworkSentinel\web-master.json`
+- Later visits require that password; change it under **Settings → Master password**
+- Hash stored as PBKDF2-SHA256 (random salt, 200k iterations) in `%ProgramData%\NetworkSentinel\web-master.json` — never plain text
 - Session cookie until sign-out, browser close, or 12 hours idle
 
 ---
