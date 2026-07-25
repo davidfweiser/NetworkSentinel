@@ -31,6 +31,12 @@ internal static class Program
             return;
         }
 
+        if (WantsSetMasterPassword(args))
+        {
+            RunSetMasterPassword();
+            return;
+        }
+
         if (WantsWeb(args, out var webPort))
         {
             RunWeb(webPort);
@@ -120,6 +126,81 @@ internal static class Program
             Console.Error.WriteLine("Network Sentinel TUI failed:");
             Console.Error.WriteLine(ex);
             Environment.Exit(1);
+        }
+    }
+
+    private static bool WantsSetMasterPassword(string[] args)
+        => args.Any(a => a is "--set-master-password" or "--reset-master-password");
+
+    private static void RunSetMasterPassword()
+    {
+        try
+        {
+            var store = new Web.WebAuthStore();
+            Console.WriteLine(store.IsConfigured
+                ? "A master password is already set for this user — this will overwrite it."
+                : "No master password is set yet for this user — creating one.");
+            Console.WriteLine($"Data directory: {Services.AppPaths.DataDirectory}");
+            Console.WriteLine();
+
+            var password = ReadPassword("New master password (min 8 characters): ");
+            var confirm = ReadPassword("Confirm master password: ");
+
+            if (!store.SetPassword(password, confirm, out var message))
+            {
+                Console.Error.WriteLine($"Failed: {message}");
+                Environment.Exit(1);
+                return;
+            }
+
+            Console.WriteLine(message);
+            Console.WriteLine();
+            Console.WriteLine("If the web service is currently running, restart it to pick up the change:");
+            Console.WriteLine("  sudo systemctl restart networksentinel-web   # system install");
+            Console.WriteLine("  systemctl --user restart networksentinel-web # --user install");
+        }
+        catch (Exception ex)
+        {
+            LogCrash("set-master-password", ex);
+            Console.Error.WriteLine("Failed to set master password:");
+            Console.Error.WriteLine(ex.Message);
+            Environment.Exit(1);
+        }
+    }
+
+    /// <summary>Reads a line with each character masked as '*'; falls back to plain ReadLine when input is redirected (e.g. piped/non-interactive).</summary>
+    private static string ReadPassword(string prompt)
+    {
+        Console.Write(prompt);
+
+        if (Console.IsInputRedirected)
+            return Console.ReadLine() ?? "";
+
+        var buffer = new System.Text.StringBuilder();
+        while (true)
+        {
+            var key = Console.ReadKey(intercept: true);
+            if (key.Key == ConsoleKey.Enter)
+            {
+                Console.WriteLine();
+                return buffer.ToString();
+            }
+
+            if (key.Key == ConsoleKey.Backspace)
+            {
+                if (buffer.Length > 0)
+                {
+                    buffer.Length--;
+                    Console.Write("\b \b");
+                }
+                continue;
+            }
+
+            if (!char.IsControl(key.KeyChar))
+            {
+                buffer.Append(key.KeyChar);
+                Console.Write('*');
+            }
         }
     }
 
@@ -262,6 +343,9 @@ internal static class Program
               --console          Same as --tui
               -w, --web [PORT]   Headless web UI (browser). Auto-picks a free high port
                                  if PORT is omitted (prefers 18765, then nearby alternatives)
+              --set-master-password    Set/reset the web UI master password from the
+                                        terminal (no browser needed). Run as the same
+                                        user the web service runs as, then restart it.
               -h, --help         Show this help
 
             Environment:

@@ -78,6 +78,39 @@ public sealed class WebAuthStore
         return true;
     }
 
+    /// <summary>
+    /// Force-set the master password from a trusted local context (CLI), bypassing the
+    /// "already configured" guard the browser setup flow uses. Used by
+    /// `--set-master-password` when the web UI isn't reachable to set it there.
+    /// </summary>
+    public bool SetPassword(string password, string confirm, out string message)
+    {
+        if (!ValidateNewPassword(password, confirm, out message))
+            return false;
+
+        var salt = RandomNumberGenerator.GetBytes(SaltSize);
+        var hash = HashPassword(password, salt, Iterations);
+
+        lock (_fileGate)
+        {
+            var createdUtc = _auth?.CreatedUtc ?? DateTime.UtcNow;
+            _auth = new AuthFile
+            {
+                Version = 1,
+                Salt = Convert.ToBase64String(salt),
+                Hash = Convert.ToBase64String(hash),
+                Iterations = Iterations,
+                CreatedUtc = createdUtc,
+                ChangedUtc = DateTime.UtcNow
+            };
+            SaveUnlocked();
+        }
+
+        _sessions.Clear();
+        message = "Master password set.";
+        return true;
+    }
+
     public bool VerifyPassword(string password)
     {
         AuthFile? auth;
