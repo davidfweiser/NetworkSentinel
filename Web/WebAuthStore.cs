@@ -23,10 +23,17 @@ public sealed class WebAuthStore
 
     private readonly object _fileGate = new();
     private readonly ConcurrentDictionary<string, DateTime> _sessions = new(StringComparer.Ordinal);
+    private readonly string _dataDirectory;
     private AuthFile? _auth;
 
-    public WebAuthStore()
+    public WebAuthStore() : this(AppPaths.DataDirectory)
     {
+    }
+
+    /// <summary>Used by `--set-master-password` to target a specific user's data directory instead of the current process's own.</summary>
+    public WebAuthStore(string dataDirectory)
+    {
+        _dataDirectory = dataDirectory;
         Load();
     }
 
@@ -39,7 +46,7 @@ public sealed class WebAuthStore
         }
     }
 
-    private static string AuthPath => Path.Combine(AppPaths.DataDirectory, "web-master.json");
+    private string AuthPath => Path.Combine(_dataDirectory, "web-master.json");
 
     public bool TrySetup(string password, string confirm, out string message)
     {
@@ -281,7 +288,7 @@ public sealed class WebAuthStore
 
     private void SaveUnlocked()
     {
-        Directory.CreateDirectory(AppPaths.DataDirectory);
+        Directory.CreateDirectory(_dataDirectory);
         var path = AuthPath;
         var tmp = path + ".tmp";
         File.WriteAllText(tmp, JsonSerializer.Serialize(_auth, JsonOptions));

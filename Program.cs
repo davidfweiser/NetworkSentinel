@@ -13,6 +13,9 @@ internal static class Program
     [DllImport("libc")]
     private static extern uint geteuid();
 
+    [DllImport("libc", SetLastError = true)]
+    private static extern int chown(string pathname, uint owner, uint group);
+
     [STAThread]
     public static void Main(string[] args)
     {
@@ -134,13 +137,27 @@ internal static class Program
 
     private static void RunSetMasterPassword()
     {
+        if (!IsRunningAsRoot())
+        {
+            Console.Error.WriteLine("--set-master-password requires root — re-run with sudo:");
+            Console.Error.WriteLine("  sudo networksentinel --set-master-password");
+            Environment.Exit(1);
+            return;
+        }
+
         try
         {
-            var store = new Web.WebAuthStore();
+            var target = ResolveMasterPasswordTarget();
+            var dataDir = Path.Combine(target.Home, ".local", "share", "NetworkSentinel");
+            Directory.CreateDirectory(dataDir);
+            if (target.NeedsChown)
+                TryChown(dataDir, target.Uid, target.Gid);
+
+            var store = new Web.WebAuthStore(dataDir);
             Console.WriteLine(store.IsConfigured
                 ? "A master password is already set for this user — this will overwrite it."
                 : "No master password is set yet for this user — creating one.");
-            Console.WriteLine($"Data directory: {Services.AppPaths.DataDirectory}");
+            Console.WriteLine($"Data directory: {dataDir}");
             Console.WriteLine();
 
             var password = ReadPassword("New master password (min 8 characters): ");
@@ -152,6 +169,9 @@ internal static class Program
                 Environment.Exit(1);
                 return;
             }
+
+            if (target.NeedsChown)
+                TryChown(Path.Combine(dataDir, "web-master.json"), target.Uid, target.Gid);
 
             Console.WriteLine(message);
             Console.WriteLine();
@@ -165,6 +185,76 @@ internal static class Program
             Console.Error.WriteLine("Failed to set master password:");
             Console.Error.WriteLine(ex.Message);
             Environment.Exit(1);
+        }
+    }
+
+    /// <summary>
+    /// The web service runs as SUDO_USER, not root (see README), so `sudo networksentinel
+    /// --set-master-password` must target that user's home — not root's — or the file lands
+    /// somewhere the running service never reads. Mirrors the SERVICE_USER/SERVICE_HOME
+    /// resolution in scripts/install-from-package.sh.
+    /// </summary>
+    private static (string Home, uint Uid, uint Gid, bool NeedsChown) ResolveMasterPasswordTarget()
+    {
+        var sudoUser = Environment.GetEnvironmentVariable("SUDO_USER");
+        if (!string.IsNullOrWhiteSpace(sudoUser) && sudoUser != "root")
+        {
+            var entry = RunGetentPasswd(sudoUser);
+            if (entry != null)
+            {
+                var parts = entry.Split(':');
+                if (parts.Length >= 6 && uint.TryParse(parts[2], out var uid) && uint.TryParse(parts[3], out var gid)
+                    && !string.IsNullOrWhiteSpace(parts[5]))
+                {
+                    return (parts[5], uid, gid, true);
+                }
+            }
+
+            Console.Error.WriteLine($"Warning: could not resolve home directory for SUDO_USER '{sudoUser}' — falling back to root's own home.");
+        }
+
+        var rootHome = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+        if (string.IsNullOrWhiteSpace(rootHome))
+            rootHome = "/root";
+        return (rootHome, 0, 0, false);
+    }
+
+    private static string? RunGetentPasswd(string user)
+    {
+        try
+        {
+            var psi = new System.Diagnostics.ProcessStartInfo
+            {
+                FileName = "getent",
+                RedirectStandardOutput = true,
+                UseShellExecute = false
+            };
+            psi.ArgumentList.Add("passwd");
+            psi.ArgumentList.Add(user);
+
+            using var proc = System.Diagnostics.Process.Start(psi);
+            if (proc == null)
+                return null;
+
+            var output = proc.StandardOutput.ReadToEnd();
+            proc.WaitForExit(5000);
+            return proc.ExitCode == 0 ? output.Trim() : null;
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    private static void TryChown(string path, uint uid, uint gid)
+    {
+        try
+        {
+            chown(path, uid, gid);
+        }
+        catch
+        {
+            // best-effort — worst case the target user needs a manual chown
         }
     }
 
@@ -344,8 +434,9 @@ internal static class Program
               -w, --web [PORT]   Headless web UI (browser). Auto-picks a free high port
                                  if PORT is omitted (prefers 18765, then nearby alternatives)
               --set-master-password    Set/reset the web UI master password from the
-                                        terminal (no browser needed). Run as the same
-                                        user the web service runs as, then restart it.
+                                        terminal (no browser needed). Requires root:
+                                        sudo networksentinel --set-master-password
+                                        Restart the web service afterwards.
               -h, --help         Show this help
 
             Environment:
