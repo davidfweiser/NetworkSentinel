@@ -19,9 +19,9 @@ public sealed class GeoIpService : IDisposable
     private static readonly TimeSpan FailureRetryAfter = TimeSpan.FromMinutes(10);
 
     /// <summary>
-    /// When false, the external ip-api.com web lookup is skipped entirely
-    /// (reverse DNS still runs). Note the free ip-api endpoint is plain HTTP,
-    /// so the IPs this machine talks to are visible on the wire when enabled.
+    /// When false, the external geo web lookup is skipped entirely (reverse
+    /// DNS still runs). Lookups go to ipwho.is over HTTPS first; only if that
+    /// fails do they fall back to the plain-HTTP ip-api.com endpoint.
     /// </summary>
     public bool LookupsEnabled { get; set; } = true;
 
@@ -90,7 +90,7 @@ public sealed class GeoIpService : IDisposable
                 return dnsOnly;
             }
 
-            var geo = await QueryIpApiAsync(ip, ct);
+            var geo = await QueryGeoAsync(ip, ct);
 
             var result = new GeoResult
             {
@@ -126,6 +126,47 @@ public sealed class GeoIpService : IDisposable
         {
             _inFlight.TryRemove(ip, out _);
         }
+    }
+
+    private async Task<(string Country, string City, string Isp, double Lat, double Lon)> QueryGeoAsync(
+        string ip, CancellationToken ct)
+    {
+        // HTTPS endpoint first so the peer IPs we look up aren't broadcast in
+        // cleartext; the plain-HTTP ip-api.com endpoint is a fallback only.
+        try
+        {
+            return await QueryIpWhoIsAsync(ip, ct);
+        }
+        catch
+        {
+            return await QueryIpApiAsync(ip, ct);
+        }
+    }
+
+    private async Task<(string Country, string City, string Isp, double Lat, double Lon)> QueryIpWhoIsAsync(
+        string ip, CancellationToken ct)
+    {
+        // Free endpoint, no key, supports HTTPS. Rate-limited; we cache aggressively.
+        var url = $"https://ipwho.is/{ip}?fields=success,country,city,connection.isp,latitude,longitude";
+        using var response = await _http.GetAsync(url, ct);
+        response.EnsureSuccessStatusCode();
+        await using var stream = await response.Content.ReadAsStreamAsync(ct);
+        using var doc = await JsonDocument.ParseAsync(stream, cancellationToken: ct);
+        var root = doc.RootElement;
+
+        if (!root.TryGetProperty("success", out var success) || !success.GetBoolean())
+            throw new InvalidOperationException("ipwho.is lookup unsuccessful");
+
+        string country = root.TryGetProperty("country", out var c) ? c.GetString() ?? "" : "";
+        string city = root.TryGetProperty("city", out var ci) ? ci.GetString() ?? "" : "";
+        string isp = root.TryGetProperty("connection", out var conn) &&
+                     conn.ValueKind == JsonValueKind.Object &&
+                     conn.TryGetProperty("isp", out var i)
+            ? i.GetString() ?? ""
+            : "";
+        double lat = root.TryGetProperty("latitude", out var la) ? la.GetDouble() : 0;
+        double lon = root.TryGetProperty("longitude", out var lo) ? lo.GetDouble() : 0;
+        return (country, city, isp, lat, lon);
     }
 
     private async Task<(string Country, string City, string Isp, double Lat, double Lon)> QueryIpApiAsync(

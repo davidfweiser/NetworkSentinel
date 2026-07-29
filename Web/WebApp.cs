@@ -79,6 +79,7 @@ public sealed class WebApp : IDisposable
 
         _firewall.Allowlist = _allowlist;
         _monitor.GeoLookupsEnabled = _settings.GeoLookupEnabled;
+        _monitor.AuthMonitoringEnabled = _settings.AuthLogMonitorEnabled;
         _allowlist.UseRemoteFeed = _settings.AllowlistUseRemoteFeed;
         _monitor.Updated += OnMonitorUpdated;
         _monitor.ThreatsDetected += OnThreatsDetected;
@@ -581,6 +582,11 @@ public sealed class WebApp : IDisposable
                             _settings.GeoLookupEnabled = on;
                             label = $"Geo lookups: {(on ? "on" : "off")}";
                             break;
+                        case "authLogMonitorEnabled":
+                            _monitor.AuthMonitoringEnabled = on;
+                            _settings.AuthLogMonitorEnabled = on;
+                            label = on ? $"Auth-log monitoring: on ({_monitor.AuthLogStatus})" : "Auth-log monitoring: off";
+                            break;
                         case "allowlistUseRemoteFeed":
                             _allowlist.UseRemoteFeed = on;
                             _settings.AllowlistUseRemoteFeed = on;
@@ -820,6 +826,8 @@ public sealed class WebApp : IDisposable
                 blockInbound = _blockInbound,
                 blockOutbound = _blockOutbound,
                 geoLookupEnabled = _settings.GeoLookupEnabled,
+                authLogMonitorEnabled = _settings.AuthLogMonitorEnabled,
+                authLogStatus = _monitor.AuthLogStatus,
                 allowlistUseRemoteFeed = _settings.AllowlistUseRemoteFeed,
                 isMonitoring = stats.IsMonitoring
             },
@@ -2034,7 +2042,8 @@ public sealed class WebApp : IDisposable
       <div class="settings-group"><h3>Monitoring</h3>
         ${row('Live monitoring', 'Watch connections, listening ports, and threats in real time.', sw('monitoring', s.isMonitoring))}
         ${row('Page refresh speed', 'How often live tabs (Dashboard, Connections, Hosts…) update in this browser.', refreshSel)}
-        ${row('Geo lookups', 'Resolve country and city for remote IPs (uses ip-api.com over plain HTTP).', sw('geoLookupEnabled', s.geoLookupEnabled))}
+        ${row('Geo lookups', 'Resolve country and city for remote IPs (ipwho.is over HTTPS, ip-api.com fallback).', sw('geoLookupEnabled', s.geoLookupEnabled))}
+        ${row('Auth-log monitoring', 'Watch system auth logs for failed SSH/PAM logons and alert on brute-force bursts. ' + (s.authLogStatus || ''), sw('authLogMonitorEnabled', s.authLogMonitorEnabled))}
       </div>
       <div class="settings-group"><h3>Auto-block</h3>
         ${row('Auto-block threats', 'Automatically create firewall rules when threats are detected.', sw('autoBlockEnabled', s.autoBlockEnabled))}

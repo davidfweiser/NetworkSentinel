@@ -9,6 +9,7 @@ public sealed class NetworkMonitorService : IDisposable
     private readonly ProcessResolver _processes = new();
     private readonly GeoIpService _geo = new();
     private readonly IntrusionDetector _detector = new();
+    private readonly AuthLogMonitor _authLog = new();
     private readonly object _sync = new();
 
     private readonly Dictionary<string, NetworkConnection> _connections = new();
@@ -38,6 +39,27 @@ public sealed class NetworkMonitorService : IDisposable
         set => _geo.LookupsEnabled = value;
     }
 
+    private bool _authMonitoringEnabled = true;
+
+    /// <summary>Enables/disables failed-logon detection from system auth logs (journald / auth.log).</summary>
+    public bool AuthMonitoringEnabled
+    {
+        get => _authMonitoringEnabled;
+        set
+        {
+            if (_authMonitoringEnabled == value) return;
+            _authMonitoringEnabled = value;
+            if (Stats.IsMonitoring)
+            {
+                if (value) _authLog.Start();
+                else _authLog.Stop();
+            }
+        }
+    }
+
+    /// <summary>State of the auth-log source (journald / auth.log / unavailable reason).</summary>
+    public string AuthLogStatus => _authLog.Status;
+
     public IReadOnlyList<NetworkConnection> Connections
     {
         get { lock (_sync) return _connections.Values.OrderByDescending(c => c.LastSeen).ToList(); }
@@ -65,6 +87,7 @@ public sealed class NetworkMonitorService : IDisposable
         _cts = new CancellationTokenSource();
         Stats.IsMonitoring = true;
         Stats.StatusText = "Monitoring network stack…";
+        if (_authMonitoringEnabled) _authLog.Start();
         _loop = Task.Run(() => RunAsync(_cts.Token));
     }
 
@@ -77,6 +100,7 @@ public sealed class NetworkMonitorService : IDisposable
         cts?.Dispose();
         _cts = null;
         _loop = null;
+        _authLog.Stop();
         Stats.IsMonitoring = false;
         Stats.StatusText = "Monitoring paused";
     }
@@ -193,6 +217,7 @@ public sealed class NetworkMonitorService : IDisposable
             // Intrusion heuristics
             var activeConns = _connections.Values.ToList();
             newThreats.AddRange(_detector.Analyze(activeConns, _hosts, listeningTcpPorts, now));
+            newThreats.AddRange(_authLog.DrainPending());
 
             foreach (var t in newThreats)
             {
@@ -361,6 +386,7 @@ public sealed class NetworkMonitorService : IDisposable
     public void Dispose()
     {
         Stop();
+        _authLog.Dispose();
         _geo.Dispose();
     }
 }

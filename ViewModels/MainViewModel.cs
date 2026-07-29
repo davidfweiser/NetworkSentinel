@@ -94,6 +94,7 @@ public partial class MainViewModel : ObservableObject, IDisposable
 
         _firewall.Allowlist = _allowlist;
         _monitor.GeoLookupsEnabled = _settings.GeoLookupEnabled;
+        _monitor.AuthMonitoringEnabled = _settings.AuthLogMonitorEnabled;
         _allowlist.UseRemoteFeed = _settings.AllowlistUseRemoteFeed;
         _monitor.Updated += OnMonitorUpdated;
         _monitor.ThreatsDetected += OnThreatsDetected;

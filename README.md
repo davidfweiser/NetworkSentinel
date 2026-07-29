@@ -28,10 +28,12 @@ Linux port of the original Windows WPF Network Sentinel. Platform layers use `/p
 
 ### Threat awareness
 Heuristics flag patterns such as:
-- Multi-port scans / reconnaissance
+- Multi-port scans / reconnaissance — fast (45 s window) **and slow/paced** (10 min window, catches `nmap -T1`-style scans)
 - SSH and SMB hammering
+- **Failed logon bursts** from the system auth log (journald or `/var/log/auth.log`) — catches SSH/PAM brute-force even when it reuses one TCP session or paces below the connection-rate thresholds
 - Sensitive-port probing (admin, DB, remote access)
 - Short-lived / transitional TCP bursts
+- **Outbound beaconing** — regular-interval new sessions to an uncommon remote port (C2 "calling home" signature); common client ports and LAN peers are excluded
 - First-seen remote hosts
 
 Each alert includes **source IP**, **method**, and **where it’s coming from** (DNS + best-effort geo).
@@ -425,6 +427,7 @@ Optional desktop entry is provided as `networksentinel.desktop` (`Icon=networkse
 | `Native/LinuxNetTable.cs` | `/proc/net` parsing + socket inode → PID |
 | `Services/NetworkMonitorService.cs` | Polling loop, host tracking, stats |
 | `Services/IntrusionDetector.cs` | Heuristic threat engine |
+| `Services/AuthLogMonitor.cs` | Failed-logon detection from journald / auth.log |
 | `Services/GeoIpService.cs` | Reverse DNS + public geo lookup |
 | `Services/FirewallService.cs` | nftables / iptables via pkexec; rule ledger |
 | `Services/AppSettings.cs` / `AppPaths.cs` | XDG data dir + JSON settings |
@@ -458,8 +461,9 @@ Optional desktop entry is provided as `networksentinel.desktop` (`Icon=networkse
 ## Important notes
 
 - This is an **awareness console**, not a substitute for enterprise IDS, EDR, or carefully tuned host firewall policy.
-- Threat heuristics count **new inbound connections to ports this PC is listening on** — long-lived sessions and ordinary outbound client traffic are never treated as probing.
-- Public IP geolocation uses the free `ip-api.com` endpoint (rate-limited, best-effort, **plain HTTP**). Toggle it off in the web console's **Settings** tab, or set `"GeoLookupEnabled": false` in settings; reverse DNS still runs.
+- Scan/brute-force heuristics count **new inbound connections to ports this PC is listening on** — long-lived sessions and ordinary outbound client traffic are never treated as probing. The only outbound rule is the beacon detector, which requires a regular cadence to an uncommon port on a public IP.
+- Public IP geolocation uses the free `ipwho.is` endpoint over **HTTPS**, falling back to `ip-api.com` (plain HTTP) only if that fails. Both are rate-limited and best-effort. Toggle lookups off in the web console's **Settings** tab, or set `"GeoLookupEnabled": false` in settings; reverse DNS still runs.
+- Failed-logon detection reads journald (`journalctl -t sshd …`) or `/var/log/auth.log` without elevation. If neither is readable by your user (add yourself to the `adm` group, or `systemd-journal` for journald), the app keeps running and shows why under **Settings → Auth-log monitoring**; set `"AuthLogMonitorEnabled": false` to turn the feature off.
 - The allowlist remote feed can likewise be toggled in **Settings** or via `"AllowlistUseRemoteFeed": false`.
 - If the app ever exits unexpectedly, check `~/.local/share/NetworkSentinel/logs/crash.log` — unhandled errors are logged there with a stack trace.
 - Non-root runs still monitor connections for processes you can see; other users’ sockets may show as `Kernel / unknown`.
