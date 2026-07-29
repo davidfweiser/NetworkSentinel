@@ -83,6 +83,10 @@ public sealed class TuiApp : IDisposable
 
         _firewall.Allowlist = _allowlist;
         _monitor.GeoLookupsEnabled = _settings.GeoLookupEnabled;
+        _monitor.AuthMonitoringEnabled = _settings.AuthLogMonitorEnabled;
+        _monitor.ProbeMonitoringEnabled = _settings.ProbeLogEnabled;
+        if (_settings.ProbeLogEnabled && _firewall.IsRoot)
+            _ = Task.Run(() => _firewall.EnableProbeLogging());
         _allowlist.UseRemoteFeed = _settings.AllowlistUseRemoteFeed;
         _monitor.Updated += OnMonitorUpdated;
         _monitor.ThreatsDetected += OnThreatsDetected;
@@ -619,6 +623,8 @@ public sealed class TuiApp : IDisposable
         }
 
         var result = _firewall.AuthorizeElevation();
+        if (result.Success && _settings.ProbeLogEnabled)
+            _firewall.EnableProbeLogging();
         _statusMessage = result.Message;
     }
 

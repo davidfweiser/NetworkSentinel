@@ -22,7 +22,17 @@ public sealed class IntrusionDetector
     private readonly Queue<(DateTime Time, string Key)> _emitHistory = new();
 
     private static readonly TimeSpan Window = TimeSpan.FromSeconds(45);
+    private static readonly TimeSpan LongWindow = TimeSpan.FromMinutes(10);
     private static readonly TimeSpan EmitCooldown = TimeSpan.FromMinutes(2);
+
+    /// <summary>
+    /// Outbound destination ports that ordinary client software hammers all
+    /// day (web, mail, DNS, NTP, SSH); excluded from beacon detection.
+    /// </summary>
+    private static readonly HashSet<int> CommonOutboundPorts = new()
+    {
+        53, 80, 123, 443, 22, 25, 110, 143, 465, 587, 993, 995, 8080, 8443
+    };
 
     public IReadOnlyList<ThreatEvent> Analyze(
         IReadOnlyList<NetworkConnection> snapshot,
@@ -68,6 +78,10 @@ public sealed class IntrusionDetector
                     bool inbound = listeningTcpPorts.Contains(c.LocalPort) ||
                                    c.State == TcpConnectionState.SynReceived;
                     activity.Events.Enqueue((now, c.LocalPort, c.State, inbound));
+                    if (inbound)
+                        activity.LongInbound.Enqueue((now, c.LocalPort));
+                    else
+                        activity.OutboundNew.Enqueue((now, c.RemotePort, c.ProcessName));
                 }
 
                 activity.ActiveKeys = currentKeys;
@@ -75,6 +89,10 @@ public sealed class IntrusionDetector
 
                 while (activity.Events.Count > 0 && now - activity.Events.Peek().Time > Window)
                     activity.Events.Dequeue();
+                while (activity.LongInbound.Count > 0 && now - activity.LongInbound.Peek().Time > LongWindow)
+                    activity.LongInbound.Dequeue();
+                while (activity.OutboundNew.Count > 0 && now - activity.OutboundNew.Peek().Time > LongWindow)
+                    activity.OutboundNew.Dequeue();
 
                 EvaluateHost(ip, activity, knownHosts, now, threats);
             }
@@ -95,6 +113,13 @@ public sealed class IntrusionDetector
         DateTime now,
         List<ThreatEvent> threats)
     {
+        string origin = knownHosts.TryGetValue(ip, out var host) && !string.IsNullOrWhiteSpace(host.GeoSummary)
+            ? host.GeoSummary
+            : "Origin resolving…";
+
+        EvaluateSlowScan(ip, activity, origin, now, threats);
+        EvaluateOutboundBeacon(ip, activity, origin, now, threats);
+
         // Only inbound events count — outbound client connections use random
         // ephemeral local ports and must never register as probing.
         var recent = activity.Events.Where(e => e.Inbound).ToList();
@@ -109,10 +134,6 @@ public sealed class IntrusionDetector
             x.State is TcpConnectionState.SynSent or TcpConnectionState.SynReceived
                 or TcpConnectionState.TimeWait or TcpConnectionState.FinWait1
                 or TcpConnectionState.FinWait2 or TcpConnectionState.CloseWait);
-
-        string origin = knownHosts.TryGetValue(ip, out var host) && !string.IsNullOrWhiteSpace(host.GeoSummary)
-            ? host.GeoSummary
-            : "Origin resolving…";
 
         // Port scan: many different local service ports hit from one remote IP in a short window
         if (distinctLocalPorts >= 8)
@@ -195,6 +216,75 @@ public sealed class IntrusionDetector
         }
     }
 
+    /// <summary>
+    /// Paced reconnaissance: many distinct listening ports probed by one IP,
+    /// spread out enough that the 45s fast window never fires (e.g. nmap -T1).
+    /// </summary>
+    private void EvaluateSlowScan(
+        string ip, HostActivity activity, string origin, DateTime now, List<ThreatEvent> threats)
+    {
+        var distinct = activity.LongInbound.Select(x => x.LocalPort).Distinct().Count();
+        if (distinct >= 16)
+        {
+            TryAdd(threats, now, ip, ThreatType.PortScan, ThreatLevel.High,
+                "Slow port scan detected",
+                $"{ip} touched {distinct} different local ports over the last {LongWindow.TotalMinutes:0} minutes — paced scanning below the fast-scan threshold.",
+                origin,
+                "Low-and-slow multi-port probing");
+        }
+        else if (distinct >= 10)
+        {
+            TryAdd(threats, now, ip, ThreatType.PortScan, ThreatLevel.Medium,
+                "Possible slow port reconnaissance",
+                $"{ip} touched {distinct} different local ports over the last {LongWindow.TotalMinutes:0} minutes.",
+                origin,
+                "Low-and-slow multi-port probing");
+        }
+    }
+
+    /// <summary>
+    /// Beacon-like outbound traffic: repeated NEW sessions from this machine
+    /// to the same remote host on an uncommon destination port at a regular
+    /// cadence — the signature of C2 check-ins after a compromise. Common
+    /// client ports (web, mail, DNS…) and private/LAN peers are excluded, so
+    /// browsers and local chatter never trip it.
+    /// </summary>
+    private void EvaluateOutboundBeacon(
+        string ip, HostActivity activity, string origin, DateTime now, List<ThreatEvent> threats)
+    {
+        if (activity.OutboundNew.Count < 6) return;
+        if (GeoIpService.IsNonPublic(ip)) return;
+
+        foreach (var group in activity.OutboundNew
+                     .Where(x => !CommonOutboundPorts.Contains(x.RemotePort))
+                     .GroupBy(x => x.RemotePort))
+        {
+            var times = group.Select(x => x.Time).OrderBy(t => t).ToList();
+            if (times.Count < 6) continue;
+
+            var intervals = new List<double>();
+            for (int i = 1; i < times.Count; i++)
+                intervals.Add((times[i] - times[i - 1]).TotalSeconds);
+
+            double mean = intervals.Average();
+            // Bursts (rapid retries) are normal failure behavior, not beaconing.
+            if (mean < 15) continue;
+
+            double variance = intervals.Sum(v => (v - mean) * (v - mean)) / intervals.Count;
+            double cv = Math.Sqrt(variance) / mean;
+            if (cv > 0.5) continue;
+
+            var process = group.Select(x => x.ProcessName)
+                .LastOrDefault(p => !string.IsNullOrWhiteSpace(p) && p != "—") ?? "unknown process";
+            TryAdd(threats, now, ip, ThreatType.SuspiciousOutbound, ThreatLevel.Medium,
+                "Possible outbound beaconing",
+                $"This machine opened {times.Count} sessions to {ip}:{group.Key} at a regular ~{mean:0}s interval over {LongWindow.TotalMinutes:0} minutes (process: {process}). Regular check-ins to an uncommon port can indicate malware calling home.",
+                origin,
+                $"Periodic outbound to port {group.Key}");
+            break;
+        }
+    }
+
     private void TryAdd(
         List<ThreatEvent> threats,
         DateTime now,
@@ -246,6 +336,8 @@ public sealed class IntrusionDetector
     private sealed class HostActivity
     {
         public Queue<(DateTime Time, int LocalPort, TcpConnectionState State, bool Inbound)> Events { get; } = new();
+        public Queue<(DateTime Time, int LocalPort)> LongInbound { get; } = new();
+        public Queue<(DateTime Time, int RemotePort, string ProcessName)> OutboundNew { get; } = new();
         public HashSet<string> ActiveKeys { get; set; } = new(StringComparer.Ordinal);
         public DateTime LastSeen { get; set; } = DateTime.Now;
     }

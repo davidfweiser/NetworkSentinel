@@ -79,6 +79,10 @@ public sealed class WebApp : IDisposable
 
         _firewall.Allowlist = _allowlist;
         _monitor.GeoLookupsEnabled = _settings.GeoLookupEnabled;
+        _monitor.AuthMonitoringEnabled = _settings.AuthLogMonitorEnabled;
+        _monitor.ProbeMonitoringEnabled = _settings.ProbeLogEnabled;
+        if (_settings.ProbeLogEnabled && _firewall.IsRoot)
+            _ = Task.Run(() => _firewall.EnableProbeLogging());
         _allowlist.UseRemoteFeed = _settings.AllowlistUseRemoteFeed;
         _monitor.Updated += OnMonitorUpdated;
         _monitor.ThreatsDetected += OnThreatsDetected;
@@ -581,6 +585,23 @@ public sealed class WebApp : IDisposable
                             _settings.GeoLookupEnabled = on;
                             label = $"Geo lookups: {(on ? "on" : "off")}";
                             break;
+                        case "authLogMonitorEnabled":
+                            _monitor.AuthMonitoringEnabled = on;
+                            _settings.AuthLogMonitorEnabled = on;
+                            label = on ? $"Auth-log monitoring: on ({_monitor.AuthLogStatus})" : "Auth-log monitoring: off";
+                            break;
+                        case "probeLogEnabled":
+                        {
+                            _settings.ProbeLogEnabled = on;
+                            var fw = on ? _firewall.EnableProbeLogging() : _firewall.DisableProbeLogging();
+                            _monitor.ProbeMonitoringEnabled = on && fw.Success;
+                            label = on
+                                ? (fw.Success
+                                    ? "Closed-port scan detection: on (probe-log firewall rule installed)"
+                                    : $"Closed-port scan detection: could not install firewall rule — {fw.Message}")
+                            : "Closed-port scan detection: off";
+                            break;
+                        }
                         case "allowlistUseRemoteFeed":
                             _allowlist.UseRemoteFeed = on;
                             _settings.AllowlistUseRemoteFeed = on;
@@ -648,6 +669,8 @@ public sealed class WebApp : IDisposable
                 case "authorize":
                 {
                     var r = _firewall.AuthorizeElevation();
+                    if (r.Success && _settings.ProbeLogEnabled)
+                        _firewall.EnableProbeLogging();
                     _statusMessage = r.Message;
                     return r.Success ? ActionResultDto.Success(r.Message) : ActionResultDto.Fail(r.Message);
                 }
@@ -820,6 +843,10 @@ public sealed class WebApp : IDisposable
                 blockInbound = _blockInbound,
                 blockOutbound = _blockOutbound,
                 geoLookupEnabled = _settings.GeoLookupEnabled,
+                authLogMonitorEnabled = _settings.AuthLogMonitorEnabled,
+                authLogStatus = _monitor.AuthLogStatus,
+                probeLogEnabled = _settings.ProbeLogEnabled,
+                probeLogStatus = _monitor.ProbeLogStatus,
                 allowlistUseRemoteFeed = _settings.AllowlistUseRemoteFeed,
                 isMonitoring = stats.IsMonitoring
             },
@@ -2034,7 +2061,9 @@ public sealed class WebApp : IDisposable
       <div class="settings-group"><h3>Monitoring</h3>
         ${row('Live monitoring', 'Watch connections, listening ports, and threats in real time.', sw('monitoring', s.isMonitoring))}
         ${row('Page refresh speed', 'How often live tabs (Dashboard, Connections, Hosts…) update in this browser.', refreshSel)}
-        ${row('Geo lookups', 'Resolve country and city for remote IPs (uses ip-api.com over plain HTTP).', sw('geoLookupEnabled', s.geoLookupEnabled))}
+        ${row('Geo lookups', 'Resolve country and city for remote IPs (ipwho.is over HTTPS, ip-api.com fallback).', sw('geoLookupEnabled', s.geoLookupEnabled))}
+        ${row('Auth-log monitoring', 'Watch system auth logs for failed SSH/PAM logons and alert on brute-force bursts. ' + (s.authLogStatus || ''), sw('authLogMonitorEnabled', s.authLogMonitorEnabled))}
+        ${row('Closed-port scan detection', 'Install a rate-limited firewall SYN-log rule (needs elevation) and watch the kernel log — catches port scans of closed ports that never appear as connections. ' + (s.probeLogStatus || ''), sw('probeLogEnabled', s.probeLogEnabled))}
       </div>
       <div class="settings-group"><h3>Auto-block</h3>
         ${row('Auto-block threats', 'Automatically create firewall rules when threats are detected.', sw('autoBlockEnabled', s.autoBlockEnabled))}

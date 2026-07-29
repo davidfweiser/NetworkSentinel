@@ -94,6 +94,10 @@ public partial class MainViewModel : ObservableObject, IDisposable
 
         _firewall.Allowlist = _allowlist;
         _monitor.GeoLookupsEnabled = _settings.GeoLookupEnabled;
+        _monitor.AuthMonitoringEnabled = _settings.AuthLogMonitorEnabled;
+        _monitor.ProbeMonitoringEnabled = _settings.ProbeLogEnabled;
+        if (_settings.ProbeLogEnabled && _firewall.IsRoot)
+            _ = Task.Run(() => _firewall.EnableProbeLogging());
         _allowlist.UseRemoteFeed = _settings.AllowlistUseRemoteFeed;
         _monitor.Updated += OnMonitorUpdated;
         _monitor.ThreatsDetected += OnThreatsDetected;
@@ -540,6 +544,8 @@ public partial class MainViewModel : ObservableObject, IDisposable
         try
         {
             var result = await Task.Run(() => _firewall.AuthorizeElevation());
+            if (result.Success && _settings.ProbeLogEnabled)
+                await Task.Run(() => _firewall.EnableProbeLogging());
             FirewallMessage = result.Message;
             IsAdmin = _firewall.IsAdministrator;
             FirewallStatusText = _firewall.PrivilegeText;
