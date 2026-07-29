@@ -10,6 +10,7 @@ public sealed class NetworkMonitorService : IDisposable
     private readonly GeoIpService _geo = new();
     private readonly IntrusionDetector _detector = new();
     private readonly AuthLogMonitor _authLog = new();
+    private readonly ProbeLogMonitor _probeLog = new();
     private readonly object _sync = new();
 
     private readonly Dictionary<string, NetworkConnection> _connections = new();
@@ -60,6 +61,31 @@ public sealed class NetworkMonitorService : IDisposable
     /// <summary>State of the auth-log source (journald / auth.log / unavailable reason).</summary>
     public string AuthLogStatus => _authLog.Status;
 
+    private bool _probeMonitoringEnabled;
+
+    /// <summary>
+    /// Enables/disables closed-port scan detection from the kernel probe log.
+    /// The firewall probe-log rule must also be installed (FirewallService)
+    /// for events to actually appear.
+    /// </summary>
+    public bool ProbeMonitoringEnabled
+    {
+        get => _probeMonitoringEnabled;
+        set
+        {
+            if (_probeMonitoringEnabled == value) return;
+            _probeMonitoringEnabled = value;
+            if (Stats.IsMonitoring)
+            {
+                if (value) _probeLog.Start();
+                else _probeLog.Stop();
+            }
+        }
+    }
+
+    /// <summary>State of the kernel probe-log source.</summary>
+    public string ProbeLogStatus => _probeLog.Status;
+
     public IReadOnlyList<NetworkConnection> Connections
     {
         get { lock (_sync) return _connections.Values.OrderByDescending(c => c.LastSeen).ToList(); }
@@ -88,6 +114,7 @@ public sealed class NetworkMonitorService : IDisposable
         Stats.IsMonitoring = true;
         Stats.StatusText = "Monitoring network stack…";
         if (_authMonitoringEnabled) _authLog.Start();
+        if (_probeMonitoringEnabled) _probeLog.Start();
         _loop = Task.Run(() => RunAsync(_cts.Token));
     }
 
@@ -101,6 +128,7 @@ public sealed class NetworkMonitorService : IDisposable
         _cts = null;
         _loop = null;
         _authLog.Stop();
+        _probeLog.Stop();
         Stats.IsMonitoring = false;
         Stats.StatusText = "Monitoring paused";
     }
@@ -218,6 +246,8 @@ public sealed class NetworkMonitorService : IDisposable
             var activeConns = _connections.Values.ToList();
             newThreats.AddRange(_detector.Analyze(activeConns, _hosts, listeningTcpPorts, now));
             newThreats.AddRange(_authLog.DrainPending());
+            _probeLog.SetListeningPorts(listeningTcpPorts);
+            newThreats.AddRange(_probeLog.DrainPending());
 
             foreach (var t in newThreats)
             {
@@ -387,6 +417,7 @@ public sealed class NetworkMonitorService : IDisposable
     {
         Stop();
         _authLog.Dispose();
+        _probeLog.Dispose();
         _geo.Dispose();
     }
 }

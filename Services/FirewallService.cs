@@ -16,6 +16,8 @@ namespace NetworkSentinel.Services;
 public sealed class FirewallService
 {
     public const string RulePrefix = "NetworkSentinel";
+    public const string ProbeLogRuleName = "NetworkSentinel-ProbeLog";
+    public const string ProbeLogPrefix = "NS-PROBE ";
     private const string NftTable = "inet networksentinel";
     private static readonly JsonSerializerOptions JsonOptions = new() { WriteIndented = true };
 
@@ -321,6 +323,74 @@ public sealed class FirewallService
         }
         return set;
     }
+
+    /// <summary>
+    /// Installs a rate-limited kernel log rule for new inbound TCP SYNs in the
+    /// managed table. Probes to CLOSED ports are answered with a RST before
+    /// they ever appear in /proc/net, so connection polling cannot see them —
+    /// this rule makes them visible via the kernel log at near-zero cost
+    /// (in-kernel match, one log line per probe, capped at 50/second).
+    /// </summary>
+    public FirewallOperationResult EnableProbeLogging()
+    {
+        if (!IsAdministrator)
+            return FirewallOperationResult.Fail("No way to elevate (need pkexec or sudo) to modify the host firewall.");
+
+        EnsureBackendReady();
+        RemoveRuleByName(ProbeLogRuleName);
+
+        FirewallOperationResult applied;
+        if (BackendIsNft())
+        {
+            var r = RunPrivileged("nft",
+                $"add rule {NftTable} input tcp flags & (syn|ack) == syn ct state new " +
+                $"limit rate 50/second log prefix \"{ProbeLogPrefix}\" comment \"{ProbeLogRuleName}\"");
+            applied = r.Success
+                ? FirewallOperationResult.Ok("Probe logging enabled (nftables).")
+                : FirewallOperationResult.Fail($"Failed to add probe log rule: {r.Message}");
+        }
+        else
+        {
+            var r = RunPrivileged("iptables",
+                $"-A INPUT -p tcp --syn -m conntrack --ctstate NEW -m limit --limit 50/sec " +
+                $"-j LOG --log-prefix \"{ProbeLogPrefix}\" -m comment --comment \"{ProbeLogRuleName}\"");
+            applied = r.Success
+                ? FirewallOperationResult.Ok("Probe logging enabled (iptables).")
+                : FirewallOperationResult.Fail($"Failed to add probe log rule: {r.Message}");
+        }
+
+        if (applied.Success)
+        {
+            UpsertLedger(new FirewallRuleInfo
+            {
+                Name = ProbeLogRuleName,
+                Description = "Logs new inbound TCP SYNs (rate-limited) so scans of closed ports are detectable",
+                Enabled = true,
+                IsBlock = false,
+                Direction = FirewallDirection.Inbound,
+                RemoteAddresses = "",
+                LocalPorts = "",
+                Protocol = "TCP",
+                Kind = FirewallRuleKind.Other
+            });
+        }
+
+        return applied;
+    }
+
+    public FirewallOperationResult DisableProbeLogging()
+    {
+        if (!IsAdministrator)
+            return FirewallOperationResult.Fail("No way to elevate (need pkexec or sudo) to modify the host firewall.");
+
+        var r = RemoveRuleByName(ProbeLogRuleName);
+        return r.Success
+            ? FirewallOperationResult.Ok("Probe logging disabled.")
+            : r;
+    }
+
+    public bool IsProbeLoggingInstalled()
+        => GetManagedRules().Any(r => string.Equals(r.Name, ProbeLogRuleName, StringComparison.OrdinalIgnoreCase));
 
     /// <summary>
     /// Pre-authorize elevation with a no-op privileged command so the first real
