@@ -85,6 +85,9 @@
           <RadioButton Classes="nav" Content="Firewall &amp; Block" GroupName="Nav"
                        IsChecked="{Binding ShowFirewall, Mode=OneWay}"
                        Command="{Binding NavigateCommand}" CommandParameter="Firewall"/>
+          <RadioButton Classes="nav" Content="Settings" GroupName="Nav"
+                       IsChecked="{Binding ShowSettings, Mode=OneWay}"
+                       Command="{Binding NavigateCommand}" CommandParameter="Settings"/>
         </StackPanel>
       </DockPanel>
     </Border>
@@ -112,7 +115,8 @@
 
       <Grid Grid.Row="1">
         <!-- DASHBOARD -->
-        <Grid IsVisible="{Binding ShowDashboard}" RowDefinitions="Auto,220,*">
+        <!-- 250, not 220: the chart card now carries a legend row under the plot. -->
+        <Grid IsVisible="{Binding ShowDashboard}" RowDefinitions="Auto,250,*">
           <Grid ColumnDefinitions="*,*,*,*,*" Margin="0,0,0,14">
             <Border Classes="stat" Margin="0,0,8,0">
               <StackPanel>
@@ -158,17 +162,38 @@
 
           <Grid Grid.Row="1" ColumnDefinitions="2*,*" Margin="0,0,0,14">
             <Border Classes="card" Margin="0,0,10,0">
-              <Grid RowDefinitions="Auto,*">
+              <Grid RowDefinitions="Auto,*,Auto">
                 <DockPanel>
                   <TextBlock Text="Connection activity" FontWeight="Bold" FontSize="14"/>
-                  <TextBlock DockPanel.Dock="Right" Text="Live samples" Foreground="{DynamicResource TextMutedBrush}"
+                  <TextBlock DockPanel.Dock="Right" Text="{Binding ActivityWindowText}"
+                             Foreground="{DynamicResource TextMutedBrush}"
                              FontSize="11" HorizontalAlignment="Right" VerticalAlignment="Center"/>
                 </DockPanel>
                 <ctrl:Sparkline Grid.Row="1" Margin="0,12,0,0"
                                 Values="{Binding ActivitySeries}"
+                                Threats="{Binding ThreatSeries}"
                                 Stroke="{DynamicResource AccentCyanBrush}"
                                 Fill="{DynamicResource ChartFill}"
                                 StrokeThickness="2.4"/>
+
+                <!-- Legend row, matching the web chart: time range at the edges,
+                     current/peak connections and the window's alert count between. -->
+                <Grid Grid.Row="2" ColumnDefinitions="Auto,*,Auto" Margin="0,8,0,0">
+                  <TextBlock Text="{Binding ActivityFromText}" FontSize="10"
+                             Foreground="{DynamicResource TextMutedBrush}" VerticalAlignment="Center"/>
+                  <WrapPanel Grid.Column="1" HorizontalAlignment="Center">
+                    <TextBlock Text="●" FontSize="11" Margin="0,0,4,0"
+                               Foreground="{DynamicResource AccentCyanBrush}" VerticalAlignment="Center"/>
+                    <TextBlock Text="{Binding ActivityConnectionsText}" FontSize="10" Margin="0,0,12,0"
+                               Foreground="{DynamicResource TextSecondaryBrush}" VerticalAlignment="Center"/>
+                    <TextBlock Text="▮" FontSize="11" Margin="0,0,4,0"
+                               Foreground="{DynamicResource DangerBrush}" VerticalAlignment="Center"/>
+                    <TextBlock Text="{Binding ActivityThreatText}" FontSize="10"
+                               Foreground="{DynamicResource TextSecondaryBrush}" VerticalAlignment="Center"/>
+                  </WrapPanel>
+                  <TextBlock Grid.Column="2" Text="{Binding ActivityToText}" FontSize="10"
+                             Foreground="{DynamicResource TextMutedBrush}" VerticalAlignment="Center"/>
+                </Grid>
               </Grid>
             </Border>
             <Border Classes="card" Grid.Column="1" Background="{DynamicResource HeroGradient}">
@@ -496,6 +521,123 @@
                 </DataGrid.Columns>
               </DataGrid>
             </DockPanel>
+          </Border>
+        </Grid>
+
+        <!-- SETTINGS — mirrors the web console's Settings tab so both front-ends
+             drive the same keys in settings.json. Auto-block lives in the sidebar
+             and the Firewall view, so it is not duplicated here. -->
+        <Grid IsVisible="{Binding ShowSettings}" RowDefinitions="*,Auto">
+          <ScrollViewer>
+            <StackPanel Spacing="14">
+              <Border Classes="card">
+                <StackPanel>
+                  <TextBlock Text="Monitoring" FontWeight="Bold" FontSize="15"/>
+                  <TextBlock Text="What the monitor watches, and how often it samples."
+                             Foreground="{DynamicResource TextSecondaryBrush}" FontSize="12"
+                             Margin="0,4,0,14" TextWrapping="Wrap"/>
+
+                  <Grid ColumnDefinitions="*,Auto" Margin="0,0,0,14">
+                    <StackPanel Margin="0,0,16,0">
+                      <TextBlock Text="Live monitoring" FontWeight="Bold" FontSize="13"/>
+                      <TextBlock Text="Watch connections, listening ports, and threats in real time."
+                                 Foreground="{DynamicResource TextSecondaryBrush}" FontSize="11"
+                                 Margin="0,2,0,0" TextWrapping="Wrap"/>
+                    </StackPanel>
+                    <Button Grid.Column="1" Classes="ghost" VerticalAlignment="Center" MinWidth="110"
+                            Content="{Binding Stats.IsMonitoring, Converter={StaticResource MonitorText}}"
+                            Command="{Binding ToggleMonitoringCommand}"/>
+                  </Grid>
+
+                  <Grid ColumnDefinitions="*,Auto" Margin="0,0,0,14">
+                    <StackPanel Margin="0,0,16,0">
+                      <TextBlock Text="Monitor poll interval" FontWeight="Bold" FontSize="13"/>
+                      <TextBlock Text="How often the monitor samples the network stack. This is also the activity chart's sample rate, so a slower interval widens the window the chart covers."
+                                 Foreground="{DynamicResource TextSecondaryBrush}" FontSize="11"
+                                 Margin="0,2,0,0" TextWrapping="Wrap"/>
+                    </StackPanel>
+                    <ComboBox Grid.Column="1" Width="205" VerticalAlignment="Center"
+                              ItemsSource="{Binding MonitorPollOptions}"
+                              SelectedItem="{Binding SelectedMonitorPoll}"/>
+                  </Grid>
+
+                  <Grid ColumnDefinitions="*,Auto" Margin="0,0,0,14">
+                    <StackPanel Margin="0,0,16,0">
+                      <TextBlock Text="Geo lookups" FontWeight="Bold" FontSize="13"/>
+                      <TextBlock Text="Resolve country and city for remote IPs (ipwho.is over HTTPS, ip-api.com fallback). Reverse DNS still runs when this is off."
+                                 Foreground="{DynamicResource TextSecondaryBrush}" FontSize="11"
+                                 Margin="0,2,0,0" TextWrapping="Wrap"/>
+                    </StackPanel>
+                    <CheckBox Grid.Column="1" VerticalAlignment="Center"
+                              IsChecked="{Binding GeoLookupEnabled}"/>
+                  </Grid>
+
+                  <Grid ColumnDefinitions="*,Auto" Margin="0,0,0,14">
+                    <StackPanel Margin="0,0,16,0">
+                      <TextBlock Text="Auth-log monitoring" FontWeight="Bold" FontSize="13"/>
+                      <TextBlock Text="Watch system auth logs (journald or /var/log/auth.log) for failed SSH/PAM logons and alert on brute-force bursts."
+                                 Foreground="{DynamicResource TextSecondaryBrush}" FontSize="11"
+                                 Margin="0,2,0,0" TextWrapping="Wrap"/>
+                      <TextBlock Text="{Binding AuthLogStatusText}" FontSize="11" Margin="0,4,0,0"
+                                 Foreground="{DynamicResource AccentCyanBrush}" TextWrapping="Wrap"/>
+                    </StackPanel>
+                    <CheckBox Grid.Column="1" VerticalAlignment="Center"
+                              IsChecked="{Binding AuthLogMonitorEnabled}"/>
+                  </Grid>
+
+                  <Grid ColumnDefinitions="*,Auto">
+                    <StackPanel Margin="0,0,16,0">
+                      <TextBlock Text="Closed-port scan detection" FontWeight="Bold" FontSize="13"/>
+                      <TextBlock Text="Install a rate-limited firewall SYN-log rule (needs elevation) and watch the kernel log — catches scans of closed ports that never appear as connections."
+                                 Foreground="{DynamicResource TextSecondaryBrush}" FontSize="11"
+                                 Margin="0,2,0,0" TextWrapping="Wrap"/>
+                      <TextBlock Text="{Binding ProbeLogStatusText}" FontSize="11" Margin="0,4,0,0"
+                                 Foreground="{DynamicResource AccentCyanBrush}" TextWrapping="Wrap"/>
+                    </StackPanel>
+                    <CheckBox Grid.Column="1" VerticalAlignment="Center"
+                              IsChecked="{Binding ProbeLogEnabled}"/>
+                  </Grid>
+                </StackPanel>
+              </Border>
+
+              <Border Classes="card">
+                <StackPanel>
+                  <TextBlock Text="Allowlist" FontWeight="Bold" FontSize="15"/>
+                  <TextBlock Text="Known-good hosts that are never blocked."
+                             Foreground="{DynamicResource TextSecondaryBrush}" FontSize="12"
+                             Margin="0,4,0,14" TextWrapping="Wrap"/>
+                  <Grid ColumnDefinitions="*,Auto">
+                    <StackPanel Margin="0,0,16,0">
+                      <TextBlock Text="Remote allowlist feed" FontWeight="Bold" FontSize="13"/>
+                      <TextBlock Text="Refresh the known-good domain/IP list from the online feed. Off uses only the local and built-in lists."
+                                 Foreground="{DynamicResource TextSecondaryBrush}" FontSize="11"
+                                 Margin="0,2,0,0" TextWrapping="Wrap"/>
+                      <TextBlock Text="{Binding AllowlistStatusText}" FontSize="11" Margin="0,4,0,0"
+                                 Foreground="{DynamicResource TextMutedBrush}" TextWrapping="Wrap"/>
+                    </StackPanel>
+                    <CheckBox Grid.Column="1" VerticalAlignment="Center"
+                              IsChecked="{Binding AllowlistUseRemoteFeed}"/>
+                  </Grid>
+                </StackPanel>
+              </Border>
+
+              <Border Classes="card">
+                <StackPanel>
+                  <TextBlock Text="Data" FontWeight="Bold" FontSize="15"/>
+                  <TextBlock Text="Settings, allowlist, and the web console's master-password hash live in your XDG data directory. Both this app and the web console read the same files."
+                             Foreground="{DynamicResource TextSecondaryBrush}" FontSize="12"
+                             Margin="0,4,0,0" TextWrapping="Wrap"/>
+                  <TextBlock Text="{Binding DataDirectoryText}" FontSize="11" Margin="0,8,0,0"
+                             Foreground="{DynamicResource TextMutedBrush}" TextWrapping="Wrap"/>
+                </StackPanel>
+              </Border>
+            </StackPanel>
+          </ScrollViewer>
+
+          <Border Grid.Row="1" Classes="card" Margin="0,12,0,0" Padding="12"
+                  IsVisible="{Binding SettingsMessage, Converter={StaticResource NotEmpty}}">
+            <TextBlock Text="{Binding SettingsMessage}" FontSize="12" TextWrapping="Wrap"
+                       Foreground="{DynamicResource AccentCyanBrush}"/>
           </Border>
         </Grid>
       </Grid>

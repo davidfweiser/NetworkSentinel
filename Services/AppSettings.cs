@@ -32,6 +32,12 @@ public sealed class AppSettings
     public bool AllowlistUseRemoteFeed { get; set; } = true;
 
     /// <summary>
+    /// Milliseconds between monitor polls (clamped to 500–10000 when applied).
+    /// Doubles as the activity-chart sample rate.
+    /// </summary>
+    public int MonitorPollMs { get; set; } = NetworkMonitorService.DefaultPollIntervalMs;
+
+    /// <summary>
     /// IPs the user manually unblocked/removed. Auto-block will not recreate rules for these
     /// until the UTC expiry (or the user blocks the IP again). Shared across GUI / TUI / web.
     /// </summary>

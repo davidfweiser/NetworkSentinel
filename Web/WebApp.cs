@@ -1895,7 +1895,7 @@ public sealed class WebApp : IDisposable
       ? `<rect x="${(x(i) - 2).toFixed(1)}" y="${padT}" width="4" height="${ih}" fill="rgba(255,93,120,.30)" rx="2"/>`
       : '').join('');
     const last = act[act.length - 1];
-    const threatTotal = act.reduce((n, a) => n + a.th, 0);
+    const threatTotal = act.reduce((n, a) => n + a.threats, 0);
     return `
       <svg viewBox="0 0 ${W} ${H}" preserveAspectRatio="none" role="img" aria-label="Connection activity chart">
         ${grid}

@@ -23,6 +23,14 @@ public sealed class NetworkMonitorService : IDisposable
     private CancellationTokenSource? _cts;
     private Task? _loop;
     private bool _firstPass = true;
+
+    /// <summary>
+    /// First-seen-host threats raised by <see cref="UpsertHost"/> this poll. They are
+    /// inserted and counted there rather than via the newThreats list, so the activity
+    /// sample has to pick them up separately or the chart shows no threat markers at
+    /// all on a quiet machine, where first contact is the only alert that ever fires.
+    /// </summary>
+    private int _hostThreatsThisPoll;
     private int _threatsTodayCount;
     private int _highThreatCount;
     private DateTime _threatsTodayDate = DateTime.Now.Date;
@@ -38,6 +46,21 @@ public sealed class NetworkMonitorService : IDisposable
     {
         get => _geo.LookupsEnabled;
         set => _geo.LookupsEnabled = value;
+    }
+
+    private int _pollIntervalMs = DefaultPollIntervalMs;
+
+    public const int DefaultPollIntervalMs = 1200;
+
+    /// <summary>
+    /// Milliseconds between polls, clamped to 500–10000. This is also the activity
+    /// sample rate, so a slower interval stretches the span the chart covers rather
+    /// than showing the same window at lower resolution. Takes effect next cycle.
+    /// </summary>
+    public int PollIntervalMs
+    {
+        get => _pollIntervalMs;
+        set => _pollIntervalMs = Math.Clamp(value, 500, 10_000);
     }
 
     private bool _authMonitoringEnabled = true;
@@ -148,7 +171,7 @@ public sealed class NetworkMonitorService : IDisposable
 
             try
             {
-                await Task.Delay(1200, ct);
+                await Task.Delay(PollIntervalMs, ct);
             }
             catch (TaskCanceledException)
             {
@@ -171,6 +194,7 @@ public sealed class NetworkMonitorService : IDisposable
 
         lock (_sync)
         {
+            _hostThreatsThisPoll = 0;
             if (now.Date != _threatsTodayDate)
             {
                 _threatsTodayDate = now.Date;
@@ -268,7 +292,7 @@ public sealed class NetworkMonitorService : IDisposable
             {
                 Time = now,
                 ConnectionCount = _connections.Count,
-                ThreatCount = newThreats.Count,
+                ThreatCount = newThreats.Count + _hostThreatsThisPoll,
                 RemoteHostCount = _hosts.Count
             });
             // ~5 minutes of history at the 1.2 s poll rate (GUI sparkline and
@@ -328,6 +352,7 @@ public sealed class NetworkMonitorService : IDisposable
                 };
                 _threats.Insert(0, t);
                 CountThreat(t);
+                _hostThreatsThisPoll++;
             }
         }
 

@@ -17,6 +17,7 @@
       <conv:BoolToVisibilityConverter x:Key="BoolToVis"/>
       <conv:MonitoringToTextConverter x:Key="MonitorText"/>
       <conv:InvertBoolConverter x:Key="InvertBool"/>
+      <conv:StringNotEmptyConverter x:Key="NotEmpty"/>
       <FontFamily x:Key="AppFont">Inter, Ubuntu, Cantarell, sans-serif</FontFamily>
     </ResourceDictionary>
   </Application.Resources>

@@ -59,3 +59,13 @@ public sealed class InvertBoolConverter : IValueConverter
     public object? ConvertBack(object? value, Type targetType, object? parameter, CultureInfo culture)
         => value is not true;
 }
+
+/// <summary>True when the bound string has content — used to hide empty status banners.</summary>
+public sealed class StringNotEmptyConverter : IValueConverter
+{
+    public object? Convert(object? value, Type targetType, object? parameter, CultureInfo culture)
+        => !string.IsNullOrWhiteSpace(value as string);
+
+    public object? ConvertBack(object? value, Type targetType, object? parameter, CultureInfo culture)
+        => throw new NotSupportedException();
+}
