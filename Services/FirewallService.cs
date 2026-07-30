@@ -336,24 +336,44 @@ public sealed class FirewallService
         if (!IsAdministrator)
             return FirewallOperationResult.Fail("No way to elevate (need pkexec or sudo) to modify the host firewall.");
 
-        EnsureBackendReady();
-        RemoveRuleByName(ProbeLogRuleName);
-
+        // Everything below runs in ONE elevated shell: creating the table/chains,
+        // clearing any stale probe rule, and adding the new one. As separate
+        // RunPrivileged calls this cost four consecutive password dialogs.
         FirewallOperationResult applied;
         if (BackendIsNft())
         {
-            var r = RunPrivileged("nft",
-                $"add rule {NftTable} input tcp flags & (syn|ack) == syn ct state new " +
-                $"limit rate 50/second log prefix \"{ProbeLogPrefix}\" comment \"{ProbeLogRuleName}\"");
+            var nft = ResolveExecutable("nft") ?? "nft";
+            var script =
+                $"set -u; NFT={Sh(nft)}; T={Sh(NftTable)};\n" +
+                "\"$NFT\" add table $T 2>/dev/null || true;\n" +
+                "\"$NFT\" add chain $T input '{ type filter hook input priority 0; policy accept; }' 2>/dev/null || true;\n" +
+                "\"$NFT\" add chain $T output '{ type filter hook output priority 0; policy accept; }' 2>/dev/null || true;\n" +
+                // Drop any previous probe rule so re-enabling cannot stack duplicates.
+                $"for h in $(\"$NFT\" -a list table $T 2>/dev/null | awk '/{ProbeLogRuleName}/{{for(i=1;i<=NF;i++) if($i==\"handle\") print $(i+1)}}'); do\n" +
+                "  \"$NFT\" delete rule $T input handle \"$h\" 2>/dev/null || true;\n" +
+                "done;\n" +
+                $"\"$NFT\" add rule $T input tcp flags '&' '(syn|ack)' == syn ct state new " +
+                $"limit rate 50/second log prefix {ShNftString(ProbeLogPrefix)} " +
+                $"comment {ShNftString(ProbeLogRuleName)}\n";
+
+            var r = RunPrivilegedBatch(script);
             applied = r.Success
                 ? FirewallOperationResult.Ok("Probe logging enabled (nftables).")
                 : FirewallOperationResult.Fail($"Failed to add probe log rule: {r.Message}");
         }
         else
         {
-            var r = RunPrivileged("iptables",
-                $"-A INPUT -p tcp --syn -m conntrack --ctstate NEW -m limit --limit 50/sec " +
-                $"-j LOG --log-prefix \"{ProbeLogPrefix}\" -m comment --comment \"{ProbeLogRuleName}\"");
+            var ipt = ResolveExecutable("iptables") ?? "iptables";
+            // -D with the identical spec is the idempotent delete for iptables.
+            var spec =
+                $"-p tcp --syn -m conntrack --ctstate NEW -m limit --limit 50/sec " +
+                $"-j LOG --log-prefix {Sh(ProbeLogPrefix)} -m comment --comment {Sh(ProbeLogRuleName)}";
+            var script =
+                $"set -u; IPT={Sh(ipt)};\n" +
+                $"\"$IPT\" -D INPUT {spec} 2>/dev/null || true;\n" +
+                $"\"$IPT\" -A INPUT {spec}\n";
+
+            var r = RunPrivilegedBatch(script);
             applied = r.Success
                 ? FirewallOperationResult.Ok("Probe logging enabled (iptables).")
                 : FirewallOperationResult.Fail($"Failed to add probe log rule: {r.Message}");
@@ -383,7 +403,27 @@ public sealed class FirewallService
         if (!IsAdministrator)
             return FirewallOperationResult.Fail("No way to elevate (need pkexec or sudo) to modify the host firewall.");
 
-        var r = RemoveRuleByName(ProbeLogRuleName);
+        // One prompt here too — the nft path otherwise costs a list plus a delete each.
+        FirewallOperationResult r;
+        if (BackendIsNft())
+        {
+            var nft = ResolveExecutable("nft") ?? "nft";
+            r = RunPrivilegedBatch(
+                $"set -u; NFT={Sh(nft)}; T={Sh(NftTable)};\n" +
+                $"for h in $(\"$NFT\" -a list table $T 2>/dev/null | awk '/{ProbeLogRuleName}/{{for(i=1;i<=NF;i++) if($i==\"handle\") print $(i+1)}}'); do\n" +
+                "  \"$NFT\" delete rule $T input handle \"$h\" 2>/dev/null || true;\n" +
+                "done\n");
+        }
+        else
+        {
+            var ipt = ResolveExecutable("iptables") ?? "iptables";
+            r = RunPrivilegedBatch(
+                $"set -u; IPT={Sh(ipt)};\n" +
+                $"\"$IPT\" -D INPUT -p tcp --syn -m conntrack --ctstate NEW -m limit --limit 50/sec " +
+                $"-j LOG --log-prefix {Sh(ProbeLogPrefix)} -m comment --comment {Sh(ProbeLogRuleName)} 2>/dev/null || true\n");
+        }
+
+        RemoveFromLedger(ProbeLogRuleName);
         return r.Success
             ? FirewallOperationResult.Ok("Probe logging disabled.")
             : r;
@@ -679,6 +719,40 @@ public sealed class FirewallService
         return FirewallOperationResult.Fail("No elevation helper (pkexec/sudo) available.");
     }
 
+    /// <summary>
+    /// Runs a whole sequence of privileged commands under a SINGLE elevation prompt.
+    /// polkit's org.freedesktop.policykit.exec is <c>auth_admin</c> (not
+    /// <c>auth_admin_keep</c>) on most desktops, so it caches nothing and every
+    /// pkexec call raises its own password dialog. An operation built from several
+    /// RunPrivileged calls therefore asked for the password several times, and
+    /// answering only the first looked exactly like authentication failing.
+    /// </summary>
+    private static FirewallOperationResult RunPrivilegedBatch(string script)
+    {
+        if (geteuid() == 0)
+            return RunDirectArgs("/bin/sh", "-c", script);
+
+        if (CommandExists("pkexec"))
+        {
+            var r = RunDirectArgs("pkexec", "/bin/sh", "-c", script);
+            if (r.Success || !LooksLikeMissingHelper(r.Message))
+                return r;
+        }
+
+        if (CommandExists("sudo"))
+        {
+            var cached = RunDirectArgs("sudo", "-n", "/bin/sh", "-c", script);
+            if (cached.Success)
+                return cached;
+
+            return FirewallOperationResult.Fail(
+                "Need admin rights for firewall changes. Install policykit-1 (pkexec) for a password dialog, " +
+                "or configure passwordless sudo for nft/iptables.");
+        }
+
+        return FirewallOperationResult.Fail("No elevation helper (pkexec/sudo) available.");
+    }
+
     private static bool LooksLikeMissingHelper(string message)
         => message.Contains("not found", StringComparison.OrdinalIgnoreCase)
            || message.Contains("No such file", StringComparison.OrdinalIgnoreCase);
@@ -706,17 +780,34 @@ public sealed class FirewallService
         }
     }
 
+    /// <summary>
+    /// Same as <see cref="RunDirect"/> but passes argv entries individually, so
+    /// shell metacharacters in an argument survive verbatim. Required for the
+    /// batched elevation path, where the payload is a shell script.
+    /// </summary>
+    private static FirewallOperationResult RunDirectArgs(string file, params string[] argv)
+    {
+        var psi = new ProcessStartInfo(file);
+        foreach (var a in argv)
+            psi.ArgumentList.Add(a);
+        return RunProcess(psi, file);
+    }
+
     private static FirewallOperationResult RunDirect(string file, string args)
+    {
+        var psi = new ProcessStartInfo(file, args);
+        return RunProcess(psi, file);
+    }
+
+    private static FirewallOperationResult RunProcess(ProcessStartInfo psi, string file)
     {
         try
         {
-            var psi = new ProcessStartInfo(file, args)
-            {
-                UseShellExecute = false,
-                RedirectStandardOutput = true,
-                RedirectStandardError = true,
-                CreateNoWindow = true
-            };
+            psi.UseShellExecute = false;
+            psi.RedirectStandardOutput = true;
+            psi.RedirectStandardError = true;
+            psi.CreateNoWindow = true;
+
             using var p = Process.Start(psi);
             if (p == null)
                 return FirewallOperationResult.Fail($"Could not start {file}.");
@@ -803,6 +894,19 @@ public sealed class FirewallService
 
     private static string Quote(string path)
         => path.Contains(' ') ? $"\"{path}\"" : path;
+
+    /// <summary>POSIX single-quoting for a value interpolated into a batched shell script.</summary>
+    private static string Sh(string value)
+        => "'" + value.Replace("'", "'\\''") + "'";
+
+    /// <summary>
+    /// Like <see cref="Sh"/>, but keeps literal double quotes around the value so
+    /// nft's own parser still sees a quoted string. nft joins its argv back into one
+    /// line and re-parses it, so a prefix like "NS-PROBE " (trailing space) has to
+    /// arrive with its quotes intact or nft rejects the rule.
+    /// </summary>
+    private static string ShNftString(string value)
+        => Sh("\"" + value + "\"");
 
     public static bool TryNormalizeIp(string? ip, out string normalized, out string error)
     {
