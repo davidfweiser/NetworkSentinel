@@ -117,20 +117,24 @@ Output:
 
 ```text
 dist\NetworkSentinel-windows-server-x64-<version>.zip
-dist\NetworkSentinel-windows-server-x64-<version>.install.ps1   ← one-file installer
+dist\NetworkSentinel-windows-server-x64-<version>.install.cmd   ← one-file installer
 dist\*.sha256
 ```
 
 Self-contained by default — the server does **not** need the .NET SDK or a compiler (runtime is inside the package).
 
-**On the Windows server (Administrator PowerShell) — one-file installer (recommended):**
+**On the Windows server — one-file installer (recommended):**
 
 ```powershell
-# Copy the .install.ps1 to the server, then:
-powershell -ExecutionPolicy Bypass -File .\NetworkSentinel-windows-server-x64-0.3.4.install.ps1
+# Copy the .install.cmd to the server, then run it (UAC prompt if not elevated):
+.\NetworkSentinel-windows-server-x64-0.3.4.install.cmd
 # optional port:
-powershell -ExecutionPolicy Bypass -File .\NetworkSentinel-windows-server-x64-0.3.4.install.ps1 -Port 18765
+.\NetworkSentinel-windows-server-x64-0.3.4.install.cmd -Port 18765
+# unpack without installing:
+.\NetworkSentinel-windows-server-x64-0.3.4.install.cmd --extract-only
 ```
+
+The one-file installer is a `.cmd`, not a `.ps1`: `cmd.exe` stops reading the script at `exit /b`, so the ZIP appended to it is never parsed. PowerShell tokenizes an entire `-File` script before running any of it, and the cost on appended binary is quadratic (16 MB ≈ 5½ minutes) before it fails to parse at all — so the shell-style "payload after exit" trick only works with a `cmd` entry point.
 
 **Or classic zip:**
 

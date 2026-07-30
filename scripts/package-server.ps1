@@ -7,15 +7,20 @@
   Publishes NetworkSentinel (self-contained win-x64) and creates:
 
     dist\NetworkSentinel-windows-server-x64-<version>.zip
-    dist\NetworkSentinel-windows-server-x64-<version>.install.ps1
+    dist\NetworkSentinel-windows-server-x64-<version>.install.cmd
     dist\*.sha256
 
-  Copy the .install.ps1 (or the zip) to the server. No .NET SDK required there.
+  Copy the .install.cmd (or the zip) to the server. No .NET SDK required there.
 
-  Server install (Administrator PowerShell):
-    powershell -ExecutionPolicy Bypass -File .\NetworkSentinel-*-windows-server-x64-*.install.ps1
+  Server install:
+    .\NetworkSentinel-windows-server-x64-<version>.install.cmd
     # optional:
-    powershell -ExecutionPolicy Bypass -File .\....install.ps1 -Port 18765
+    .\NetworkSentinel-windows-server-x64-<version>.install.cmd -Port 18765
+
+  The one-file installer is a .cmd, not a .ps1, on purpose: cmd.exe stops
+  reading the script at "exit /b", so an appended ZIP payload is never parsed.
+  PowerShell instead tokenizes the whole file before running a single line,
+  which on a 67 MB payload takes hours and then fails to parse.
 
 .PARAMETER OutputDir
   Folder for artifacts (default: <repo>\dist)
@@ -59,7 +64,7 @@ $stage = Join-Path $Root "bin\package\windows-server-$rid-$flavor"
 $pkgBase = "NetworkSentinel-windows-server-x64-$Version"
 $zipName = "$pkgBase.zip"
 $zipPath = Join-Path $OutputDir $zipName
-$installName = "$pkgBase.install.ps1"
+$installName = "$pkgBase.install.cmd"
 $installPath = Join-Path $OutputDir $installName
 
 Write-Host "Network Sentinel - package for Windows server" -ForegroundColor Cyan
@@ -146,7 +151,7 @@ $runtimeNote = if ($FrameworkDependent) {
     "Quick install (Administrator)"
     "------------------------------------------------"
     ""
-    "  1. Copy this folder (or the .zip / .install.ps1) onto the server."
+    "  1. Copy this folder (or the .zip / .install.cmd) onto the server."
     "  2. Right-click PowerShell -> Run as administrator"
     "  3. cd to the unzipped folder"
     "  4. powershell -ExecutionPolicy Bypass -File .\install-from-package.ps1"
@@ -157,8 +162,9 @@ $runtimeNote = if ($FrameworkDependent) {
     "  powershell -ExecutionPolicy Bypass -File .\install-from-package.ps1 -Port 18765"
     ""
     "One-file installer (if you have $installName):"
-    "  powershell -ExecutionPolicy Bypass -File .\$installName"
-    "  powershell -ExecutionPolicy Bypass -File .\$installName -Port 18765"
+    "  .\$installName"
+    "  .\$installName -Port 18765"
+    "  .\$installName --extract-only   (unpack only, no install)"
     ""
     "After install:"
     "  Browser:  http://localhost:18765/   (or http://SERVER-IP:18765/)"
@@ -181,199 +187,105 @@ if (Test-Path $zipPath) {
 Write-Host "Creating zip..." -ForegroundColor Yellow
 Compress-Archive -Path (Join-Path $stage "*") -DestinationPath $zipPath -Force
 
-# One-file self-extracting installer: PowerShell header + embedded zip
+# One-file self-extracting installer: cmd.exe header + embedded zip.
+#
+# The header MUST be a .cmd, not a .ps1: cmd.exe reads the script command by
+# command and stops at "exit /b", so the appended ZIP is never looked at.
+# PowerShell parses an entire -File script before executing anything, and the
+# cost of tokenizing appended binary is quadratic (1 MB ~ 3 s, 16 MB ~ 5 min)
+# before it finally reports a syntax error - so the sh-style "append a payload
+# after exit" trick cannot work with a PowerShell entry point.
+#
+# The real work runs as a PowerShell payload passed via -EncodedCommand, which
+# sidesteps cmd quoting entirely. It extracts the payload and hands off to
+# install-from-package.ps1, which does its own UAC elevation.
 Write-Host "Building one-file installer..." -ForegroundColor Yellow
-$sfxHeader = @'
-#Requires -Version 5.1
-<#
-.SYNOPSIS
-  Network Sentinel - self-extracting Windows server installer.
 
-.DESCRIPTION
-  Extracts the embedded package and installs the headless web UI as a
-  startup task (SYSTEM). No .NET SDK required on this machine.
+# Kept deliberately small: this is the only code that must fit on one cmd line
+# (base64 of UTF-16 grows ~2.7x). Everything else lives in the package itself,
+# so the stub only locates and unpacks the payload, then hands off to
+# install-from-package.ps1 (which does its own UAC elevation).
+$sfxPayload = @'
+$ErrorActionPreference = 'Stop'
+$self = $env:NS_SFX
+$mark = ':__NS' + 'ZIP__:'
 
-  Run in Administrator PowerShell, or accept the UAC prompt.
-
-.PARAMETER Port
-  Web listen port (default 18765).
-
-.PARAMETER TaskName
-  Scheduled task name (default NetworkSentinel-Web).
-
-.PARAMETER StartNow
-  Start the service immediately after install (default: true).
-
-.PARAMETER ExtractOnly
-  Only extract the package to a folder; do not install.
-#>
-[CmdletBinding()]
-param(
-    [int]$Port = 18765,
-    [string]$TaskName = "NetworkSentinel-Web",
-    [bool]$StartNow = $true,
-    [switch]$ExtractOnly,
-    [string]$ExtractTo = ""
-)
-
-$ErrorActionPreference = "Stop"
-
-function Test-IsAdministrator {
-    try {
-        $id = [Security.Principal.WindowsIdentity]::GetCurrent()
-        $p = New-Object Security.Principal.WindowsPrincipal($id)
-        return $p.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
-    }
-    catch {
-        return $false
-    }
+$fs = [IO.File]::OpenRead($self)
+$head = New-Object byte[] 8192
+$n = $fs.Read($head, 0, $head.Length)
+$off = [Text.Encoding]::ASCII.GetString($head, 0, $n).LastIndexOf($mark)
+if ($off -lt 0) { throw 'Corrupt installer: archive marker missing.' }
+$off += $mark.Length
+while ($off -lt $n -and ($head[$off] -eq 13 -or $head[$off] -eq 10)) { $off++ }
+if ($head[$off] -ne 0x50 -or $head[$off + 1] -ne 0x4B) {
+    throw 'Corrupt installer: no ZIP archive after the marker.'
 }
 
-# Relaunch elevated unless ExtractOnly (no system changes).
-if (-not $ExtractOnly -and -not (Test-IsAdministrator)) {
-    Write-Host "Administrator rights required. Requesting elevation (UAC)..." -ForegroundColor Yellow
-    $scriptPath = if ($PSCommandPath) { $PSCommandPath } else { $MyInvocation.MyCommand.Path }
-    if (-not $scriptPath -or -not (Test-Path -LiteralPath $scriptPath)) {
-        throw "Could not resolve installer path for elevation. Right-click PowerShell -> Run as administrator."
-    }
+$work = Join-Path $env:TEMP ('NetworkSentinel-sfx-' + [Guid]::NewGuid().ToString('N'))
+$null = New-Item -ItemType Directory -Force -Path $work
+$zip = Join-Path $work 'package.zip'
+$fs.Position = $off
+$out = [IO.File]::Create($zip)
+try { $fs.CopyTo($out, 1048576) } finally { $out.Dispose(); $fs.Dispose() }
 
-    $argList = @(
-        "-NoProfile"
-        "-ExecutionPolicy", "Bypass"
-        "-File", "`"$scriptPath`""
-        "-Port", "$Port"
-        "-TaskName", "`"$TaskName`""
-        "-StartNow", "`$$StartNow"
-    )
-    if ($ExtractOnly) { $argList += "-ExtractOnly" }
-    if (-not [string]::IsNullOrWhiteSpace($ExtractTo)) {
-        $argList += @("-ExtractTo", "`"$ExtractTo`"")
-    }
+Write-Host 'Extracting package...' -ForegroundColor Yellow
+Expand-Archive -LiteralPath $zip -DestinationPath (Join-Path $work 'pkg') -Force
+$exe = Get-ChildItem (Join-Path $work 'pkg') -Recurse -Filter 'NetworkSentinel.exe' | Select-Object -First 1
+if (-not $exe) { throw 'Extracted package is missing NetworkSentinel.exe.' }
+$pkg = $exe.DirectoryName
 
-    try {
-        $p = Start-Process -FilePath "powershell.exe" -Verb RunAs -ArgumentList $argList -Wait -PassThru
-        exit $p.ExitCode
-    }
-    catch {
-        throw "UAC elevation was cancelled or failed. Start PowerShell as Administrator and run again. $($_.Exception.Message)"
-    }
-}
-
-function Find-ArchiveOffset {
-    param([byte[]]$Bytes)
-
-    # Marker is in the script header (first few KB). Scan only a small prefix.
-    $scanLen = [Math]::Min($Bytes.Length, 256KB)
-    $text = [Text.Encoding]::ASCII.GetString($Bytes, 0, $scanLen)
-    $marker = "# __ARCHIVE_BELOW__"
-    $idx = $text.IndexOf($marker, [StringComparison]::Ordinal)
-    if ($idx -lt 0) { return -1 }
-
-    $after = $idx + $marker.Length
-    if ($after -lt $text.Length -and $text[$after] -eq "`r") { $after++ }
-    if ($after -lt $text.Length -and $text[$after] -eq "`n") { $after++ }
-    return $after
-}
-
-$selfPath = if ($PSCommandPath) { $PSCommandPath } else { $MyInvocation.MyCommand.Path }
-if (-not $selfPath -or -not (Test-Path -LiteralPath $selfPath)) {
-    throw "Could not resolve this installer script path."
-}
-
-Write-Host "Network Sentinel - self-extracting Windows server installer" -ForegroundColor Cyan
-Write-Host "  Installer : $selfPath"
-Write-Host ""
-
-Write-Host "Reading embedded package..." -ForegroundColor Yellow
-$allBytes = [IO.File]::ReadAllBytes($selfPath)
-$offset = Find-ArchiveOffset -Bytes $allBytes
-if ($offset -lt 0 -or $offset -ge $allBytes.Length) {
-    throw "Corrupt installer: missing embedded archive marker (# __ARCHIVE_BELOW__)."
-}
-
-$zipBytes = New-Object byte[] ($allBytes.Length - $offset)
-[Array]::Copy($allBytes, $offset, $zipBytes, 0, $zipBytes.Length)
-
-# ZIP local file header signature PK\x03\x04
-if ($zipBytes.Length -lt 4 -or $zipBytes[0] -ne 0x50 -or $zipBytes[1] -ne 0x4B) {
-    throw "Corrupt installer: embedded data is not a ZIP archive."
-}
-
-$workRoot = if (-not [string]::IsNullOrWhiteSpace($ExtractTo)) {
-    $ExtractTo
-} else {
-    Join-Path $env:TEMP ("NetworkSentinel-sfx-" + [Guid]::NewGuid().ToString("N"))
-}
-New-Item -ItemType Directory -Force -Path $workRoot | Out-Null
-$zipFile = Join-Path $workRoot "package.zip"
-[IO.File]::WriteAllBytes($zipFile, $zipBytes)
-
-$extractDir = Join-Path $workRoot "pkg"
-New-Item -ItemType Directory -Force -Path $extractDir | Out-Null
-Write-Host "Extracting to $extractDir ..." -ForegroundColor Yellow
-Expand-Archive -Path $zipFile -DestinationPath $extractDir -Force
-
-# Zip may be flat files or a single top-level folder
-$pkgDir = $extractDir
-$probe = Join-Path $extractDir "NetworkSentinel.exe"
-if (-not (Test-Path $probe)) {
-    $child = Get-ChildItem $extractDir -Directory | Select-Object -First 1
-    if ($child -and (Test-Path (Join-Path $child.FullName "NetworkSentinel.exe"))) {
-        $pkgDir = $child.FullName
-    }
-}
-
-if (-not (Test-Path (Join-Path $pkgDir "NetworkSentinel.exe"))) {
-    throw "Extracted package is missing NetworkSentinel.exe."
-}
-
-if ($ExtractOnly) {
-    Write-Host ""
-    Write-Host "Extracted only (no install)." -ForegroundColor Green
-    Write-Host "  $pkgDir"
+$extra = @(($env:NS_ARGS -split '\s+') | Where-Object { $_ })
+if ($extra -contains '--extract-only') {
+    Write-Host "Extracted to $pkg" -ForegroundColor Green
     exit 0
 }
 
-$innerInstall = Join-Path $pkgDir "install-from-package.ps1"
-if (-not (Test-Path $innerInstall)) {
-    throw "Package is missing install-from-package.ps1."
-}
-
-Write-Host "Running package installer..." -ForegroundColor Yellow
-& powershell.exe -NoProfile -ExecutionPolicy Bypass -File $innerInstall `
-    -PackagePath $pkgDir `
-    -Port $Port `
-    -TaskName $TaskName `
-    -StartNow $StartNow
-
-$exit = $LASTEXITCODE
-if ($null -eq $exit) { $exit = 0 }
-
-# Clean temp extract unless user chose a permanent path
-if ([string]::IsNullOrWhiteSpace($ExtractTo) -and (Test-Path $workRoot)) {
-    try { Remove-Item -LiteralPath $workRoot -Recurse -Force -ErrorAction SilentlyContinue } catch { }
-}
-
-exit $exit
-
-# Embedded ZIP archive follows this marker. Do not edit below.
-# __ARCHIVE_BELOW__
+& powershell.exe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $pkg 'install-from-package.ps1') -PackagePath $pkg @extra
+$code = $LASTEXITCODE
+if ($null -eq $code) { $code = 0 }
+Remove-Item -LiteralPath $work -Recurse -Force -ErrorAction SilentlyContinue
+exit $code
 '@
 
-# Write UTF-8 (no BOM) header, then append raw ZIP bytes
-$utf8NoBom = New-Object System.Text.UTF8Encoding $false
-# Normalize header to LF-only for a stable marker, then write with CRLF-friendly content:
-# Keep the marker line exactly as "# __ARCHIVE_BELOW__" + CRLF after WriteAllText on Windows.
-$headerPath = $installPath + ".hdr.tmp"
-[IO.File]::WriteAllText($headerPath, $sfxHeader.TrimEnd() + "`r`n", $utf8NoBom)
+$encoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($sfxPayload))
+if ($encoded.Length -gt 7000) {
+    # cmd.exe caps a command line at 8191 characters.
+    throw "Encoded SFX payload is $($encoded.Length) chars - too long for a single cmd line."
+}
 
-$headerBytes = [IO.File]::ReadAllBytes($headerPath)
-$zipBytesOut = [IO.File]::ReadAllBytes($zipPath)
-$combined = New-Object byte[] ($headerBytes.Length + $zipBytesOut.Length)
-[Array]::Copy($headerBytes, 0, $combined, 0, $headerBytes.Length)
-[Array]::Copy($zipBytesOut, 0, $combined, $headerBytes.Length, $zipBytesOut.Length)
-[IO.File]::WriteAllBytes($installPath, $combined)
-Remove-Item $headerPath -Force -ErrorAction SilentlyContinue
+$sfxHeader = @"
+@echo off
+setlocal
+rem ===================================================================
+rem  Network Sentinel $Version - self-extracting Windows server installer
+rem
+rem  Usage:   .\$installName [-Port 18765] [--extract-only]
+rem
+rem  A ZIP payload is appended after the marker line at the end of this file.
+rem  cmd.exe stops reading here at "exit /b", so it never tries to parse the
+rem  binary tail. Do not write the marker text anywhere above it.
+rem ===================================================================
+set "NS_SFX=%~f0"
+set "NS_ARGS=%*"
+echo Network Sentinel $Version - Windows server installer
+echo.
+powershell -NoProfile -ExecutionPolicy Bypass -EncodedCommand $encoded
+set "NS_CODE=%ERRORLEVEL%"
+endlocal & exit /b %NS_CODE%
+:__NSZIP__:
+"@
+# Write the header (UTF-8 without BOM, CRLF) then stream the ZIP bytes in after
+# the marker line. Streaming, not ReadAllBytes: the payload is ~67 MB and there
+# is no reason to hold two copies of it in memory.
+$utf8NoBom = New-Object System.Text.UTF8Encoding $false
+[IO.File]::WriteAllText($installPath, $sfxHeader.TrimEnd() + "`r`n", $utf8NoBom)
+
+$outStream = [IO.File]::Open($installPath, [IO.FileMode]::Append, [IO.FileAccess]::Write)
+try {
+    $zipStream = [IO.File]::OpenRead($zipPath)
+    try { $zipStream.CopyTo($outStream, 1048576) } finally { $zipStream.Dispose() }
+}
+finally { $outStream.Dispose() }
 
 # Checksums
 function Write-Sha256File {
@@ -397,8 +309,8 @@ Write-Host "  Installer : $($installItem.FullName)  ($([math]::Round($installIte
 Write-Host "  Checksums : $shaZip"
 Write-Host "             $shaInstall"
 Write-Host ""
-Write-Host "On the Windows server (Administrator PowerShell):"
-Write-Host "  powershell -ExecutionPolicy Bypass -File .\$installName"
+Write-Host "On the Windows server:"
+Write-Host "  .\$installName            (UAC prompt if not already elevated)"
 Write-Host "  # or unzip the zip and run INSTALL.cmd / install-from-package.ps1"
 Write-Host ""
 Write-Host "Open after install: http://SERVER-IP:18765/  (create master password on first visit)"
