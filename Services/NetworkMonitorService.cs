@@ -271,7 +271,9 @@ public sealed class NetworkMonitorService : IDisposable
                 ThreatCount = newThreats.Count,
                 RemoteHostCount = _hosts.Count
             });
-            while (_activity.Count > 60) _activity.RemoveAt(0);
+            // ~5 minutes of history at the 1.2 s poll rate (GUI sparkline and
+            // web activity chart both render whatever range is here).
+            while (_activity.Count > 240) _activity.RemoveAt(0);
 
             Stats.ListeningPorts = _listeners.Count;
             Stats.ActiveConnections = _connections.Count;
