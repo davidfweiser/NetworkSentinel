@@ -79,6 +79,7 @@ The page header shows the running version (e.g. `v0.3.1`) — check it after an 
 ### Web UI security
 - First browser visit **creates a master password** (min. 8 characters)
 - Every later visit **requires that password**; change it under **Settings → Master password**
+- Can't reach a browser yet (e.g. still opening the port in a cloud firewall)? Set/reset it from the terminal instead: `sudo networksentinel --set-master-password`
 - Hash stored as PBKDF2-SHA256 (random salt, 200k iterations) in `~/.local/share/NetworkSentinel/web-master.json` — never plain text
 - Session cookie until sign-out, browser close, or 12 hours idle
 
@@ -231,7 +232,7 @@ networksentinel --help
 systemctl status networksentinel-web
 ```
 
-`sudo` is only needed for **install**, **uninstall**, editing `/etc/…`, or restarting the **system** service — not for normal use of the app.
+`sudo` is only needed for **install**, **uninstall**, editing `/etc/…`, restarting the **system** service, or `--set-master-password` — not for normal use of the app.
 
 ```bash
 sudo networksentinel-uninstall
@@ -246,7 +247,14 @@ sudo networksentinel-uninstall
 | `/etc/networksentinel/web.env` | `WEB_PORT` for systemd |
 | `~/.local/share/NetworkSentinel/` | Settings, allowlist, master-password hash |
 
-Reset web master password:
+Set or reset the web master password (requires root — resolves the real service user via `SUDO_USER`, not root's own home):
+
+```bash
+sudo networksentinel --set-master-password
+sudo systemctl restart networksentinel-web   # so the running service picks it up
+```
+
+Or delete it outright and let the next browser visit create a fresh one:
 
 ```bash
 rm ~/.local/share/NetworkSentinel/web-master.json
@@ -348,6 +356,30 @@ Prefer `./scripts/package.sh` when shipping to a server — it builds the instal
 ```
 
 When you block an IP/port (or click **Authorize firewall**), only `nft`/`iptables` are elevated via **pkexec** and you get a password dialog. Monitoring works without elevation.
+
+### Firewall elevation on a headless server (no pkexec)
+
+`pkexec` needs a graphical polkit session (D-Bus + auth agent), which doesn't exist for a `systemd`-run web service with no display. On a headless box, block/unblock and **Authorize firewall** will fail with *"Elevation failed... Need admin rights for firewall changes"* until you grant the service user **passwordless sudo scoped to just `nft`/`iptables`**:
+
+```bash
+# 1. Confirm which user the service runs as
+systemctl show networksentinel-web -p User
+
+# 2. Find the exact binary paths (varies by distro)
+which nft iptables ip6tables
+
+# 3. Add a scoped sudoers rule (replace YOUR_USER and the paths below)
+sudo visudo -f /etc/sudoers.d/networksentinel
+```
+```
+YOUR_USER ALL=(root) NOPASSWD: /usr/sbin/nft, /usr/sbin/iptables, /usr/sbin/ip6tables
+```
+```bash
+sudo visudo -c                              # verify syntax
+sudo systemctl restart networksentinel-web  # retry block/unblock afterwards
+```
+
+This keeps the service itself running as your unprivileged user for everything else, and only elevates the two firewall binaries — the headless equivalent of the pkexec prompt the desktop GUI uses.
 
 ---
 
@@ -498,12 +530,14 @@ On GNOME / Pop!_OS the indicator appears in the top bar (StatusNotifier / AppInd
 | `XOpenDisplay failed` after `sudo` | Run **without** sudo. Use **Authorize firewall** / pkexec for rules only. Or use `--tui` / `-w`. |
 | Do I need `sudo` to launch? | **No.** Install with sudo if system-wide; run as your normal user. The web service also runs as your user. |
 | No password dialog for block | Install `policykit-1` (`pkexec`). |
+| `Elevation failed... Need admin rights` on a **headless server** | `pkexec` can't work without a display/polkit session. Grant the service user passwordless sudo for `nft`/`iptables` — see [Firewall elevation on a headless server](#firewall-elevation-on-a-headless-server-no-pkexec). |
 | `.NET location: Not found` | Use the **server installer** / self-contained package, or set `DOTNET_ROOT` / `PATH`. |
 | Process names missing | Expected for other users’ sockets without root; monitoring still works. |
 | No tray icon | DE must support StatusNotifier/AppIndicator; window title still updates when minimized. |
 | Web UI asks for password every time | Expected after sign-out, browser close, or 12h idle. Reset: delete `web-master.json`. |
 | `networksentinel-web` won’t start | `journalctl -u networksentinel-web -e`; check port in `/etc/networksentinel/web.env`; confirm binary exists at `/usr/local/bin/networksentinel`. |
 | Port already in use | Change `WEB_PORT` or run `networksentinel -w` to auto-pick a free high port. |
+| Port shows `LISTEN` locally but unreachable from outside | On a cloud VPS (Linode, AWS, DigitalOcean, …), the process listening (`sudo ss -ltnp \| grep 18765`) only proves the app is up — the provider's network firewall/security group can still drop inbound traffic before it reaches the box. Open the port in the provider's dashboard. |
 | Service dies after logout (user unit) | `sudo loginctl enable-linger "$USER"` |
 
 ---
