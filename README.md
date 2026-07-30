@@ -66,7 +66,7 @@ Domains are DNS-resolved to current IPs. Auto-block never touches allowlisted IP
 
 | Tab | What you can do |
 |-----|-----------------|
-| **Dashboard** | Live counters, monitoring/firewall status, recent threats |
+| **Dashboard** | Live counters, **5-minute activity chart** (connections + threat markers), monitoring/firewall status, recent threats |
 | **Connections / Threats** | Live traffic with a **Block** button on every row |
 | **Hosts** | Remote peers; block / unblock by row or by typed IP |
 | **Ports** | Local listeners; one-click **Block port** |
