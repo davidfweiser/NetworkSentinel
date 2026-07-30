@@ -79,6 +79,11 @@ public sealed class WebApp : IDisposable
 
         _firewall.Allowlist = _allowlist;
         _monitor.GeoLookupsEnabled = _settings.GeoLookupEnabled;
+        _monitor.AuthMonitoringEnabled = _settings.AuthLogMonitorEnabled;
+        _monitor.ProbeMonitoringEnabled = _settings.ProbeLogEnabled;
+        _monitor.PollIntervalMs = _settings.MonitorPollMs;
+        if (_settings.ProbeLogEnabled && _firewall.IsAdministrator)
+            _ = Task.Run(() => _firewall.EnableProbeLogging());
         _allowlist.UseRemoteFeed = _settings.AllowlistUseRemoteFeed;
         _monitor.Updated += OnMonitorUpdated;
         _monitor.ThreatsDetected += OnThreatsDetected;
@@ -583,6 +588,25 @@ public sealed class WebApp : IDisposable
                             _settings.GeoLookupEnabled = on;
                             label = $"Geo lookups: {(on ? "on" : "off")}";
                             break;
+                        case "authLogMonitorEnabled":
+                            _monitor.AuthMonitoringEnabled = on;
+                            _settings.AuthLogMonitorEnabled = on;
+                            label = on ? $"Failed-logon monitoring: on ({_monitor.AuthLogStatus})" : "Failed-logon monitoring: off";
+                            break;
+                        case "probeLogEnabled":
+                        {
+                            _settings.ProbeLogEnabled = on;
+                            var fw = on ? _firewall.EnableProbeLogging() : _firewall.DisableProbeLogging();
+                            _monitor.ProbeMonitoringEnabled = on && fw.Success;
+                            if (on && !fw.Success)
+                                _settings.ProbeLogEnabled = false;
+                            label = on
+                                ? (fw.Success
+                                    ? "Closed-port scan detection: on (firewall dropped-packet logging enabled)"
+                                    : $"Closed-port scan detection: could not change firewall logging — {fw.Message}")
+                                : "Closed-port scan detection: off";
+                            break;
+                        }
                         case "allowlistUseRemoteFeed":
                             _allowlist.UseRemoteFeed = on;
                             _settings.AllowlistUseRemoteFeed = on;
@@ -823,6 +847,10 @@ public sealed class WebApp : IDisposable
                 blockInbound = _blockInbound,
                 blockOutbound = _blockOutbound,
                 geoLookupEnabled = _settings.GeoLookupEnabled,
+                authLogMonitorEnabled = _settings.AuthLogMonitorEnabled,
+                authLogStatus = _monitor.AuthLogStatus,
+                probeLogEnabled = _settings.ProbeLogEnabled,
+                probeLogStatus = _monitor.ProbeLogStatus,
                 allowlistUseRemoteFeed = _settings.AllowlistUseRemoteFeed,
                 isMonitoring = stats.IsMonitoring
             },
@@ -907,7 +935,7 @@ public sealed class WebApp : IDisposable
                 value = e.Value,
                 detail = e.Detail
             }),
-            activity = _monitor.Activity.TakeLast(60).Select(a => new
+            activity = _monitor.Activity.Select(a => new
             {
                 time = a.Time.ToString("HH:mm:ss"),
                 connections = a.ConnectionCount,
@@ -1322,7 +1350,18 @@ public sealed class WebApp : IDisposable
   }
   tbody tr:nth-child(even) td.row-actions { background: #101a2f; }
   tr:hover td.row-actions { background: var(--bg-hover); }
-  td.mono { overflow-wrap: anywhere; }
+  /* IPs, ports, and timestamps must never break mid-value — wide tables
+     scroll horizontally instead (the actions column stays pinned). */
+  td.mono { white-space: nowrap; }
+  .chart-card {
+    background: var(--bg-panel); border: 1px solid var(--stroke);
+    border-radius: 12px; padding: 12px 14px 8px;
+  }
+  .chart-card svg { display: block; width: 100%; height: 170px; }
+  .chart-meta {
+    display: flex; justify-content: space-between; gap: 12px;
+    color: var(--muted); font-size: .74rem; padding: 6px 2px 2px;
+  }
   .chip {
     display: inline-block; padding: 1px 8px; border-radius: 999px; margin-right: 4px;
     font-size: .72rem; font-weight: 600;
@@ -1501,12 +1540,12 @@ public sealed class WebApp : IDisposable
     <h1>Network Sentinel</h1>
     <p class="lead" id="authLead">Checking session…</p>
     <form id="authForm" autocomplete="on">
+      <label for="pw" id="pwLabel">Master password</label>
+      <input id="pw" type="password" name="password" autocomplete="current-password" required minlength="8" autofocus />
       <div id="setupFields" class="hidden">
         <label for="pwConfirm">Confirm master password</label>
         <input id="pwConfirm" type="password" name="confirm" autocomplete="new-password" minlength="8" />
       </div>
-      <label for="pw" id="pwLabel">Master password</label>
-      <input id="pw" type="password" name="password" autocomplete="current-password" required minlength="8" autofocus />
       <p class="auth-error" id="authError"></p>
       <button type="submit" class="submit" id="authSubmit">Continue</button>
     </form>
@@ -1551,6 +1590,8 @@ public sealed class WebApp : IDisposable
       <span class="pill" id="fwPill">—</span>
       <span class="pill" id="abPill">—</span>
     </div>
+    <h3 style="margin:18px 0 8px;font-size:.95rem;color:var(--text2)">Activity — last 5 minutes</h3>
+    <div class="chart-card" id="dash-chart"></div>
     <h3 style="margin:18px 0 8px;font-size:.95rem;color:var(--text2)">Recent threats</h3>
     <div id="dash-threats"></div>
   </section>
@@ -1840,6 +1881,42 @@ public sealed class WebApp : IDisposable
     if (sc) sc.scrollTop = top || 0;
   }
 
+  // Inline-SVG activity chart: connection-count area/line, red columns where
+  // threats were detected in that sample. No libraries, no external requests.
+  function chartHtml(act) {
+    if (!act || act.length < 2)
+      return '<div class="chart-meta" style="padding:26px 4px">Collecting samples… the chart appears after a few seconds of monitoring.</div>';
+    const W = 1000, H = 170, padT = 12, padB = 6;
+    const ih = H - padT - padB;
+    const maxC = Math.max(1, ...act.map(a => a.connections));
+    const x = i => (W * i / (act.length - 1));
+    const y = v => padT + ih * (1 - v / maxC);
+    const pts = act.map((a, i) => `${x(i).toFixed(1)},${y(a.connections).toFixed(1)}`).join(' ');
+    const area = `0,${H - padB} ${pts} ${W},${H - padB}`;
+    const grid = [0.25, 0.5, 0.75].map(f =>
+      `<line x1="0" y1="${(padT + ih * f).toFixed(1)}" x2="${W}" y2="${(padT + ih * f).toFixed(1)}" stroke="rgba(255,255,255,.07)" stroke-width="1"/>`).join('');
+    const threats = act.map((a, i) => a.threats > 0
+      ? `<rect x="${(x(i) - 2).toFixed(1)}" y="${padT}" width="4" height="${ih}" fill="rgba(255,93,120,.30)" rx="2"/>`
+      : '').join('');
+    const last = act[act.length - 1];
+    const threatTotal = act.reduce((n, a) => n + a.threats, 0);
+    return `
+      <svg viewBox="0 0 ${W} ${H}" preserveAspectRatio="none" role="img" aria-label="Connection activity chart">
+        ${grid}
+        <polygon points="${area}" fill="rgba(61,231,200,.13)"/>
+        ${threats}
+        <polyline points="${pts}" fill="none" stroke="#3de7c8" stroke-width="2"
+          vector-effect="non-scaling-stroke" stroke-linejoin="round" stroke-linecap="round"/>
+        <circle cx="${x(act.length - 1).toFixed(1)}" cy="${y(last.connections).toFixed(1)}" r="3.5" fill="#3de7c8"/>
+      </svg>
+      <div class="chart-meta">
+        <span>${esc(act[0].time)}</span>
+        <span><span style="color:#3de7c8">●</span> connections (now ${esc(last.connections)}, peak ${esc(maxC)})
+          &nbsp; <span style="color:#ff5d78">▮</span> threat detected${threatTotal ? ` (${esc(threatTotal)} in window)` : ' (none in window)'}</span>
+        <span>${esc(last.time)}</span>
+      </div>`;
+  }
+
   function render(opts) {
     opts = opts || {};
     if (!state) return;
@@ -1874,6 +1951,8 @@ public sealed class WebApp : IDisposable
         <div class="label">${esc(label)}</div>
         <div class="value ${cls}">${esc(val ?? 0)}</div>
       </div>`).join('');
+
+    $('dash-chart').innerHTML = chartHtml(state.activity || []);
 
     const threats = state.threats || [];
     $('dash-threats').innerHTML = table(
@@ -2037,7 +2116,9 @@ public sealed class WebApp : IDisposable
       <div class="settings-group"><h3>Monitoring</h3>
         ${row('Live monitoring', 'Watch connections, listening ports, and threats in real time.', sw('monitoring', s.isMonitoring))}
         ${row('Page refresh speed', 'How often live tabs (Dashboard, Connections, Hosts…) update in this browser.', refreshSel)}
-        ${row('Geo lookups', 'Resolve country and city for remote IPs (uses ip-api.com over plain HTTP).', sw('geoLookupEnabled', s.geoLookupEnabled))}
+        ${row('Geo lookups', 'Resolve country and city for remote IPs (ipwho.is over HTTPS, ip-api.com fallback).', sw('geoLookupEnabled', s.geoLookupEnabled))}
+        ${row('Failed-logon monitoring', 'Watch the Windows Security event log (4625 / 4771) for failed RDP, SMB, and WinRM logons and alert on brute-force bursts. ' + (s.authLogStatus || ''), sw('authLogMonitorEnabled', s.authLogMonitorEnabled))}
+        ${row('Closed-port scan detection', 'Turn on Windows Firewall dropped-packet logging (needs elevation) and watch that log — catches port scans of closed ports that never appear as connections. ' + (s.probeLogStatus || ''), sw('probeLogEnabled', s.probeLogEnabled))}
       </div>
       <div class="settings-group"><h3>Auto-block</h3>
         ${row('Auto-block threats', 'Automatically create firewall rules when threats are detected.', sw('autoBlockEnabled', s.autoBlockEnabled))}

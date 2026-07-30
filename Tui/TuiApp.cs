@@ -85,6 +85,11 @@ public sealed class TuiApp : IDisposable
 
         _firewall.Allowlist = _allowlist;
         _monitor.GeoLookupsEnabled = _settings.GeoLookupEnabled;
+        _monitor.AuthMonitoringEnabled = _settings.AuthLogMonitorEnabled;
+        _monitor.ProbeMonitoringEnabled = _settings.ProbeLogEnabled;
+        _monitor.PollIntervalMs = _settings.MonitorPollMs;
+        if (_settings.ProbeLogEnabled && _firewall.IsAdministrator)
+            _ = Task.Run(() => _firewall.EnableProbeLogging());
         _allowlist.UseRemoteFeed = _settings.AllowlistUseRemoteFeed;
         LoadPersistedAutoBlockSuppressions();
         _monitor.Updated += OnMonitorUpdated;

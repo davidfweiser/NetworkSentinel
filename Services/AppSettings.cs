@@ -16,11 +16,26 @@ public sealed class AppSettings
     public bool AutoBlockInbound { get; set; } = true;
     public bool AutoBlockOutbound { get; set; } = true;
 
-    /// <summary>Geo lookups use the free ip-api.com endpoint over plain HTTP; set false to disable.</summary>
+    /// <summary>Geo lookups use a free web endpoint (HTTPS preferred); set false to disable.</summary>
     public bool GeoLookupEnabled { get; set; } = true;
+
+    /// <summary>Watch the Windows Security event log for failed-logon bursts (4625); set false to disable.</summary>
+    public bool AuthLogMonitorEnabled { get; set; } = true;
+
+    /// <summary>
+    /// Detect scans of CLOSED ports by watching the Windows Firewall dropped-packet log.
+    /// Off by default because turning that logging on needs Administrator.
+    /// </summary>
+    public bool ProbeLogEnabled { get; set; }
 
     /// <summary>Refresh the allowlist from this repo's GitHub feed; set false to use only local/built-in lists.</summary>
     public bool AllowlistUseRemoteFeed { get; set; } = true;
+
+    /// <summary>
+    /// Milliseconds between monitor polls (clamped to 500–10000 when applied).
+    /// Doubles as the activity-chart sample rate.
+    /// </summary>
+    public int MonitorPollMs { get; set; } = NetworkMonitorService.DefaultPollIntervalMs;
 
     /// <summary>
     /// IPs the user manually unblocked/removed. Auto-block will not recreate rules for these

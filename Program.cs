@@ -42,6 +42,16 @@ internal static class Program
             return;
         }
 
+        if (WantsSetMasterPassword(args))
+        {
+            // Owns its console when launched without one (Start-Process, shortcut),
+            // so the masked prompt is not competing with a parent shell for keys.
+            var ownConsole = EnsureConsole();
+            RunSetMasterPassword();
+            if (ownConsole) WaitBeforeClosing();
+            return;
+        }
+
         if (WantsWeb(args, out var webPort))
         {
             EnsureConsole();
@@ -91,6 +101,130 @@ internal static class Program
             Console.Error.WriteLine(ex);
             Environment.Exit(1);
         }
+    }
+
+    private static bool WantsSetMasterPassword(string[] args)
+        => args.Any(a => a is "--set-master-password" or "--reset-master-password");
+
+    /// <summary>
+    /// Sets the web UI master password from the terminal, for servers where the
+    /// browser flow is not reachable (or the password was lost). Writes to the
+    /// shared data directory the web service reads — never a per-user copy, which
+    /// the service (running as SYSTEM) would silently ignore.
+    /// </summary>
+    private static void RunSetMasterPassword()
+    {
+        try
+        {
+            var dataDir = Path.Combine(
+                Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData),
+                "NetworkSentinel");
+
+            if (!TryPrepareSharedDirectory(dataDir, out var prepareError))
+            {
+                Console.Error.WriteLine($"Cannot write to the shared data directory: {dataDir}");
+                Console.Error.WriteLine(prepareError);
+                Console.Error.WriteLine();
+                Console.Error.WriteLine("Re-run this from an elevated prompt (Run as administrator) so the");
+                Console.Error.WriteLine("password lands where the web service reads it.");
+                Environment.Exit(1);
+                return;
+            }
+
+            var store = new Web.WebAuthStore(dataDir);
+            Console.WriteLine(store.IsConfigured
+                ? "A master password is already set — this will overwrite it."
+                : "No master password is set yet — creating one.");
+            Console.WriteLine($"Data directory: {dataDir}");
+            Console.WriteLine();
+
+            var password = ReadPassword($"New master password (min {Web.WebAuthStore.MinPasswordLength} characters): ");
+            var confirm = ReadPassword("Confirm master password: ");
+
+            if (!store.SetPassword(password, confirm, out var message))
+            {
+                Console.Error.WriteLine($"Failed: {message}");
+                Environment.Exit(1);
+                return;
+            }
+
+            Console.WriteLine(message);
+            Console.WriteLine();
+            Console.WriteLine("If the web service is currently running, restart it to pick up the change:");
+            Console.WriteLine("  schtasks /End /TN \"NetworkSentinel-Web\"");
+            Console.WriteLine("  schtasks /Run /TN \"NetworkSentinel-Web\"");
+        }
+        catch (Exception ex)
+        {
+            LogCrash("set-master-password", ex);
+            Console.Error.WriteLine("Failed to set master password:");
+            Console.Error.WriteLine(ex.Message);
+            Environment.Exit(1);
+        }
+    }
+
+    private static bool TryPrepareSharedDirectory(string dir, out string error)
+    {
+        try
+        {
+            Directory.CreateDirectory(dir);
+            var probe = Path.Combine(dir, $".write-test-{Environment.ProcessId}");
+            File.WriteAllText(probe, "");
+            File.Delete(probe);
+            error = "";
+            return true;
+        }
+        catch (Exception ex)
+        {
+            error = ex.Message;
+            return false;
+        }
+    }
+
+    /// <summary>Reads a line with each character masked as '*'; falls back to plain ReadLine when input is redirected (e.g. piped/non-interactive).</summary>
+    private static string ReadPassword(string prompt)
+    {
+        Console.Write(prompt);
+
+        if (Console.IsInputRedirected)
+            return Console.ReadLine() ?? "";
+
+        var buffer = new System.Text.StringBuilder();
+        while (true)
+        {
+            var key = Console.ReadKey(intercept: true);
+            if (key.Key == ConsoleKey.Enter)
+            {
+                Console.WriteLine();
+                return buffer.ToString();
+            }
+
+            if (key.Key == ConsoleKey.Backspace)
+            {
+                if (buffer.Length > 0)
+                {
+                    buffer.Length--;
+                    Console.Write("\b \b");
+                }
+                continue;
+            }
+
+            if (!char.IsControl(key.KeyChar))
+            {
+                buffer.Append(key.KeyChar);
+                Console.Write('*');
+            }
+        }
+    }
+
+    /// <summary>Keeps an app-owned console window open long enough to read the result.</summary>
+    private static void WaitBeforeClosing()
+    {
+        if (Console.IsInputRedirected) return;
+        Console.WriteLine();
+        Console.Write("Press any key to close…");
+        try { Console.ReadKey(intercept: true); } catch { /* no console input */ }
+        Console.WriteLine();
     }
 
     private static void RunWeb(int? port)
@@ -190,12 +324,16 @@ internal static class Program
         return false;
     }
 
-    private static void EnsureConsole()
+    /// <summary>
+    /// Attaches to the parent console (cmd/PowerShell) when launched from a terminal;
+    /// otherwise allocates a new console window for TUI/web logs. Returns true when
+    /// this process owns the console — i.e. closing it would take the output with it.
+    /// </summary>
+    private static bool EnsureConsole()
     {
-        // Attach to parent console (cmd/PowerShell) when launched from a terminal;
-        // otherwise allocate a new console window for TUI/web logs.
+        var owned = false;
         if (!AttachConsole(AttachParentProcess))
-            AllocConsole();
+            owned = AllocConsole();
 
         try
         {
@@ -210,6 +348,8 @@ internal static class Program
         {
             // best-effort
         }
+
+        return owned;
     }
 
     private static void PrintUsage()
@@ -227,6 +367,12 @@ internal static class Program
               --console          Same as --tui
               -w, --web [PORT]   Headless web UI (browser). Auto-picks a free high port
                                  if PORT is omitted (prefers 18765, then nearby alternatives)
+              --set-master-password    Set/reset the web UI master password from the
+                                        terminal (no browser needed). Writes to
+                                        %ProgramData%\NetworkSentinel, so run it elevated
+                                        if that folder is not writable, then restart the
+                                        web service. From PowerShell, launch it with
+                                        Start-Process -Wait so the prompt owns the console.
               -h, --help         Show this help
 
             Environment:

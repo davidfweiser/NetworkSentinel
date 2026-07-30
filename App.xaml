@@ -15,6 +15,7 @@
             <conv:MonitoringToTextConverter x:Key="MonitorText"/>
             <conv:NavSelectedConverter x:Key="NavSelected"/>
             <conv:InvertBoolConverter x:Key="InvertBool"/>
+            <conv:StringNotEmptyToVisibilityConverter x:Key="NotEmptyVis"/>
 
             <FontFamily x:Key="AppFont">Segoe UI Variable, Segoe UI</FontFamily>
         </ResourceDictionary>

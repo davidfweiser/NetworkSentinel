@@ -10,7 +10,7 @@ Three ways to run it (same idea as the Linux build):
 | **Terminal UI (`--tui`)** | Server Core, RDP console, SSH-style workflows |
 | **Headless web UI (`-w`)** | Browser dashboard on a server (master-password protected) |
 
-> Awareness / monitoring tooling — not a full IDS/IPS replacement. Version **0.3.1**.
+> Awareness / monitoring tooling — not a full IDS/IPS replacement. Version **0.3.4**.
 
 ---
 
@@ -22,14 +22,17 @@ Three ways to run it (same idea as the Linux build):
 | **Open ports** | TCP listeners and UDP endpoints via Windows IP Helper (`GetExtendedTcpTable` / `GetExtendedUdpTable`) |
 | **Live connections** | Process name, local/remote endpoints, TCP state, origin summary |
 | **Remote computers** | Peers observed talking to this PC, reverse DNS, geo/ISP when public |
-| **Activity chart** | Live sparkline of connection samples |
+| **Activity chart** | 5-minute connection chart with **threat markers**, in both the desktop app and the web console |
 
 ### Threat awareness
 Heuristics flag patterns such as:
-- Multi-port scans / reconnaissance
+- Multi-port scans / reconnaissance — fast (45 s window) **and slow/paced** (10 min window, catches `nmap -T1`-style scans)
+- **Scans of closed ports** (opt-in) — Windows Firewall drops those SYNs before the TCP stack sees them, so they never appear as connections; with dropped-packet logging on, a log watcher turns them into alerts within seconds
 - RDP, SSH, and SMB hammering
+- **Failed logon bursts** from the Windows Security event log (4625 / 4771) — catches RDP/SMB/WinRM brute-force even when it reuses one TCP session or paces below the connection-rate thresholds
 - Sensitive-port probing (admin, DB, remote access)
 - Short-lived / transitional TCP bursts
+- **Outbound beaconing** — regular-interval new sessions to an uncommon remote port (C2 "calling home" signature); common client ports and LAN peers are excluded
 - First-seen remote hosts
 
 Each alert includes **source IP**, **method**, and **where it’s coming from** (DNS + best-effort geo).
@@ -94,6 +97,9 @@ dotnet run -c Release -- --tui
 # Headless web UI (browser) — auto-picks a free high port, or set one
 dotnet run -c Release -- -w
 dotnet run -c Release -- -w 18765
+
+# Set/reset the web console master password from the terminal
+dotnet run -c Release -- --set-master-password
 ```
 
 Environment variables: `NETWORKSENTINEL_TUI=1`, `NETWORKSENTINEL_WEB=1`.
@@ -121,9 +127,9 @@ Self-contained by default — the server does **not** need the .NET SDK or a com
 
 ```powershell
 # Copy the .install.ps1 to the server, then:
-powershell -ExecutionPolicy Bypass -File .\NetworkSentinel-windows-server-x64-0.3.1.install.ps1
+powershell -ExecutionPolicy Bypass -File .\NetworkSentinel-windows-server-x64-0.3.4.install.ps1
 # optional port:
-powershell -ExecutionPolicy Bypass -File .\NetworkSentinel-windows-server-x64-0.3.1.install.ps1 -Port 18765
+powershell -ExecutionPolicy Bypass -File .\NetworkSentinel-windows-server-x64-0.3.4.install.ps1 -Port 18765
 ```
 
 **Or classic zip:**
@@ -142,19 +148,19 @@ NetworkSentinel.exe -w 18765
 
 Open `http://localhost:18765/` (or `http://<server-ip>:18765/`). **First browser visit creates a master password.** Change it anytime under **Settings → Master password**.
 
-Re-running the installer **upgrades in place**: it stops the running task, replaces the binaries, and restarts. Master password, settings, and allowlist are **preserved**. The web page header shows the running version (e.g. `v0.3.1`) — check it after an upgrade to confirm the new build is live.
+Re-running the installer **upgrades in place**: it stops the running task, replaces the binaries, and restarts. Master password, settings, and allowlist are **preserved**. The web page header shows the running version (e.g. `v0.3.4`) — check it after an upgrade to confirm the new build is live.
 
 #### Web console tabs
 
 | Tab | What you can do |
 |-----|-----------------|
-| **Dashboard** | Live counters, monitoring/firewall status, recent threats |
+| **Dashboard** | Live counters, **5-minute activity chart** (connections + threat markers), monitoring/firewall status, recent threats |
 | **Connections / Threats** | Live traffic with a **Block** button on every row |
 | **Hosts** | Remote peers; block / unblock by row or by typed IP |
 | **Ports** | Local listeners; one-click **Block port** |
 | **Firewall** | Managed rules grouped as In/Out pairs; manual IP and port blocking; **Restore allowlisted** |
 | **Allowlist** | Add/remove trusted domains and IPs; refresh the feed |
-| **Settings** | Monitoring on/off, page refresh speed, geo lookups, auto-block + minimum severity, block direction (in/out), allowlist feed, **change master password**, **Remove all rules** |
+| **Settings** | Monitoring on/off, page refresh speed, geo lookups, failed-logon monitoring, closed-port scan detection, auto-block + minimum severity, block direction (in/out), allowlist feed, **change master password**, **Remove all rules** |
 
 The console protects itself: it refuses to remove its own firewall access rule or block its own port (doing so would cut off your browser mid-request and look exactly like a crash).
 
@@ -228,8 +234,22 @@ The app starts **without** forcing UAC (so TUI/web work on servers). Desktop ins
 ### Web UI security
 - First browser visit **creates a master password** (min. 8 characters)
 - Later visits require that password; change it under **Settings → Master password**
+- Can't reach a browser yet (e.g. still opening the port in a cloud firewall), or lost the password? Set/reset it from the terminal instead — see below
 - Hash stored as PBKDF2-SHA256 (random salt, 200k iterations) in `%ProgramData%\NetworkSentinel\web-master.json` — never plain text
 - Session cookie until sign-out, browser close, or 12 hours idle
+
+#### Set or reset the master password from the terminal
+
+```powershell
+# elevated prompt (so the file lands in %ProgramData%, where the service reads it)
+Start-Process -Wait .\NetworkSentinel.exe --set-master-password
+
+# then restart the web service so it picks up the change
+schtasks /End /TN "NetworkSentinel-Web"
+schtasks /Run /TN "NetworkSentinel-Web"
+```
+
+`Start-Process -Wait` (or running it from `cmd.exe`) matters: the app is a GUI-subsystem binary, so launched directly from PowerShell the prompt would share the console with your shell. Or delete `%ProgramData%\NetworkSentinel\web-master.json` outright and let the next browser visit create a fresh one.
 
 ---
 
@@ -243,6 +263,7 @@ The app starts **without** forcing UAC (so TUI/web work on servers). Desktop ins
 | **Break-in Attempts** | Heuristic alerts with origin and method |
 | **Open Ports** | Listening TCP/UDP; optional inbound port block |
 | **Firewall & Block** | Manual IP/port rules, auto-block toggle, managed rule list |
+| **Settings** | Monitor poll interval, geo lookups, failed-logon monitoring, closed-port scan detection, allowlist feed, data folder |
 
 ### Auto-block
 1. Run elevated (Administrator).
@@ -281,6 +302,8 @@ The app starts **without** forcing UAC (so TUI/web work on servers). Desktop ins
 | `Native/IpHelper.cs` | P/Invoke into Windows IP Helper API |
 | `Services/NetworkMonitorService.cs` | Polling loop, host tracking, stats |
 | `Services/IntrusionDetector.cs` | Heuristic threat engine |
+| `Services/AuthLogMonitor.cs` | Failed-logon detection from the Windows Security event log |
+| `Services/ProbeLogMonitor.cs` | Closed-port scan detection from the Windows Firewall log |
 | `Services/GeoIpService.cs` | Reverse DNS + public geo lookup |
 | `Services/FirewallService.cs` | Windows Firewall rule create/list/remove (netsh, cached rule list) |
 | `Services/AppSettings.cs` | Auto-block preferences + suppress list (JSON on disk) |
@@ -297,13 +320,16 @@ The app starts **without** forcing UAC (so TUI/web work on servers). Desktop ins
 ## Important notes
 
 - This is an **awareness console**, not a substitute for enterprise IDS, EDR, or carefully tuned host firewall policy.
-- Threat heuristics count **new inbound connections to ports this PC is listening on** — long-lived sessions and ordinary outbound client traffic are never treated as probing.
-- Public IP geolocation uses the free `ip-api.com` endpoint (rate-limited, best-effort, **plain HTTP** — remote IPs you talk to are visible on the wire). Toggle it off in the web console's **Settings** tab, or set `"GeoLookupEnabled": false` in `%ProgramData%\NetworkSentinel\settings.json`; reverse DNS still runs. LAN/private addresses are labeled as local.
+- Scan/brute-force heuristics count **new inbound connections to ports this PC is listening on** — long-lived sessions and ordinary outbound client traffic are never treated as probing. The only outbound rule is the beacon detector, which requires a regular cadence to an uncommon port on a public IP.
+- Public IP geolocation uses the free `ipwho.is` endpoint over **HTTPS**, falling back to `ip-api.com` (plain HTTP) only if that fails. Both are rate-limited and best-effort. Toggle lookups off in **Settings** (desktop app or web console), or set `"GeoLookupEnabled": false` in `%ProgramData%\NetworkSentinel\settings.json`; reverse DNS still runs. LAN/private addresses are labeled as local.
+- **Failed-logon detection** subscribes to the Windows Security event log (4625 / 4771), which requires Administrator or membership in the local **Event Log Readers** group. Without it the app keeps running and shows why under **Settings → Failed-logon monitoring**; set `"AuthLogMonitorEnabled": false` to turn the feature off. The web service runs as SYSTEM, so it always has access.
+- **Closed-port scan detection** is off by default because it turns on Windows Firewall **dropped-packet logging** (a firewall setting, not a rule — nothing extra is blocked or allowed). Enable it under **Settings → Closed-port scan detection** while elevated, or set `"ProbeLogEnabled": true`. The watcher tails `%windir%\System32\LogFiles\Firewall\pfirewall.log` (readable by Administrators/SYSTEM), counts pure SYNs only, and the toggle turns the logging back off.
+- **Monitor poll interval** (desktop **Settings**, default 1.2 s, `"MonitorPollMs"`) is also the activity-chart sample rate, so a slower interval widens the window the chart covers rather than thinning it.
 - The allowlist remote feed can likewise be toggled in **Settings** or via `"AllowlistUseRemoteFeed": false` in the same file.
 - If the app ever exits unexpectedly, check `%ProgramData%\NetworkSentinel\logs\crash.log` — unhandled errors are logged there with a stack trace.
 - Some system sockets may show as `System` or `PID n` depending on permissions.
 - Existing TCP sessions may remain until they reconnect after a block; new matching traffic is stopped by the firewall.
-- For host hardening, also review Windows Security event **4625** (failed logons) and enable Firewall logging when needed.
+- A port that shows `LISTEN` locally but is unreachable from outside is usually a **network** firewall, not this app: on a cloud VM (Azure, AWS, …) the provider's security group can drop inbound traffic before it reaches the host. Open the port there too.
 
 ---
 

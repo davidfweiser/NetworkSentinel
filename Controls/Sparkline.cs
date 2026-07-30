@@ -23,12 +23,39 @@ public sealed class Sparkline : FrameworkElement
         DependencyProperty.Register(nameof(StrokeThickness), typeof(double), typeof(Sparkline),
             new FrameworkPropertyMetadata(2.2, FrameworkPropertyMetadataOptions.AffectsRender));
 
-    private INotifyCollectionChanged? _subscribed;
+    /// <summary>
+    /// Per-sample threat counts, parallel to <see cref="Values"/>. Samples with a
+    /// non-zero count get a vertical marker column, matching the web console's chart.
+    /// </summary>
+    public static readonly DependencyProperty ThreatsProperty =
+        DependencyProperty.Register(nameof(Threats), typeof(IEnumerable<double>), typeof(Sparkline),
+            new FrameworkPropertyMetadata(null, FrameworkPropertyMetadataOptions.AffectsRender, OnThreatsChanged));
+
+    public static readonly DependencyProperty ThreatBrushProperty =
+        DependencyProperty.Register(nameof(ThreatBrush), typeof(Brush), typeof(Sparkline),
+            new FrameworkPropertyMetadata(
+                new SolidColorBrush(Color.FromArgb(77, 0xFF, 0x5D, 0x78)),
+                FrameworkPropertyMetadataOptions.AffectsRender));
+
+    private INotifyCollectionChanged? _subscribedValues;
+    private INotifyCollectionChanged? _subscribedThreats;
 
     public IEnumerable<double>? Values
     {
         get => (IEnumerable<double>?)GetValue(ValuesProperty);
         set => SetValue(ValuesProperty, value);
+    }
+
+    public IEnumerable<double>? Threats
+    {
+        get => (IEnumerable<double>?)GetValue(ThreatsProperty);
+        set => SetValue(ThreatsProperty, value);
+    }
+
+    public Brush? ThreatBrush
+    {
+        get => (Brush?)GetValue(ThreatBrushProperty);
+        set => SetValue(ThreatBrushProperty, value);
     }
 
     public Brush Stroke
@@ -52,14 +79,25 @@ public sealed class Sparkline : FrameworkElement
     private static void OnValuesChanged(DependencyObject d, DependencyPropertyChangedEventArgs e)
     {
         var spark = (Sparkline)d;
-        if (spark._subscribed != null)
-            spark._subscribed.CollectionChanged -= spark.OnCollectionChanged;
+        spark.Resubscribe(ref spark._subscribedValues, e.NewValue);
+    }
 
-        spark._subscribed = e.NewValue as INotifyCollectionChanged;
-        if (spark._subscribed != null)
-            spark._subscribed.CollectionChanged += spark.OnCollectionChanged;
+    private static void OnThreatsChanged(DependencyObject d, DependencyPropertyChangedEventArgs e)
+    {
+        var spark = (Sparkline)d;
+        spark.Resubscribe(ref spark._subscribedThreats, e.NewValue);
+    }
 
-        spark.InvalidateVisual();
+    private void Resubscribe(ref INotifyCollectionChanged? slot, object? newValue)
+    {
+        if (slot != null)
+            slot.CollectionChanged -= OnCollectionChanged;
+
+        slot = newValue as INotifyCollectionChanged;
+        if (slot != null)
+            slot.CollectionChanged += OnCollectionChanged;
+
+        InvalidateVisual();
     }
 
     private void OnCollectionChanged(object? sender, NotifyCollectionChangedEventArgs e)
@@ -97,9 +135,9 @@ public sealed class Sparkline : FrameworkElement
             return;
         }
 
-        double min = values.Min();
-        double max = values.Max();
-        if (Math.Abs(max - min) < 0.001) { max = min + 1; min = Math.Max(0, min - 1); }
+        // Zero-baseline scale, matching the web console's chart. Scaling to min..max
+        // instead would stretch trivial noise into dramatic peaks.
+        double max = Math.Max(1, values.Max());
 
         double pad = 6;
         double usableH = h - pad * 2;
@@ -108,7 +146,7 @@ public sealed class Sparkline : FrameworkElement
         var points = new Point[values.Count];
         for (int i = 0; i < values.Count; i++)
         {
-            double norm = (values[i] - min) / (max - min);
+            double norm = values[i] / max;
             points[i] = new Point(i * stepX, h - pad - norm * usableH);
         }
 
@@ -134,6 +172,21 @@ public sealed class Sparkline : FrameworkElement
             }
             fillGeo.Freeze();
             dc.DrawGeometry(Fill, null, fillGeo);
+        }
+
+        // Threat markers: a translucent column on each sample that carried an alert.
+        // Drawn over the area fill but under the line, as the web chart does.
+        var threats = Threats?.ToList();
+        var threatBrush = ThreatBrush;
+        if (threats != null && threatBrush != null)
+        {
+            int marked = Math.Min(threats.Count, values.Count);
+            for (int i = 0; i < marked; i++)
+            {
+                if (threats[i] <= 0) continue;
+                dc.DrawRoundedRectangle(threatBrush, null,
+                    new Rect(i * stepX - 2, pad, 4, usableH), 2, 2);
+            }
         }
 
         var pen = new Pen(Stroke, StrokeThickness)

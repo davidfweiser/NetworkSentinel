@@ -27,6 +27,7 @@ public partial class MainViewModel : ObservableObject, IDisposable
     private DateTime _blockedIpsRefreshedAt = DateTime.MinValue;
     private bool _blockedIpsRefreshInFlight;
     private int _monitorRefreshQueued;
+    private bool _suppressProbeLogHandler;
 
     [ObservableProperty] private string _clockText = DateTime.Now.ToString("dddd, MMM d  ·  HH:mm:ss");
     [ObservableProperty] private string _selectedNav = "Dashboard";
@@ -36,6 +37,7 @@ public partial class MainViewModel : ObservableObject, IDisposable
     [ObservableProperty] private bool _showThreats;
     [ObservableProperty] private bool _showPorts;
     [ObservableProperty] private bool _showFirewall;
+    [ObservableProperty] private bool _showSettings;
     [ObservableProperty] private string _searchText = "";
     [ObservableProperty] private string _heroSubtitle = "Watching local ports, remote peers, and break-in patterns in real time.";
     [ObservableProperty] private string _firewallStatusText = "";
@@ -58,8 +60,27 @@ public partial class MainViewModel : ObservableObject, IDisposable
     [ObservableProperty] private NetworkConnection? _selectedConnection;
     [ObservableProperty] private ListeningPort? _selectedPort;
 
+    // ── Settings view (mirrors the web console's Settings tab) ─────────────────
+    [ObservableProperty] private bool _geoLookupEnabled = true;
+    [ObservableProperty] private bool _authLogMonitorEnabled = true;
+    [ObservableProperty] private bool _probeLogEnabled;
+    [ObservableProperty] private bool _allowlistUseRemoteFeed = true;
+    [ObservableProperty] private string _selectedMonitorPoll = "1.2 seconds (default)";
+    [ObservableProperty] private string _authLogStatusText = "";
+    [ObservableProperty] private string _probeLogStatusText = "";
+    [ObservableProperty] private string _settingsMessage = "";
+
+    // ── Activity chart legend (mirrors the web chart's legend row) ─────────────
+    [ObservableProperty] private string _activityConnectionsText = "connections";
+    [ObservableProperty] private string _activityThreatText = "threat detected (none in window)";
+    [ObservableProperty] private string _activityFromText = "";
+    [ObservableProperty] private string _activityToText = "";
+    [ObservableProperty] private string _activityWindowText = "collecting…";
+
     public string AppVersion { get; } = FormatAppVersion();
     public string WindowTitle => $"Network Sentinel  ·  {AppVersion}";
+
+    public string DataDirectoryText { get; } = AppPaths.DataDirectory;
 
     public DashboardStats Stats => _monitor.Stats;
     public ObservableCollection<NetworkConnection> Connections { get; } = new();
@@ -71,6 +92,14 @@ public partial class MainViewModel : ObservableObject, IDisposable
     public ObservableCollection<double> ActivitySeries { get; } = new();
     public ObservableCollection<double> ThreatSeries { get; } = new();
     public ObservableCollection<string> ProtocolOptions { get; } = new() { "TCP", "UDP" };
+    public ObservableCollection<string> MonitorPollOptions { get; } = new()
+    {
+        "0.5 seconds",
+        "1.2 seconds (default)",
+        "2.5 seconds",
+        "5 seconds",
+        "10 seconds"
+    };
     public ObservableCollection<string> AutoBlockLevelOptions { get; } = new()
     {
         nameof(ThreatLevel.Medium),
@@ -88,8 +117,21 @@ public partial class MainViewModel : ObservableObject, IDisposable
         _blockInbound = _settings.AutoBlockInbound;
         _blockOutbound = _settings.AutoBlockOutbound;
 
+        // Assign backing fields, not properties: the generated setters would fire the
+        // OnXChanged handlers below and re-save settings (or re-elevate) during startup.
+        _geoLookupEnabled = _settings.GeoLookupEnabled;
+        _authLogMonitorEnabled = _settings.AuthLogMonitorEnabled;
+        _probeLogEnabled = _settings.ProbeLogEnabled;
+        _allowlistUseRemoteFeed = _settings.AllowlistUseRemoteFeed;
+        _selectedMonitorPoll = PollMsToLabel(_settings.MonitorPollMs);
+
         _firewall.Allowlist = _allowlist;
         _monitor.GeoLookupsEnabled = _settings.GeoLookupEnabled;
+        _monitor.AuthMonitoringEnabled = _settings.AuthLogMonitorEnabled;
+        _monitor.ProbeMonitoringEnabled = _settings.ProbeLogEnabled;
+        _monitor.PollIntervalMs = _settings.MonitorPollMs;
+        if (_settings.ProbeLogEnabled && _firewall.IsAdministrator)
+            _ = Task.Run(() => _firewall.EnableProbeLogging());
         _allowlist.UseRemoteFeed = _settings.AllowlistUseRemoteFeed;
         LoadPersistedAutoBlockSuppressions();
         _monitor.Updated += OnMonitorUpdated;
@@ -105,6 +147,7 @@ public partial class MainViewModel : ObservableObject, IDisposable
         _clockTimer = new DispatcherTimer { Interval = TimeSpan.FromSeconds(1) };
         _clockTimer.Tick += (_, _) => ClockText = DateTime.Now.ToString("dddd, MMM d  ·  HH:mm:ss");
         _clockTimer.Start();
+        RefreshMonitorStatusText();
     }
 
     private async Task InitializeAllowlistAsync()
@@ -284,13 +327,15 @@ public partial class MainViewModel : ObservableObject, IDisposable
         Sync(RemoteHosts, FilterHosts(_monitor.RemoteHosts));
         Sync(Threats, FilterThreats(_monitor.Threats));
 
+        var activity = _monitor.Activity;
         ActivitySeries.Clear();
         ThreatSeries.Clear();
-        foreach (var sample in _monitor.Activity)
+        foreach (var sample in activity)
         {
             ActivitySeries.Add(sample.ConnectionCount);
-            ThreatSeries.Add(sample.ThreatCount * 4.0);
+            ThreatSeries.Add(sample.ThreatCount);
         }
+        UpdateActivityLegend(activity);
 
         var high = Stats.HighThreats;
         var blocked = _blockedIps.Count;
@@ -298,6 +343,40 @@ public partial class MainViewModel : ObservableObject, IDisposable
         HeroSubtitle = high > 0
             ? $"{high} high/critical · {blocked} blocked · {auto}"
             : $"{blocked} IPs blocked · {auto}";
+    }
+
+    /// <summary>
+    /// Fills the chart legend the way the web console does: current and peak
+    /// connection counts, total alerts in the window, and the window's time range.
+    /// </summary>
+    private void UpdateActivityLegend(IReadOnlyList<ActivitySample> activity)
+    {
+        if (activity.Count < 2)
+        {
+            ActivityConnectionsText = "connections";
+            ActivityThreatText = "threat detected (none in window)";
+            ActivityFromText = "";
+            ActivityToText = "";
+            ActivityWindowText = "collecting…";
+            return;
+        }
+
+        var first = activity[0];
+        var last = activity[^1];
+        var peak = activity.Max(a => a.ConnectionCount);
+        var threatTotal = activity.Sum(a => a.ThreatCount);
+        var span = last.Time - first.Time;
+
+        ActivityConnectionsText = $"connections (now {last.ConnectionCount}, peak {peak})";
+        ActivityThreatText = threatTotal > 0
+            ? $"threat detected ({threatTotal} in window)"
+            : "threat detected (none in window)";
+        ActivityFromText = first.Time.ToString("HH:mm:ss");
+        ActivityToText = last.Time.ToString("HH:mm:ss");
+        // The span is derived, not assumed: a slower poll interval widens it.
+        ActivityWindowText = span.TotalMinutes >= 1
+            ? $"last {Math.Round(span.TotalMinutes)} min"
+            : $"last {Math.Max(1, (int)span.TotalSeconds)} s";
     }
 
     private void RefreshBlockedIpsInBackground(bool force = false)
@@ -462,10 +541,153 @@ public partial class MainViewModel : ObservableObject, IDisposable
         ShowThreats = SelectedNav == "Threats";
         ShowPorts = SelectedNav == "Ports";
         ShowFirewall = SelectedNav == "Firewall";
+        ShowSettings = SelectedNav == "Settings";
 
         if (ShowFirewall)
             RefreshFirewallRules();
+        if (ShowSettings)
+            RefreshMonitorStatusText();
     }
+
+    // ── Settings handlers ─────────────────────────────────────────────────────
+    // Each mirrors the equivalent set_setting case in the web console so the two
+    // front-ends produce identical state in settings.json.
+
+    partial void OnGeoLookupEnabledChanged(bool value)
+    {
+        _monitor.GeoLookupsEnabled = value;
+        _settings.GeoLookupEnabled = value;
+        _settings.Save();
+        SettingsMessage = $"Geo lookups: {(value ? "on" : "off")}";
+    }
+
+    partial void OnAuthLogMonitorEnabledChanged(bool value)
+    {
+        _monitor.AuthMonitoringEnabled = value;
+        _settings.AuthLogMonitorEnabled = value;
+        _settings.Save();
+        RefreshMonitorStatusText();
+        SettingsMessage = value
+            ? $"Failed-logon monitoring: on ({_monitor.AuthLogStatus})"
+            : "Failed-logon monitoring: off";
+    }
+
+    partial void OnProbeLogEnabledChanged(bool value)
+    {
+        // Set while reverting the toggle after a failed logging change, so the revert
+        // doesn't re-enter this handler and try to undo itself.
+        if (_suppressProbeLogHandler) return;
+
+        _settings.ProbeLogEnabled = value;
+        _settings.Save();
+        SettingsMessage = value
+            ? "Turning on Windows Firewall dropped-packet logging…"
+            : "Turning off Windows Firewall dropped-packet logging…";
+
+        // Changing firewall logging shells out to netsh, so keep it off the UI thread.
+        _ = Task.Run(() =>
+        {
+            var result = value ? _firewall.EnableProbeLogging() : _firewall.DisableProbeLogging();
+            var dispatcher = Application.Current?.Dispatcher;
+            if (dispatcher == null) return;
+
+            dispatcher.BeginInvoke(() =>
+            {
+                _monitor.ProbeMonitoringEnabled = value && result.Success;
+                if (value && !result.Success)
+                {
+                    // Logging could not be turned on (usually not elevated) — don't
+                    // leave the toggle claiming a detection that isn't running.
+                    _settings.ProbeLogEnabled = false;
+                    _settings.Save();
+                    _suppressProbeLogHandler = true;
+                    try { ProbeLogEnabled = false; }
+                    finally { _suppressProbeLogHandler = false; }
+                    SettingsMessage = $"Closed-port scan detection: could not change firewall logging — {result.Message}";
+                }
+                else
+                {
+                    SettingsMessage = value
+                        ? "Closed-port scan detection: on (firewall dropped-packet logging enabled)"
+                        : "Closed-port scan detection: off";
+                }
+                RefreshMonitorStatusText();
+            });
+        });
+    }
+
+    partial void OnAllowlistUseRemoteFeedChanged(bool value)
+    {
+        _allowlist.UseRemoteFeed = value;
+        _settings.AllowlistUseRemoteFeed = value;
+        _settings.Save();
+        SettingsMessage = $"Allowlist remote feed: {(value ? "on" : "off")}";
+    }
+
+    partial void OnSelectedMonitorPollChanged(string value)
+    {
+        var ms = PollLabelToMs(value);
+        _monitor.PollIntervalMs = ms;
+        _settings.MonitorPollMs = ms;
+        _settings.Save();
+        SettingsMessage = $"Monitor poll interval: {value}";
+    }
+
+    private void RefreshMonitorStatusText()
+    {
+        AuthLogStatusText = string.IsNullOrWhiteSpace(_monitor.AuthLogStatus)
+            ? (AuthLogMonitorEnabled ? "Starting…" : "Disabled.")
+            : _monitor.AuthLogStatus;
+        ProbeLogStatusText = string.IsNullOrWhiteSpace(_monitor.ProbeLogStatus)
+            ? (ProbeLogEnabled ? "Starting…" : "Disabled — firewall dropped-packet logging is off.")
+            : _monitor.ProbeLogStatus;
+
+        if (ProbeLogEnabled)
+            VerifyProbeLoggingInBackground();
+    }
+
+    /// <summary>
+    /// The watcher can be happily tailing a log the firewall is no longer writing to —
+    /// logging can be turned off by policy or another admin after we enabled it. Confirm
+    /// with the firewall itself, off the UI thread (it shells out to netsh).
+    /// </summary>
+    private void VerifyProbeLoggingInBackground()
+    {
+        _ = Task.Run(() =>
+        {
+            bool installed;
+            try { installed = _firewall.IsProbeLoggingInstalled(); }
+            catch { return; }
+            if (installed) return;
+
+            var dispatcher = Application.Current?.Dispatcher;
+            dispatcher?.BeginInvoke(() =>
+            {
+                if (!ProbeLogEnabled) return;
+                ProbeLogStatusText =
+                    "Windows Firewall dropped-packet logging is not enabled on any profile — " +
+                    "no probes will be seen. Re-toggle this setting while running as Administrator.";
+            });
+        });
+    }
+
+    private static int PollLabelToMs(string? label) => label switch
+    {
+        "0.5 seconds" => 500,
+        "2.5 seconds" => 2500,
+        "5 seconds" => 5000,
+        "10 seconds" => 10_000,
+        _ => NetworkMonitorService.DefaultPollIntervalMs
+    };
+
+    private static string PollMsToLabel(int ms) => ms switch
+    {
+        500 => "0.5 seconds",
+        2500 => "2.5 seconds",
+        5000 => "5 seconds",
+        10_000 => "10 seconds",
+        _ => "1.2 seconds (default)"
+    };
 
     [RelayCommand]
     private void ToggleMonitoring()

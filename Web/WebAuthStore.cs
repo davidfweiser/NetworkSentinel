@@ -24,10 +24,17 @@ public sealed class WebAuthStore
 
     private readonly object _fileGate = new();
     private readonly ConcurrentDictionary<string, DateTime> _sessions = new(StringComparer.Ordinal);
+    private readonly string _dataDirectory;
     private AuthFile? _auth;
 
-    public WebAuthStore()
+    public WebAuthStore() : this(AppPaths.DataDirectory)
     {
+    }
+
+    /// <summary>Used by `--set-master-password` to target a specific data directory instead of the resolved one.</summary>
+    public WebAuthStore(string dataDirectory)
+    {
+        _dataDirectory = dataDirectory;
         Load();
     }
 
@@ -40,7 +47,7 @@ public sealed class WebAuthStore
         }
     }
 
-    private static string AuthPath => Path.Combine(AppPaths.DataDirectory, "web-master.json");
+    private string AuthPath => Path.Combine(_dataDirectory, "web-master.json");
 
     public bool TrySetup(string password, string confirm, out string message)
     {
@@ -76,6 +83,39 @@ public sealed class WebAuthStore
         }
 
         message = "Master password created. You are signed in.";
+        return true;
+    }
+
+    /// <summary>
+    /// Force-set the master password from a trusted local context (CLI), bypassing the
+    /// "already configured" guard the browser setup flow uses. Used by
+    /// `--set-master-password` when the web UI isn't reachable to set it there.
+    /// </summary>
+    public bool SetPassword(string password, string confirm, out string message)
+    {
+        if (!ValidateNewPassword(password, confirm, out message))
+            return false;
+
+        var salt = RandomNumberGenerator.GetBytes(SaltSize);
+        var hash = HashPassword(password, salt, Iterations);
+
+        lock (_fileGate)
+        {
+            var createdUtc = _auth?.CreatedUtc ?? DateTime.UtcNow;
+            _auth = new AuthFile
+            {
+                Version = 1,
+                Salt = Convert.ToBase64String(salt),
+                Hash = Convert.ToBase64String(hash),
+                Iterations = Iterations,
+                CreatedUtc = createdUtc,
+                ChangedUtc = DateTime.UtcNow
+            };
+            SaveUnlocked();
+        }
+
+        _sessions.Clear();
+        message = "Master password set.";
         return true;
     }
 
@@ -249,7 +289,7 @@ public sealed class WebAuthStore
 
     private void SaveUnlocked()
     {
-        Directory.CreateDirectory(AppPaths.DataDirectory);
+        Directory.CreateDirectory(_dataDirectory);
         var path = AuthPath;
         var tmp = path + ".tmp";
         File.WriteAllText(tmp, JsonSerializer.Serialize(_auth, JsonOptions));

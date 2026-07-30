@@ -403,6 +403,97 @@ public sealed class FirewallService
         return set;
     }
 
+    /// <summary>
+    /// Turns on Windows Firewall dropped-packet logging for every profile, so
+    /// probes to ports this machine does not accept leave a log line. Those
+    /// packets never reach the TCP stack, so connection polling cannot see them
+    /// (see <see cref="ProbeLogMonitor"/>). Logging is a firewall setting, not a
+    /// rule — nothing is blocked or allowed by turning it on, and the log is
+    /// capped at MaxFileSize with rotation by the firewall service itself.
+    /// </summary>
+    public FirewallOperationResult EnableProbeLogging()
+    {
+        if (!IsAdministrator)
+            return FirewallOperationResult.Fail("Administrator rights are required to change firewall logging.");
+
+        // Give the log an explicit path + size cap when the profile has none, so
+        // the monitor knows where to look and the file cannot grow unbounded.
+        var current = ReadLoggingSettings();
+        if (string.IsNullOrWhiteSpace(current.FileName))
+        {
+            RunNetsh($"advfirewall set allprofiles logging filename \"{DefaultProbeLogPath}\"");
+            RunNetsh("advfirewall set allprofiles logging maxfilesize 4096");
+        }
+
+        var applied = RunNetsh("advfirewall set allprofiles logging droppedconnections enable");
+        if (!applied.Success)
+            return FirewallOperationResult.Fail($"Failed to enable dropped-packet logging: {applied.Message}");
+
+        return FirewallOperationResult.Ok($"Dropped-packet logging enabled ({ResolveProbeLogPath()}).");
+    }
+
+    public FirewallOperationResult DisableProbeLogging()
+    {
+        if (!IsAdministrator)
+            return FirewallOperationResult.Fail("Administrator rights are required to change firewall logging.");
+
+        var applied = RunNetsh("advfirewall set allprofiles logging droppedconnections disable");
+        return applied.Success
+            ? FirewallOperationResult.Ok("Dropped-packet logging disabled.")
+            : FirewallOperationResult.Fail($"Failed to disable dropped-packet logging: {applied.Message}");
+    }
+
+    /// <summary>True when at least one profile is logging dropped packets.</summary>
+    public bool IsProbeLoggingInstalled() => ReadLoggingSettings().DroppedEnabled;
+
+    /// <summary>
+    /// Path the firewall writes dropped packets to. Falls back to the Windows
+    /// default when the setting cannot be read (netsh output is localized, so
+    /// parsing is best-effort — the default is correct on a stock install).
+    /// </summary>
+    public static string ResolveProbeLogPath()
+    {
+        var name = ReadLoggingSettings().FileName;
+        return string.IsNullOrWhiteSpace(name) ? DefaultProbeLogPath : name;
+    }
+
+    private static string DefaultProbeLogPath => Path.Combine(
+        Environment.SystemDirectory, "LogFiles", "Firewall", "pfirewall.log");
+
+    /// <summary>
+    /// Parses `netsh advfirewall show allprofiles logging`. Its output is
+    /// "Key<spaces>Value" per line, repeated per profile; a value found in any
+    /// profile is good enough for both callers.
+    /// </summary>
+    private static (bool DroppedEnabled, string FileName) ReadLoggingSettings()
+    {
+        var dropped = false;
+        var fileName = "";
+
+        var result = RunNetsh("advfirewall show allprofiles logging");
+        if (string.IsNullOrWhiteSpace(result.Message))
+            return (dropped, fileName);
+
+        foreach (var raw in result.Message.Split('\n'))
+        {
+            var line = raw.Trim();
+            if (line.StartsWith("LogDroppedConnections", StringComparison.OrdinalIgnoreCase))
+            {
+                var value = line["LogDroppedConnections".Length..].Trim();
+                if (value.StartsWith("Enable", StringComparison.OrdinalIgnoreCase))
+                    dropped = true;
+            }
+            else if (line.StartsWith("FileName", StringComparison.OrdinalIgnoreCase))
+            {
+                var value = line["FileName".Length..].Trim();
+                if (!string.IsNullOrWhiteSpace(value) && fileName.Length == 0)
+                    fileName = Environment.ExpandEnvironmentVariables(value);
+            }
+        }
+
+        return (dropped, fileName);
+    }
+
     public void RestartAsAdministrator(string? arguments = null)
     {
         var exe = Environment.ProcessPath

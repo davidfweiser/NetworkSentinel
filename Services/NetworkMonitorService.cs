@@ -9,6 +9,8 @@ public sealed class NetworkMonitorService : IDisposable
     private readonly ProcessResolver _processes = new();
     private readonly GeoIpService _geo = new();
     private readonly IntrusionDetector _detector = new();
+    private readonly AuthLogMonitor _authLog = new();
+    private readonly ProbeLogMonitor _probeLog = new();
     private readonly object _sync = new();
 
     private readonly Dictionary<string, NetworkConnection> _connections = new();
@@ -21,6 +23,14 @@ public sealed class NetworkMonitorService : IDisposable
     private CancellationTokenSource? _cts;
     private Task? _loop;
     private bool _firstPass = true;
+
+    /// <summary>
+    /// First-seen-host threats raised by <see cref="UpsertHost"/> this poll. They are
+    /// inserted and counted there rather than via the newThreats list, so the activity
+    /// sample has to pick them up separately or the chart shows no threat markers at
+    /// all on a quiet machine, where first contact is the only alert that ever fires.
+    /// </summary>
+    private int _hostThreatsThisPoll;
     private int _threatsTodayCount;
     private int _highThreatCount;
     private DateTime _threatsTodayDate = DateTime.Now.Date;
@@ -37,6 +47,67 @@ public sealed class NetworkMonitorService : IDisposable
         get => _geo.LookupsEnabled;
         set => _geo.LookupsEnabled = value;
     }
+
+    private int _pollIntervalMs = DefaultPollIntervalMs;
+
+    public const int DefaultPollIntervalMs = 1200;
+
+    /// <summary>
+    /// Milliseconds between polls, clamped to 500–10000. This is also the activity
+    /// sample rate, so a slower interval stretches the span the chart covers rather
+    /// than showing the same window at lower resolution. Takes effect next cycle.
+    /// </summary>
+    public int PollIntervalMs
+    {
+        get => _pollIntervalMs;
+        set => _pollIntervalMs = Math.Clamp(value, 500, 10_000);
+    }
+
+    private bool _authMonitoringEnabled = true;
+
+    /// <summary>Enables/disables failed-logon detection from the Windows Security event log.</summary>
+    public bool AuthMonitoringEnabled
+    {
+        get => _authMonitoringEnabled;
+        set
+        {
+            if (_authMonitoringEnabled == value) return;
+            _authMonitoringEnabled = value;
+            if (Stats.IsMonitoring)
+            {
+                if (value) _authLog.Start();
+                else _authLog.Stop();
+            }
+        }
+    }
+
+    /// <summary>State of the auth-log source (Security channel, or why it is unavailable).</summary>
+    public string AuthLogStatus => _authLog.Status;
+
+    private bool _probeMonitoringEnabled;
+
+    /// <summary>
+    /// Enables/disables closed-port scan detection from the Windows Firewall log.
+    /// Dropped-packet logging must also be turned on (FirewallService) for events
+    /// to actually appear.
+    /// </summary>
+    public bool ProbeMonitoringEnabled
+    {
+        get => _probeMonitoringEnabled;
+        set
+        {
+            if (_probeMonitoringEnabled == value) return;
+            _probeMonitoringEnabled = value;
+            if (Stats.IsMonitoring)
+            {
+                if (value) _probeLog.Start();
+                else _probeLog.Stop();
+            }
+        }
+    }
+
+    /// <summary>State of the firewall probe-log source.</summary>
+    public string ProbeLogStatus => _probeLog.Status;
 
     public IReadOnlyList<NetworkConnection> Connections
     {
@@ -65,6 +136,8 @@ public sealed class NetworkMonitorService : IDisposable
         _cts = new CancellationTokenSource();
         Stats.IsMonitoring = true;
         Stats.StatusText = "Monitoring network stack…";
+        if (_authMonitoringEnabled) _authLog.Start();
+        if (_probeMonitoringEnabled) _probeLog.Start();
         _loop = Task.Run(() => RunAsync(_cts.Token));
     }
 
@@ -77,6 +150,8 @@ public sealed class NetworkMonitorService : IDisposable
         cts?.Dispose();
         _cts = null;
         _loop = null;
+        _authLog.Stop();
+        _probeLog.Stop();
         Stats.IsMonitoring = false;
         Stats.StatusText = "Monitoring paused";
     }
@@ -96,7 +171,7 @@ public sealed class NetworkMonitorService : IDisposable
 
             try
             {
-                await Task.Delay(1200, ct);
+                await Task.Delay(PollIntervalMs, ct);
             }
             catch (TaskCanceledException)
             {
@@ -120,6 +195,7 @@ public sealed class NetworkMonitorService : IDisposable
 
         lock (_sync)
         {
+            _hostThreatsThisPoll = 0;
             if (now.Date != _threatsTodayDate)
             {
                 _threatsTodayDate = now.Date;
@@ -205,6 +281,9 @@ public sealed class NetworkMonitorService : IDisposable
             // Intrusion heuristics
             var activeConns = _connections.Values.ToList();
             newThreats.AddRange(_detector.Analyze(activeConns, _hosts, listeningTcpPorts, now));
+            newThreats.AddRange(_authLog.DrainPending());
+            _probeLog.SetListeningPorts(listeningTcpPorts);
+            newThreats.AddRange(_probeLog.DrainPending());
 
             foreach (var t in newThreats)
             {
@@ -225,10 +304,12 @@ public sealed class NetworkMonitorService : IDisposable
             {
                 Time = now,
                 ConnectionCount = _connections.Count,
-                ThreatCount = newThreats.Count,
+                ThreatCount = newThreats.Count + _hostThreatsThisPoll,
                 RemoteHostCount = _hosts.Count
             });
-            while (_activity.Count > 60) _activity.RemoveAt(0);
+            // ~5 minutes of history at the 1.2 s poll rate (GUI sparkline and
+            // web activity chart both render whatever range is here).
+            while (_activity.Count > 240) _activity.RemoveAt(0);
 
             Stats.ListeningPorts = _listeners.Count;
             Stats.ActiveConnections = _connections.Count;
@@ -283,6 +364,7 @@ public sealed class NetworkMonitorService : IDisposable
                 };
                 _threats.Insert(0, t);
                 CountThreat(t);
+                _hostThreatsThisPoll++;
             }
         }
 
@@ -393,6 +475,8 @@ public sealed class NetworkMonitorService : IDisposable
     public void Dispose()
     {
         Stop();
+        _authLog.Dispose();
+        _probeLog.Dispose();
         _geo.Dispose();
     }
 }
