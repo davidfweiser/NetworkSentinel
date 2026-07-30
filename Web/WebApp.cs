@@ -607,6 +607,10 @@ public sealed class WebApp : IDisposable
                             _settings.AllowlistUseRemoteFeed = on;
                             label = $"Allowlist remote feed: {(on ? "on" : "off")}";
                             break;
+                        case "criticalAlertsEnabled":
+                            _settings.CriticalAlertsEnabled = on;
+                            label = $"Critical threat alerts: {(on ? "on" : "off")}";
+                            break;
                         default:
                             return ActionResultDto.Fail($"Unknown setting: {key}");
                     }
@@ -848,6 +852,7 @@ public sealed class WebApp : IDisposable
                 probeLogEnabled = _settings.ProbeLogEnabled,
                 probeLogStatus = _monitor.ProbeLogStatus,
                 allowlistUseRemoteFeed = _settings.AllowlistUseRemoteFeed,
+                criticalAlertsEnabled = _settings.CriticalAlertsEnabled,
                 isMonitoring = stats.IsMonitoring
             },
             stats = new
@@ -891,6 +896,7 @@ public sealed class WebApp : IDisposable
             }),
             threats = _monitor.Threats.Take(200).Select(t => new
             {
+                ts = t.Timestamp.ToString("o"),
                 time = t.TimeText,
                 level = t.LevelText,
                 levelNum = (int)t.Level,
@@ -1913,9 +1919,45 @@ public sealed class WebApp : IDisposable
       </div>`;
   }
 
+  // ── Critical-threat warnings: tab-title badge + browser notification ───────
+  // The badge always tracks live Critical rows; notifications additionally need
+  // the criticalAlertsEnabled setting AND granted browser permission.
+  const seenCritical = new Set();
+  let criticalPrimed = false;
+  function criticalKey(t) {
+    return (t.ts || t.time) + '|' + (t.sourceIp || '') + '|' + (t.title || '');
+  }
+  function updateCriticalAlerts() {
+    const crit = (state.threats || []).filter(t => t.levelNum >= 4);
+    document.title = crit.length
+      ? '⚠ ' + crit.length + ' · Network Sentinel'
+      : 'Network Sentinel';
+
+    if (seenCritical.size > 2000) {
+      // Prune runaway growth on very long sessions; re-seed silently.
+      seenCritical.clear();
+      crit.forEach(t => seenCritical.add(criticalKey(t)));
+      return;
+    }
+    const fresh = crit.filter(t => !seenCritical.has(criticalKey(t)));
+    fresh.forEach(t => seenCritical.add(criticalKey(t)));
+    // First poll after page load: everything is "new" — seed silently so a
+    // reload does not replay alerts for old events.
+    if (!criticalPrimed) { criticalPrimed = true; return; }
+    if (!fresh.length || !state.settings?.criticalAlertsEnabled) return;
+    if (!('Notification' in window) || Notification.permission !== 'granted') return;
+    const head = fresh.length === 1
+      ? 'Critical threat: ' + (fresh[0].type || 'threat detected')
+      : fresh.length + ' critical threats detected';
+    const body = fresh.slice(0, 4)
+      .map(t => t.title + (t.sourceIp ? ' — ' + t.sourceIp : '')).join('\n');
+    try { new Notification(head, { body, tag: 'ns-critical' }); } catch { /* blocked */ }
+  }
+
   function render(opts) {
     opts = opts || {};
     if (!state) return;
+    updateCriticalAlerts();
     const forceLists = !!opts.forceLists;
     $('ver').textContent = 'v' + (state.version || '?');
     $('clock').textContent = state.clock || '';
@@ -2094,6 +2136,13 @@ public sealed class WebApp : IDisposable
     }
   }
 
+  function notifPermText() {
+    if (!('Notification' in window)) return 'This browser does not support notifications.';
+    if (Notification.permission === 'granted') return 'Browser permission: granted.';
+    if (Notification.permission === 'denied') return 'Browser permission: blocked — allow notifications for this site in your browser settings.';
+    return '';
+  }
+
   function renderSettings() {
     const s = state.settings || {};
     const row = (label, desc, control) => `
@@ -2115,6 +2164,7 @@ public sealed class WebApp : IDisposable
         ${row('Geo lookups', 'Resolve country and city for remote IPs (ipwho.is over HTTPS, ip-api.com fallback).', sw('geoLookupEnabled', s.geoLookupEnabled))}
         ${row('Auth-log monitoring', 'Watch system auth logs for failed SSH/PAM logons and alert on brute-force bursts. ' + (s.authLogStatus || ''), sw('authLogMonitorEnabled', s.authLogMonitorEnabled))}
         ${row('Closed-port scan detection', 'Install a rate-limited firewall SYN-log rule (needs elevation) and watch the kernel log — catches port scans of closed ports that never appear as connections. ' + (s.probeLogStatus || ''), sw('probeLogEnabled', s.probeLogEnabled))}
+        ${row('Critical threat alerts', 'Badge the tab title and pop a browser notification when a Critical-level threat appears. Your browser asks for notification permission when you switch this on. ' + notifPermText(), sw('criticalAlertsEnabled', s.criticalAlertsEnabled))}
       </div>
       <div class="settings-group"><h3>Auto-block</h3>
         ${row('Auto-block threats', 'Automatically create firewall rules when threats are detected.', sw('autoBlockEnabled', s.autoBlockEnabled))}
@@ -2213,6 +2263,9 @@ public sealed class WebApp : IDisposable
     const t = e.target;
     if (t.matches('[data-setting]')) {
       const key = t.dataset.setting;
+      if (key === 'criticalAlertsEnabled' && t.checked &&
+          'Notification' in window && Notification.permission === 'default')
+        Notification.requestPermission().then(() => renderSettings());
       if (key === 'monitoring') apiAction('toggle_monitor');
       else apiAction('set_setting', { name: key, value: t.checked ? 'true' : 'false' });
       return;

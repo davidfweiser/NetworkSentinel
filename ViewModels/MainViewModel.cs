@@ -14,6 +14,7 @@ public partial class MainViewModel : ObservableObject, IDisposable
     private readonly NetworkMonitorService _monitor = new();
     private readonly FirewallService _firewall = new();
     private readonly AllowlistService _allowlist = new();
+    private readonly DesktopNotifier _notifier = new();
     private readonly AppSettings _settings;
     private readonly DispatcherTimer _clockTimer;
     private readonly object _autoBlockGate = new();
@@ -61,10 +62,14 @@ public partial class MainViewModel : ObservableObject, IDisposable
     [ObservableProperty] private bool _authLogMonitorEnabled = true;
     [ObservableProperty] private bool _probeLogEnabled;
     [ObservableProperty] private bool _allowlistUseRemoteFeed = true;
+    [ObservableProperty] private bool _criticalAlertsEnabled = true;
     [ObservableProperty] private string _selectedMonitorPoll = "1.2 seconds (default)";
     [ObservableProperty] private string _authLogStatusText = "";
     [ObservableProperty] private string _probeLogStatusText = "";
     [ObservableProperty] private string _settingsMessage = "";
+
+    /// <summary>Availability of the desktop notification channel (fixed at startup).</summary>
+    public string CriticalAlertStatusText => _notifier.StatusText;
 
     // ── Activity chart legend (mirrors the web chart's legend row) ─────────────
     [ObservableProperty] private string _activityConnectionsText = "connections";
@@ -127,6 +132,7 @@ public partial class MainViewModel : ObservableObject, IDisposable
         _authLogMonitorEnabled = _settings.AuthLogMonitorEnabled;
         _probeLogEnabled = _settings.ProbeLogEnabled;
         _allowlistUseRemoteFeed = _settings.AllowlistUseRemoteFeed;
+        _criticalAlertsEnabled = _settings.CriticalAlertsEnabled;
         _selectedMonitorPoll = PollMsToLabel(_settings.MonitorPollMs);
 
         _firewall.Allowlist = _allowlist;
@@ -214,7 +220,17 @@ public partial class MainViewModel : ObservableObject, IDisposable
 
     private void OnThreatsDetected(IReadOnlyList<ThreatEvent> threats)
     {
-        if (!AutoBlockEnabled || threats.Count == 0)
+        if (threats.Count == 0)
+            return;
+
+        if (CriticalAlertsEnabled)
+        {
+            var critical = threats.Where(t => t.Level >= ThreatLevel.Critical).ToList();
+            if (critical.Count > 0)
+                _ = Task.Run(() => _notifier.NotifyCritical(critical));
+        }
+
+        if (!AutoBlockEnabled)
             return;
 
         _ = Task.Run(() =>
@@ -617,6 +633,15 @@ public partial class MainViewModel : ObservableObject, IDisposable
                 RefreshMonitorStatusText();
             });
         });
+    }
+
+    partial void OnCriticalAlertsEnabledChanged(bool value)
+    {
+        _settings.CriticalAlertsEnabled = value;
+        _settings.Save();
+        SettingsMessage = value
+            ? $"Critical threat alerts: on — {_notifier.StatusText}"
+            : "Critical threat alerts: off";
     }
 
     partial void OnAllowlistUseRemoteFeedChanged(bool value)

@@ -585,7 +585,7 @@
                               IsChecked="{Binding AuthLogMonitorEnabled}"/>
                   </Grid>
 
-                  <Grid ColumnDefinitions="*,Auto">
+                  <Grid ColumnDefinitions="*,Auto" Margin="0,0,0,14">
                     <StackPanel Margin="0,0,16,0">
                       <TextBlock Text="Closed-port scan detection" FontWeight="Bold" FontSize="13"/>
                       <TextBlock Text="Install a rate-limited firewall SYN-log rule (needs elevation) and watch the kernel log — catches scans of closed ports that never appear as connections."
@@ -596,6 +596,19 @@
                     </StackPanel>
                     <CheckBox Grid.Column="1" VerticalAlignment="Center"
                               IsChecked="{Binding ProbeLogEnabled}"/>
+                  </Grid>
+
+                  <Grid ColumnDefinitions="*,Auto">
+                    <StackPanel Margin="0,0,16,0">
+                      <TextBlock Text="Critical threat alerts" FontWeight="Bold" FontSize="13"/>
+                      <TextBlock Text="Send a desktop notification when a Critical-level threat is detected, so you are warned even while this window is minimized or in the tray."
+                                 Foreground="{DynamicResource TextSecondaryBrush}" FontSize="11"
+                                 Margin="0,2,0,0" TextWrapping="Wrap"/>
+                      <TextBlock Text="{Binding CriticalAlertStatusText}" FontSize="11" Margin="0,4,0,0"
+                                 Foreground="{DynamicResource AccentCyanBrush}" TextWrapping="Wrap"/>
+                    </StackPanel>
+                    <CheckBox Grid.Column="1" VerticalAlignment="Center"
+                              IsChecked="{Binding CriticalAlertsEnabled}"/>
                   </Grid>
                 </StackPanel>
               </Border>
