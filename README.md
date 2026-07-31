@@ -88,9 +88,9 @@ Domains are DNS-resolved to current IPs. Auto-block never touches allowlisted IP
 | **Ports** | Local listeners; one-click **Block port** |
 | **Firewall** | Managed rules grouped as In/Out pairs; manual IP and port blocking; **Restore allowlisted** |
 | **Allowlist** | Add/remove trusted domains and IPs; refresh the feed |
-| **Settings** | Monitoring on/off, page refresh speed, geo lookups, auto-block + minimum severity, block direction (in/out), allowlist feed, **change master password**, **Remove all rules** |
+| **Settings** | Monitoring on/off, poll interval, geo lookups, auth-log and closed-port scan detection, the 0.4.0 detectors (threat intel, new-listener alerts, process reputation, ARP/gateway watch, startup-item watch, exfiltration threshold, honeypot ports), webhook URL, auto-block + minimum severity + expiry, block direction (in/out), allowlist feed, **change master password**, **Remove all rules** |
 
-The page header shows the running version (e.g. `v0.3.1`) — check it after an upgrade to confirm the new build is live.
+The page header shows the running version (e.g. `v0.4.0`) — check it after an upgrade to confirm the new build is live.
 
 ### Web UI security
 - First browser visit **creates a master password** (min. 8 characters)
@@ -109,6 +109,8 @@ The page header shows the running version (e.g. `v0.3.1`) — check it after an 
 - Desktop libraries for Avalonia GUI (usual X11/Wayland desktop)
 - **policykit-1** (`pkexec`) recommended for firewall password prompts
 - `nft` (nftables) or `iptables` for host firewall changes
+- `ss` (iproute2) for the exfiltration monitor — present on essentially every distro; without it that one feature reports itself unavailable
+- Read access to the system auth log (`adm` / `systemd-journal` group) for failed-logon and closed-port scan detection — optional, the app runs without it
 - **systemd** optional (used by `--web-service` installer)
 
 ---
@@ -142,17 +144,17 @@ Build on a machine with the .NET SDK; install on the server **without** .NET:
 
 ```bash
 # build machine
-scp dist/networksentinel-0.3.1-linux-x64.install.sh user@server:
+scp dist/networksentinel-0.4.0-linux-x64.install.sh user@server:
 
 # server
-chmod +x networksentinel-0.3.1-linux-x64.install.sh
-sudo ./networksentinel-0.3.1-linux-x64.install.sh --web-service
+chmod +x networksentinel-0.4.0-linux-x64.install.sh
+sudo ./networksentinel-0.4.0-linux-x64.install.sh --web-service
 ```
 
 Confirm the installer is current before using root:
 
 ```bash
-./networksentinel-0.3.1-linux-x64.install.sh --help
+./networksentinel-0.4.0-linux-x64.install.sh --help
 # Should list: --web-service
 ```
 
@@ -188,8 +190,8 @@ sudo ./….install.sh --web-service --port 18765
 ./….install.sh --user --web-service         # user systemd unit
 
 # classic tarball
-tar xzf networksentinel-0.3.1-linux-x64.tar.gz
-cd networksentinel-0.3.1-linux-x64
+tar xzf networksentinel-0.4.0-linux-x64.tar.gz
+cd networksentinel-0.4.0-linux-x64
 sudo ./install.sh --web-service
 ```
 
@@ -434,8 +436,48 @@ Optional desktop entry is provided as `networksentinel.desktop` (`Icon=networkse
 | **Remote Computers** | Tracked peers, origin, threat level; block / unblock |
 | **Break-in Attempts** | Heuristic alerts with origin and method |
 | **Open Ports** | Listening TCP/UDP; optional inbound port block |
-| **Firewall & Block** | Manual IP/port rules, auto-block, allowlist, managed rule list |
-| **Allowlist** | Domains/IPs that are never blocked |
+| **Firewall & Block** | Manual IP/port rules, auto-block, managed rule list, and the **allowlist** panel (domains/IPs that are never blocked) |
+| **Settings** | Monitoring · Intrusion detection · Alerting & auto-block · Allowlist · Data — every toggle described below |
+
+The GUI **Settings** view groups the same options the web console exposes:
+
+| Group | Options |
+|-------|---------|
+| **Monitoring** | Live monitoring on/off, poll interval, geo lookups, auth-log monitoring, closed-port scan detection, Critical desktop notifications |
+| **Intrusion detection** | Threat-intel blocklists, new-listener alerts, process reputation, ARP/gateway watch, startup-item watch, exfiltration threshold (MB / 10 min), honeypot decoy ports |
+| **Alerting & auto-block** | Webhook URL, auto-block expiry |
+| **Allowlist** | Remote allowlist feed |
+| **Data** | Where settings, allowlist, and the master-password hash live |
+
+Each toggle shows a live status line underneath (e.g. why auth-log monitoring is unavailable, or which honeypot ports actually bound), so a feature that can't run says so instead of failing silently.
+
+### Settings keys
+
+All three UIs write the same `~/.local/share/NetworkSentinel/settings.json`, so anything you can toggle in the GUI can also be set on a headless box by editing the file (restart the app or service afterwards):
+
+| Key | Default | Meaning |
+|-----|---------|---------|
+| `MonitorPollMs` | `1200` | Poll interval, ms — also the activity chart's sample rate |
+| `GeoLookupEnabled` | `true` | Country/city lookups for public IPs (reverse DNS runs either way) |
+| `AuthLogMonitorEnabled` | `true` | Failed-logon bursts from journald / `auth.log` |
+| `ProbeLogEnabled` | `false` | Closed-port scan detection (installs one firewall SYN-log rule) |
+| `CriticalAlertsEnabled` | `true` | Desktop notification on Critical (GUI) |
+| `ThreatIntelEnabled` | `true` | FireHOL level1 + Spamhaus DROP matching |
+| `NewListenerAlertsEnabled` | `true` | New / re-owned listening ports vs. the baseline |
+| `ProcessReputationEnabled` | `true` | Reverse-shell, fileless, throwaway-path, unpackaged-binary checks |
+| `ArpWatchEnabled` | `true` | Gateway MAC change / duplicate MAC |
+| `PersistenceWatchEnabled` | `true` | systemd / cron / autostart folder watch |
+| `ExfilMonitorEnabled` | `true` | Per-socket outbound byte monitoring via `ss` |
+| `ExfilMbPer10Min` | `250` | Exfiltration alert threshold, MB per 10 minutes |
+| `HoneypotEnabled` | `false` | Bind decoy TCP ports |
+| `HoneypotPorts` | `"2323,3389,5900"` | Which ports to decoy (busy ones are skipped) |
+| `WebhookUrl` | `""` | Push alerts to ntfy / Slack / Discord / generic JSON; empty disables |
+| `WebhookMinLevel` | `"Critical"` | Minimum severity that fires the webhook |
+| `AutoBlockEnabled` | `false` | Create firewall rules automatically |
+| `AutoBlockMinLevel` | `"High"` | Minimum severity for auto-block |
+| `AutoBlockInbound` / `AutoBlockOutbound` | `true` / `true` | Direction of auto-created rules |
+| `AutoBlockExpiryMinutes` | `0` (off) | Auto-block lifetime; manual blocks are always permanent |
+| `AllowlistUseRemoteFeed` | `true` | Refresh the known-good list from the online feed |
 
 ### Auto-block
 1. Click **Authorize firewall** (or allow the first pkexec prompt when blocking).
