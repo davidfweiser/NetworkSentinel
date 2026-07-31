@@ -32,6 +32,12 @@ public sealed class AppSettings
     public bool AllowlistUseRemoteFeed { get; set; } = true;
 
     /// <summary>
+    /// Actively warn when a Critical-level threat is detected: desktop notification
+    /// in the GUI, tab-title badge + browser notification in the web console.
+    /// </summary>
+    public bool CriticalAlertsEnabled { get; set; } = true;
+
+    /// <summary>
     /// Milliseconds between monitor polls (clamped to 500–10000 when applied).
     /// Doubles as the activity-chart sample rate.
     /// </summary>

@@ -990,7 +990,7 @@
                                                       IsChecked="{Binding AuthLogMonitorEnabled}"/>
                                         </Grid>
 
-                                        <Grid>
+                                        <Grid Margin="0,0,0,14">
                                             <Grid.ColumnDefinitions>
                                                 <ColumnDefinition Width="*"/>
                                                 <ColumnDefinition Width="Auto"/>
@@ -1006,6 +1006,24 @@
                                             <CheckBox Grid.Column="1" VerticalAlignment="Center"
                                                       Style="{StaticResource ModernCheckBox}"
                                                       IsChecked="{Binding ProbeLogEnabled}"/>
+                                        </Grid>
+
+                                        <Grid>
+                                            <Grid.ColumnDefinitions>
+                                                <ColumnDefinition Width="*"/>
+                                                <ColumnDefinition Width="Auto"/>
+                                            </Grid.ColumnDefinitions>
+                                            <StackPanel Margin="0,0,16,0">
+                                                <TextBlock Text="Critical threat alerts" FontWeight="Bold" FontSize="13"/>
+                                                <TextBlock Text="Send a desktop notification when a Critical-level threat is detected, so you are warned even while this window is minimized."
+                                                           Foreground="{StaticResource TextSecondaryBrush}" FontSize="11"
+                                                           Margin="0,2,0,0" TextWrapping="Wrap"/>
+                                                <TextBlock Text="{Binding CriticalAlertStatusText}" FontSize="11" Margin="0,4,0,0"
+                                                           Foreground="{StaticResource AccentCyanBrush}" TextWrapping="Wrap"/>
+                                            </StackPanel>
+                                            <CheckBox Grid.Column="1" VerticalAlignment="Center"
+                                                      Style="{StaticResource ModernCheckBox}"
+                                                      IsChecked="{Binding CriticalAlertsEnabled}"/>
                                         </Grid>
                                     </StackPanel>
                                 </Border>
