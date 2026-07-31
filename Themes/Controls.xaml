@@ -3,7 +3,7 @@
 
     <Style x:Key="GhostButton" TargetType="Button">
         <Setter Property="Foreground" Value="{StaticResource TextPrimaryBrush}"/>
-        <Setter Property="Background" Value="#22182A4A"/>
+        <Setter Property="Background" Value="#1AFFFFFF"/>
         <Setter Property="BorderBrush" Value="{StaticResource StrokeSoftBrush}"/>
         <Setter Property="BorderThickness" Value="1"/>
         <Setter Property="Padding" Value="12,8"/>
@@ -65,9 +65,11 @@
         </Setter>
     </Style>
 
-    <!-- Light label on saturated gradient — dark text was hard to read on blue/violet. -->
+    <!-- Ink label on the bright teal->blue gradient, as on iOS. The light label here
+         existed because the old gradient ended in violet, where dark text failed;
+         that stop is gone with the NSTheme palette. -->
     <Style x:Key="PrimaryButton" TargetType="Button" BasedOn="{StaticResource GhostButton}">
-        <Setter Property="Foreground" Value="#FFF7FBFF"/>
+        <Setter Property="Foreground" Value="#FF0A0E14"/>
         <Setter Property="Background" Value="{StaticResource AccentGradient}"/>
         <Setter Property="BorderThickness" Value="0"/>
         <Setter Property="FontWeight" Value="Bold"/>
@@ -305,7 +307,7 @@
                             <Setter Property="Foreground" Value="{StaticResource TextPrimaryBrush}"/>
                         </Trigger>
                         <Trigger Property="IsChecked" Value="True">
-                            <Setter TargetName="bd" Property="Background" Value="#331E3A68"/>
+                            <Setter TargetName="bd" Property="Background" Value="#264A9EFF"/>
                             <Setter TargetName="indicator" Property="Background" Value="{StaticResource AccentCyanBrush}"/>
                             <Setter Property="Foreground" Value="{StaticResource TextPrimaryBrush}"/>
                             <Trigger.EnterActions>
@@ -347,7 +349,7 @@
 
     <Style x:Key="ModernTextBox" TargetType="TextBox">
         <Setter Property="Foreground" Value="{StaticResource TextPrimaryBrush}"/>
-        <Setter Property="Background" Value="#22101828"/>
+        <Setter Property="Background" Value="#0DFFFFFF"/>
         <Setter Property="BorderBrush" Value="{StaticResource StrokeSoftBrush}"/>
         <Setter Property="BorderThickness" Value="1"/>
         <Setter Property="CaretBrush" Value="{StaticResource AccentCyanBrush}"/>
@@ -374,7 +376,7 @@
         <Setter Property="BorderThickness" Value="0"/>
         <Setter Property="RowBackground" Value="Transparent"/>
         <Setter Property="AlternatingRowBackground" Value="#120B1224"/>
-        <Setter Property="HorizontalGridLinesBrush" Value="#18A8C5FF"/>
+        <Setter Property="HorizontalGridLinesBrush" Value="#14FFFFFF"/>
         <Setter Property="VerticalGridLinesBrush" Value="Transparent"/>
         <Setter Property="GridLinesVisibility" Value="Horizontal"/>
         <Setter Property="HeadersVisibility" Value="Column"/>
@@ -398,7 +400,7 @@
     </Style>
 
     <Style TargetType="DataGridColumnHeader">
-        <Setter Property="Background" Value="#22101828"/>
+        <Setter Property="Background" Value="#0DFFFFFF"/>
         <Setter Property="Foreground" Value="{StaticResource TextSecondaryBrush}"/>
         <Setter Property="FontWeight" Value="SemiBold"/>
         <Setter Property="Padding" Value="10,0"/>

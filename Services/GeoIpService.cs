@@ -264,6 +264,9 @@ public sealed class GeoIpService : IDisposable
     public static bool IsNonPublic(string ip)
     {
         if (!IPAddress.TryParse(ip, out var address)) return true;
+        // The IPv6 TCP table reports peers of dual-stack sockets as ::ffff:a.b.c.d,
+        // so an unmapped check would call every LAN peer of an IPv6 listener public.
+        if (address.IsIPv4MappedToIPv6) address = address.MapToIPv4();
         if (IPAddress.IsLoopback(address)) return true;
         if (address.AddressFamily == AddressFamily.InterNetwork)
         {
@@ -281,6 +284,19 @@ public sealed class GeoIpService : IDisposable
             if (address.Equals(IPAddress.IPv6Any)) return true;
         }
         return false;
+    }
+
+    /// <summary>Multicast / broadcast destinations (mDNS, SSDP, …) — noise, not peers.</summary>
+    public static bool IsMulticastOrBroadcast(string ip)
+    {
+        if (!IPAddress.TryParse(ip, out var address)) return false;
+        if (address.IsIPv4MappedToIPv6) address = address.MapToIPv4();
+        if (address.AddressFamily == AddressFamily.InterNetwork)
+        {
+            var bytes = address.GetAddressBytes();
+            return bytes[0] >= 224; // 224–239 multicast, 240+ reserved, 255 broadcast
+        }
+        return address.IsIPv6Multicast;
     }
 
     private static bool IsLoopback(string ip)

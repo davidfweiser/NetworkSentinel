@@ -71,6 +71,22 @@ public partial class MainViewModel : ObservableObject, IDisposable
     [ObservableProperty] private string _authLogStatusText = "";
     [ObservableProperty] private string _probeLogStatusText = "";
     [ObservableProperty] private string _settingsMessage = "";
+    [ObservableProperty] private bool _threatIntelEnabled = true;
+    [ObservableProperty] private bool _processReputationEnabled = true;
+    [ObservableProperty] private bool _newListenerAlertsEnabled = true;
+    [ObservableProperty] private bool _arpWatchEnabled = true;
+    [ObservableProperty] private bool _persistenceWatchEnabled = true;
+    [ObservableProperty] private bool _exfilMonitorEnabled = true;
+    [ObservableProperty] private string _exfilThresholdMbText = "250";
+    [ObservableProperty] private bool _honeypotEnabled;
+    [ObservableProperty] private string _honeypotPortsText = "2323,3389,5900";
+    [ObservableProperty] private string _webhookUrl = "";
+    [ObservableProperty] private string _selectedAutoBlockExpiry = "Never (permanent)";
+    [ObservableProperty] private string _arpWatchStatusText = "";
+    [ObservableProperty] private string _persistenceWatchStatusText = "";
+    [ObservableProperty] private string _exfilStatusText = "";
+    [ObservableProperty] private string _honeypotStatusText = "";
+    [ObservableProperty] private string _webhookStatusText = "";
 
     /// <summary>Availability of the desktop notification channel (fixed at startup).</summary>
     public string CriticalAlertStatusText => _notifier.StatusText;
@@ -111,6 +127,14 @@ public partial class MainViewModel : ObservableObject, IDisposable
         nameof(ThreatLevel.High),
         nameof(ThreatLevel.Critical)
     };
+    public ObservableCollection<string> AutoBlockExpiryOptions { get; } = new()
+    {
+        "Never (permanent)",
+        "1 hour",
+        "6 hours",
+        "24 hours",
+        "7 days"
+    };
 
     public MainViewModel()
     {
@@ -130,12 +154,37 @@ public partial class MainViewModel : ObservableObject, IDisposable
         _allowlistUseRemoteFeed = _settings.AllowlistUseRemoteFeed;
         _criticalAlertsEnabled = _settings.CriticalAlertsEnabled;
         _selectedMonitorPoll = PollMsToLabel(_settings.MonitorPollMs);
+        _threatIntelEnabled = _settings.ThreatIntelEnabled;
+        _processReputationEnabled = _settings.ProcessReputationEnabled;
+        _newListenerAlertsEnabled = _settings.NewListenerAlertsEnabled;
+        _arpWatchEnabled = _settings.ArpWatchEnabled;
+        _persistenceWatchEnabled = _settings.PersistenceWatchEnabled;
+        _exfilMonitorEnabled = _settings.ExfilMonitorEnabled;
+        _exfilThresholdMbText = _settings.ExfilMbPer10Min.ToString();
+        _honeypotEnabled = _settings.HoneypotEnabled;
+        _honeypotPortsText = _settings.HoneypotPorts;
+        _webhookUrl = _settings.WebhookUrl;
+        _selectedAutoBlockExpiry = ExpiryMinutesToLabel(_settings.AutoBlockExpiryMinutes);
 
         _firewall.Allowlist = _allowlist;
+        _firewall.AutoBlockExpiry = ExpiryMinutesToSpan(_settings.AutoBlockExpiryMinutes);
+        _firewall.StartExpirySweep();
         _monitor.GeoLookupsEnabled = _settings.GeoLookupEnabled;
         _monitor.AuthMonitoringEnabled = _settings.AuthLogMonitorEnabled;
         _monitor.ProbeMonitoringEnabled = _settings.ProbeLogEnabled;
         _monitor.PollIntervalMs = _settings.MonitorPollMs;
+        _monitor.ThreatIntelEnabled = _settings.ThreatIntelEnabled;
+        _monitor.ProcessReputationEnabled = _settings.ProcessReputationEnabled;
+        _monitor.NewListenerAlertsEnabled = _settings.NewListenerAlertsEnabled;
+        _monitor.ArpWatchEnabled = _settings.ArpWatchEnabled;
+        _monitor.PersistenceWatchEnabled = _settings.PersistenceWatchEnabled;
+        _monitor.ExfilMonitorEnabled = _settings.ExfilMonitorEnabled;
+        _monitor.ExfilThresholdMb = _settings.ExfilMbPer10Min;
+        _monitor.HoneypotPorts = HoneypotService.ParsePorts(_settings.HoneypotPorts);
+        _monitor.HoneypotEnabled = _settings.HoneypotEnabled;
+        _monitor.WebhookUrl = _settings.WebhookUrl;
+        _monitor.WebhookMinLevel = _settings.GetWebhookMinLevel();
+        _monitor.IsIpAllowlisted = ip => _allowlist.IsAllowed(ip, out _);
         if (_settings.ProbeLogEnabled && _firewall.IsAdministrator)
             _ = Task.Run(() => _firewall.EnableProbeLogging());
         _allowlist.UseRemoteFeed = _settings.AllowlistUseRemoteFeed;
@@ -303,7 +352,7 @@ public partial class MainViewModel : ObservableObject, IDisposable
             }
 
             var reason = $"Auto-block · {threat.LevelText} · {threat.TypeText}: {threat.Title}";
-            var result = _firewall.BlockIp(ip, direction, reason);
+            var result = _firewall.BlockIp(ip, direction, reason, expiresAfter: _firewall.AutoBlockExpiry);
             if (result.Success)
             {
                 lock (_autoBlockGate) _blockedIps.Add(ip);
@@ -658,6 +707,145 @@ public partial class MainViewModel : ObservableObject, IDisposable
         SettingsMessage = $"Monitor poll interval: {value}";
     }
 
+    partial void OnThreatIntelEnabledChanged(bool value)
+    {
+        _monitor.ThreatIntelEnabled = value;
+        _settings.ThreatIntelEnabled = value;
+        _settings.Save();
+        SettingsMessage = value
+            ? $"Threat-intel feeds: on ({_monitor.ThreatIntelStatus})"
+            : "Threat-intel feeds: off";
+    }
+
+    partial void OnProcessReputationEnabledChanged(bool value)
+    {
+        _monitor.ProcessReputationEnabled = value;
+        _settings.ProcessReputationEnabled = value;
+        _settings.Save();
+        SettingsMessage = $"Process reputation checks: {(value ? "on" : "off")}";
+    }
+
+    partial void OnNewListenerAlertsEnabledChanged(bool value)
+    {
+        _monitor.NewListenerAlertsEnabled = value;
+        _settings.NewListenerAlertsEnabled = value;
+        _settings.Save();
+        SettingsMessage = $"New-listener alerts: {(value ? "on" : "off")}";
+    }
+
+    partial void OnArpWatchEnabledChanged(bool value)
+    {
+        _monitor.ArpWatchEnabled = value;
+        _settings.ArpWatchEnabled = value;
+        _settings.Save();
+        SettingsMessage = value
+            ? $"ARP / gateway watch: on ({_monitor.ArpWatchStatus})"
+            : "ARP / gateway watch: off";
+    }
+
+    partial void OnPersistenceWatchEnabledChanged(bool value)
+    {
+        _monitor.PersistenceWatchEnabled = value;
+        _settings.PersistenceWatchEnabled = value;
+        _settings.Save();
+        SettingsMessage = value
+            ? $"Startup-item watch: on ({_monitor.PersistenceWatchStatus})"
+            : "Startup-item watch: off";
+    }
+
+    partial void OnExfilMonitorEnabledChanged(bool value)
+    {
+        _monitor.ExfilMonitorEnabled = value;
+        _settings.ExfilMonitorEnabled = value;
+        _settings.Save();
+        SettingsMessage = value
+            ? $"Exfiltration monitor: on ({_monitor.ExfilStatus})"
+            : "Exfiltration monitor: off";
+    }
+
+    partial void OnExfilThresholdMbTextChanged(string value)
+    {
+        if (!int.TryParse(value?.Trim(), out var mb) || mb < 10)
+        {
+            SettingsMessage = "Exfiltration threshold must be a number ≥ 10 (MB per 10 minutes).";
+            return;
+        }
+
+        _monitor.ExfilThresholdMb = mb;
+        _settings.ExfilMbPer10Min = mb;
+        _settings.Save();
+        SettingsMessage = $"Exfiltration alert threshold: {mb} MB / 10 min";
+    }
+
+    partial void OnHoneypotEnabledChanged(bool value)
+    {
+        _monitor.HoneypotPorts = HoneypotService.ParsePorts(HoneypotPortsText);
+        _monitor.HoneypotEnabled = value;
+        _settings.HoneypotEnabled = value;
+        _settings.Save();
+        SettingsMessage = value ? _monitor.HoneypotStatus : "Honeypot: off";
+    }
+
+    partial void OnHoneypotPortsTextChanged(string value)
+    {
+        var ports = HoneypotService.ParsePorts(value);
+        if (ports.Count == 0)
+        {
+            SettingsMessage = "Enter decoy ports as a comma-separated list, e.g. 2323,3389,5900.";
+            return;
+        }
+
+        _settings.HoneypotPorts = string.Join(",", ports);
+        _settings.Save();
+        _monitor.HoneypotPorts = ports;
+        SettingsMessage = HoneypotEnabled
+            ? _monitor.HoneypotStatus
+            : $"Decoy ports saved ({_settings.HoneypotPorts}) — enable the honeypot to arm them.";
+    }
+
+    partial void OnWebhookUrlChanged(string value)
+    {
+        var url = value?.Trim() ?? "";
+        _monitor.WebhookUrl = url;
+        _settings.WebhookUrl = url;
+        _settings.Save();
+        SettingsMessage = string.IsNullOrEmpty(url)
+            ? "Webhook alerts: off"
+            : $"Webhook alerts: Critical threats will POST to {url}";
+    }
+
+    partial void OnSelectedAutoBlockExpiryChanged(string value)
+    {
+        var minutes = ExpiryLabelToMinutes(value);
+        _settings.AutoBlockExpiryMinutes = minutes;
+        _settings.Save();
+        _firewall.AutoBlockExpiry = ExpiryMinutesToSpan(minutes);
+        SettingsMessage = minutes == 0
+            ? "Auto-block rules are permanent until removed."
+            : $"New auto-block rules expire after {value}.";
+    }
+
+    private static int ExpiryLabelToMinutes(string? label) => label switch
+    {
+        "1 hour" => 60,
+        "6 hours" => 360,
+        "24 hours" => 1440,
+        "7 days" => 10_080,
+        _ => 0
+    };
+
+    private static string ExpiryMinutesToLabel(int minutes) => minutes switch
+    {
+        60 => "1 hour",
+        360 => "6 hours",
+        1440 => "24 hours",
+        10_080 => "7 days",
+        _ => "Never (permanent)"
+    };
+
+    private static TimeSpan? ExpiryMinutesToSpan(int minutes)
+        => minutes > 0 ? TimeSpan.FromMinutes(minutes) : null;
+
     private void RefreshMonitorStatusText()
     {
         AuthLogStatusText = string.IsNullOrWhiteSpace(_monitor.AuthLogStatus)
@@ -666,6 +854,13 @@ public partial class MainViewModel : ObservableObject, IDisposable
         ProbeLogStatusText = string.IsNullOrWhiteSpace(_monitor.ProbeLogStatus)
             ? (ProbeLogEnabled ? "Starting…" : "Disabled — firewall dropped-packet logging is off.")
             : _monitor.ProbeLogStatus;
+
+        ArpWatchStatusText = ArpWatchEnabled ? _monitor.ArpWatchStatus : "Disabled.";
+        PersistenceWatchStatusText = PersistenceWatchEnabled ? _monitor.PersistenceWatchStatus : "Disabled.";
+        ExfilStatusText = ExfilMonitorEnabled ? _monitor.ExfilStatus : "Disabled.";
+        HoneypotStatusText = HoneypotEnabled ? _monitor.HoneypotStatus : "Disabled — no decoy ports are bound.";
+        // Only meaningful once a URL is configured; otherwise it always reads "idle".
+        WebhookStatusText = string.IsNullOrWhiteSpace(WebhookUrl) ? "" : _monitor.WebhookStatus;
 
         if (ProbeLogEnabled)
             VerifyProbeLoggingInBackground();

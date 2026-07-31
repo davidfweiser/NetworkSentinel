@@ -21,7 +21,14 @@ public enum ThreatType
     ManyShortConnections,
     NewRemoteHost,
     SuspiciousOutbound,
-    FailedLogonBurst
+    FailedLogonBurst,
+    NewListener,
+    SuspiciousProcess,
+    KnownBadAddress,
+    HoneypotHit,
+    ArpSpoof,
+    PersistenceChange,
+    DataExfiltration
 }
 
 public enum TcpConnectionState
@@ -272,6 +279,13 @@ public sealed class ThreatEvent : INotifyPropertyChanged
         ThreatType.NewRemoteHost => "New Remote Host",
         ThreatType.SuspiciousOutbound => "Suspicious Outbound",
         ThreatType.FailedLogonBurst => "Failed Logon Burst",
+        ThreatType.NewListener => "New Listener",
+        ThreatType.SuspiciousProcess => "Suspicious Process",
+        ThreatType.KnownBadAddress => "Known-Bad Address",
+        ThreatType.HoneypotHit => "Honeypot Hit",
+        ThreatType.ArpSpoof => "ARP Spoofing",
+        ThreatType.PersistenceChange => "Persistence Change",
+        ThreatType.DataExfiltration => "Data Exfiltration",
         _ => Type.ToString()
     };
 }

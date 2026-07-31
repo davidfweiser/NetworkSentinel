@@ -3,6 +3,7 @@ using System.IO;
 using System.Net;
 using System.Security.Principal;
 using System.Text;
+using System.Text.Json;
 using System.Text.RegularExpressions;
 using NetworkSentinel.Models;
 
@@ -76,7 +77,13 @@ public sealed class FirewallService
         }
     }
 
-    public FirewallOperationResult BlockIp(string ip, FirewallDirection direction = FirewallDirection.Both, string? reason = null, bool overrideAllowlist = false)
+    /// <summary>
+    /// Expiry applied to auto-created block rules (null = permanent). Manual
+    /// blocks are always permanent; auto-block passes this through.
+    /// </summary>
+    public TimeSpan? AutoBlockExpiry { get; set; }
+
+    public FirewallOperationResult BlockIp(string ip, FirewallDirection direction = FirewallDirection.Both, string? reason = null, bool overrideAllowlist = false, TimeSpan? expiresAfter = null)
     {
         if (!TryNormalizeIp(ip, out var normalized, out var error))
             return FirewallOperationResult.Fail(error);
@@ -97,14 +104,14 @@ public sealed class FirewallService
 
         if (direction is FirewallDirection.Inbound or FirewallDirection.Both)
         {
-            var r = EnsureIpRule(normalized, isInbound: true, reason);
+            var r = EnsureIpRule(normalized, isInbound: true, reason, expiresAfter);
             ok &= r.Success;
             results.Add(r.Message);
         }
 
         if (direction is FirewallDirection.Outbound or FirewallDirection.Both)
         {
-            var r = EnsureIpRule(normalized, isInbound: false, reason);
+            var r = EnsureIpRule(normalized, isInbound: false, reason, expiresAfter);
             ok &= r.Success;
             results.Add(r.Message);
         }
@@ -388,14 +395,14 @@ public sealed class FirewallService
 
         var rules = GetManagedRules();
         return rules.Any(r =>
-            r.Kind == FirewallRuleKind.IpBlock &&
+            r.Kind == FirewallRuleKind.IpBlock && !r.IsExpired &&
             string.Equals(r.RemoteAddresses, normalized, StringComparison.OrdinalIgnoreCase));
     }
 
     public HashSet<string> GetBlockedIps()
     {
         var set = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-        foreach (var rule in GetManagedRules().Where(r => r.Kind == FirewallRuleKind.IpBlock))
+        foreach (var rule in GetManagedRules().Where(r => r.Kind == FirewallRuleKind.IpBlock && !r.IsExpired))
         {
             if (!string.IsNullOrWhiteSpace(rule.RemoteAddresses))
                 set.Add(rule.RemoteAddresses);
@@ -518,7 +525,7 @@ public sealed class FirewallService
         Process.Start(start);
     }
 
-    private FirewallOperationResult EnsureIpRule(string ip, bool isInbound, string? reason)
+    private FirewallOperationResult EnsureIpRule(string ip, bool isInbound, string? reason, TimeSpan? expiresAfter = null)
     {
         var name = IpRuleName(ip, isInbound);
         RemoveRuleByName(name); // replace cleanly
@@ -528,9 +535,13 @@ public sealed class FirewallService
         // netsh ONLY — HNetCfg COM from web/thread-pool (MTA) can AccessViolation and kill the process.
         var netsh = RunNetsh(
             $"advfirewall firewall add rule name=\"{name}\" dir={dir} action=block remoteip={ip} enable=yes profile=any description=\"{Escape(description)}\"");
-        return netsh.Success
-            ? FirewallOperationResult.Ok($"Rule \"{name}\" applied.")
-            : FirewallOperationResult.Fail($"Failed to add rule {name}: {netsh.Message}");
+        if (!netsh.Success)
+            return FirewallOperationResult.Fail($"Failed to add rule {name}: {netsh.Message}");
+
+        // netsh has no expiry of its own, so it is tracked alongside the rule
+        // and enforced by the sweep below.
+        ExpiryLedger.Set(name, expiresAfter.HasValue ? DateTime.UtcNow + expiresAfter.Value : null);
+        return FirewallOperationResult.Ok($"Rule \"{name}\" applied.");
     }
 
     private FirewallOperationResult EnsurePortRule(int port, string protocol, bool isInbound, string? reason)
@@ -640,7 +651,8 @@ public sealed class FirewallService
                 LocalPorts = portsNorm,
                 Protocol = protoNorm,
                 Kind = ClassifyRuleKind(currentName, remoteNorm, portsNorm),
-                Description = profiles
+                Description = profiles,
+                ExpiresUtc = ExpiryLedger.Get(currentName)
             });
         }
 
@@ -812,6 +824,127 @@ public sealed class FirewallService
 
     public static bool IsPrivateOrLocal(string ip)
         => GeoIpService.IsNonPublic(ip);
+
+    // ── Block expiry ─────────────────────────────────────────────────────
+
+    private Timer? _expiryTimer;
+
+    /// <summary>
+    /// Starts the background sweep that removes expired block rules. Deleting a
+    /// firewall rule needs elevation, so the sweep only acts when this process
+    /// already has it (the headless service runs as SYSTEM; an unelevated GUI
+    /// does not). Otherwise the rule stays in the firewall but is already
+    /// treated as lifted everywhere the UI looks — a timer must never trigger
+    /// a UAC prompt in the user's face.
+    /// </summary>
+    public void StartExpirySweep()
+    {
+        _expiryTimer ??= new Timer(_ => TrySweepExpired(), null,
+            TimeSpan.FromMinutes(1), TimeSpan.FromMinutes(1));
+    }
+
+    private void TrySweepExpired()
+    {
+        try
+        {
+            var expired = ExpiryLedger.ExpiredNames();
+            if (expired.Count == 0) return;
+            if (!IsAdministrator) return;
+
+            foreach (var name in expired)
+            {
+                RemoveRuleByName(name);
+                ExpiryLedger.Remove(name);
+            }
+            InvalidateRuleCache();
+        }
+        catch
+        {
+            // sweep is best-effort; it simply retries next minute
+        }
+    }
+
+    /// <summary>
+    /// Expiry times for auto-created rules, keyed by firewall rule name.
+    ///
+    /// The Windows build enumerates rules from netsh rather than from a ledger
+    /// of its own, and netsh has nowhere to hang an expiry, so it is kept in a
+    /// small side file next to the other shared state. It lives under
+    /// %ProgramData% so the GUI, TUI and web service all agree on when a rule
+    /// stops counting.
+    /// </summary>
+    private static class ExpiryLedger
+    {
+        private static readonly object Gate = new();
+
+        private static string LedgerPath
+            => Path.Combine(AppPaths.DataDirectory, "auto-block-expiry.json");
+
+        public static DateTime? Get(string ruleName)
+        {
+            lock (Gate)
+            {
+                var map = Load();
+                return map.TryGetValue(ruleName, out var expiry) ? expiry : null;
+            }
+        }
+
+        /// <summary>Records an expiry, or clears one when <paramref name="expiresUtc"/> is null.</summary>
+        public static void Set(string ruleName, DateTime? expiresUtc)
+        {
+            lock (Gate)
+            {
+                var map = Load();
+                if (expiresUtc.HasValue) map[ruleName] = expiresUtc.Value;
+                else if (!map.Remove(ruleName)) return; // nothing to persist
+                Save(map);
+            }
+        }
+
+        public static void Remove(string ruleName) => Set(ruleName, null);
+
+        public static List<string> ExpiredNames()
+        {
+            lock (Gate)
+            {
+                var now = DateTime.UtcNow;
+                return Load().Where(kv => kv.Value <= now).Select(kv => kv.Key).ToList();
+            }
+        }
+
+        private static Dictionary<string, DateTime> Load()
+        {
+            try
+            {
+                var path = LedgerPath;
+                if (!File.Exists(path))
+                    return new Dictionary<string, DateTime>(StringComparer.OrdinalIgnoreCase);
+
+                var map = JsonSerializer.Deserialize<Dictionary<string, DateTime>>(File.ReadAllText(path));
+                return map == null
+                    ? new Dictionary<string, DateTime>(StringComparer.OrdinalIgnoreCase)
+                    : new Dictionary<string, DateTime>(map, StringComparer.OrdinalIgnoreCase);
+            }
+            catch
+            {
+                // A corrupt ledger must not make blocking fail — rules simply
+                // read as permanent until the file is rewritten.
+                return new Dictionary<string, DateTime>(StringComparer.OrdinalIgnoreCase);
+            }
+        }
+
+        private static void Save(Dictionary<string, DateTime> map)
+        {
+            try
+            {
+                File.WriteAllText(LedgerPath, JsonSerializer.Serialize(map));
+            }
+            catch
+            {
+                // best-effort persistence
+            }
+        }
+    }
 }
 
 public enum FirewallDirection
@@ -839,6 +972,15 @@ public sealed class FirewallRuleInfo
     public string LocalPorts { get; init; } = "";
     public string Protocol { get; init; } = "Any";
     public FirewallRuleKind Kind { get; init; }
+
+    /// <summary>UTC time this rule stops applying (null = permanent). Set by auto-block expiry.</summary>
+    public DateTime? ExpiresUtc { get; init; }
+
+    public bool IsExpired => ExpiresUtc.HasValue && ExpiresUtc.Value <= DateTime.UtcNow;
+
+    public string ExpiryText => ExpiresUtc.HasValue
+        ? (IsExpired ? "Expired" : $"Expires {ExpiresUtc.Value.ToLocalTime():HH:mm}")
+        : "Permanent";
 
     public string DirectionText => Direction.ToString();
     public string KindText => Kind switch

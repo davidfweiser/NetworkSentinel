@@ -38,6 +38,7 @@ public sealed class IntrusionDetector
         IReadOnlyList<NetworkConnection> snapshot,
         IReadOnlyDictionary<string, RemoteHost> knownHosts,
         IReadOnlySet<int> listeningTcpPorts,
+        IReadOnlySet<int> listeningUdpPorts,
         DateTime now)
     {
         var threats = new List<ThreatEvent>();
@@ -75,8 +76,13 @@ public sealed class IntrusionDetector
                     if (activity.ActiveKeys.Contains(c.Key))
                         continue;
 
-                    bool inbound = listeningTcpPorts.Contains(c.LocalPort) ||
-                                   c.State == TcpConnectionState.SynReceived;
+                    // Inbound = landing on a port this machine serves. UDP has no
+                    // handshake, so a peer talking to one of our UDP listeners is
+                    // the closest equivalent.
+                    bool inbound = c.Protocol == "UDP"
+                        ? listeningUdpPorts.Contains(c.LocalPort)
+                        : listeningTcpPorts.Contains(c.LocalPort) ||
+                          c.State == TcpConnectionState.SynReceived;
                     activity.Events.Enqueue((now, c.LocalPort, c.State, inbound));
                     if (inbound)
                         activity.LongInbound.Enqueue((now, c.LocalPort));
@@ -326,10 +332,12 @@ public sealed class IntrusionDetector
 
     private static bool IsInterestingRemote(NetworkConnection c)
     {
-        if (c.Protocol != "TCP") return false;
+        if (c.Protocol is not ("TCP" or "UDP")) return false;
         if (string.IsNullOrWhiteSpace(c.RemoteAddress)) return false;
         if (c.RemoteAddress is "0.0.0.0" or "::" or "127.0.0.1" or "::1") return false;
         if (c.State == TcpConnectionState.Listen) return false;
+        // Multicast/broadcast peers (mDNS, SSDP) are LAN chatter, not hosts.
+        if (GeoIpService.IsMulticastOrBroadcast(c.RemoteAddress)) return false;
         return true;
     }
 

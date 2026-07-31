@@ -90,12 +90,22 @@ internal static class IpHelper
         return list;
     }
 
-    public static IReadOnlyList<ListeningPort> GetUdpListeners()
+    /// <summary>
+    /// UDP sockets split into bound-only listeners and connected sockets.
+    ///
+    /// The connection list is always empty on Windows: MIB_UDPROW_OWNER_PID
+    /// carries only the local endpoint and owning PID, and no UDP table class
+    /// exposes the peer of a connected socket the way /proc/net/udp does on
+    /// Linux. The tuple shape is kept so the shared monitor code is identical
+    /// across both builds — UDP listeners still feed inbound classification,
+    /// and UDP conversations remain covered by the connection-rate heuristics.
+    /// </summary>
+    public static (IReadOnlyList<ListeningPort> Listeners, IReadOnlyList<NetworkConnection> Connections) GetUdpTable()
     {
-        var list = new List<ListeningPort>();
-        list.AddRange(ReadUdpV4());
-        list.AddRange(ReadUdpV6());
-        return list;
+        var listeners = new List<ListeningPort>();
+        listeners.AddRange(ReadUdpV4());
+        listeners.AddRange(ReadUdpV6());
+        return (listeners, Array.Empty<NetworkConnection>());
     }
 
     private static List<NetworkConnection> ReadTcpV4()
