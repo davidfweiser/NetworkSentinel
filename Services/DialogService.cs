@@ -41,8 +41,10 @@ public static class DialogService
             Height = 220,
             CanResize = false,
             WindowStartupLocation = WindowStartupLocation.CenterOwner,
-            Background = new SolidColorBrush(Color.Parse("#0E1628")),
-            Foreground = new SolidColorBrush(Color.Parse("#F2F7FF"))
+            // NSTheme.card / NSTheme.text — dialogs are built in code, so they
+            // can't pull from Themes/Colors.axaml.
+            Background = new SolidColorBrush(Color.Parse("#161B26")),
+            Foreground = new SolidColorBrush(Color.Parse("#EDF1F7"))
         };
 
         var text = new TextBlock

@@ -1,22 +1,42 @@
 <ResourceDictionary xmlns="https://github.com/avaloniaui"
                     xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml">
 
-  <Color x:Key="BgDeep">#FF070B16</Color>
-  <Color x:Key="BgPanel">#FF0E1628</Color>
-  <Color x:Key="BgCard">#FF121C31</Color>
-  <Color x:Key="BgCardHover">#FF18243F</Color>
-  <Color x:Key="StrokeSoft">#33A8C5FF</Color>
-  <Color x:Key="StrokeStrong">#557CF9FF</Color>
-  <Color x:Key="TextPrimary">#FFF2F7FF</Color>
-  <Color x:Key="TextSecondary">#FF93A4C3</Color>
-  <Color x:Key="TextMuted">#FF667794</Color>
-  <Color x:Key="AccentCyan">#FF3DE7C8</Color>
-  <Color x:Key="AccentBlue">#FF4C8DFF</Color>
-  <Color x:Key="AccentViolet">#FF9B7BFF</Color>
-  <Color x:Key="AccentPink">#FFFF4D8D</Color>
-  <Color x:Key="AccentAmber">#FFFFB020</Color>
-  <Color x:Key="Danger">#FFFF4D6D</Color>
-  <Color x:Key="Success">#FF3DDC97</Color>
+  <!--
+    Palette ported verbatim from the iOS app's NSTheme (NetworkSentinel-iOS/Theme.swift)
+    so the two front-ends read as one product. SwiftUI declares these as 0–1 sRGB
+    components; the hex below is that value x255, rounded.
+
+    The defining change from the old desktop palette: backgrounds are deep SLATE,
+    not navy. iOS chose that deliberately ("keeps the glass panels from turning
+    blue") and the blue-tinted surfaces here fought the same accent colours.
+  -->
+
+  <!-- Surfaces. iOS has three tiers (ink / card / cardElevated); the desktop needs a
+       fourth for the sidebar, so BgPanel sits on the ink->card line. -->
+  <Color x:Key="BgDeep">#FF0A0E14</Color>        <!-- NSTheme.ink -->
+  <Color x:Key="BgPanel">#FF10141C</Color>       <!-- derived: ink -> card midpoint -->
+  <Color x:Key="BgCard">#FF161B26</Color>        <!-- NSTheme.card -->
+  <Color x:Key="BgCardHover">#FF1E2534</Color>   <!-- NSTheme.cardElevated -->
+
+  <!-- Borders. iOS uses plain white at low alpha rather than a tinted stroke. -->
+  <Color x:Key="StrokeSoft">#1AFFFFFF</Color>    <!-- NSTheme.border (white 10%) -->
+  <Color x:Key="StrokeStrong">#664A9EFF</Color>  <!-- accent 40%, matching iOS tinted strokes -->
+
+  <!-- Text. iOS defines two tiers (text / muted); TextMuted is muted scaled down
+       ~0.72 in the same hue so the desktop keeps its third, dimmest tier. -->
+  <Color x:Key="TextPrimary">#FFEDF1F7</Color>   <!-- NSTheme.text -->
+  <Color x:Key="TextSecondary">#FF8A94A6</Color> <!-- NSTheme.muted -->
+  <Color x:Key="TextMuted">#FF636B78</Color>     <!-- derived from muted -->
+  <Color x:Key="TextOnTint">#FFC7CCD5</Color>    <!-- NSTheme.mutedOnTint -->
+
+  <!-- Signals. Each colour means one thing about the network, as on iOS:
+       teal = healthy, blue = interactive, amber = caution, red = trouble. -->
+  <Color x:Key="AccentCyan">#FF3BC8B4</Color>    <!-- NSTheme.signal ("everything is fine" teal) -->
+  <Color x:Key="AccentBlue">#FF4A9EFF</Color>    <!-- NSTheme.accent (interactive) -->
+  <Color x:Key="AccentIce">#FF4DD9E6</Color>     <!-- NSTheme.cyan -->
+  <Color x:Key="AccentAmber">#FFF5B93B</Color>   <!-- NSTheme.warning -->
+  <Color x:Key="Danger">#FFFF5D78</Color>        <!-- NSTheme.danger / threatMarker -->
+  <Color x:Key="Success">#FF4DD18C</Color>       <!-- NSTheme.success -->
 
   <SolidColorBrush x:Key="BgDeepBrush" Color="{StaticResource BgDeep}"/>
   <SolidColorBrush x:Key="BgPanelBrush" Color="{StaticResource BgPanel}"/>
@@ -27,38 +47,42 @@
   <SolidColorBrush x:Key="TextPrimaryBrush" Color="{StaticResource TextPrimary}"/>
   <SolidColorBrush x:Key="TextSecondaryBrush" Color="{StaticResource TextSecondary}"/>
   <SolidColorBrush x:Key="TextMutedBrush" Color="{StaticResource TextMuted}"/>
+  <SolidColorBrush x:Key="TextOnTintBrush" Color="{StaticResource TextOnTint}"/>
   <SolidColorBrush x:Key="AccentCyanBrush" Color="{StaticResource AccentCyan}"/>
   <SolidColorBrush x:Key="AccentBlueBrush" Color="{StaticResource AccentBlue}"/>
-  <SolidColorBrush x:Key="AccentVioletBrush" Color="{StaticResource AccentViolet}"/>
-  <SolidColorBrush x:Key="AccentPinkBrush" Color="{StaticResource AccentPink}"/>
+  <SolidColorBrush x:Key="AccentIceBrush" Color="{StaticResource AccentIce}"/>
   <SolidColorBrush x:Key="AccentAmberBrush" Color="{StaticResource AccentAmber}"/>
   <SolidColorBrush x:Key="DangerBrush" Color="{StaticResource Danger}"/>
   <SolidColorBrush x:Key="SuccessBrush" Color="{StaticResource Success}"/>
 
+  <!-- Mirrors the iOS AmbientField: a teal glow in one corner, a blue glow in the
+       other, ink between them. -->
   <LinearGradientBrush x:Key="HeroGradient" StartPoint="0%,0%" EndPoint="100%,100%">
-    <GradientStop Color="#FF101B33" Offset="0"/>
-    <GradientStop Color="#FF152447" Offset="0.45"/>
-    <GradientStop Color="#FF1A1840" Offset="1"/>
+    <GradientStop Color="#FF11282A" Offset="0"/>
+    <GradientStop Color="#FF0F151F" Offset="0.5"/>
+    <GradientStop Color="#FF121F30" Offset="1"/>
   </LinearGradientBrush>
 
+  <!-- signal -> accent, the two AmbientField glow colours. iOS has no violet, so the
+       old third stop is gone rather than approximated. -->
   <LinearGradientBrush x:Key="AccentGradient" StartPoint="0%,0%" EndPoint="100%,100%">
-    <GradientStop Color="#FF3DE7C8" Offset="0"/>
-    <GradientStop Color="#FF4C8DFF" Offset="0.55"/>
-    <GradientStop Color="#FF9B7BFF" Offset="1"/>
+    <GradientStop Color="#FF3BC8B4" Offset="0"/>
+    <GradientStop Color="#FF4A9EFF" Offset="1"/>
   </LinearGradientBrush>
 
+  <!-- danger -> the Critical/High severity orange. -->
   <LinearGradientBrush x:Key="DangerGradient" StartPoint="0%,0%" EndPoint="100%,0%">
-    <GradientStop Color="#FFFF4D6D" Offset="0"/>
-    <GradientStop Color="#FFFF8A4C" Offset="1"/>
+    <GradientStop Color="#FFFF5D78" Offset="0"/>
+    <GradientStop Color="#FFFA7340" Offset="1"/>
   </LinearGradientBrush>
 
   <LinearGradientBrush x:Key="ChartFill" StartPoint="0%,0%" EndPoint="0%,100%">
-    <GradientStop Color="#663DE7C8" Offset="0"/>
-    <GradientStop Color="#003DE7C8" Offset="1"/>
+    <GradientStop Color="#663BC8B4" Offset="0"/>
+    <GradientStop Color="#003BC8B4" Offset="1"/>
   </LinearGradientBrush>
 
   <LinearGradientBrush x:Key="ThreatChartFill" StartPoint="0%,0%" EndPoint="0%,100%">
-    <GradientStop Color="#66FF4D6D" Offset="0"/>
-    <GradientStop Color="#00FF4D6D" Offset="1"/>
+    <GradientStop Color="#66FF5D78" Offset="0"/>
+    <GradientStop Color="#00FF5D78" Offset="1"/>
   </LinearGradientBrush>
 </ResourceDictionary>

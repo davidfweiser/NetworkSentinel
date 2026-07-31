@@ -12,7 +12,7 @@ Three ways to run it:
 
 > Awareness / monitoring tooling — not a full IDS/IPS replacement.
 
-Linux port of the original Windows WPF Network Sentinel. Platform layers use `/proc/net`, `nftables`/`iptables` (elevated via **pkexec**), and XDG data paths. Version **0.3.1**.
+Linux port of the original Windows WPF Network Sentinel. Platform layers use `/proc/net`, `ss`, `nftables`/`iptables` (elevated via **pkexec**), and XDG data paths. Version **0.4.0**.
 
 ---
 
@@ -35,9 +35,24 @@ Heuristics flag patterns such as:
 - Sensitive-port probing (admin, DB, remote access)
 - Short-lived / transitional TCP bursts
 - **Outbound beaconing** — regular-interval new sessions to an uncommon remote port (C2 "calling home" signature); common client ports and LAN peers are excluded
-- First-seen remote hosts
+- First-seen remote hosts — tracked **across restarts** (30-day persistent host history), so relaunching doesn't make every known peer look new again
+- **UDP peers** — connected UDP sockets with a real remote address (from `/proc/net/udp{,6}`) count toward the scan/probe heuristics and the Remote Computers view; multicast/broadcast chatter (mDNS, SSDP) is excluded
 
-Each alert includes **source IP**, **method**, and **where it’s coming from** (DNS + best-effort geo).
+### Intrusion detection (0.4.0)
+| Detector | What it catches |
+|----------|-----------------|
+| **New-listener alerts** | A new port starts listening after the baseline (backdoor/implant signature), or a known port changes owner process (service replaced/impersonated). Baseline persists in `host-history.json`; loopback-only and ephemeral (49152+) listeners are skipped. Owner-change detection needs the socket→PID map, so it only works for sockets your user can see unless you run as root. |
+| **Threat-intel blocklists** | Remote IPs checked against **FireHOL level1** and **Spamhaus DROP** (fetched daily over HTTPS, cached offline). A match is an instant **Critical** — those ranges are attack infrastructure. |
+| **Process reputation** | Shells/interpreters (`bash`, `python`, `nc`, …) holding outbound connections to public hosts (reverse-shell signature, High); **fileless** processes running from `memfd` or a deleted binary staged in `/tmp` (High); binaries running from `/tmp`, `/dev/shm`, `~/Downloads` with network activity; **system** binaries that no installed package owns (`dpkg`/`rpm`/`pacman`/`apk`). Executable paths come from `/proc/PID/exe` — no per-poll shelling out, and package queries are cached per path off the poll loop. |
+| **Honeypot decoy ports** (opt-in) | Binds decoy TCP ports (default `2323,3389,5900`). Nothing legitimate connects to a decoy, so any completed connection is a **zero-false-positive Critical**. Busy ports are skipped automatically. |
+| **ARP / gateway watch** | The default gateway's MAC address changing (**Critical** — classic ARP-spoof MITM opener) or another LAN IP claiming the gateway's MAC (High). Reads `/proc/net/route` and `/proc/net/arp`; no elevation, no subprocess. |
+| **Startup-item watch** | New or modified files under `/etc/systemd/system` (including `*.wants` symlinks), `~/.config/systemd/user`, `/etc/cron.d`, `/etc/cron.{hourly,daily,weekly,monthly}`, `/var/spool/cron`, `/etc/init.d`, `/etc/xdg/autostart` and `~/.config/autostart` — the standard persistence step right after a successful intrusion. Root-only folders are skipped when running unprivileged. |
+| **Exfiltration monitor** | `ss -tinp` per-socket byte counters; alerts when outbound traffic to a single non-allowlisted public host exceeds a threshold (default **250 MB / 10 min**). LAN destinations (NAS backups) and allowlisted hosts stay quiet. TCP only — UDP/QUIC carries no equivalent kernel counter. |
+
+Each alert includes **source IP**, **method**, and **where it’s coming from** (DNS + best-effort geo). Threat events and the host/listener baseline **persist across restarts** (`threat-log.jsonl`, `host-history.json`).
+
+### Remote alerting (webhook)
+Set **Settings → Webhook URL** to push Critical threats off the machine — the payload adapts automatically: **ntfy** (plain text + `Title`/`Priority` headers), **Slack** (`{"text": …}`), **Discord** (`{"content": …}`), anything else gets a generic JSON document. Per-source/type cooldown stops a burst from flooding the channel.
 
 ### Firewall & block
 - **Block / unblock** remote IPs (inbound, outbound, or both)
@@ -47,6 +62,7 @@ Each alert includes **source IP**, **method**, and **where it’s coming from** 
 - Block rules are created as an `-In`/`-Out` pair and **removed together** in one click
 - **Auto-block** on/off with minimum severity (`Medium` / `High` / `Critical`)
 - Removing/unblocking a rule **suppresses auto-block for that IP for 24 h** (persisted), so removed rules stay gone across restarts
+- **Auto-block expiry** (1 h … 7 days, off by default) — an expired address stops counting as blocked immediately; the `nft`/`iptables` rule itself is dropped by a background sweep as soon as it can elevate without a prompt (running as root, or cached/passwordless sudo). Manual blocks are always permanent
 - The web console **refuses to block its own port** — that would cut off your browser mid-request and look like a crash
 - Settings in `~/.local/share/NetworkSentinel/settings.json` (or `$XDG_DATA_HOME/NetworkSentinel`)
 - **Authorize firewall** — elevates only `nft`/`iptables` via **pkexec** (password dialog). The GUI always runs as your user
@@ -245,7 +261,7 @@ sudo networksentinel-uninstall
 | `/usr/local/bin/networksentinel-web` | Web UI helper |
 | `/etc/systemd/system/networksentinel-web.service` | Auto-start unit |
 | `/etc/networksentinel/web.env` | `WEB_PORT` for systemd |
-| `~/.local/share/NetworkSentinel/` | Settings, allowlist, master-password hash |
+| `~/.local/share/NetworkSentinel/` | Settings, allowlist, master-password hash, firewall ledger, `host-history.json` (known peers + listener baseline), `threat-log.jsonl`, `threat-intel-cache.json` |
 
 Set or reset the web master password (requires root — resolves the real service user via `SUDO_USER`, not root's own home):
 
@@ -462,8 +478,16 @@ Optional desktop entry is provided as `networksentinel.desktop` (`Icon=networkse
 | `Services/IntrusionDetector.cs` | Heuristic threat engine |
 | `Services/AuthLogMonitor.cs` | Failed-logon detection from journald / auth.log |
 | `Services/ProbeLogMonitor.cs` | Closed-port scan detection from the kernel probe log |
+| `Services/ProcessReputationService.cs` | Shell / fileless / throwaway-path / unpackaged binary checks |
+| `Services/ThreatIntelService.cs` | FireHOL + Spamhaus feed download, cache, CIDR matching |
+| `Services/HoneypotService.cs` | Decoy TCP listeners |
+| `Services/ArpWatchService.cs` | Gateway MAC watch from `/proc/net/route` + `/proc/net/arp` |
+| `Services/PersistenceWatcher.cs` | systemd / cron / autostart folder watch |
+| `Services/ExfiltrationMonitor.cs` | `ss` per-socket byte sampling |
+| `Services/HostHistoryStore.cs` | Persistent host + listener baseline, threat log |
+| `Services/WebhookNotifier.cs` | ntfy / Slack / Discord / generic JSON alerts |
 | `Services/GeoIpService.cs` | Reverse DNS + public geo lookup |
-| `Services/FirewallService.cs` | nftables / iptables via pkexec; rule ledger |
+| `Services/FirewallService.cs` | nftables / iptables via pkexec; rule ledger; auto-block expiry sweep |
 | `Services/AppSettings.cs` / `AppPaths.cs` | XDG data dir + JSON settings |
 | `Services/DialogService.cs` | Avalonia confirm/info dialogs |
 | `ViewModels/MainViewModel.cs` | UI state, commands, auto-block wiring |
@@ -500,6 +524,9 @@ Optional desktop entry is provided as `networksentinel.desktop` (`Icon=networkse
 - Failed-logon detection reads journald (`journalctl -t sshd …`) or `/var/log/auth.log` without elevation. If neither is readable by your user (add yourself to the `adm` group, or `systemd-journal` for journald), the app keeps running and shows why under **Settings → Auth-log monitoring**; set `"AuthLogMonitorEnabled": false` to turn the feature off.
 - **Closed-port scan detection** is off by default because it installs one firewall rule (rate-limited to 50 log lines/second — negligible overhead). Enable it under **Settings → Closed-port scan detection** (prompts for elevation once), or set `"ProbeLogEnabled": true` and click **Authorize firewall**. The rule is listed on the **Firewall** tab as `NetworkSentinel-ProbeLog` and is removed with the toggle. Reading the kernel log follows the same group rules as auth-log monitoring.
 - The allowlist remote feed can likewise be toggled in **Settings** or via `"AllowlistUseRemoteFeed": false`.
+- **Threat-intel feeds** download FireHOL level1 and Spamhaus DROP once a day to `threat-intel-cache.json` and fall back to the cache when offline; turn them off with `"ThreatIntelEnabled": false`.
+- The **honeypot** is off by default because it binds real ports — enable it under **Settings → Honeypot decoy ports** once you have confirmed the chosen ports are free.
+- The **exfiltration monitor** needs `ss` (iproute2, present on essentially every distro); without it the feature reports itself unavailable and stays quiet.
 - If the app ever exits unexpectedly, check `~/.local/share/NetworkSentinel/logs/crash.log` — unhandled errors are logged there with a stack trace.
 - Non-root runs still monitor connections for processes you can see; other users’ sockets may show as `Kernel / unknown`.
 - Existing TCP sessions may remain until they reconnect after a block; new matching traffic is stopped by the firewall.

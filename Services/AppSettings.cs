@@ -49,6 +49,49 @@ public sealed class AppSettings
     /// </summary>
     public Dictionary<string, DateTime> AutoBlockSuppressedUntil { get; set; } = new(StringComparer.OrdinalIgnoreCase);
 
+    /// <summary>Check remote IPs against public threat-intel blocklists (FireHOL level1, Spamhaus DROP).</summary>
+    public bool ThreatIntelEnabled { get; set; } = true;
+
+    /// <summary>Flag unpackaged system binaries, fileless processes, suspicious install paths, and shell processes with outbound connections.</summary>
+    public bool ProcessReputationEnabled { get; set; } = true;
+
+    /// <summary>Alert when a new port starts listening after baseline, or a known port changes owner process.</summary>
+    public bool NewListenerAlertsEnabled { get; set; } = true;
+
+    /// <summary>Watch the ARP table for gateway MAC changes (ARP spoofing / MITM).</summary>
+    public bool ArpWatchEnabled { get; set; } = true;
+
+    /// <summary>Watch systemd unit, cron and autostart folders for new or modified startup items.</summary>
+    public bool PersistenceWatchEnabled { get; set; } = true;
+
+    /// <summary>Sample per-socket byte counts (ss) and alert on large sustained outbound transfers.</summary>
+    public bool ExfilMonitorEnabled { get; set; } = true;
+
+    /// <summary>Outbound megabytes to a single uncommon public host within 10 minutes before alerting.</summary>
+    public int ExfilMbPer10Min { get; set; } = 250;
+
+    /// <summary>Listen on decoy ports; any completed connection is a Critical alert. Off by default (binds ports).</summary>
+    public bool HoneypotEnabled { get; set; }
+
+    /// <summary>Comma-separated decoy TCP ports for the honeypot.</summary>
+    public string HoneypotPorts { get; set; } = "2323,3389,5900";
+
+    /// <summary>
+    /// Minutes before auto-created block rules expire (0 = never). An expired rule stops
+    /// counting as blocking immediately; the kernel rule itself is dropped by the background
+    /// sweep as soon as it can elevate without a prompt (root or cached sudo).
+    /// </summary>
+    public int AutoBlockExpiryMinutes { get; set; }
+
+    /// <summary>POST alerts to this webhook URL (ntfy / Slack / Discord / generic JSON). Empty = off.</summary>
+    public string WebhookUrl { get; set; } = "";
+
+    /// <summary>Minimum threat level that triggers the webhook.</summary>
+    public string WebhookMinLevel { get; set; } = nameof(ThreatLevel.Critical);
+
+    public ThreatLevel GetWebhookMinLevel()
+        => Enum.TryParse<ThreatLevel>(WebhookMinLevel, true, out var level) ? level : ThreatLevel.Critical;
+
     public ThreatLevel GetMinLevel()
     {
         return Enum.TryParse<ThreatLevel>(AutoBlockMinLevel, true, out var level)

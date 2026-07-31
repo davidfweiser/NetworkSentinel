@@ -52,7 +52,13 @@ public sealed class FirewallService
         }
     }
 
-    public FirewallOperationResult BlockIp(string ip, FirewallDirection direction = FirewallDirection.Both, string? reason = null, bool overrideAllowlist = false)
+    /// <summary>
+    /// Expiry applied to auto-created block rules (null = permanent). Manual
+    /// blocks are always permanent; auto-block passes this through.
+    /// </summary>
+    public TimeSpan? AutoBlockExpiry { get; set; }
+
+    public FirewallOperationResult BlockIp(string ip, FirewallDirection direction = FirewallDirection.Both, string? reason = null, bool overrideAllowlist = false, TimeSpan? expiresAfter = null)
     {
         if (!TryNormalizeIp(ip, out var normalized, out var error))
             return FirewallOperationResult.Fail(error);
@@ -72,14 +78,14 @@ public sealed class FirewallService
 
         if (direction is FirewallDirection.Inbound or FirewallDirection.Both)
         {
-            var r = EnsureIpRule(normalized, isInbound: true, reason);
+            var r = EnsureIpRule(normalized, isInbound: true, reason, expiresAfter);
             ok &= r.Success;
             results.Add(r.Message);
         }
 
         if (direction is FirewallDirection.Outbound or FirewallDirection.Both)
         {
-            var r = EnsureIpRule(normalized, isInbound: false, reason);
+            var r = EnsureIpRule(normalized, isInbound: false, reason, expiresAfter);
             ok &= r.Success;
             results.Add(r.Message);
         }
@@ -309,14 +315,14 @@ public sealed class FirewallService
             return false;
 
         return GetManagedRules().Any(r =>
-            r.Kind == FirewallRuleKind.IpBlock &&
+            r.Kind == FirewallRuleKind.IpBlock && !r.IsExpired &&
             string.Equals(r.RemoteAddresses, normalized, StringComparison.OrdinalIgnoreCase));
     }
 
     public HashSet<string> GetBlockedIps()
     {
         var set = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-        foreach (var rule in GetManagedRules().Where(r => r.Kind == FirewallRuleKind.IpBlock))
+        foreach (var rule in GetManagedRules().Where(r => r.Kind == FirewallRuleKind.IpBlock && !r.IsExpired))
         {
             if (!string.IsNullOrWhiteSpace(rule.RemoteAddresses))
                 set.Add(rule.RemoteAddresses);
@@ -469,7 +475,7 @@ public sealed class FirewallService
             throw new InvalidOperationException(result.Message);
     }
 
-    private FirewallOperationResult EnsureIpRule(string ip, bool isInbound, string? reason)
+    private FirewallOperationResult EnsureIpRule(string ip, bool isInbound, string? reason, TimeSpan? expiresAfter = null)
     {
         var name = IpRuleName(ip, isInbound);
         RemoveRuleByName(name);
@@ -513,7 +519,8 @@ public sealed class FirewallService
                 RemoteAddresses = ip,
                 LocalPorts = "",
                 Protocol = "Any",
-                Kind = FirewallRuleKind.IpBlock
+                Kind = FirewallRuleKind.IpBlock,
+                ExpiresUtc = expiresAfter.HasValue ? DateTime.UtcNow + expiresAfter.Value : null
             });
         }
 
@@ -686,6 +693,14 @@ public sealed class FirewallService
         // Resolve absolute path so pkexec/sudo can find the binary in secure PATH.
         var resolved = ResolveExecutable(file) ?? file;
 
+        // Background sweeps take the cached-sudo path only — no dialogs.
+        if (_silentElevationOnly)
+        {
+            return CommandExists("sudo")
+                ? RunDirect("sudo", $"-n {Quote(resolved)} {args}")
+                : FirewallOperationResult.Fail("No silent elevation available.");
+        }
+
         // 1) pkexec — graphical polkit dialog, works under Wayland
         if (CommandExists("pkexec"))
         {
@@ -833,6 +848,70 @@ public sealed class FirewallService
         }
     }
 
+    // ── Block expiry ─────────────────────────────────────────────────────
+
+    private Timer? _expiryTimer;
+
+    /// <summary>
+    /// Starts the background sweep that removes expired block rules. Deleting
+    /// an nft/iptables rule needs root, and pkexec raises a password dialog per
+    /// call, so the sweep only acts when it can elevate silently (running as
+    /// root, or sudo credentials are cached/passwordless). Otherwise the rule
+    /// stays in the kernel but is already treated as lifted everywhere the UI
+    /// looks — never a surprise password dialog from a timer.
+    /// </summary>
+    public void StartExpirySweep()
+    {
+        _expiryTimer ??= new Timer(_ => TrySweepExpired(), null,
+            TimeSpan.FromMinutes(1), TimeSpan.FromMinutes(1));
+    }
+
+    private void TrySweepExpired()
+    {
+        try
+        {
+            var expired = LoadLedger().Where(r => r.IsExpired).ToList();
+            if (expired.Count == 0) return;
+            if (!CanElevateSilently()) return;
+
+            _silentElevationOnly = true;
+            try
+            {
+                foreach (var rule in expired)
+                    RemoveRuleByName(rule.Name);
+            }
+            finally
+            {
+                _silentElevationOnly = false;
+            }
+        }
+        catch
+        {
+            // sweep is best-effort; it simply retries next minute
+        }
+    }
+
+    private static bool CanElevateSilently()
+    {
+        if (geteuid() == 0) return true;
+        try
+        {
+            return CommandExists("sudo") && RunDirectArgs("sudo", "-n", "true").Success;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    /// <summary>
+    /// Set for the duration of the expiry sweep on the sweeping thread: makes
+    /// <see cref="RunPrivileged"/> use cached sudo only, so a background timer
+    /// can never pop a polkit dialog in the user's face.
+    /// </summary>
+    [ThreadStatic]
+    private static bool _silentElevationOnly;
+
     // ── Rule ledger (JSON under XDG config) ──────────────────────────────
 
     private static string LedgerPath
@@ -974,6 +1053,15 @@ public sealed class FirewallRuleInfo
     public string LocalPorts { get; init; } = "";
     public string Protocol { get; init; } = "Any";
     public FirewallRuleKind Kind { get; init; }
+
+    /// <summary>UTC time this rule stops applying (null = permanent). Set by auto-block expiry.</summary>
+    public DateTime? ExpiresUtc { get; init; }
+
+    public bool IsExpired => ExpiresUtc.HasValue && ExpiresUtc.Value <= DateTime.UtcNow;
+
+    public string ExpiryText => ExpiresUtc.HasValue
+        ? (IsExpired ? "Expired" : $"Expires {ExpiresUtc.Value.ToLocalTime():HH:mm}")
+        : "Permanent";
 
     public string DirectionText => Direction.ToString();
     public string KindText => Kind switch

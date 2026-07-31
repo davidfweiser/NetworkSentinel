@@ -49,12 +49,19 @@ internal static class LinuxNetTable
         return list;
     }
 
-    public static IReadOnlyList<ListeningPort> GetUdpListeners()
+    /// <summary>
+    /// UDP sockets split into bound-only listeners and connected sockets. A UDP
+    /// socket that has called connect() carries a real peer in rem_address, and
+    /// that peer is as much a remote host as any TCP conversation — DNS
+    /// resolvers, QUIC/HTTP3, WireGuard and most beacons live there.
+    /// </summary>
+    public static (IReadOnlyList<ListeningPort> Listeners, IReadOnlyList<NetworkConnection> Connections) GetUdpTable()
     {
-        var list = new List<ListeningPort>();
-        list.AddRange(ReadUdp("/proc/net/udp", AddressFamily.InterNetwork));
-        list.AddRange(ReadUdp("/proc/net/udp6", AddressFamily.InterNetworkV6));
-        return list;
+        var listeners = new List<ListeningPort>();
+        var connections = new List<NetworkConnection>();
+        ReadUdp("/proc/net/udp", AddressFamily.InterNetwork, listeners, connections);
+        ReadUdp("/proc/net/udp6", AddressFamily.InterNetworkV6, listeners, connections);
+        return (listeners, connections);
     }
 
     private static List<NetworkConnection> ReadTcp(string path, AddressFamily family)
@@ -88,20 +95,41 @@ internal static class LinuxNetTable
         return result;
     }
 
-    private static List<ListeningPort> ReadUdp(string path, AddressFamily family)
+    private static void ReadUdp(
+        string path,
+        AddressFamily family,
+        List<ListeningPort> listeners,
+        List<NetworkConnection> connections)
     {
-        var result = new List<ListeningPort>();
-        if (!File.Exists(path)) return result;
+        if (!File.Exists(path)) return;
 
         var inodeMap = GetInodeToPidMap();
         foreach (var line in File.ReadLines(path).Skip(1))
         {
             if (!TryParseSocketLine(line, family, out var localIp, out var localPort,
-                    out _, out _, out _, out var inode))
+                    out var remoteIp, out var remotePort, out _, out var inode))
                 continue;
 
             inodeMap.TryGetValue(inode, out var pid);
-            result.Add(new ListeningPort
+
+            if (remotePort > 0 && remoteIp is not ("" or "0.0.0.0" or "::"))
+            {
+                connections.Add(new NetworkConnection
+                {
+                    Protocol = "UDP",
+                    LocalAddress = localIp,
+                    LocalPort = localPort,
+                    RemoteAddress = remoteIp,
+                    RemotePort = remotePort,
+                    // UDP is stateless; Established is the closest label for a
+                    // socket with a fixed peer.
+                    State = TcpConnectionState.Established,
+                    ProcessId = pid
+                });
+                continue;
+            }
+
+            listeners.Add(new ListeningPort
             {
                 Protocol = "UDP",
                 Address = localIp,
@@ -110,8 +138,6 @@ internal static class LinuxNetTable
                 ServiceHint = PortCatalog.GetHint(localPort, "UDP")
             });
         }
-
-        return result;
     }
 
     private static bool TryParseSocketLine(
@@ -249,8 +275,8 @@ internal static class IpHelper
     public static IReadOnlyList<NetworkConnection> GetTcpConnections()
         => LinuxNetTable.GetTcpConnections();
 
-    public static IReadOnlyList<ListeningPort> GetUdpListeners()
-        => LinuxNetTable.GetUdpListeners();
+    public static (IReadOnlyList<ListeningPort> Listeners, IReadOnlyList<NetworkConnection> Connections) GetUdpTable()
+        => LinuxNetTable.GetUdpTable();
 }
 
 internal static class PortCatalog

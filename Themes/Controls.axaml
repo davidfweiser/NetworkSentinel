@@ -3,7 +3,7 @@
 
   <Style Selector="Button.ghost">
     <Setter Property="Foreground" Value="{DynamicResource TextPrimaryBrush}"/>
-    <Setter Property="Background" Value="#22182A4A"/>
+    <Setter Property="Background" Value="#1AFFFFFF"/>
     <Setter Property="BorderBrush" Value="{DynamicResource StrokeSoftBrush}"/>
     <Setter Property="BorderThickness" Value="1"/>
     <Setter Property="Padding" Value="12,8"/>
@@ -13,7 +13,7 @@
   </Style>
 
   <Style Selector="Button.primary">
-    <Setter Property="Foreground" Value="#FF041018"/>
+    <Setter Property="Foreground" Value="#FF0A0E14"/>
     <Setter Property="Background" Value="{DynamicResource AccentGradient}"/>
     <Setter Property="BorderThickness" Value="0"/>
     <Setter Property="Padding" Value="12,8"/>
@@ -44,7 +44,7 @@
 
   <Style Selector="Button.mini-ghost">
     <Setter Property="Foreground" Value="{DynamicResource TextPrimaryBrush}"/>
-    <Setter Property="Background" Value="#22182A4A"/>
+    <Setter Property="Background" Value="#1AFFFFFF"/>
     <Setter Property="BorderBrush" Value="{DynamicResource StrokeSoftBrush}"/>
     <Setter Property="BorderThickness" Value="1"/>
     <Setter Property="Padding" Value="10,6"/>
@@ -71,7 +71,7 @@
 
   <Style Selector="TextBox.modern">
     <Setter Property="Foreground" Value="{DynamicResource TextPrimaryBrush}"/>
-    <Setter Property="Background" Value="#22101828"/>
+    <Setter Property="Background" Value="#0DFFFFFF"/>
     <Setter Property="BorderBrush" Value="{DynamicResource StrokeSoftBrush}"/>
     <Setter Property="BorderThickness" Value="1"/>
     <Setter Property="Padding" Value="12,10"/>
@@ -90,7 +90,7 @@
 
   <Style Selector="RadioButton.nav:checked">
     <Setter Property="Foreground" Value="{DynamicResource TextPrimaryBrush}"/>
-    <Setter Property="Background" Value="#331E3A68"/>
+    <Setter Property="Background" Value="#264A9EFF"/>
   </Style>
 
   <Style Selector="DataGrid">
@@ -98,7 +98,7 @@
     <Setter Property="Foreground" Value="{DynamicResource TextPrimaryBrush}"/>
     <Setter Property="BorderThickness" Value="0"/>
     <Setter Property="GridLinesVisibility" Value="Horizontal"/>
-    <Setter Property="HorizontalGridLinesBrush" Value="#18A8C5FF"/>
+    <Setter Property="HorizontalGridLinesBrush" Value="#14FFFFFF"/>
     <Setter Property="IsReadOnly" Value="True"/>
     <Setter Property="CanUserReorderColumns" Value="False"/>
     <Setter Property="CanUserResizeColumns" Value="True"/>
@@ -108,7 +108,7 @@
   </Style>
 
   <Style Selector="DataGridColumnHeader">
-    <Setter Property="Background" Value="#22101828"/>
+    <Setter Property="Background" Value="#0DFFFFFF"/>
     <Setter Property="Foreground" Value="{DynamicResource TextSecondaryBrush}"/>
     <Setter Property="FontWeight" Value="SemiBold"/>
     <Setter Property="Padding" Value="10,8"/>
@@ -121,9 +121,9 @@
   </Style>
 
   <Style Selector="ComboBox">
-    <Setter Property="Foreground" Value="#FFF2F7FF"/>
-    <Setter Property="Background" Value="#FF121C31"/>
-    <Setter Property="BorderBrush" Value="#33A8C5FF"/>
+    <Setter Property="Foreground" Value="{DynamicResource TextPrimaryBrush}"/>
+    <Setter Property="Background" Value="{DynamicResource BgCardBrush}"/>
+    <Setter Property="BorderBrush" Value="{DynamicResource StrokeSoftBrush}"/>
     <Setter Property="Padding" Value="10,8"/>
     <Setter Property="MinHeight" Value="36"/>
   </Style>

@@ -10,14 +10,17 @@ public sealed class ThreatLevelToBrushConverter : IValueConverter
 {
     public object? Convert(object? value, Type targetType, object? parameter, CultureInfo culture)
     {
+        // Severity ramp ported from the iOS app's ThreatSeverity.color
+        // (NetworkSentinel-iOS/Models/Models.swift) so a Critical reads the same
+        // red on both platforms.
         var level = value is ThreatLevel tl ? tl : ThreatLevel.Info;
         return level switch
         {
-            ThreatLevel.Critical => Brush("#FF4D6D"),
-            ThreatLevel.High => Brush("#FF8A4C"),
-            ThreatLevel.Medium => Brush("#FFD166"),
-            ThreatLevel.Low => Brush("#5BC0EB"),
-            _ => Brush("#3DE7C8")
+            ThreatLevel.Critical => Brush("#F24059"),
+            ThreatLevel.High => Brush("#FA7340"),
+            ThreatLevel.Medium => Brush("#F2BF40"),
+            ThreatLevel.Low => Brush("#59BFF2"),
+            _ => Brush("#3BC8B4")
         };
     }
 

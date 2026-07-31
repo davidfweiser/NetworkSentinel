@@ -82,9 +82,25 @@ public sealed class TuiApp : IDisposable
         _blockOutbound = _settings.AutoBlockOutbound;
 
         _firewall.Allowlist = _allowlist;
+        _firewall.AutoBlockExpiry = _settings.AutoBlockExpiryMinutes > 0
+            ? TimeSpan.FromMinutes(_settings.AutoBlockExpiryMinutes)
+            : null;
+        _firewall.StartExpirySweep();
         _monitor.GeoLookupsEnabled = _settings.GeoLookupEnabled;
         _monitor.AuthMonitoringEnabled = _settings.AuthLogMonitorEnabled;
         _monitor.ProbeMonitoringEnabled = _settings.ProbeLogEnabled;
+        _monitor.ThreatIntelEnabled = _settings.ThreatIntelEnabled;
+        _monitor.ProcessReputationEnabled = _settings.ProcessReputationEnabled;
+        _monitor.NewListenerAlertsEnabled = _settings.NewListenerAlertsEnabled;
+        _monitor.ArpWatchEnabled = _settings.ArpWatchEnabled;
+        _monitor.PersistenceWatchEnabled = _settings.PersistenceWatchEnabled;
+        _monitor.ExfilMonitorEnabled = _settings.ExfilMonitorEnabled;
+        _monitor.ExfilThresholdMb = _settings.ExfilMbPer10Min;
+        _monitor.HoneypotPorts = HoneypotService.ParsePorts(_settings.HoneypotPorts);
+        _monitor.HoneypotEnabled = _settings.HoneypotEnabled;
+        _monitor.WebhookUrl = _settings.WebhookUrl;
+        _monitor.WebhookMinLevel = _settings.GetWebhookMinLevel();
+        _monitor.IsIpAllowlisted = ip => _allowlist.IsAllowed(ip, out _);
         if (_settings.ProbeLogEnabled && _firewall.IsRoot)
             _ = Task.Run(() => _firewall.EnableProbeLogging());
         _allowlist.UseRemoteFeed = _settings.AllowlistUseRemoteFeed;
@@ -241,7 +257,7 @@ public sealed class TuiApp : IDisposable
             }
 
             var reason = $"Auto-block · {threat.LevelText} · {threat.TypeText}: {threat.Title}";
-            var result = _firewall.BlockIp(ip, direction, reason);
+            var result = _firewall.BlockIp(ip, direction, reason, expiresAfter: _firewall.AutoBlockExpiry);
             if (result.Success)
             {
                 lock (_autoBlockGate) _blockedIps.Add(ip);
