@@ -14,6 +14,27 @@ Three ways to run it (same idea as the Linux build):
 
 ---
 
+## What's new in 0.4.0
+
+Brings the Windows build level with the Linux and macOS 0.4.0 releases.
+
+| Area | What changed |
+|------|--------------|
+| **Intrusion detection** | Seven new detectors beyond the connection heuristics — [new-listener baseline](#intrusion-detection), threat-intel blocklists (FireHOL + Spamhaus), process reputation, honeypot decoy ports, ARP/gateway watch, startup-item watch, and an exfiltration monitor. All are toggleable per detector in **Settings** (desktop, TUI, and web console). |
+| **Remote alerting** | Webhook push for Critical threats — **ntfy**, **Slack**, and **Discord** payloads are detected automatically, anything else gets generic JSON. |
+| **Auto-block expiry** | Block rules can now expire after 1 h … 7 days instead of accumulating forever. Off by default; manual blocks stay permanent. |
+| **Persistence** | First-seen hosts, the listening-port baseline, and the threat log survive restarts (`host-history.json`, `threat-log.jsonl`), so a relaunch no longer makes every known peer look new. |
+| **New palette** | Backgrounds move from navy to deep slate and the severity colours are now shared with the iOS app, so the two front-ends read as one product. |
+
+**Upgrading** is in place — master password, settings, and allowlist are preserved. Re-run the installer and confirm the web header reads `v0.4.0`.
+
+Two Windows-specific notes:
+
+- The **exfiltration monitor** needs administrator rights to enable its per-connection counters. The headless web service runs as SYSTEM and collects normally; an unelevated desktop session says so in its status line and stays quiet.
+- **Connected UDP peers** are not tracked on Windows — the UDP table exposes no peer address for a connected socket. UDP *listeners* are still enumerated and still classify inbound traffic.
+
+---
+
 ## Features
 
 ### Monitoring
