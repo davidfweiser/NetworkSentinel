@@ -10,7 +10,7 @@ Three ways to run it (same idea as the Linux build):
 | **Terminal UI (`--tui`)** | Server Core, RDP console, SSH-style workflows |
 | **Headless web UI (`-w`)** | Browser dashboard on a server (master-password protected) |
 
-> Awareness / monitoring tooling — not a full IDS/IPS replacement. Version **0.3.4**.
+> Awareness / monitoring tooling — not a full IDS/IPS replacement. Version **0.4.0**.
 
 ---
 
@@ -143,11 +143,11 @@ Self-contained by default — the server does **not** need the .NET SDK or a com
 
 ```powershell
 # Copy the .install.cmd to the server, then run it (UAC prompt if not elevated):
-.\NetworkSentinel-windows-server-x64-0.3.4.install.cmd
+.\NetworkSentinel-windows-server-x64-0.4.0.install.cmd
 # optional port:
-.\NetworkSentinel-windows-server-x64-0.3.4.install.cmd -Port 18765
+.\NetworkSentinel-windows-server-x64-0.4.0.install.cmd -Port 18765
 # unpack without installing:
-.\NetworkSentinel-windows-server-x64-0.3.4.install.cmd --extract-only
+.\NetworkSentinel-windows-server-x64-0.4.0.install.cmd --extract-only
 ```
 
 The one-file installer is a `.cmd`, not a `.ps1`: `cmd.exe` stops reading the script at `exit /b`, so the ZIP appended to it is never parsed. PowerShell tokenizes an entire `-File` script before running any of it, and the cost on appended binary is quadratic (16 MB ≈ 5½ minutes) before it fails to parse at all — so the shell-style "payload after exit" trick only works with a `cmd` entry point.
@@ -168,7 +168,7 @@ NetworkSentinel.exe -w 18765
 
 Open `http://localhost:18765/` (or `http://<server-ip>:18765/`). **First browser visit creates a master password.** Change it anytime under **Settings → Master password**.
 
-Re-running the installer **upgrades in place**: it stops the running task, replaces the binaries, and restarts. Master password, settings, and allowlist are **preserved**. The web page header shows the running version (e.g. `v0.3.4`) — check it after an upgrade to confirm the new build is live.
+Re-running the installer **upgrades in place**: it stops the running task, replaces the binaries, and restarts. Master password, settings, and allowlist are **preserved**. The web page header shows the running version (e.g. `v0.4.0`) — check it after an upgrade to confirm the new build is live.
 
 #### Web console tabs
 
