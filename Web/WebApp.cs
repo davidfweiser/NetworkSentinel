@@ -628,6 +628,68 @@ public sealed class WebApp : IDisposable
         return "HTTPS: enabled in settings but not running — restart the web console.";
     }
 
+    // ── Certificate issuance ───────────────────────────────────────────────────
+    // Issuance takes minutes (DNS propagation), far longer than a request should
+    // hold, so the action starts it and the page polls certIssueBusy for the result.
+    private int _certIssueBusy;
+    private string _certIssueMessage = "";
+
+    /// <summary>
+    /// Kick off a Let's Encrypt issuance for the saved DuckDNS name. Requires an
+    /// authenticated session like every other action, and runs one at a time —
+    /// concurrent ACME runs for the same name fight over the same TXT record.
+    /// </summary>
+    private ActionResultDto StartCertIssuance()
+    {
+        var domain = DuckDnsUpdater.NormalizeDomain(_duckDns.Config.Domain);
+        var token = _duckDns.Config.Token;
+
+        if (domain.Length == 0 || token.Length == 0)
+            return ActionResultDto.Fail("Save the DuckDNS subdomain and token first — issuance proves control through them.");
+
+        if (CertIssuanceService.FindScript() == null)
+            return ActionResultDto.Fail("Could not find issue-duckdns-cert.sh on this host.");
+
+        if (Interlocked.CompareExchange(ref _certIssueBusy, 1, 0) != 0)
+            return ActionResultDto.Fail("A certificate is already being issued.");
+
+        _certIssueMessage = $"Issuing a certificate for {domain}.duckdns.org — this waits on DNS propagation and can take a few minutes…";
+        _statusMessage = _certIssueMessage;
+
+        _ = Task.Run(async () =>
+        {
+            try
+            {
+                var result = await CertIssuanceService.IssueAsync(domain, token, _settings.AcmeAccountEmail);
+                if (result.Success)
+                {
+                    // Same as the desktop app: point the console at what was produced.
+                    // Takes effect at the next console start, like any other TLS change.
+                    _settings.WebTlsCertPath = result.CertPath;
+                    if (result.KeyPath.Length > 0)
+                        _settings.WebTlsKeyPath = result.KeyPath;
+                    _settings.Save();
+                    _certIssueMessage = $"{result.Message} Paths filled in — switch HTTPS on, then restart the console.";
+                }
+                else
+                {
+                    _certIssueMessage = result.Message;
+                }
+            }
+            catch (Exception ex)
+            {
+                _certIssueMessage = $"Certificate issuance failed: {ex.Message}";
+            }
+            finally
+            {
+                _statusMessage = _certIssueMessage;
+                Volatile.Write(ref _certIssueBusy, 0);
+            }
+        });
+
+        return ActionResultDto.Success(_certIssueMessage);
+    }
+
     /// <summary>Copy of the live DuckDNS config so a partial edit keeps the fields it did not touch.</summary>
     private DuckDnsConfig CloneDuckDns() => new()
     {
@@ -966,6 +1028,13 @@ public sealed class WebApp : IDisposable
                             break;
                         }
 
+                        case "acmeEmail":
+                            _settings.AcmeAccountEmail = raw;
+                            label = raw.Length == 0
+                                ? "Let's Encrypt account email cleared."
+                                : $"Let's Encrypt account email set to {raw}.";
+                            break;
+
                         default:
                             return ActionResultDto.Fail($"Unknown setting: {key}");
                     }
@@ -973,6 +1042,9 @@ public sealed class WebApp : IDisposable
                     _statusMessage = label;
                     return ActionResultDto.Success(label);
                 }
+
+                case "issue_cert":
+                    return StartCertIssuance();
 
                 case "block_port":
                 {
@@ -1237,6 +1309,9 @@ public sealed class WebApp : IDisposable
                 // The token itself is never sent to the browser — only whether one is stored.
                 duckDnsTokenSet = _duckDns.Config.Token.Length > 0,
                 duckDnsStatus = _duckDns.Status,
+                acmeEmail = _settings.AcmeAccountEmail,
+                certIssueBusy = Volatile.Read(ref _certIssueBusy) == 1,
+                certIssueMessage = _certIssueMessage,
                 isMonitoring = stats.IsMonitoring
             },
             stats = new
@@ -2578,7 +2653,12 @@ public sealed class WebApp : IDisposable
         <div class="settings-note">${esc(s.httpsStatus || '')}${s.duckDnsStatus ? ' · ' + esc(s.duckDnsStatus) : ''}</div>
         ${row('HTTPS', 'Serve this console over TLS as well as plain HTTP. Needs a certificate below. Takes effect when the web console restarts.', sw('httpsEnabled', s.httpsEnabled))}
         ${row('HTTPS port', 'TCP port for the TLS endpoint (ports below 1024 need root). Forward this port on your router if you want access from outside the LAN.', txt('httpsPort', s.httpsPort ?? 18443, '18443'))}
-        ${row('Certificate (PEM fullchain or .pfx)', 'Full path to the certificate. Get a free trusted one for your duckdns.org name with scripts/issue-duckdns-cert.sh — renewals are picked up automatically.', txt('tlsCertPath', s.tlsCertPath || '', '/etc/networksentinel/fullchain.cer'))}
+        ${row('Issue certificate',
+          'Get a free trusted Let\'s Encrypt certificate for the DuckDNS name above and fill in the two paths below. Proves control through the saved token, so nothing needs to be reachable on port 80. Takes a few minutes waiting on DNS. The email is used only the first time, to register the account when acme.sh is installed. '
+            + (s.certIssueMessage || ''),
+          `<input type="text" data-setting-text="acmeEmail" value="${esc(String(s.acmeEmail ?? ''))}" placeholder="you@example.com" style="min-width:180px"/>
+           <button type="button" data-issue-cert ${s.certIssueBusy ? 'disabled' : ''}>${s.certIssueBusy ? 'Issuing…' : 'Issue certificate'}</button>`)}
+        ${row('Certificate (PEM fullchain or .pfx)', 'Filled in by Issue certificate; edit it if the certificate lives somewhere else.', txt('tlsCertPath', s.tlsCertPath || '', '/etc/networksentinel/fullchain.cer'))}
         ${row('Private key (PEM)', 'Full path to the private key. Leave empty when the certificate is a .pfx bundle.', txt('tlsKeyPath', s.tlsKeyPath || '', '/etc/networksentinel/privkey.key'))}
         ${row('Redirect HTTP to HTTPS', 'Requests that arrive by hostname get sent to the TLS port. Requests to a bare IP stay on HTTP — the certificate only covers the name.', sw('httpsRedirect', s.httpsRedirect))}
         ${row('DuckDNS dynamic DNS', 'Keep a free duckdns.org hostname pointed at this machine so it stays reachable when your ISP changes your IP.', sw('duckDnsEnabled', s.duckDnsEnabled))}
@@ -2703,7 +2783,36 @@ public sealed class WebApp : IDisposable
       if (!isFrozenTab()) startPolling();
     }
   });
-  $('settingsPanel').addEventListener('click', (e) => {
+  $('settingsPanel').addEventListener('click', async (e) => {
+    const issue = e.target.closest('[data-issue-cert]');
+    if (issue) {
+      issue.disabled = true;
+      issue.textContent = 'Issuing…';
+      const started = await apiAction('issue_cert');
+      // The Settings tab freezes the periodic poll, so drive our own until the
+      // run finishes — then redraw to pick up the filled-in certificate paths.
+      if (started && started.ok) {
+        const tick = setInterval(async () => {
+          try {
+            if (!(await fetchState())) return;
+            if (state.settings && state.settings.certIssueBusy) {
+              setStatus(state.settings.certIssueMessage || 'Issuing…', false, false);
+              return;
+            }
+            clearInterval(tick);
+            const msg = (state.settings && state.settings.certIssueMessage) || '';
+            setStatus(msg, !/issued/i.test(msg), /issued/i.test(msg));
+            statusHoldUntil = Date.now() + 15000;
+            render({ forceLists: true });
+          } catch { /* keep polling; a transient failure is not the end of the run */ }
+        }, 5000);
+      } else if (issue.isConnected) {
+        issue.disabled = false;
+        issue.textContent = 'Issue certificate';
+      }
+      return;
+    }
+
     const btn = e.target.closest('[data-remove-all]');
     if (!btn) return;
     if (confirm('Remove ALL Network Sentinel firewall rules?\n\nEvery IP and port block will be deleted (the web console access rule is kept). Auto-block will not re-add them for 24 hours.')) {

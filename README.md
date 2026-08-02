@@ -88,7 +88,7 @@ Domains are DNS-resolved to current IPs. Auto-block never touches allowlisted IP
 | **Ports** | Local listeners; one-click **Block port** |
 | **Firewall** | Managed rules grouped as In/Out pairs; manual IP and port blocking; **Restore allowlisted** |
 | **Allowlist** | Add/remove trusted domains and IPs; refresh the feed |
-| **Settings** | Monitoring on/off, poll interval, geo lookups, auth-log and closed-port scan detection, the 0.4.0 detectors (threat intel, new-listener alerts, process reputation, ARP/gateway watch, startup-item watch, exfiltration threshold, honeypot ports), **HTTPS + DuckDNS remote access**, webhook URL, auto-block + minimum severity + expiry, block direction (in/out), allowlist feed, **change master password**, **Remove all rules** |
+| **Settings** | Monitoring on/off, poll interval, geo lookups, auth-log and closed-port scan detection, the 0.4.0 detectors (threat intel, new-listener alerts, process reputation, ARP/gateway watch, startup-item watch, exfiltration threshold, honeypot ports), **HTTPS + DuckDNS remote access** (including **Issue certificate**), webhook URL, auto-block + minimum severity + expiry, block direction (in/out), allowlist feed, **change master password**, **Remove all rules** |
 
 The page header shows the running version (e.g. `v0.5.0`) — check it after an upgrade to confirm the new build is live.
 
@@ -127,7 +127,7 @@ Under systemd, HTTPS and DuckDNS are **not** set in `web.env` — they persist i
 
 [DuckDNS](https://www.duckdns.org) gives a free hostname that follows your public IP. The certificate comes from Let's Encrypt via a **DNS-01** challenge — proving control by writing a TXT record through the DuckDNS API, so **nothing has to be reachable on port 80**.
 
-Easiest route is the GUI: fill in the subdomain and token under **Settings → Remote access**, then press **Issue certificate**. It runs the same script below and fills the two path fields in for you. From a terminal:
+Easiest route is either front-end: fill in the subdomain and token under **Settings → Remote access** (desktop app or web console), then press **Issue certificate**. It runs the same script below and fills the two path fields in for you. From a terminal:
 
 ```bash
 networksentinel --set-duckdns                 # subdomain + token (token is prompted, not a flag)
@@ -536,7 +536,9 @@ Each toggle shows a live status line underneath (e.g. why auth-log monitoring is
 | **Certificate** / **Private key** | Filled in by **Issue certificate**; still editable if your certificate lives elsewhere. Validated as you enter them |
 | **Redirect HTTP to HTTPS** | On by default |
 
-**Issue certificate** shells out to `issue-duckdns-cert.sh` — the installer puts a copy beside the binary so it works without a source tree. It runs the script non-interactively, so it needs the subdomain and token saved first; issuance waits on DNS propagation and takes a few minutes, during which the button reads *Issuing…*. Failures report the script's own error rather than an exit code. The button is **GUI-only** — the web console still points you at the script, since letting a browser session trigger a shell script that downloads and runs an installer is a different security proposition.
+**Issue certificate** shells out to `issue-duckdns-cert.sh` — the installer puts a copy beside the binary so it works without a source tree. It runs the script non-interactively, so it needs the subdomain and token saved first; issuance waits on DNS propagation and takes a few minutes, during which the button reads *Issuing…*. Failures report the script's own error rather than an exit code.
+
+The same button is in the **web console's** Settings tab. There it runs in the background and the page polls for the result, because holding an HTTP request open for the length of an ACME run would time out the browser. It needs an authenticated session like every other action, and only one run happens at a time — concurrent ACME runs for the same name fight over the same TXT record. Be aware of what the button is: an authenticated browser session can start a shell script that, on first use, downloads and runs the acme.sh installer and registers a Let's Encrypt account. That is a real capability to expose remotely — the master password is the only thing in front of it, so make it a long unique one, and prefer a VPN or Tailscale over a forwarded port.
 
 A status line at the top of the card shows certificate expiry, the live DuckDNS result, and the full console URL once both halves are configured. Certificate and port changes apply the next time the **web console** starts — the desktop app doesn't serve anything itself — but the **DuckDNS refresh runs in the desktop app too**, so the hostname stays current whenever either front-end is open.
 
