@@ -13,8 +13,13 @@
     <RootNamespace>NetworkSentinel</RootNamespace>
     <Product>Network Sentinel</Product>
     <Description>Linux-native network port monitor and intrusion awareness console</Description>
-    <Version>0.4.0</Version>
+    <Version>0.5.0</Version>
   </PropertyGroup>
+
+  <ItemGroup>
+    <!-- Kestrel backs the headless web console (-w): HttpListener cannot serve TLS on Linux. -->
+    <FrameworkReference Include="Microsoft.AspNetCore.App" />
+  </ItemGroup>
 
   <ItemGroup>
     <PackageReference Include="Avalonia" Version="11.2.5" />

@@ -6,6 +6,12 @@ using System.Reflection;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
+using Microsoft.AspNetCore.Builder;
+using Microsoft.AspNetCore.Hosting;
+using Microsoft.AspNetCore.Http;
+using Microsoft.AspNetCore.Server.Kestrel.Core;
+using Microsoft.Extensions.Hosting;
+using Microsoft.Extensions.Logging;
 using NetworkSentinel.Models;
 using NetworkSentinel.Services;
 
@@ -45,13 +51,21 @@ public sealed class WebApp : IDisposable
     /// until the user manually blocks again (or the suppress window expires).
     /// </summary>
     private readonly Dictionary<string, DateTime> _autoBlockSuppressedUntil = new(StringComparer.OrdinalIgnoreCase);
+    /// <summary>Stand-in shown in the settings page where a DuckDNS token is stored but must not be sent.</summary>
+    private const string TokenPlaceholder = "••••••••";
+
     private static readonly TimeSpan AutoBlockRetryAfter = TimeSpan.FromMinutes(10);
     private static readonly TimeSpan ManualUnblockSuppressFor = TimeSpan.FromHours(24);
 
     private readonly int _port;
     private readonly bool _bindAll;
     private bool _listeningLocalOnly;
-    private HttpListener? _listener;
+    private WebApplication? _host;
+    private readonly LoginThrottle _loginThrottle = new();
+    private readonly DuckDnsUpdater _duckDns = new();
+    private TlsCertificateProvider? _tls;
+    private int _httpsPort;
+    private bool _httpsActive;
     private CancellationTokenSource? _cts;
     private string _statusMessage = "Web UI ready — monitoring started.";
     private bool _autoBlockEnabled;
@@ -65,11 +79,15 @@ public sealed class WebApp : IDisposable
 
     public int Port => _port;
 
-    public WebApp(int? requestedPort = null, bool bindAll = true)
+    /// <summary>HTTPS port actually in use, or 0 when TLS is off.</summary>
+    public int HttpsPort => _httpsActive ? _httpsPort : 0;
+
+    public WebApp(int? requestedPort = null, bool bindAll = true, WebTlsOptions? tlsOverrides = null)
     {
         _bindAll = bindAll;
         _port = ResolvePort(requestedPort);
         _settings = AppSettings.Load();
+        ApplyTlsOverrides(tlsOverrides);
         _autoBlockEnabled = _settings.AutoBlockEnabled;
         _autoBlockMinLevel = _settings.AutoBlockMinLevel;
         if (_autoBlockMinLevel is not (nameof(ThreatLevel.Medium) or nameof(ThreatLevel.High) or nameof(ThreatLevel.Critical)))
@@ -104,6 +122,18 @@ public sealed class WebApp : IDisposable
         _monitor.ThreatsDetected += OnThreatsDetected;
     }
 
+    /// <summary>Command-line TLS flags win over the persisted settings, without overwriting them.</summary>
+    private void ApplyTlsOverrides(WebTlsOptions? o)
+    {
+        if (o == null)
+            return;
+        if (o.Enabled.HasValue) _settings.WebHttpsEnabled = o.Enabled.Value;
+        if (o.Port.HasValue) _settings.WebHttpsPort = o.Port.Value;
+        if (!string.IsNullOrWhiteSpace(o.CertPath)) _settings.WebTlsCertPath = o.CertPath!.Trim();
+        if (!string.IsNullOrWhiteSpace(o.KeyPath)) _settings.WebTlsKeyPath = o.KeyPath!.Trim();
+        if (!string.IsNullOrWhiteSpace(o.PfxPassword)) _settings.WebTlsPfxPassword = o.PfxPassword!;
+    }
+
     public async Task RunAsync()
     {
         _cts = new CancellationTokenSource();
@@ -130,92 +160,126 @@ public sealed class WebApp : IDisposable
         LoadPersistedAutoBlockSuppressions();
         RefreshBlockedIps(force: true);
         _monitor.Start();
+        StartDuckDns();
 
-        _listener = new HttpListener();
-        // HttpListener prefixes must end with '/'.
-        // Windows: "+" (all interfaces) needs URL ACL or admin; fall back to localhost.
-        // Linux: "*" binds all interfaces.
-        var candidates = _bindAll
-            ? (OperatingSystem.IsWindows()
-                ? new[] { $"http://+:{_port}/", $"http://*:{_port}/", $"http://127.0.0.1:{_port}/" }
-                : new[] { $"http://*:{_port}/", $"http://127.0.0.1:{_port}/" })
-            : new[] { $"http://127.0.0.1:{_port}/" };
+        _host = BuildHost();
 
-        Exception? lastBindError = null;
-        string? boundPrefix = null;
-        foreach (var prefix in candidates)
+        try
         {
-            try
-            {
-                _listener.Prefixes.Clear();
-                _listener.Prefixes.Add(prefix);
-                _listener.Start();
-                boundPrefix = prefix;
-                break;
-            }
-            catch (Exception ex)
-            {
-                lastBindError = ex;
-                try { _listener.Close(); } catch { /* ignore */ }
-                _listener = new HttpListener();
-            }
+            await _host.StartAsync(_cts.Token);
         }
-
-        if (boundPrefix == null)
+        catch (Exception ex)
         {
+            // ResolvePort only guarantees the HTTP port is free — the HTTPS port is whatever
+            // was configured, so name both rather than blaming the one that is probably fine.
+            var ports = _httpsActive ? $"port {_port} (HTTP) or {_httpsPort} (HTTPS)" : $"port {_port}";
             throw new InvalidOperationException(
-                "Failed to bind web UI. Try another port with -w PORT " +
-                $"(ports below 1024 need root). Detail: {lastBindError?.Message}", lastBindError);
-        }
-
-        _listeningLocalOnly = boundPrefix.Contains("127.0.0.1", StringComparison.Ordinal);
-        if (_listeningLocalOnly && _bindAll)
-        {
-            Console.WriteLine(
-                "Note: bound to localhost only (URL ACL / elevation required for all-interfaces). " +
-                "Use SSH tunnel or add a URL ACL to expose the LAN.");
+                $"Failed to bind web UI on {ports}. Try another port with -w PORT " +
+                (_httpsActive ? "or --https-port PORT " : "") +
+                $"(ports below 1024 need root). Detail: {ex.Message}", ex);
         }
 
         PrintListenBanner();
 
         try
         {
-            while (!_cts.IsCancellationRequested)
-            {
-                HttpListenerContext ctx;
-                try
-                {
-                    ctx = await _listener.GetContextAsync().WaitAsync(_cts.Token);
-                }
-                catch (OperationCanceledException)
-                {
-                    break;
-                }
-                catch (ObjectDisposedException)
-                {
-                    break;
-                }
-                catch (Exception ex)
-                {
-                    // A reset/aborted connection can surface here as HttpListenerException.
-                    // That must never end the accept loop — Program.RunWeb treats an escape
-                    // as fatal and exits the whole server process.
-                    if (_cts.IsCancellationRequested)
-                        break;
-                    Console.Error.WriteLine($"Accept error (continuing): {ex.Message}");
-                    await Task.Delay(100, CancellationToken.None);
-                    continue;
-                }
-
-                // Handle each request without blocking the accept loop for long polls.
-                _ = Task.Run(() => HandleRequestSafe(ctx));
-            }
+            await _host.WaitForShutdownAsync(_cts.Token);
+        }
+        catch (OperationCanceledException)
+        {
+            // Ctrl+C — normal shutdown.
         }
         finally
         {
             _monitor.Stop();
-            try { _listener.Stop(); } catch { /* ignore */ }
+            _duckDns.Stop();
+            try { await _host.StopAsync(TimeSpan.FromSeconds(3)); } catch { /* ignore */ }
             Console.WriteLine("Network Sentinel web UI stopped.");
+        }
+    }
+
+    /// <summary>
+    /// Kestrel serves the console: unlike HttpListener it terminates TLS on Linux, and it
+    /// hands us the real client address for login throttling.
+    /// </summary>
+    private WebApplication BuildHost()
+    {
+        var builder = WebApplication.CreateBuilder();
+        // Kestrel's own logs would interleave with the console banner and alert output.
+        builder.Logging.ClearProviders();
+
+        var bindAddress = _bindAll ? IPAddress.Any : IPAddress.Loopback;
+        _listeningLocalOnly = !_bindAll;
+
+        var tlsError = ConfigureTls();
+
+        builder.WebHost.ConfigureKestrel(options =>
+        {
+            // The request handler writes responses synchronously (Stream.Write / ReadToEnd).
+            options.AllowSynchronousIO = true;
+            // Nothing here accepts uploads; a small cap blunts memory-pressure probing.
+            options.Limits.MaxRequestBodySize = 1 * 1024 * 1024;
+            options.AddServerHeader = false;
+
+            options.Listen(bindAddress, _port);
+
+            if (_httpsActive && _tls != null)
+            {
+                options.Listen(bindAddress, _httpsPort, listen =>
+                    listen.UseHttps(httpsOptions =>
+                    {
+                        // Re-read on each connection so an ACME renewal applies without a restart.
+                        httpsOptions.ServerCertificateSelector = (_, _) => _tls.Current;
+                    }));
+            }
+        });
+
+        var app = builder.Build();
+        app.Run(ctx =>
+        {
+            HandleRequestSafe(ctx);
+            return Task.CompletedTask;
+        });
+
+        if (tlsError != null)
+            Console.Error.WriteLine($"HTTPS disabled: {tlsError}");
+
+        return app;
+    }
+
+    /// <summary>Loads the certificate if HTTPS is switched on. Returns an error string when it cannot be used.</summary>
+    private string? ConfigureTls()
+    {
+        _httpsActive = false;
+        if (!_settings.WebHttpsEnabled)
+            return null;
+
+        _httpsPort = _settings.WebHttpsPort is >= 1 and <= 65535 ? _settings.WebHttpsPort : 18443;
+        if (_httpsPort == _port)
+            return $"HTTPS port {_httpsPort} is the same as the HTTP port — set a different --https-port.";
+
+        if (!TlsCertificateProvider.TryLoad(_settings.WebTlsCertPath, _settings.WebTlsKeyPath,
+                _settings.WebTlsPfxPassword, out var cert, out var error))
+        {
+            return error;
+        }
+
+        cert?.Dispose();
+        _tls = new TlsCertificateProvider(_settings.WebTlsCertPath, _settings.WebTlsKeyPath, _settings.WebTlsPfxPassword);
+        _ = _tls.Current; // populate Status for the banner and settings page
+        _httpsActive = true;
+        return null;
+    }
+
+    private void StartDuckDns()
+    {
+        try
+        {
+            _duckDns.Start();
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine($"DuckDNS updater failed to start: {ex.Message}");
         }
     }
 
@@ -230,6 +294,19 @@ public sealed class WebApp : IDisposable
             foreach (var ip in GetLanIpv4Addresses().Take(4))
                 Console.WriteLine($"  Network: http://{ip}:{_port}/");
         }
+
+        if (_httpsActive)
+        {
+            Console.WriteLine();
+            Console.WriteLine($"  HTTPS on port {_httpsPort}");
+            var hostname = _duckDns.Hostname;
+            if (!string.IsNullOrEmpty(hostname))
+                Console.WriteLine($"  Secure:  https://{hostname}:{_httpsPort}/");
+            Console.WriteLine($"  {_tls?.Status}");
+        }
+
+        if (_duckDns.Config.IsUsable)
+            Console.WriteLine($"  {_duckDns.Status}");
 
         Console.WriteLine();
         Console.WriteLine("  Open the URL above in your browser.");
@@ -266,7 +343,7 @@ public sealed class WebApp : IDisposable
         return list;
     }
 
-    private void HandleRequestSafe(HttpListenerContext ctx)
+    private void HandleRequestSafe(HttpContext ctx)
     {
         try
         {
@@ -280,30 +357,34 @@ public sealed class WebApp : IDisposable
             }
             catch
             {
-                try { ctx.Response.Abort(); } catch { /* ignore */ }
+                try { ctx.Abort(); } catch { /* ignore */ }
             }
         }
     }
 
-    private void HandleRequest(HttpListenerContext ctx)
+    private void HandleRequest(HttpContext ctx)
     {
         var req = ctx.Request;
         var res = ctx.Response;
         res.Headers["Cache-Control"] = "no-store";
         res.Headers["X-Content-Type-Options"] = "nosniff";
+        res.Headers["Referrer-Policy"] = "same-origin";
 
-        var path = req.Url?.AbsolutePath?.TrimEnd('/') ?? "";
+        if (TryRedirectToHttps(ctx))
+            return;
+
+        var path = (req.Path.Value ?? "").TrimEnd('/');
         if (path.Length == 0)
             path = "/";
 
-        if (req.HttpMethod == "GET" && (path is "/" or "/index.html"))
+        if (req.Method == "GET" && (path is "/" or "/index.html"))
         {
             WriteHtml(res, IndexHtml);
             return;
         }
 
         // --- Auth endpoints (public) ---
-        if (req.HttpMethod == "GET" && path == "/api/auth/status")
+        if (req.Method == "GET" && path == "/api/auth/status")
         {
             var authed = _auth.IsSessionValid(GetSessionToken(req));
             WriteJson(res, 200, new
@@ -316,7 +397,7 @@ public sealed class WebApp : IDisposable
             return;
         }
 
-        if (req.HttpMethod == "POST" && path == "/api/auth/setup")
+        if (req.Method == "POST" && path == "/api/auth/setup")
         {
             var body = ReadBody(req);
             var authReq = DeserializeAuth(body);
@@ -326,21 +407,26 @@ public sealed class WebApp : IDisposable
                 return;
             }
 
+            if (IsLockedOut(ctx, res))
+                return;
+
             if (!_auth.TrySetup(authReq.Password ?? "", authReq.Confirm ?? authReq.Password ?? "", out var setupMsg))
             {
                 // Slow down scripted setup attempts.
                 Thread.Sleep(400);
+                _loginThrottle.RecordFailure(ClientAddress(ctx));
                 WriteJson(res, 400, new { ok = false, message = setupMsg });
                 return;
             }
 
+            _loginThrottle.RecordSuccess(ClientAddress(ctx));
             var token = _auth.CreateSession();
-            SetSessionCookie(res, token);
+            SetSessionCookie(ctx, token);
             WriteJson(res, 200, new { ok = true, message = setupMsg, authenticated = true });
             return;
         }
 
-        if (req.HttpMethod == "POST" && path == "/api/auth/login")
+        if (req.Method == "POST" && path == "/api/auth/login")
         {
             var body = ReadBody(req);
             var authReq = DeserializeAuth(body);
@@ -356,24 +442,35 @@ public sealed class WebApp : IDisposable
                 return;
             }
 
-            // Constant-ish delay on failure to blunt brute force.
+            if (IsLockedOut(ctx, res))
+                return;
+
+            // Delay blunts a serial guesser; the lockout is what stops a parallel one.
             if (!_auth.VerifyPassword(authReq.Password ?? ""))
             {
                 Thread.Sleep(600);
-                WriteJson(res, 401, new { ok = false, message = "Incorrect master password." });
+                var lockout = _loginThrottle.RecordFailure(ClientAddress(ctx));
+                WriteJson(res, 401, new
+                {
+                    ok = false,
+                    message = lockout > TimeSpan.Zero
+                        ? $"Incorrect master password. Too many attempts — locked out for {LoginThrottle.Describe(lockout)}."
+                        : "Incorrect master password."
+                });
                 return;
             }
 
+            _loginThrottle.RecordSuccess(ClientAddress(ctx));
             var token = _auth.CreateSession();
-            SetSessionCookie(res, token);
+            SetSessionCookie(ctx, token);
             WriteJson(res, 200, new { ok = true, message = "Signed in.", authenticated = true });
             return;
         }
 
-        if (req.HttpMethod == "POST" && path == "/api/auth/logout")
+        if (req.Method == "POST" && path == "/api/auth/logout")
         {
             _auth.RevokeSession(GetSessionToken(req));
-            ClearSessionCookie(res);
+            ClearSessionCookie(ctx);
             WriteJson(res, 200, new { ok = true, message = "Signed out." });
             return;
         }
@@ -391,7 +488,7 @@ public sealed class WebApp : IDisposable
             return;
         }
 
-        if (req.HttpMethod == "POST" && path == "/api/auth/change-password")
+        if (req.Method == "POST" && path == "/api/auth/change-password")
         {
             var body = ReadBody(req);
             var authReq = DeserializeAuth(body);
@@ -406,24 +503,30 @@ public sealed class WebApp : IDisposable
             var confirm = authReq.Confirm ?? "";
             var session = GetSessionToken(req);
 
+            if (IsLockedOut(ctx, res))
+                return;
+
             if (!_auth.TryChangePassword(current, next, confirm, session, out var changeMsg))
             {
                 Thread.Sleep(600);
+                _loginThrottle.RecordFailure(ClientAddress(ctx));
                 WriteJson(res, 400, new { ok = false, message = changeMsg });
                 return;
             }
+
+            _loginThrottle.RecordSuccess(ClientAddress(ctx));
 
             WriteJson(res, 200, new { ok = true, message = changeMsg });
             return;
         }
 
-        if (req.HttpMethod == "GET" && path == "/api/state")
+        if (req.Method == "GET" && path == "/api/state")
         {
             WriteJson(res, 200, BuildState());
             return;
         }
 
-        if (req.HttpMethod == "POST" && path == "/api/action")
+        if (req.Method == "POST" && path == "/api/action")
         {
             var body = ReadBody(req);
             ActionRequest? actionReq = null;
@@ -451,9 +554,10 @@ public sealed class WebApp : IDisposable
         WriteJson(res, 404, new { ok = false, message = "Not found." });
     }
 
-    private static string ReadBody(HttpListenerRequest req)
+    private static string ReadBody(HttpRequest req)
     {
-        using var reader = new StreamReader(req.InputStream, req.ContentEncoding);
+        // Kestrel exposes the body as UTF-8 bytes; the console only ever posts JSON.
+        using var reader = new StreamReader(req.Body, Encoding.UTF8);
         return reader.ReadToEnd();
     }
 
@@ -469,13 +573,12 @@ public sealed class WebApp : IDisposable
         }
     }
 
-    private static string? GetSessionToken(HttpListenerRequest req)
+    private static string? GetSessionToken(HttpRequest req)
     {
         try
         {
-            var cookie = req.Cookies[WebAuthStore.CookieName];
-            if (cookie != null && !string.IsNullOrEmpty(cookie.Value))
-                return cookie.Value;
+            if (req.Cookies.TryGetValue(WebAuthStore.CookieName, out var cookie) && !string.IsNullOrEmpty(cookie))
+                return cookie;
         }
         catch
         {
@@ -483,7 +586,7 @@ public sealed class WebApp : IDisposable
         }
 
         // Also accept Authorization: Bearer <token> for non-browser clients.
-        var authHeader = req.Headers["Authorization"];
+        var authHeader = req.Headers.Authorization.ToString();
         if (!string.IsNullOrEmpty(authHeader) &&
             authHeader.StartsWith("Bearer ", StringComparison.OrdinalIgnoreCase))
             return authHeader["Bearer ".Length..].Trim();
@@ -491,18 +594,94 @@ public sealed class WebApp : IDisposable
         return null;
     }
 
-    private static void SetSessionCookie(HttpListenerResponse res, string token)
+    private static void SetSessionCookie(HttpContext ctx, string token)
     {
         // Session cookie (no Max-Age): browser discards on close → login again next visit.
         // HttpOnly so JS cannot read it; SameSite=Strict for CSRF-ish protection on POST.
-        res.Headers.Add("Set-Cookie",
-            $"{WebAuthStore.CookieName}={token}; Path=/; HttpOnly; SameSite=Strict");
+        // Secure only over TLS — setting it on plain HTTP would make the cookie unusable.
+        ctx.Response.Cookies.Append(WebAuthStore.CookieName, token, new CookieOptions
+        {
+            Path = "/",
+            HttpOnly = true,
+            SameSite = SameSiteMode.Strict,
+            Secure = ctx.Request.IsHttps
+        });
     }
 
-    private static void ClearSessionCookie(HttpListenerResponse res)
+    private static void ClearSessionCookie(HttpContext ctx)
     {
-        res.Headers.Add("Set-Cookie",
-            $"{WebAuthStore.CookieName}=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0");
+        ctx.Response.Cookies.Delete(WebAuthStore.CookieName, new CookieOptions
+        {
+            Path = "/",
+            HttpOnly = true,
+            SameSite = SameSiteMode.Strict,
+            Secure = ctx.Request.IsHttps
+        });
+    }
+
+    private string HttpsStatusText()
+    {
+        if (_httpsActive)
+            return _tls?.Status ?? $"HTTPS: serving on port {_httpsPort}";
+        if (!_settings.WebHttpsEnabled)
+            return "HTTPS: off — this page is served over plain HTTP.";
+        return "HTTPS: enabled in settings but not running — restart the web console.";
+    }
+
+    /// <summary>Copy of the live DuckDNS config so a partial edit keeps the fields it did not touch.</summary>
+    private DuckDnsConfig CloneDuckDns() => new()
+    {
+        Enabled = _duckDns.Config.Enabled,
+        Domain = _duckDns.Config.Domain,
+        Token = _duckDns.Config.Token,
+        IntervalMinutes = _duckDns.Config.IntervalMinutes
+    };
+
+    private static string DescribeProbe(System.Security.Cryptography.X509Certificates.X509Certificate2? cert)
+    {
+        if (cert == null)
+            return "";
+        var name = cert.GetNameInfo(System.Security.Cryptography.X509Certificates.X509NameType.DnsName, false);
+        return $"{(string.IsNullOrEmpty(name) ? cert.Subject : name)}, expires {cert.NotAfter:yyyy-MM-dd}.";
+    }
+
+    /// <summary>Remote address for throttling. Kestrel gives the real peer — no proxy is assumed.</summary>
+    private static string ClientAddress(HttpContext ctx)
+        => ctx.Connection.RemoteIpAddress?.ToString() ?? "unknown";
+
+    /// <summary>Writes a 429 and returns true when this client is currently locked out.</summary>
+    private bool IsLockedOut(HttpContext ctx, HttpResponse res)
+    {
+        if (!_loginThrottle.IsLocked(ClientAddress(ctx), out var retryAfter))
+            return false;
+
+        res.Headers["Retry-After"] = ((int)Math.Ceiling(retryAfter.TotalSeconds)).ToString();
+        WriteJson(res, 429, new
+        {
+            ok = false,
+            message = $"Too many failed attempts. Try again in {LoginThrottle.Describe(retryAfter)}."
+        });
+        return true;
+    }
+
+    /// <summary>
+    /// Sends hostname-based HTTP traffic to the HTTPS endpoint. Requests to a bare IP are left
+    /// on HTTP: the certificate covers the DuckDNS name, so redirecting an IP would only produce
+    /// a certificate warning.
+    /// </summary>
+    private bool TryRedirectToHttps(HttpContext ctx)
+    {
+        if (!_httpsActive || !_settings.WebHttpsRedirect || ctx.Request.IsHttps)
+            return false;
+
+        var host = ctx.Request.Host.Host;
+        if (string.IsNullOrEmpty(host) || IPAddress.TryParse(host, out _))
+            return false;
+
+        var target = $"https://{host}:{_httpsPort}{ctx.Request.Path}{ctx.Request.QueryString}";
+        ctx.Response.StatusCode = StatusCodes.Status308PermanentRedirect;
+        ctx.Response.Headers.Location = target;
+        return true;
     }
 
     private ActionResultDto RunAction(ActionRequest req)
@@ -700,6 +879,93 @@ public sealed class WebApp : IDisposable
                                 ? "Auto-block rules are permanent until removed."
                                 : $"New auto-block rules expire after {minutes} minutes.";
                             break;
+                        // --- HTTPS ---
+                        // Kestrel binds its endpoints at startup, so TLS changes are saved
+                        // here but only take effect when the console is restarted.
+                        case "httpsEnabled":
+                            if (on && string.IsNullOrWhiteSpace(_settings.WebTlsCertPath))
+                                return ActionResultDto.Fail(
+                                    "Set the certificate path first — see scripts/issue-duckdns-cert.sh for a Let's Encrypt certificate.");
+                            _settings.WebHttpsEnabled = on;
+                            label = on
+                                ? $"HTTPS enabled on port {_settings.WebHttpsPort} — restart the web console to apply."
+                                : "HTTPS disabled — restart the web console to apply.";
+                            break;
+                        case "httpsPort":
+                            if (!int.TryParse(raw, out var httpsPort) || httpsPort is < 1 or > 65535)
+                                return ActionResultDto.Fail("HTTPS port must be between 1 and 65535.");
+                            if (httpsPort == _port)
+                                return ActionResultDto.Fail($"Port {_port} already serves the HTTP console — pick a different HTTPS port.");
+                            _settings.WebHttpsPort = httpsPort;
+                            label = $"HTTPS port set to {httpsPort} — restart the web console to apply.";
+                            break;
+                        case "tlsCertPath":
+                        case "tlsKeyPath":
+                        {
+                            if (raw.Length > 0 && !File.Exists(raw))
+                                return ActionResultDto.Fail($"File not found: {raw}");
+                            if (key == "tlsCertPath") _settings.WebTlsCertPath = raw;
+                            else _settings.WebTlsKeyPath = raw;
+
+                            var certPath = _settings.WebTlsCertPath;
+                            if (certPath.Length == 0)
+                            {
+                                label = "Certificate path cleared — HTTPS cannot start without it.";
+                                break;
+                            }
+
+                            // Validate now: a bad path found at restart means no console at all.
+                            label = TlsCertificateProvider.TryLoad(certPath, _settings.WebTlsKeyPath,
+                                _settings.WebTlsPfxPassword, out var probe, out var probeError)
+                                ? $"Certificate OK — {DescribeProbe(probe)} Restart the web console to apply."
+                                : $"Saved, but the certificate cannot be loaded yet: {probeError}";
+                            probe?.Dispose();
+                            break;
+                        }
+                        case "httpsRedirect":
+                            _settings.WebHttpsRedirect = on;
+                            label = on
+                                ? "Hostname requests over plain HTTP will redirect to HTTPS."
+                                : "HTTP requests are served as-is (no HTTPS redirect).";
+                            break;
+
+                        // --- DuckDNS (stored separately in duckdns.json, mode 0600) ---
+                        case "duckDnsEnabled":
+                        {
+                            var cfg = CloneDuckDns();
+                            cfg.Enabled = on;
+                            if (on && (cfg.Domain.Length == 0 || cfg.Token.Length == 0))
+                                return ActionResultDto.Fail("Enter the DuckDNS subdomain and token first.");
+                            label = _duckDns.Apply(cfg);
+                            break;
+                        }
+                        case "duckDnsDomain":
+                        {
+                            var cfg = CloneDuckDns();
+                            cfg.Domain = DuckDnsUpdater.NormalizeDomain(raw);
+                            if (raw.Length > 0 && cfg.Domain.Length == 0)
+                                return ActionResultDto.Fail("Enter the subdomain label, e.g. myhost (or myhost.duckdns.org).");
+                            _duckDns.Apply(cfg);
+                            label = cfg.Domain.Length == 0
+                                ? "DuckDNS subdomain cleared."
+                                : $"DuckDNS subdomain set to {cfg.Domain}.duckdns.org — {_duckDns.Status}";
+                            break;
+                        }
+                        case "duckDnsToken":
+                        {
+                            // The page renders a bullet placeholder for a stored token so the user
+                            // can empty the field to clear it; echoing it back unchanged is a no-op.
+                            if (raw == TokenPlaceholder)
+                                return ActionResultDto.Success(_duckDns.Status);
+                            var cfg = CloneDuckDns();
+                            cfg.Token = raw;
+                            _duckDns.Apply(cfg);
+                            label = raw.Length == 0
+                                ? "DuckDNS token cleared."
+                                : $"DuckDNS token saved — {_duckDns.Status}";
+                            break;
+                        }
+
                         default:
                             return ActionResultDto.Fail($"Unknown setting: {key}");
                     }
@@ -959,6 +1225,18 @@ public sealed class WebApp : IDisposable
                 webhookUrl = _settings.WebhookUrl,
                 webhookStatus = _monitor.WebhookStatus,
                 autoBlockExpiryMinutes = _settings.AutoBlockExpiryMinutes,
+                httpsEnabled = _settings.WebHttpsEnabled,
+                httpsActive = _httpsActive,
+                httpsPort = _settings.WebHttpsPort,
+                httpsRedirect = _settings.WebHttpsRedirect,
+                httpsStatus = HttpsStatusText(),
+                tlsCertPath = _settings.WebTlsCertPath,
+                tlsKeyPath = _settings.WebTlsKeyPath,
+                duckDnsEnabled = _duckDns.Config.Enabled,
+                duckDnsDomain = _duckDns.Config.Domain,
+                // The token itself is never sent to the browser — only whether one is stored.
+                duckDnsTokenSet = _duckDns.Config.Token.Length > 0,
+                duckDnsStatus = _duckDns.Status,
                 isMonitoring = stats.IsMonitoring
             },
             stats = new
@@ -1263,24 +1541,22 @@ public sealed class WebApp : IDisposable
         }
     }
 
-    private static void WriteHtml(HttpListenerResponse res, string html)
+    private static void WriteHtml(HttpResponse res, string html)
     {
         var bytes = Encoding.UTF8.GetBytes(html);
         res.StatusCode = 200;
         res.ContentType = "text/html; charset=utf-8";
-        res.ContentLength64 = bytes.Length;
-        res.OutputStream.Write(bytes, 0, bytes.Length);
-        res.OutputStream.Close();
+        res.ContentLength = bytes.Length;
+        res.Body.Write(bytes, 0, bytes.Length);
     }
 
-    private static void WriteJson(HttpListenerResponse res, int status, object payload)
+    private static void WriteJson(HttpResponse res, int status, object payload)
     {
         var bytes = JsonSerializer.SerializeToUtf8Bytes(payload, JsonOptions);
         res.StatusCode = status;
         res.ContentType = "application/json; charset=utf-8";
-        res.ContentLength64 = bytes.Length;
-        res.OutputStream.Write(bytes, 0, bytes.Length);
-        res.OutputStream.Close();
+        res.ContentLength = bytes.Length;
+        res.Body.Write(bytes, 0, bytes.Length);
     }
 
     private static string FormatAppVersion()
@@ -1292,8 +1568,10 @@ public sealed class WebApp : IDisposable
     public void Dispose()
     {
         _cts?.Cancel();
-        try { _listener?.Stop(); } catch { /* ignore */ }
-        _listener?.Close();
+        try { _host?.StopAsync(TimeSpan.FromSeconds(2)).GetAwaiter().GetResult(); } catch { /* ignore */ }
+        try { (_host as IDisposable)?.Dispose(); } catch { /* ignore */ }
+        _duckDns.Dispose();
+        _tls?.Dispose();
         _monitor.Dispose();
         _allowlist.Dispose();
         _cts?.Dispose();
@@ -1506,6 +1784,11 @@ public sealed class WebApp : IDisposable
     text-transform: uppercase; letter-spacing: .07em;
   }
   .settings-group:first-child h3 { margin-top: 0; }
+  .settings-note {
+    max-width: 760px; margin: 0 0 10px; padding: 9px 12px;
+    background: var(--bg-card); border: 1px solid var(--stroke);
+    border-radius: 8px; color: var(--muted); font-size: .8rem; line-height: 1.5;
+  }
   .pw-change {
     max-width: 760px; padding: 16px; background: var(--bg-card);
     border: 1px solid var(--stroke); border-radius: 12px;
@@ -2290,6 +2573,18 @@ public sealed class WebApp : IDisposable
       </div>
       <div class="settings-group"><h3>Alerting</h3>
         ${row('Webhook URL', 'POST Critical threats to a webhook — ntfy, Slack, and Discord formats are detected automatically; anything else gets generic JSON. Empty = off. ' + (s.webhookStatus && s.webhookUrl ? s.webhookStatus : ''), txt('webhookUrl', s.webhookUrl || '', 'https://ntfy.sh/your-topic'))}
+      </div>
+      <div class="settings-group"><h3>Remote access</h3>
+        <div class="settings-note">${esc(s.httpsStatus || '')}${s.duckDnsStatus ? ' · ' + esc(s.duckDnsStatus) : ''}</div>
+        ${row('HTTPS', 'Serve this console over TLS as well as plain HTTP. Needs a certificate below. Takes effect when the web console restarts.', sw('httpsEnabled', s.httpsEnabled))}
+        ${row('HTTPS port', 'TCP port for the TLS endpoint (ports below 1024 need root). Forward this port on your router if you want access from outside the LAN.', txt('httpsPort', s.httpsPort ?? 18443, '18443'))}
+        ${row('Certificate (PEM fullchain or .pfx)', 'Full path to the certificate. Get a free trusted one for your duckdns.org name with scripts/issue-duckdns-cert.sh — renewals are picked up automatically.', txt('tlsCertPath', s.tlsCertPath || '', '/etc/networksentinel/fullchain.cer'))}
+        ${row('Private key (PEM)', 'Full path to the private key. Leave empty when the certificate is a .pfx bundle.', txt('tlsKeyPath', s.tlsKeyPath || '', '/etc/networksentinel/privkey.key'))}
+        ${row('Redirect HTTP to HTTPS', 'Requests that arrive by hostname get sent to the TLS port. Requests to a bare IP stay on HTTP — the certificate only covers the name.', sw('httpsRedirect', s.httpsRedirect))}
+        ${row('DuckDNS dynamic DNS', 'Keep a free duckdns.org hostname pointed at this machine so it stays reachable when your ISP changes your IP.', sw('duckDnsEnabled', s.duckDnsEnabled))}
+        ${row('DuckDNS subdomain', 'Just the label — "myhost" for myhost.duckdns.org.', txt('duckDnsDomain', s.duckDnsDomain || '', 'myhost'))}
+        ${row('DuckDNS token', 'Account token from duckdns.org. Stored owner-only on disk and never sent back to this page. ' + (s.duckDnsTokenSet ? 'A token is saved — replace the placeholder to change it, or empty the field to remove it.' : 'No token saved yet.'), txt('duckDnsToken', s.duckDnsTokenSet ? '••••••••' : '', 'paste token'))}
+        <div class="settings-note">Exposing this console to the internet gives anyone who guesses the master password control of this machine's firewall. Prefer a VPN or Tailscale; if you do forward a port, forward only the HTTPS one and use a long unique password.</div>
       </div>
       <div class="settings-group"><h3>Auto-block</h3>
         ${row('Auto-block threats', 'Automatically create firewall rules when threats are detected.', sw('autoBlockEnabled', s.autoBlockEnabled))}

@@ -705,6 +705,94 @@
 
               <Border Classes="card">
                 <StackPanel>
+                  <TextBlock Text="Remote access (web console)" FontWeight="Bold" FontSize="15"/>
+                  <TextBlock Text="Reach the browser console from outside this machine over HTTPS. These settings configure the headless web console (--web); this app saves them and keeps the DuckDNS hostname current."
+                             Foreground="{DynamicResource TextSecondaryBrush}" FontSize="12"
+                             Margin="0,4,0,10" TextWrapping="Wrap"/>
+                  <TextBlock Text="{Binding RemoteAccessStatus}" FontSize="11"
+                             Foreground="{DynamicResource TextMutedBrush}"
+                             Margin="0,0,0,14" TextWrapping="Wrap"/>
+
+                  <Grid ColumnDefinitions="*,Auto,Auto" Margin="0,0,0,14">
+                    <StackPanel Margin="0,0,16,0">
+                      <TextBlock Text="DuckDNS subdomain" FontWeight="Bold" FontSize="13"/>
+                      <TextBlock Text="Free hostname that follows your public IP. Enter just the label — &quot;myhost&quot; for myhost.duckdns.org. The switch turns the every-5-minute refresh on."
+                                 Foreground="{DynamicResource TextSecondaryBrush}" FontSize="11"
+                                 Margin="0,2,0,0" TextWrapping="Wrap"/>
+                    </StackPanel>
+                    <TextBox Grid.Column="1" Width="180" VerticalAlignment="Center" Margin="0,0,12,0"
+                             Text="{Binding DuckDnsDomain}" Watermark="myhost"/>
+                    <CheckBox Grid.Column="2" VerticalAlignment="Center"
+                              IsChecked="{Binding DuckDnsEnabled}"/>
+                  </Grid>
+
+                  <Grid ColumnDefinitions="*,Auto,Auto" Margin="0,0,0,14">
+                    <StackPanel Margin="0,0,16,0">
+                      <TextBlock Text="DuckDNS token" FontWeight="Bold" FontSize="13"/>
+                      <TextBlock Text="The token from your duckdns.org account page. Stored owner-only (mode 0600) in its own file, separate from the other settings."
+                                 Foreground="{DynamicResource TextSecondaryBrush}" FontSize="11"
+                                 Margin="0,2,0,0" TextWrapping="Wrap"/>
+                    </StackPanel>
+                    <TextBox Grid.Column="1" Width="180" VerticalAlignment="Center" Margin="0,0,12,0"
+                             PasswordChar="●" Text="{Binding DuckDnsToken}" Watermark="paste token"/>
+                    <Button Grid.Column="2" Content="Update now" VerticalAlignment="Center"
+                            Command="{Binding UpdateDuckDnsNowCommand}"/>
+                  </Grid>
+
+                  <Grid ColumnDefinitions="*,Auto,Auto" Margin="0,0,0,14">
+                    <StackPanel Margin="0,0,16,0">
+                      <TextBlock Text="Serve the console over HTTPS" FontWeight="Bold" FontSize="13"/>
+                      <TextBlock Text="Adds a TLS port alongside the plain-HTTP one. Needs the certificate below. Takes effect the next time the web console starts."
+                                 Foreground="{DynamicResource TextSecondaryBrush}" FontSize="11"
+                                 Margin="0,2,0,0" TextWrapping="Wrap"/>
+                    </StackPanel>
+                    <TextBox Grid.Column="1" Width="90" VerticalAlignment="Center" Margin="0,0,12,0"
+                             Text="{Binding HttpsPortText}" Watermark="18443"/>
+                    <CheckBox Grid.Column="2" VerticalAlignment="Center"
+                              IsChecked="{Binding HttpsEnabled}"/>
+                  </Grid>
+
+                  <Grid ColumnDefinitions="*,Auto" Margin="0,0,0,14">
+                    <StackPanel Margin="0,0,16,0">
+                      <TextBlock Text="Certificate (PEM fullchain or .pfx)" FontWeight="Bold" FontSize="13"/>
+                      <TextBlock Text="Get a free trusted certificate for your duckdns.org name by running scripts/issue-duckdns-cert.sh — it prints the two paths to paste here. Renewals are picked up automatically."
+                                 Foreground="{DynamicResource TextSecondaryBrush}" FontSize="11"
+                                 Margin="0,2,0,0" TextWrapping="Wrap"/>
+                    </StackPanel>
+                    <TextBox Grid.Column="1" Width="280" VerticalAlignment="Center"
+                             Text="{Binding TlsCertPath}" Watermark="…/tls/myhost.duckdns.org.fullchain.cer"/>
+                  </Grid>
+
+                  <Grid ColumnDefinitions="*,Auto" Margin="0,0,0,14">
+                    <StackPanel Margin="0,0,16,0">
+                      <TextBlock Text="Private key (PEM)" FontWeight="Bold" FontSize="13"/>
+                      <TextBlock Text="Leave empty when the certificate is a .pfx bundle."
+                                 Foreground="{DynamicResource TextSecondaryBrush}" FontSize="11"
+                                 Margin="0,2,0,0" TextWrapping="Wrap"/>
+                    </StackPanel>
+                    <TextBox Grid.Column="1" Width="280" VerticalAlignment="Center"
+                             Text="{Binding TlsKeyPath}" Watermark="…/tls/myhost.duckdns.org.key"/>
+                  </Grid>
+
+                  <Grid ColumnDefinitions="*,Auto">
+                    <StackPanel Margin="0,0,16,0">
+                      <TextBlock Text="Redirect HTTP to HTTPS" FontWeight="Bold" FontSize="13"/>
+                      <TextBlock Text="Requests that arrive by hostname get sent to the TLS port. Requests to a bare IP stay on HTTP, because the certificate only covers the name."
+                                 Foreground="{DynamicResource TextSecondaryBrush}" FontSize="11"
+                                 Margin="0,2,0,0" TextWrapping="Wrap"/>
+                    </StackPanel>
+                    <CheckBox Grid.Column="1" VerticalAlignment="Center"
+                              IsChecked="{Binding HttpsRedirect}"/>
+                  </Grid>
+
+                  <TextBlock Text="Reaching this from outside your network means anyone who guesses the master password can change this machine's firewall. A VPN or Tailscale is safer than forwarding a port; if you do forward one, forward only the HTTPS port."
+                             Foreground="{DynamicResource TextMutedBrush}" FontSize="11"
+                             Margin="0,14,0,0" TextWrapping="Wrap"/>
+                </StackPanel>
+              </Border>
+
+              <Border Classes="card">
+                <StackPanel>
                   <TextBlock Text="Alerting &amp; auto-block" FontWeight="Bold" FontSize="15"/>
                   <TextBlock Text="Get alerts off this machine, and stop block rules from piling up forever."
                              Foreground="{DynamicResource TextSecondaryBrush}" FontSize="12"

@@ -52,7 +52,9 @@ chmod +x "$PUBLISH_DIR/NetworkSentinel"
 # Install / uninstall helpers shipped inside the tarball
 cp "$ROOT/scripts/install-from-package.sh" "$STAGE/install.sh"
 cp "$ROOT/scripts/uninstall-from-package.sh" "$STAGE/uninstall.sh"
-chmod +x "$STAGE/install.sh" "$STAGE/uninstall.sh"
+# HTTPS setup: the console points at this script when a certificate is missing.
+cp "$ROOT/scripts/issue-duckdns-cert.sh" "$STAGE/issue-duckdns-cert.sh"
+chmod +x "$STAGE/install.sh" "$STAGE/uninstall.sh" "$STAGE/issue-duckdns-cert.sh"
 
 # systemd unit + env example
 mkdir -p "$STAGE/systemd"
@@ -119,6 +121,23 @@ Change web port
 ---------------
   sudoedit /etc/networksentinel/web.env     # set WEB_PORT=…
   sudo systemctl restart networksentinel-web
+
+HTTPS + remote access (0.5.0)
+-----------------------------
+  Run these as the user the service runs as — NOT under sudo, or the config
+  lands in root's home where the app never looks.
+
+    networksentinel --set-duckdns     # free hostname that follows your IP
+    ./issue-duckdns-cert.sh           # Let's Encrypt cert via DNS-01
+
+  Then turn HTTPS on under Settings -> Remote access (GUI or web console),
+  or run:  networksentinel -w --https --tls-cert PATH --tls-key PATH
+
+  HTTPS settings persist in settings.json, not web.env, so the systemd
+  service picks them up. Renewals are re-read without a restart.
+
+  Before forwarding a port: this console can change the firewall, so prefer
+  a VPN/Tailscale. If you do forward one, forward only the HTTPS port.
 
 Uninstall
 ---------

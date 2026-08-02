@@ -1,5 +1,6 @@
 using System.Collections.ObjectModel;
 using System.Diagnostics;
+using System.IO;
 using System.Reflection;
 using Avalonia.Threading;
 using CommunityToolkit.Mvvm.ComponentModel;
@@ -15,6 +16,7 @@ public partial class MainViewModel : ObservableObject, IDisposable
     private readonly FirewallService _firewall = new();
     private readonly AllowlistService _allowlist = new();
     private readonly DesktopNotifier _notifier = new();
+    private readonly DuckDnsUpdater _duckDns = new();
     private readonly AppSettings _settings;
     private readonly DispatcherTimer _clockTimer;
     private readonly object _autoBlockGate = new();
@@ -78,6 +80,20 @@ public partial class MainViewModel : ObservableObject, IDisposable
     [ObservableProperty] private string _honeypotPortsText = "2323,3389,5900";
     [ObservableProperty] private string _webhookUrl = "";
     [ObservableProperty] private string _selectedAutoBlockExpiry = "Never (permanent)";
+
+    // ── Remote access (web console HTTPS + DuckDNS) ────────────────────────────
+    // These configure the headless console (`--web`); this GUI only edits and
+    // persists them. The DuckDNS refresh does run here too, so the hostname stays
+    // current whenever either front-end is open.
+    [ObservableProperty] private bool _httpsEnabled;
+    [ObservableProperty] private string _httpsPortText = "18443";
+    [ObservableProperty] private string _tlsCertPath = "";
+    [ObservableProperty] private string _tlsKeyPath = "";
+    [ObservableProperty] private bool _httpsRedirect = true;
+    [ObservableProperty] private bool _duckDnsEnabled;
+    [ObservableProperty] private string _duckDnsDomain = "";
+    [ObservableProperty] private string _duckDnsToken = "";
+    [ObservableProperty] private string _remoteAccessStatus = "";
 
     /// <summary>Availability of the desktop notification channel (fixed at startup).</summary>
     public string CriticalAlertStatusText => _notifier.StatusText;
@@ -165,6 +181,20 @@ public partial class MainViewModel : ObservableObject, IDisposable
         _webhookUrl = _settings.WebhookUrl;
         _selectedAutoBlockExpiry = ExpiryMinutesToLabel(_settings.AutoBlockExpiryMinutes);
 
+        // Backing fields, not properties: assigning the property here would fire the
+        // OnChanged handlers below and re-save settings during construction.
+        _httpsEnabled = _settings.WebHttpsEnabled;
+        _httpsPortText = _settings.WebHttpsPort.ToString();
+        _tlsCertPath = _settings.WebTlsCertPath;
+        _tlsKeyPath = _settings.WebTlsKeyPath;
+        _httpsRedirect = _settings.WebHttpsRedirect;
+        _duckDnsEnabled = _duckDns.Config.Enabled;
+        _duckDnsDomain = _duckDns.Config.Domain;
+        _duckDnsToken = _duckDns.Config.Token;
+        if (_duckDns.Config.IsUsable)
+            _duckDns.Start();
+        _remoteAccessStatus = BuildRemoteAccessStatus();
+
         _firewall.Allowlist = _allowlist;
         _firewall.AutoBlockExpiry = ExpiryMinutesToSpan(_settings.AutoBlockExpiryMinutes);
         _firewall.StartExpirySweep();
@@ -204,6 +234,10 @@ public partial class MainViewModel : ObservableObject, IDisposable
             // Keep chrome fresh even between monitor polls (clock second tick).
             if (DateTime.Now.Second % 2 == 0)
                 UpdateStatusChrome();
+            // The DuckDNS half of this updates on its own schedule, so poll the
+            // cached parts rather than leaving a stale "refreshing…" on screen.
+            if (ShowSettings)
+                RefreshRemoteAccessStatus();
         };
         _clockTimer.Start();
         UpdateStatusChrome();
@@ -773,6 +807,181 @@ public partial class MainViewModel : ObservableObject, IDisposable
         _settings.ExfilMbPer10Min = mb;
         _settings.Save();
         SettingsMessage = $"Exfiltration alert threshold: {mb} MB / 10 min";
+    }
+
+    // ── Remote access (web console HTTPS + DuckDNS) ────────────────────────────
+
+    partial void OnHttpsEnabledChanged(bool value)
+    {
+        if (value && string.IsNullOrWhiteSpace(TlsCertPath))
+        {
+            SettingsMessage = "Choose a certificate first — run scripts/issue-duckdns-cert.sh to get one.";
+            HttpsEnabled = false;
+            return;
+        }
+
+        _settings.WebHttpsEnabled = value;
+        _settings.Save();
+        SettingsMessage = value
+            ? $"Web console HTTPS enabled on port {_settings.WebHttpsPort} — restart the web console to apply."
+            : "Web console HTTPS disabled — restart the web console to apply.";
+        RefreshRemoteAccessStatus(reloadCertificate: true);
+    }
+
+    partial void OnHttpsPortTextChanged(string value)
+    {
+        if (!int.TryParse(value?.Trim(), out var port) || port is < 1 or > 65535)
+        {
+            SettingsMessage = "HTTPS port must be a number between 1 and 65535.";
+            return;
+        }
+
+        _settings.WebHttpsPort = port;
+        _settings.Save();
+        SettingsMessage = $"Web console HTTPS port set to {port} — restart the web console to apply.";
+        RefreshRemoteAccessStatus(reloadCertificate: true);
+    }
+
+    partial void OnTlsCertPathChanged(string value) => ApplyTlsPath(certChanged: true, value);
+
+    partial void OnTlsKeyPathChanged(string value) => ApplyTlsPath(certChanged: false, value);
+
+    private void ApplyTlsPath(bool certChanged, string value)
+    {
+        var path = value?.Trim() ?? "";
+        if (path.Length > 0 && !File.Exists(path))
+        {
+            SettingsMessage = $"File not found: {path}";
+            return;
+        }
+
+        if (certChanged) _settings.WebTlsCertPath = path;
+        else _settings.WebTlsKeyPath = path;
+        _settings.Save();
+
+        if (_settings.WebTlsCertPath.Length == 0)
+        {
+            SettingsMessage = "Certificate cleared — the web console cannot serve HTTPS without one.";
+            RefreshRemoteAccessStatus(reloadCertificate: true);
+            return;
+        }
+
+        // Validate now rather than at the next console start, where a bad path
+        // means no console at all.
+        if (TlsCertificateProvider.TryLoad(_settings.WebTlsCertPath, _settings.WebTlsKeyPath,
+                _settings.WebTlsPfxPassword, out var cert, out var error))
+        {
+            SettingsMessage = $"Certificate OK — expires {cert!.NotAfter:yyyy-MM-dd}. " +
+                              "Restart the web console to apply.";
+            cert.Dispose();
+        }
+        else
+        {
+            SettingsMessage = $"Saved, but the certificate cannot be loaded yet: {error}";
+        }
+
+        RefreshRemoteAccessStatus(reloadCertificate: true);
+    }
+
+    partial void OnHttpsRedirectChanged(bool value)
+    {
+        _settings.WebHttpsRedirect = value;
+        _settings.Save();
+        SettingsMessage = value
+            ? "Plain-HTTP requests that arrive by hostname will redirect to HTTPS."
+            : "HTTP requests are served as-is (no HTTPS redirect).";
+    }
+
+    partial void OnDuckDnsEnabledChanged(bool value)
+    {
+        if (value && (DuckDnsDomain.Trim().Length == 0 || DuckDnsToken.Trim().Length == 0))
+        {
+            SettingsMessage = "Enter the DuckDNS subdomain and token first.";
+            DuckDnsEnabled = false;
+            return;
+        }
+
+        SettingsMessage = ApplyDuckDns();
+    }
+
+    partial void OnDuckDnsDomainChanged(string value) => SettingsMessage = ApplyDuckDns();
+
+    partial void OnDuckDnsTokenChanged(string value) => SettingsMessage = ApplyDuckDns();
+
+    private string ApplyDuckDns()
+    {
+        var status = _duckDns.Apply(new DuckDnsConfig
+        {
+            Enabled = DuckDnsEnabled,
+            Domain = DuckDnsUpdater.NormalizeDomain(DuckDnsDomain),
+            Token = DuckDnsToken.Trim(),
+            IntervalMinutes = _duckDns.Config.IntervalMinutes
+        });
+
+        RefreshRemoteAccessStatus();
+        return status;
+    }
+
+    /// <summary>Refresh the DuckDNS record immediately instead of waiting for the next cycle.</summary>
+    [RelayCommand]
+    private async Task UpdateDuckDnsNowAsync()
+    {
+        if (!_duckDns.Config.IsUsable)
+        {
+            SettingsMessage = "Enter the DuckDNS subdomain and token, then switch DuckDNS on.";
+            return;
+        }
+
+        SettingsMessage = "Updating DuckDNS…";
+        await _duckDns.UpdateOnceAsync();
+        SettingsMessage = _duckDns.Status;
+        RefreshRemoteAccessStatus();
+    }
+
+    /// <summary>
+    /// Cached HTTPS half of the remote-access status. Reading and parsing the certificate
+    /// is far too expensive to redo on the one-second clock tick, and it only changes when
+    /// one of these settings does.
+    /// </summary>
+    private string _httpsStatusPart = "";
+
+    private void RefreshRemoteAccessStatus(bool reloadCertificate = false)
+    {
+        if (reloadCertificate || _httpsStatusPart.Length == 0)
+            _httpsStatusPart = BuildHttpsStatusPart();
+
+        var parts = new List<string> { _httpsStatusPart, _duckDns.Status };
+        if (_duckDns.Config.IsUsable && _settings.WebHttpsEnabled)
+            parts.Add($"Console URL: https://{_duckDns.Hostname}:{_settings.WebHttpsPort}/");
+
+        var text = string.Join("  ·  ", parts);
+        if (text != RemoteAccessStatus)
+            RemoteAccessStatus = text;
+    }
+
+    private string BuildHttpsStatusPart()
+    {
+        if (!_settings.WebHttpsEnabled)
+            return "HTTPS off — the web console serves plain HTTP only.";
+
+        if (TlsCertificateProvider.TryLoad(_settings.WebTlsCertPath, _settings.WebTlsKeyPath,
+                _settings.WebTlsPfxPassword, out var cert, out var error))
+        {
+            var text = $"HTTPS ready on port {_settings.WebHttpsPort} — certificate expires {cert!.NotAfter:yyyy-MM-dd}.";
+            cert.Dispose();
+            return text;
+        }
+
+        return $"HTTPS enabled but the certificate cannot be loaded: {error}";
+    }
+
+    private string BuildRemoteAccessStatus()
+    {
+        _httpsStatusPart = BuildHttpsStatusPart();
+        var parts = new List<string> { _httpsStatusPart, _duckDns.Status };
+        if (_duckDns.Config.IsUsable && _settings.WebHttpsEnabled)
+            parts.Add($"Console URL: https://{_duckDns.Hostname}:{_settings.WebHttpsPort}/");
+        return string.Join("  ·  ", parts);
     }
 
     partial void OnHoneypotEnabledChanged(bool value)
@@ -1359,6 +1568,7 @@ public partial class MainViewModel : ObservableObject, IDisposable
         _monitor.Updated -= OnMonitorUpdated;
         _monitor.ThreatsDetected -= OnThreatsDetected;
         PersistSettings();
+        _duckDns.Dispose();
         _allowlist.Dispose();
         _monitor.Dispose();
     }

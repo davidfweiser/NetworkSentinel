@@ -83,6 +83,31 @@ public sealed class AppSettings
     /// </summary>
     public int AutoBlockExpiryMinutes { get; set; }
 
+    /// <summary>
+    /// Serve the web console over HTTPS in addition to HTTP. Needs <see cref="WebTlsCertPath"/>;
+    /// endpoint changes only take effect when the web console restarts.
+    /// </summary>
+    public bool WebHttpsEnabled { get; set; }
+
+    /// <summary>TCP port for the HTTPS endpoint. Ports below 1024 need root.</summary>
+    public int WebHttpsPort { get; set; } = 18443;
+
+    /// <summary>PEM fullchain (Let's Encrypt fullchain.cer) or a .pfx / .p12 bundle.</summary>
+    public string WebTlsCertPath { get; set; } = "";
+
+    /// <summary>PEM private key. Ignored for .pfx / .p12 certificates.</summary>
+    public string WebTlsKeyPath { get; set; } = "";
+
+    /// <summary>Password for a .pfx / .p12 certificate. Empty for PEM.</summary>
+    public string WebTlsPfxPassword { get; set; } = "";
+
+    /// <summary>
+    /// Redirect plain-HTTP requests to HTTPS when the request arrived by hostname.
+    /// Requests to a bare IP keep serving HTTP — the certificate only covers the name,
+    /// so redirecting those would trade a working page for a certificate warning.
+    /// </summary>
+    public bool WebHttpsRedirect { get; set; } = true;
+
     /// <summary>POST alerts to this webhook URL (ntfy / Slack / Discord / generic JSON). Empty = off.</summary>
     public string WebhookUrl { get; set; } = "";
 

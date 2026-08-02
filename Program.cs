@@ -40,9 +40,15 @@ internal static class Program
             return;
         }
 
+        if (WantsSetDuckDns(args))
+        {
+            RunSetDuckDns();
+            return;
+        }
+
         if (WantsWeb(args, out var webPort))
         {
-            RunWeb(webPort);
+            RunWeb(webPort, ParseTlsOptions(args));
             return;
         }
 
@@ -128,6 +134,180 @@ internal static class Program
         {
             Console.Error.WriteLine("Network Sentinel TUI failed:");
             Console.Error.WriteLine(ex);
+            Environment.Exit(1);
+        }
+    }
+
+    private static void RunWeb(int? port, WebTlsOptions? tls)
+    {
+        try
+        {
+            using var app = new WebApp(port, bindAll: true, tlsOverrides: tls);
+            app.RunAsync().GetAwaiter().GetResult();
+        }
+        catch (Exception ex)
+        {
+            LogCrash("web-host", ex);
+            Console.Error.WriteLine("Network Sentinel web UI failed:");
+            Console.Error.WriteLine(ex.Message);
+            if (ex.InnerException != null)
+                Console.Error.WriteLine(ex.InnerException.Message);
+            Environment.Exit(1);
+        }
+    }
+
+    /// <summary>
+    /// TLS flags for the web console. Values given here win over settings.json for this run
+    /// but are not persisted, so `--https` is safe to try without committing to it.
+    /// </summary>
+    private static WebTlsOptions? ParseTlsOptions(string[] args)
+    {
+        var o = new WebTlsOptions();
+
+        for (var i = 0; i < args.Length; i++)
+        {
+            var a = args[i];
+            string? Inline(string prefix)
+                => a.StartsWith(prefix + "=", StringComparison.Ordinal) ? a[(prefix.Length + 1)..] : null;
+            string? Next() => i + 1 < args.Length && !args[i + 1].StartsWith('-') ? args[++i] : null;
+
+            switch (a)
+            {
+                case "--https":
+                    o.Enabled = true;
+                    continue;
+                case "--no-https":
+                    o.Enabled = false;
+                    continue;
+                case "--https-port":
+                    if (int.TryParse(Next(), out var hp) && hp is >= 1 and <= 65535)
+                    {
+                        o.Enabled ??= true;
+                        o.Port = hp;
+                    }
+                    else
+                    {
+                        Fail("--https-port needs a port number, e.g. --https-port 18443");
+                    }
+                    continue;
+                case "--tls-cert":
+                    o.CertPath = Next() ?? Fail("--tls-cert needs a path to a PEM or .pfx certificate");
+                    o.Enabled ??= true;
+                    continue;
+                case "--tls-key":
+                    o.KeyPath = Next() ?? Fail("--tls-key needs a path to the PEM private key");
+                    continue;
+                case "--tls-password":
+                    o.PfxPassword = Next() ?? Fail("--tls-password needs the .pfx password");
+                    continue;
+            }
+
+            if (Inline("--https-port") is { } hpInline)
+            {
+                if (int.TryParse(hpInline, out var p) && p is >= 1 and <= 65535)
+                {
+                    o.Enabled ??= true;
+                    o.Port = p;
+                }
+                else
+                {
+                    Fail($"Invalid HTTPS port in '{a}'");
+                }
+            }
+            else if (Inline("--tls-cert") is { } cert)
+            {
+                o.CertPath = cert;
+                o.Enabled ??= true;
+            }
+            else if (Inline("--tls-key") is { } key)
+            {
+                o.KeyPath = key;
+            }
+            else if (Inline("--tls-password") is { } pw)
+            {
+                o.PfxPassword = pw;
+            }
+        }
+
+        return o.HasAny ? o : null;
+    }
+
+    private static string Fail(string message)
+    {
+        Console.Error.WriteLine(message);
+        Environment.Exit(2);
+        return "";
+    }
+
+    private static bool WantsSetDuckDns(string[] args)
+        => args.Any(a => a is "--set-duckdns" or "--duckdns");
+
+    /// <summary>
+    /// Interactive DuckDNS setup. The token is prompted for rather than passed as a flag so it
+    /// does not end up in shell history or the process list.
+    /// </summary>
+    private static void RunSetDuckDns()
+    {
+        try
+        {
+            var updater = new Services.DuckDnsUpdater();
+            var current = updater.Config;
+
+            Console.WriteLine("DuckDNS dynamic DNS — keeps a duckdns.org name pointed at this machine.");
+            Console.WriteLine($"Config file: {Path.Combine(Services.AppPaths.DataDirectory, "duckdns.json")}");
+            if (current.Domain.Length > 0)
+                Console.WriteLine($"Current subdomain: {current.Domain}.duckdns.org");
+            Console.WriteLine();
+
+            Console.Write("Subdomain (just the label, e.g. 'myhost'): ");
+            var domain = Services.DuckDnsUpdater.NormalizeDomain(Console.ReadLine() ?? "");
+            if (domain.Length == 0)
+            {
+                Console.Error.WriteLine("No subdomain entered — nothing changed.");
+                Environment.Exit(1);
+                return;
+            }
+
+            var token = ReadPassword("DuckDNS token (from duckdns.org, hidden): ");
+            if (string.IsNullOrWhiteSpace(token))
+            {
+                Console.Error.WriteLine("No token entered — nothing changed.");
+                Environment.Exit(1);
+                return;
+            }
+
+            var status = updater.Apply(new Services.DuckDnsConfig
+            {
+                Enabled = true,
+                Domain = domain,
+                Token = token.Trim(),
+                IntervalMinutes = current.IntervalMinutes <= 0 ? 5 : current.IntervalMinutes
+            });
+
+            Console.WriteLine();
+            Console.WriteLine("Testing the update…");
+            var ok = updater.UpdateOnceAsync().GetAwaiter().GetResult();
+            Console.WriteLine("  " + updater.Status);
+            updater.Dispose();
+
+            if (!ok)
+            {
+                Console.Error.WriteLine();
+                Console.Error.WriteLine("Saved, but DuckDNS rejected the update. Check the subdomain and token.");
+                Environment.Exit(1);
+                return;
+            }
+
+            Console.WriteLine();
+            Console.WriteLine($"Saved. The web console refreshes {domain}.duckdns.org every few minutes while it runs.");
+            Console.WriteLine("Next: issue a certificate with scripts/issue-duckdns-cert.sh, then start with --https.");
+            _ = status;
+        }
+        catch (Exception ex)
+        {
+            LogCrash("set-duckdns", ex);
+            Console.Error.WriteLine("Failed to configure DuckDNS:");
+            Console.Error.WriteLine(ex.Message);
             Environment.Exit(1);
         }
     }
@@ -294,24 +474,6 @@ internal static class Program
         }
     }
 
-    private static void RunWeb(int? port)
-    {
-        try
-        {
-            using var app = new WebApp(port);
-            app.RunAsync().GetAwaiter().GetResult();
-        }
-        catch (Exception ex)
-        {
-            LogCrash("web-host", ex);
-            Console.Error.WriteLine("Network Sentinel web UI failed:");
-            Console.Error.WriteLine(ex.Message);
-            if (ex.InnerException != null)
-                Console.Error.WriteLine(ex.InnerException.Message);
-            Environment.Exit(1);
-        }
-    }
-
     private static void LogCrash(string kind, Exception? ex)
     {
         try
@@ -437,7 +599,20 @@ internal static class Program
                                         terminal (no browser needed). Requires root:
                                         sudo networksentinel --set-master-password
                                         Restart the web service afterwards.
+              --set-duckdns      Configure DuckDNS dynamic DNS (subdomain + token, prompted).
+                                 The web service then keeps the record pointed here.
               -h, --help         Show this help
+
+            Web console over HTTPS (used with -w):
+              --https            Serve TLS as well as HTTP (needs a certificate)
+              --https-port PORT  TLS port (default 18443; below 1024 needs root)
+              --tls-cert PATH    PEM fullchain, or a .pfx / .p12 bundle
+              --tls-key PATH     PEM private key (omit for .pfx)
+              --tls-password PW  Password for a .pfx / .p12 certificate
+              --no-https         Force plain HTTP for this run
+                                 Flags override settings.json without overwriting it.
+                                 Get a trusted certificate for a duckdns.org name with:
+                                 scripts/issue-duckdns-cert.sh
 
             Environment:
               NETWORKSENTINEL_TUI=1              Force TUI
@@ -456,6 +631,8 @@ internal static class Program
               ./NetworkSentinel --tui
               ./NetworkSentinel -w
               ./NetworkSentinel -w 18765
+              ./NetworkSentinel -w --https --tls-cert ~/.acme.sh/myhost.duckdns.org_ecc/fullchain.cer \
+                                        --tls-key  ~/.acme.sh/myhost.duckdns.org_ecc/myhost.duckdns.org.key
             """);
     }
 

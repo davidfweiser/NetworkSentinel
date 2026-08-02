@@ -12,7 +12,7 @@ Three ways to run it:
 
 > Awareness / monitoring tooling — not a full IDS/IPS replacement.
 
-Linux port of the original Windows WPF Network Sentinel. Platform layers use `/proc/net`, `ss`, `nftables`/`iptables` (elevated via **pkexec**), and XDG data paths. Version **0.4.0**.
+Linux port of the original Windows WPF Network Sentinel. Platform layers use `/proc/net`, `ss`, `nftables`/`iptables` (elevated via **pkexec**), and XDG data paths. Version **0.5.0**.
 
 ---
 
@@ -88,9 +88,9 @@ Domains are DNS-resolved to current IPs. Auto-block never touches allowlisted IP
 | **Ports** | Local listeners; one-click **Block port** |
 | **Firewall** | Managed rules grouped as In/Out pairs; manual IP and port blocking; **Restore allowlisted** |
 | **Allowlist** | Add/remove trusted domains and IPs; refresh the feed |
-| **Settings** | Monitoring on/off, poll interval, geo lookups, auth-log and closed-port scan detection, the 0.4.0 detectors (threat intel, new-listener alerts, process reputation, ARP/gateway watch, startup-item watch, exfiltration threshold, honeypot ports), webhook URL, auto-block + minimum severity + expiry, block direction (in/out), allowlist feed, **change master password**, **Remove all rules** |
+| **Settings** | Monitoring on/off, poll interval, geo lookups, auth-log and closed-port scan detection, the 0.4.0 detectors (threat intel, new-listener alerts, process reputation, ARP/gateway watch, startup-item watch, exfiltration threshold, honeypot ports), **HTTPS + DuckDNS remote access**, webhook URL, auto-block + minimum severity + expiry, block direction (in/out), allowlist feed, **change master password**, **Remove all rules** |
 
-The page header shows the running version (e.g. `v0.4.0`) — check it after an upgrade to confirm the new build is live.
+The page header shows the running version (e.g. `v0.5.0`) — check it after an upgrade to confirm the new build is live.
 
 ### Web UI security
 - First browser visit **creates a master password** (min. 8 characters)
@@ -98,6 +98,45 @@ The page header shows the running version (e.g. `v0.4.0`) — check it after an 
 - Can't reach a browser yet (e.g. still opening the port in a cloud firewall)? Set/reset it from the terminal instead: `sudo networksentinel --set-master-password`
 - Hash stored as PBKDF2-SHA256 (random salt, 200k iterations) in `~/.local/share/NetworkSentinel/web-master.json` — never plain text
 - Session cookie until sign-out, browser close, or 12 hours idle
+- Failed attempts are throttled **per client IP**: five wrong guesses trigger a lockout that doubles with each further attempt (1 minute up to 1 hour), answered with `429` and a `Retry-After`. A fixed delay alone only slows one connection at a time — this caps a parallel guesser
+
+### HTTPS and remote access (0.5.0)
+
+The console is served by **Kestrel**, so it terminates TLS itself (`HttpListener` cannot). HTTP and HTTPS are served side by side: the LAN keeps working on plain HTTP while requests that arrive **by hostname** are redirected to TLS — requests to a bare IP are left alone, since the certificate only covers the name and redirecting an IP would trade a working page for a certificate warning.
+
+```bash
+networksentinel -w --https \
+    --tls-cert ~/.local/share/NetworkSentinel/tls/myhost.duckdns.org.fullchain.cer \
+    --tls-key  ~/.local/share/NetworkSentinel/tls/myhost.duckdns.org.key
+```
+
+| Flag | Meaning |
+|------|---------|
+| `--https` | Serve TLS in addition to HTTP |
+| `--https-port PORT` | TLS port (default **18443**; below 1024 needs root or `CAP_NET_BIND_SERVICE`) |
+| `--tls-cert PATH` | PEM fullchain, or a `.pfx` / `.p12` bundle |
+| `--tls-key PATH` | PEM private key (omit for `.pfx`) |
+| `--tls-password PW` | Password for a `.pfx` / `.p12` |
+| `--no-https` | Force plain HTTP for this run |
+
+Flags win over `settings.json` for that run **without overwriting it**, so `--https` is safe to try. The same values live under **Settings → Remote access** in *both* front-ends — the desktop app and the web console — so you never have to hand-edit a config file; endpoint changes take effect at the console's next restart. Certificate files are re-read when they change on disk (checked every 5 minutes), so an **ACME renewal applies without restarting** the console. Session cookies gain the `Secure` flag automatically when the request arrives over TLS.
+
+Under systemd, HTTPS and DuckDNS are **not** set in `web.env` — they persist in `settings.json`, so the service picks up whatever the GUI, TUI, or console saved. Only `WEB_PORT` lives in the env file.
+
+#### Free trusted certificate for a duckdns.org name
+
+[DuckDNS](https://www.duckdns.org) gives a free hostname that follows your public IP. The certificate comes from Let's Encrypt via a **DNS-01** challenge — proving control by writing a TXT record through the DuckDNS API, so **nothing has to be reachable on port 80**.
+
+```bash
+networksentinel --set-duckdns                 # subdomain + token (token is prompted, not a flag)
+./scripts/issue-duckdns-cert.sh               # installs acme.sh if needed, issues + installs the cert
+```
+
+Run both as your normal user — **not** under `sudo`. They write into *your* `~/.local/share/NetworkSentinel` (or `$XDG_DATA_HOME`), which is where the GUI and the console read from; under `sudo` the files would land in root's home instead and be invisible to the app.
+
+The token is stored in `~/.local/share/NetworkSentinel/duckdns.json` with mode `0600`, is **never sent to the browser** (the settings page shows only whether one is saved), and is prompted for rather than passed as a flag so it stays out of shell history and the process list. While the console runs it refreshes the A record every 5 minutes. `acme.sh` installs its own renewal cron entry.
+
+> **Before you forward a port.** This console can add and remove firewall rules on this machine, and anyone who guesses the master password gets that control. A VPN or [Tailscale](https://tailscale.com) is the safer way to reach it from outside — `tailscale serve` even supplies a valid certificate with no port-forwarding at all. If you do forward a port, forward **only** the HTTPS one and use a long unique password.
 
 ---
 
@@ -137,6 +176,8 @@ Build on a machine with the .NET SDK; install on the server **without** .NET:
 | `--web-service` | **Installer only** (`*.install.sh` / `install.sh`) | Install app **and** enable systemd auto-start |
 | `-w` / `--web` | **App** (`networksentinel`) | Run headless web UI in the foreground |
 | `--tui` | **App** | Terminal UI |
+| `--https` (+ `--tls-cert` / `--tls-key`) | **App**, with `-w` | Serve the console over TLS — see [HTTPS and remote access](#https-and-remote-access-050) |
+| `--set-duckdns` | **App** | Configure the DuckDNS hostname (run as your normal user, **not** `sudo`) |
 
 `--web-service` is **not** a runtime flag for `networksentinel`. If install prints `Unknown option: --web-service`, your package is too old — rebuild with `./scripts/package.sh` and copy the new installer, or use [manual auto-start](#auto-start-on-boot-systemd) below.
 
@@ -144,17 +185,17 @@ Build on a machine with the .NET SDK; install on the server **without** .NET:
 
 ```bash
 # build machine
-scp dist/networksentinel-0.4.0-linux-x64.install.sh user@server:
+scp dist/networksentinel-0.5.0-linux-x64.install.sh user@server:
 
 # server
-chmod +x networksentinel-0.4.0-linux-x64.install.sh
-sudo ./networksentinel-0.4.0-linux-x64.install.sh --web-service
+chmod +x networksentinel-0.5.0-linux-x64.install.sh
+sudo ./networksentinel-0.5.0-linux-x64.install.sh --web-service
 ```
 
 Confirm the installer is current before using root:
 
 ```bash
-./networksentinel-0.4.0-linux-x64.install.sh --help
+./networksentinel-0.5.0-linux-x64.install.sh --help
 # Should list: --web-service
 ```
 
@@ -190,8 +231,8 @@ sudo ./….install.sh --web-service --port 18765
 ./….install.sh --user --web-service         # user systemd unit
 
 # classic tarball
-tar xzf networksentinel-0.4.0-linux-x64.tar.gz
-cd networksentinel-0.4.0-linux-x64
+tar xzf networksentinel-0.5.0-linux-x64.tar.gz
+cd networksentinel-0.5.0-linux-x64
 sudo ./install.sh --web-service
 ```
 
@@ -263,7 +304,7 @@ sudo networksentinel-uninstall
 | `/usr/local/bin/networksentinel-web` | Web UI helper |
 | `/etc/systemd/system/networksentinel-web.service` | Auto-start unit |
 | `/etc/networksentinel/web.env` | `WEB_PORT` for systemd |
-| `~/.local/share/NetworkSentinel/` | Settings, allowlist, master-password hash, firewall ledger, `host-history.json` (known peers + listener baseline), `threat-log.jsonl`, `threat-intel-cache.json` |
+| `~/.local/share/NetworkSentinel/` | Settings, allowlist, master-password hash, firewall ledger, `host-history.json` (known peers + listener baseline), `threat-log.jsonl`, `threat-intel-cache.json`, `duckdns.json` (`0600`), `tls/` (certificate + key) |
 
 Set or reset the web master password (requires root — resolves the real service user via `SUDO_USER`, not root's own home):
 
@@ -445,11 +486,28 @@ The GUI **Settings** view groups the same options the web console exposes:
 |-------|---------|
 | **Monitoring** | Live monitoring on/off, poll interval, geo lookups, auth-log monitoring, closed-port scan detection, Critical desktop notifications |
 | **Intrusion detection** | Threat-intel blocklists, new-listener alerts, process reputation, ARP/gateway watch, startup-item watch, exfiltration threshold (MB / 10 min), honeypot decoy ports |
+| **Remote access (web console)** | DuckDNS subdomain + token, HTTPS on/off and TLS port, certificate and key paths, HTTP→HTTPS redirect, **Update now** |
 | **Alerting & auto-block** | Webhook URL, auto-block expiry |
 | **Allowlist** | Remote allowlist feed |
 | **Data** | Where settings, allowlist, and the master-password hash live |
 
 Each toggle shows a live status line underneath (e.g. why auth-log monitoring is unavailable, or which honeypot ports actually bound), so a feature that can't run says so instead of failing silently.
+
+#### Remote access from the desktop Settings (0.5.0)
+
+**Settings → Remote access (web console)** configures HTTPS and DuckDNS without touching a config file or the command line:
+
+| Field | What goes in it |
+|-------|-----------------|
+| **DuckDNS subdomain** | Just the label — `myhost`, not `myhost.duckdns.org`. The switch arms the 5-minute refresh. |
+| **DuckDNS token** | Your token from duckdns.org, masked as you type. **Update now** tests it immediately and reports the result. |
+| **Serve the console over HTTPS** | On/off, with the TLS port beside it |
+| **Certificate** / **Private key** | The two paths printed by `scripts/issue-duckdns-cert.sh`, validated as you enter them |
+| **Redirect HTTP to HTTPS** | On by default |
+
+A status line at the top of the card shows certificate expiry, the live DuckDNS result, and the full console URL once both halves are configured. Certificate and port changes apply the next time the **web console** starts — the desktop app doesn't serve anything itself — but the **DuckDNS refresh runs in the desktop app too**, so the hostname stays current whenever either front-end is open.
+
+The token is written to `duckdns.json` (mode `0600`), not `settings.json`; the GUI, TUI, and web console all read the same file.
 
 ### Settings keys
 
@@ -471,6 +529,12 @@ All three UIs write the same `~/.local/share/NetworkSentinel/settings.json`, so 
 | `ExfilMbPer10Min` | `250` | Exfiltration alert threshold, MB per 10 minutes |
 | `HoneypotEnabled` | `false` | Bind decoy TCP ports |
 | `HoneypotPorts` | `"2323,3389,5900"` | Which ports to decoy (busy ones are skipped) |
+| `WebHttpsEnabled` | `false` | Serve the console over TLS as well as HTTP (needs `WebTlsCertPath`) |
+| `WebHttpsPort` | `18443` | TLS port; below 1024 needs root or `CAP_NET_BIND_SERVICE` |
+| `WebTlsCertPath` | `""` | PEM fullchain, or a `.pfx` / `.p12` bundle |
+| `WebTlsKeyPath` | `""` | PEM private key (leave empty for `.pfx`) |
+| `WebTlsPfxPassword` | `""` | Password for a `.pfx` / `.p12` |
+| `WebHttpsRedirect` | `true` | Redirect hostname requests to HTTPS (bare-IP requests stay on HTTP) |
 | `WebhookUrl` | `""` | Push alerts to ntfy / Slack / Discord / generic JSON; empty disables |
 | `WebhookMinLevel` | `"Critical"` | Minimum severity that fires the webhook |
 | `AutoBlockEnabled` | `false` | Create firewall rules automatically |
@@ -532,10 +596,14 @@ All three UIs write the same `~/.local/share/NetworkSentinel/settings.json`, so 
 | `Services/FirewallService.cs` | nftables / iptables via pkexec; rule ledger; auto-block expiry sweep |
 | `Services/AppSettings.cs` / `AppPaths.cs` | XDG data dir + JSON settings |
 | `Services/DialogService.cs` | Avalonia confirm/info dialogs |
-| `ViewModels/MainViewModel.cs` | UI state, commands, auto-block wiring |
+| `ViewModels/MainViewModel.cs` | UI state, commands, auto-block wiring, Settings view (incl. Remote access) |
 | `MainWindow.axaml` | Avalonia dashboard UI |
 | `Tui/TuiApp.cs` | Spectre.Console terminal UI (`--tui`) |
-| `Web/WebApp.cs` | Headless browser UI (`-w` / `--web`) |
+| `Web/WebApp.cs` | Headless browser UI (`-w` / `--web`, Kestrel) |
+| `Services/TlsCertificateProvider.cs` | Loads the console's PEM/PFX certificate; hot-reloads on renewal |
+| `Services/DuckDnsUpdater.cs` | DuckDNS dynamic-DNS refresh; token stored `0600` |
+| `Services/LoginThrottle.cs` | Per-IP lockout for the console's password endpoints |
+| `scripts/issue-duckdns-cert.sh` | Let's Encrypt DNS-01 issuance for a duckdns.org name |
 | `Web/WebAuthStore.cs` | Master password hash + session tokens |
 | `scripts/package.sh` | Build self-contained tarball + `.install.sh` |
 | `scripts/install-from-package.sh` | Server/desktop installer (shipped as `install.sh`) |
