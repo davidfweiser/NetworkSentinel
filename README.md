@@ -174,6 +174,8 @@ Build on a machine with the .NET SDK; install on the server **without** .NET:
 | Flag | Used with | Meaning |
 |------|-----------|---------|
 | `--web-service` | **Installer only** (`*.install.sh` / `install.sh`) | Install app **and** enable systemd auto-start |
+| `--desktop-shortcut` | **Installer only** | Also drop an icon on the Desktop (opt-in; desktops only) |
+| `--no-desktop` | **Installer only** | Skip the application-menu entry entirely |
 | `-w` / `--web` | **App** (`networksentinel`) | Run headless web UI in the foreground |
 | `--tui` | **App** | Terminal UI |
 | `--https` (+ `--tls-cert` / `--tls-key`) | **App**, with `-w` | Serve the console over TLS — see [HTTPS and remote access](#https-and-remote-access-050) |
@@ -229,6 +231,7 @@ sudo ./….install.sh                         # app only (no systemd)
 sudo ./….install.sh --web-service --port 18765
 ./….install.sh --user                       # ~/.local (no root)
 ./….install.sh --user --web-service         # user systemd unit
+./….install.sh --user --desktop-shortcut    # ~/.local + icon on the Desktop
 
 # classic tarball
 tar xzf networksentinel-0.5.0-linux-x64.tar.gz
@@ -465,6 +468,21 @@ update-desktop-database ~/.local/share/applications 2>/dev/null || true
 ```
 
 Optional desktop entry is provided as `networksentinel.desktop` (`Icon=networksentinel`). The server installer can install it under the chosen prefix.
+
+### Desktop shortcut
+
+The installer writes an application-menu entry by default. Add `--desktop-shortcut` to also drop an icon on the Desktop:
+
+```bash
+./install.sh --user --desktop-shortcut
+```
+
+It is opt-in because a server has no Desktop directory and no use for an icon; `--no-desktop` skips the menu entry as well. The shortcut is a copy of the menu entry, so its `Exec=` already points at the installed launcher (`<bindir>/networksentinel`) rather than a build directory — a hand-written `.desktop` pointing into a source tree keeps launching whatever is left in `bin/` after an upgrade.
+
+Two things the installer handles that a plain `cp` does not:
+
+- GNOME and COSMIC ignore a desktop file that is not **both** executable and marked trusted — it shows as an inert text file. The installer sets `chmod +x` and `gio set … metadata::trusted true`.
+- Under `sudo` the icon goes to `SUDO_USER`'s Desktop, not root's. `xdg-user-dir DESKTOP` is consulted first, so a localised or relocated Desktop still works.
 
 ---
 

@@ -99,6 +99,7 @@ Other install options
   sudo ./install.sh --web-service --port 18765
   ./install.sh --user                        # no root → ~/.local
   ./install.sh --user --web-service          # user systemd unit
+  ./install.sh --user --desktop-shortcut     # also put an icon on the Desktop
   sudo ./install.sh --prefix /opt
 
 One-file installer (if you have ${NAME}.install.sh)
