@@ -127,10 +127,22 @@ Under systemd, HTTPS and DuckDNS are **not** set in `web.env` — they persist i
 
 [DuckDNS](https://www.duckdns.org) gives a free hostname that follows your public IP. The certificate comes from Let's Encrypt via a **DNS-01** challenge — proving control by writing a TXT record through the DuckDNS API, so **nothing has to be reachable on port 80**.
 
+Easiest route is the GUI: fill in the subdomain and token under **Settings → Remote access**, then press **Issue certificate**. It runs the same script below and fills the two path fields in for you. From a terminal:
+
 ```bash
 networksentinel --set-duckdns                 # subdomain + token (token is prompted, not a flag)
 ./scripts/issue-duckdns-cert.sh               # installs acme.sh if needed, issues + installs the cert
 ```
+
+Entering the subdomain and token only sets up **dynamic DNS** — it keeps the name pointed at your current IP. Issuing the certificate is a separate step, whether you press the button or run the script.
+
+The script is non-interactive when it has everything it needs, which is how the button drives it:
+
+```bash
+NS_ASSUME_YES=1 NS_ACME_EMAIL=you@example.com ./scripts/issue-duckdns-cert.sh myhost
+```
+
+`NS_ACME_EMAIL` is only used the first time, to register the Let's Encrypt account when `acme.sh` is installed. Without a terminal the script never prompts — anything missing is a clear error instead of a hang.
 
 Run both as your normal user — **not** under `sudo`. They write into *your* `~/.local/share/NetworkSentinel` (or `$XDG_DATA_HOME`), which is where the GUI and the console read from; under `sudo` the files would land in root's home instead and be invisible to the app.
 
@@ -520,8 +532,11 @@ Each toggle shows a live status line underneath (e.g. why auth-log monitoring is
 | **DuckDNS subdomain** | Just the label — `myhost`, not `myhost.duckdns.org`. The switch arms the 5-minute refresh. |
 | **DuckDNS token** | Your token from duckdns.org, masked as you type. **Update now** tests it immediately and reports the result. |
 | **Serve the console over HTTPS** | On/off, with the TLS port beside it |
-| **Certificate** / **Private key** | The two paths printed by `scripts/issue-duckdns-cert.sh`, validated as you enter them |
+| **Issue certificate** | Gets a free Let's Encrypt certificate for the DuckDNS name above and **fills in the two paths below**. The email box beside it is only used the first time, to register the account when `acme.sh` is installed. |
+| **Certificate** / **Private key** | Filled in by **Issue certificate**; still editable if your certificate lives elsewhere. Validated as you enter them |
 | **Redirect HTTP to HTTPS** | On by default |
+
+**Issue certificate** shells out to `issue-duckdns-cert.sh` — the installer puts a copy beside the binary so it works without a source tree. It runs the script non-interactively, so it needs the subdomain and token saved first; issuance waits on DNS propagation and takes a few minutes, during which the button reads *Issuing…*. Failures report the script's own error rather than an exit code. The button is **GUI-only** — the web console still points you at the script, since letting a browser session trigger a shell script that downloads and runs an installer is a different security proposition.
 
 A status line at the top of the card shows certificate expiry, the live DuckDNS result, and the full console URL once both halves are configured. Certificate and port changes apply the next time the **web console** starts — the desktop app doesn't serve anything itself — but the **DuckDNS refresh runs in the desktop app too**, so the hostname stays current whenever either front-end is open.
 
@@ -553,6 +568,7 @@ All three UIs write the same `~/.local/share/NetworkSentinel/settings.json`, so 
 | `WebTlsKeyPath` | `""` | PEM private key (leave empty for `.pfx`) |
 | `WebTlsPfxPassword` | `""` | Password for a `.pfx` / `.p12` |
 | `WebHttpsRedirect` | `true` | Redirect hostname requests to HTTPS (bare-IP requests stay on HTTP) |
+| `AcmeAccountEmail` | `""` | Address the Let's Encrypt account is registered against; first issuance only |
 | `WebhookUrl` | `""` | Push alerts to ntfy / Slack / Discord / generic JSON; empty disables |
 | `WebhookMinLevel` | `"Critical"` | Minimum severity that fires the webhook |
 | `AutoBlockEnabled` | `false` | Create firewall rules automatically |
@@ -620,6 +636,7 @@ All three UIs write the same `~/.local/share/NetworkSentinel/settings.json`, so 
 | `Web/WebApp.cs` | Headless browser UI (`-w` / `--web`, Kestrel) |
 | `Services/TlsCertificateProvider.cs` | Loads the console's PEM/PFX certificate; hot-reloads on renewal |
 | `Services/DuckDnsUpdater.cs` | DuckDNS dynamic-DNS refresh; token stored `0600` |
+| `Services/CertIssuanceService.cs` | Runs the issuance script for the Settings **Issue certificate** button |
 | `Services/LoginThrottle.cs` | Per-IP lockout for the console's password endpoints |
 | `scripts/issue-duckdns-cert.sh` | Let's Encrypt DNS-01 issuance for a duckdns.org name |
 | `Web/WebAuthStore.cs` | Master password hash + session tokens |

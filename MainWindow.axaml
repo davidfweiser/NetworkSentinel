@@ -752,10 +752,27 @@
                               IsChecked="{Binding HttpsEnabled}"/>
                   </Grid>
 
+                  <Grid ColumnDefinitions="*,Auto,Auto" Margin="0,0,0,14">
+                    <StackPanel Margin="0,0,16,0">
+                      <TextBlock Text="Issue certificate" FontWeight="Bold" FontSize="13"/>
+                      <TextBlock Text="Get a free trusted Let's Encrypt certificate for your duckdns.org name. Proves control through the DuckDNS token above, so nothing needs to be reachable on port 80. Takes a few minutes waiting on DNS, then fills in the two paths below. Renewals are automatic."
+                                 Foreground="{DynamicResource TextSecondaryBrush}" FontSize="11"
+                                 Margin="0,2,0,0" TextWrapping="Wrap"/>
+                      <TextBlock Text="First run only: installs acme.sh and registers a Let's Encrypt account with the email beside it."
+                                 Foreground="{DynamicResource TextMutedBrush}" FontSize="11"
+                                 Margin="0,4,0,0" TextWrapping="Wrap"/>
+                    </StackPanel>
+                    <TextBox Grid.Column="1" Width="200" VerticalAlignment="Center" Margin="0,0,12,0"
+                             Text="{Binding AcmeEmail}" Watermark="you@example.com"/>
+                    <Button Grid.Column="2" Classes="primary" VerticalAlignment="Center" MinWidth="130"
+                            Content="{Binding IsIssuingCertificate, Converter={StaticResource IssueCertText}}"
+                            Command="{Binding IssueCertificateCommand}"/>
+                  </Grid>
+
                   <Grid ColumnDefinitions="*,Auto" Margin="0,0,0,14">
                     <StackPanel Margin="0,0,16,0">
                       <TextBlock Text="Certificate (PEM fullchain or .pfx)" FontWeight="Bold" FontSize="13"/>
-                      <TextBlock Text="Get a free trusted certificate for your duckdns.org name by running scripts/issue-duckdns-cert.sh — it prints the two paths to paste here. Renewals are picked up automatically."
+                      <TextBlock Text="Filled in by Issue certificate; edit it if your certificate lives somewhere else."
                                  Foreground="{DynamicResource TextSecondaryBrush}" FontSize="11"
                                  Margin="0,2,0,0" TextWrapping="Wrap"/>
                     </StackPanel>

@@ -16,6 +16,7 @@
       <conv:ThreatLevelToBrushConverter x:Key="ThreatBrush"/>
       <conv:BoolToVisibilityConverter x:Key="BoolToVis"/>
       <conv:MonitoringToTextConverter x:Key="MonitorText"/>
+      <conv:IssuingToTextConverter x:Key="IssueCertText"/>
       <conv:InvertBoolConverter x:Key="InvertBool"/>
       <conv:StringNotEmptyConverter x:Key="NotEmpty"/>
       <FontFamily x:Key="AppFont">Inter, Ubuntu, Cantarell, sans-serif</FontFamily>

@@ -108,6 +108,12 @@ public sealed class AppSettings
     /// </summary>
     public bool WebHttpsRedirect { get; set; } = true;
 
+    /// <summary>
+    /// Address the Let's Encrypt account is registered against. Only read the first time
+    /// acme.sh is installed; kept so a retry does not ask for it again. Not a credential.
+    /// </summary>
+    public string AcmeAccountEmail { get; set; } = "";
+
     /// <summary>POST alerts to this webhook URL (ntfy / Slack / Discord / generic JSON). Empty = off.</summary>
     public string WebhookUrl { get; set; } = "";
 

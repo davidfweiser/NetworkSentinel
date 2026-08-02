@@ -95,6 +95,12 @@ public partial class MainViewModel : ObservableObject, IDisposable
     [ObservableProperty] private string _duckDnsToken = "";
     [ObservableProperty] private string _remoteAccessStatus = "";
 
+    /// <summary>Registered with Let's Encrypt the first time acme.sh is installed; unused after that.</summary>
+    [ObservableProperty] private string _acmeEmail = "";
+
+    /// <summary>True while the issuance script runs — disables the button and drives the spinner text.</summary>
+    [ObservableProperty] private bool _isIssuingCertificate;
+
     /// <summary>Availability of the desktop notification channel (fixed at startup).</summary>
     public string CriticalAlertStatusText => _notifier.StatusText;
 
@@ -191,6 +197,7 @@ public partial class MainViewModel : ObservableObject, IDisposable
         _duckDnsEnabled = _duckDns.Config.Enabled;
         _duckDnsDomain = _duckDns.Config.Domain;
         _duckDnsToken = _duckDns.Config.Token;
+        _acmeEmail = _settings.AcmeAccountEmail;
         if (_duckDns.Config.IsUsable)
             _duckDns.Start();
         _remoteAccessStatus = BuildRemoteAccessStatus();
@@ -904,6 +911,12 @@ public partial class MainViewModel : ObservableObject, IDisposable
         SettingsMessage = ApplyDuckDns();
     }
 
+    partial void OnAcmeEmailChanged(string value)
+    {
+        _settings.AcmeAccountEmail = value.Trim();
+        _settings.Save();
+    }
+
     partial void OnDuckDnsDomainChanged(string value) => SettingsMessage = ApplyDuckDns();
 
     partial void OnDuckDnsTokenChanged(string value) => SettingsMessage = ApplyDuckDns();
@@ -937,6 +950,64 @@ public partial class MainViewModel : ObservableObject, IDisposable
         SettingsMessage = _duckDns.Status;
         RefreshRemoteAccessStatus();
     }
+
+    /// <summary>
+    /// Issue a Let's Encrypt certificate for the saved DuckDNS name by running
+    /// scripts/issue-duckdns-cert.sh, then point the console at what it produced.
+    /// </summary>
+    [RelayCommand(CanExecute = nameof(CanIssueCertificate))]
+    private async Task IssueCertificateAsync()
+    {
+        var domain = DuckDnsUpdater.NormalizeDomain(DuckDnsDomain);
+        if (domain.Length == 0 || DuckDnsToken.Trim().Length == 0)
+        {
+            SettingsMessage = "Enter the DuckDNS subdomain and token first — issuance proves control through them.";
+            return;
+        }
+
+        // The token is masked in the UI; the real one lives in duckdns.json.
+        var token = _duckDns.Config.Token;
+        if (token.Length == 0)
+        {
+            SettingsMessage = "No DuckDNS token saved yet — enter one first.";
+            return;
+        }
+
+        IsIssuingCertificate = true;
+        IssueCertificateCommand.NotifyCanExecuteChanged();
+        SettingsMessage = $"Issuing a certificate for {domain}.duckdns.org — this waits on DNS propagation and can take a few minutes…";
+
+        try
+        {
+            var result = await CertIssuanceService.IssueAsync(domain, token, AcmeEmail);
+            _lastIssuanceOutput = result.Output;
+
+            if (result.Success)
+            {
+                // Fill the paths in for the user; both fields stay editable.
+                TlsCertPath = result.CertPath;
+                if (result.KeyPath.Length > 0)
+                    TlsKeyPath = result.KeyPath;
+
+                SettingsMessage = $"{result.Message} Paths filled in below — switch HTTPS on, then restart the web console.";
+            }
+            else
+            {
+                SettingsMessage = result.Message;
+            }
+        }
+        finally
+        {
+            IsIssuingCertificate = false;
+            IssueCertificateCommand.NotifyCanExecuteChanged();
+            RefreshRemoteAccessStatus(reloadCertificate: true);
+        }
+    }
+
+    private bool CanIssueCertificate() => !IsIssuingCertificate;
+
+    /// <summary>Full output of the last issuance, so a failure can be inspected.</summary>
+    private string _lastIssuanceOutput = "";
 
     /// <summary>
     /// Cached HTTPS half of the remote-access status. Reading and parsing the certificate

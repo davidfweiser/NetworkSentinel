@@ -10,9 +10,19 @@
 #   ./scripts/issue-duckdns-cert.sh myhost                # subdomain as an argument
 #   DuckDNS_Token=xxxx ./scripts/issue-duckdns-cert.sh myhost
 #
+# Non-interactive (this is how the desktop app's "Issue certificate" button runs it —
+# there is no terminal to answer prompts on, so anything missing is an error, not a read):
+#   NS_ASSUME_YES=1 NS_ACME_EMAIL=you@example.com ./scripts/issue-duckdns-cert.sh myhost
+#
 # Renewal: acme.sh installs its own cron entry. The console re-reads the files when
 # they change, so a renewal applies without restarting it.
 set -euo pipefail
+
+# No TTY means nothing can answer a prompt; treat it as non-interactive so a
+# missing value fails with a message instead of hanging on a read forever.
+NS_ASSUME_YES="${NS_ASSUME_YES:-0}"
+[[ -t 0 ]] || NS_ASSUME_YES=1
+interactive() { [[ "$NS_ASSUME_YES" != "1" ]]; }
 
 # Mirrors AppPaths.DataDirectory: XDG_DATA_HOME, else ~/.local/share.
 DATA_DIR="${XDG_DATA_HOME:-${HOME}/.local/share}/NetworkSentinel"
@@ -38,6 +48,7 @@ except Exception:
 fi
 
 if [[ -z "$DOMAIN_LABEL" ]]; then
+  interactive || die "no DuckDNS subdomain — pass it as an argument or save one first"
   read -r -p "DuckDNS subdomain (just the label, e.g. 'myhost'): " DOMAIN_LABEL
 fi
 
@@ -62,6 +73,7 @@ except Exception:
 fi
 
 if [[ -z "${DuckDNS_Token:-}" ]]; then
+  interactive || die "no DuckDNS token saved — set one in Settings or with --set-duckdns"
   read -r -s -p "DuckDNS token (hidden): " DuckDNS_Token
   echo
 fi
@@ -73,11 +85,23 @@ if [[ ! -x "$ACME" ]]; then
   say ""
   say "acme.sh is not installed (looked for ${ACME})."
   say "It is a shell ACME client; the installer writes to ~/.acme.sh and adds a renewal cron entry."
-  read -r -p "Install it now from https://get.acme.sh? [y/N] " reply
-  [[ "$reply" =~ ^[Yy]$ ]] || die "acme.sh is required — install it and re-run"
 
-  read -r -p "Email for Let's Encrypt expiry notices: " ACCOUNT_EMAIL
+  if interactive; then
+    read -r -p "Install it now from https://get.acme.sh? [y/N] " reply
+    [[ "$reply" =~ ^[Yy]$ ]] || die "acme.sh is required — install it and re-run"
+  else
+    say "Installing it now (NS_ASSUME_YES)."
+  fi
+
+  ACCOUNT_EMAIL="${NS_ACME_EMAIL:-}"
+  if [[ -z "$ACCOUNT_EMAIL" ]]; then
+    # Let's Encrypt registers the account against this address; there is no way to
+    # skip it on first run, so fail with the fix rather than registering a fake one.
+    interactive || die "acme.sh is not installed yet and no email was given — set NS_ACME_EMAIL to register the Let's Encrypt account"
+    read -r -p "Email for Let's Encrypt expiry notices: " ACCOUNT_EMAIL
+  fi
   [[ -n "$ACCOUNT_EMAIL" ]] || die "an email is required to register an ACME account"
+
   curl -fsSL https://get.acme.sh | sh -s "email=${ACCOUNT_EMAIL}"
   [[ -x "$ACME" ]] || die "acme.sh install did not produce ${ACME}"
 fi
@@ -107,6 +131,14 @@ KEY_FILE="${TLS_DIR}/${FQDN}.key"
   --key-file "$KEY_FILE"
 
 chmod 600 "$KEY_FILE"
+
+# Machine-readable result for the desktop app, which fills the two path fields in
+# Settings from these lines. Only emitted when driven non-interactively, so the
+# hand-run output stays prose.
+if ! interactive; then
+  printf 'NS_CERT_FILE=%s\n' "$CERT_FILE"
+  printf 'NS_KEY_FILE=%s\n' "$KEY_FILE"
+fi
 
 say ""
 say "Certificate installed:"

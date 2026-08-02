@@ -144,6 +144,14 @@ find "$LIBDIR" -mindepth 1 -maxdepth 1 -exec rm -rf {} + 2>/dev/null || true
 cp -a "${APP_SRC}/." "$LIBDIR/"
 chmod +x "$LIBDIR/NetworkSentinel"
 
+# Certificate helper lives beside the binary: Settings → Remote access shells out
+# to it for the "Issue certificate" button, and it has to exist after an install
+# where no source tree is present.
+if [[ -f "${PKG_ROOT}/issue-duckdns-cert.sh" ]]; then
+  cp "${PKG_ROOT}/issue-duckdns-cert.sh" "${LIBDIR}/issue-duckdns-cert.sh"
+  chmod +x "${LIBDIR}/issue-duckdns-cert.sh"
+fi
+
 # Record layout for uninstall
 cat > "$META" <<EOF
 MODE=${MODE}
