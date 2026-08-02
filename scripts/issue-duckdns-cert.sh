@@ -112,12 +112,30 @@ say "DuckDNS TXT records take a couple of minutes to propagate — this is not s
 say ""
 
 # --dnssleep: DuckDNS is slower to publish TXT records than acme.sh's default probe allows.
-"$ACME" --issue \
-  --dns dns_duckdns \
-  -d "$FQDN" \
-  --server letsencrypt \
-  --dnssleep 120 \
-  --keylength ec-256 || die "certificate issuance failed (see the acme.sh output above)"
+# NS_FORCE_RENEW re-issues a certificate that is still current, which Let's Encrypt
+# rate-limits — so it is opt-in rather than the default.
+ISSUE_ARGS=(--issue --dns dns_duckdns -d "$FQDN" --server letsencrypt --dnssleep 120 --keylength ec-256)
+# An `if`, not `[[ ]] && …`: under `set -e` a false test on the last command of an
+# AND-list aborts the script.
+if [[ "${NS_FORCE_RENEW:-0}" == "1" ]]; then
+  ISSUE_ARGS+=(--force)
+fi
+
+set +e
+"$ACME" "${ISSUE_ARGS[@]}"
+ISSUE_RC=$?
+set -e
+
+# acme.sh exits 2 when the certificate is still valid and it skipped the renewal.
+# Nothing failed — the certificate exists, and the console still needs it copied
+# into place, so carry on to --install-cert instead of treating this as an error.
+if [[ $ISSUE_RC -eq 2 ]]; then
+  say ""
+  say "Certificate is still current, so acme.sh skipped renewal — installing the existing one."
+  say "Re-issue early with NS_FORCE_RENEW=1 (Let's Encrypt rate-limits this, so only when needed)."
+elif [[ $ISSUE_RC -ne 0 ]]; then
+  die "certificate issuance failed (see the acme.sh output above)"
+fi
 
 # --- Install where the console reads it ------------------------------------
 mkdir -p "$TLS_DIR"

@@ -633,6 +633,7 @@ public sealed class WebApp : IDisposable
     // hold, so the action starts it and the page polls certIssueBusy for the result.
     private int _certIssueBusy;
     private string _certIssueMessage = "";
+    private bool _certIssueOk;
 
     /// <summary>
     /// Kick off a Let's Encrypt issuance for the saved DuckDNS name. Requires an
@@ -653,6 +654,7 @@ public sealed class WebApp : IDisposable
         if (Interlocked.CompareExchange(ref _certIssueBusy, 1, 0) != 0)
             return ActionResultDto.Fail("A certificate is already being issued.");
 
+        _certIssueOk = false;
         _certIssueMessage = $"Issuing a certificate for {domain}.duckdns.org — this waits on DNS propagation and can take a few minutes…";
         _statusMessage = _certIssueMessage;
 
@@ -669,6 +671,7 @@ public sealed class WebApp : IDisposable
                     if (result.KeyPath.Length > 0)
                         _settings.WebTlsKeyPath = result.KeyPath;
                     _settings.Save();
+                    _certIssueOk = true;
                     _certIssueMessage = $"{result.Message} Paths filled in — switch HTTPS on, then restart the console.";
                 }
                 else
@@ -1312,6 +1315,7 @@ public sealed class WebApp : IDisposable
                 acmeEmail = _settings.AcmeAccountEmail,
                 certIssueBusy = Volatile.Read(ref _certIssueBusy) == 1,
                 certIssueMessage = _certIssueMessage,
+                certIssueOk = _certIssueOk,
                 isMonitoring = stats.IsMonitoring
             },
             stats = new
@@ -2800,8 +2804,9 @@ public sealed class WebApp : IDisposable
               return;
             }
             clearInterval(tick);
+            const ok = !!(state.settings && state.settings.certIssueOk);
             const msg = (state.settings && state.settings.certIssueMessage) || '';
-            setStatus(msg, !/issued/i.test(msg), /issued/i.test(msg));
+            setStatus(msg, !ok, ok);
             statusHoldUntil = Date.now() + 15000;
             render({ forceLists: true });
           } catch { /* keep polling; a transient failure is not the end of the run */ }

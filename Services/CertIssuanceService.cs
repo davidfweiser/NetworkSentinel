@@ -131,10 +131,16 @@ public sealed class CertIssuanceService
             if (cert.Length == 0 || !File.Exists(cert))
                 return Failure(output, "Issuance reported success but no certificate file was produced.");
 
+            // acme.sh skips a renewal that is not due yet; the script installs the existing
+            // certificate in that case, so say so rather than claiming a fresh issuance.
+            var reused = text.Contains("skipped renewal", StringComparison.OrdinalIgnoreCase);
+
             return new CertIssuanceResult
             {
                 Success = true,
-                Message = $"Certificate issued for {domainLabel}.duckdns.org.",
+                Message = reused
+                    ? $"Certificate for {domainLabel}.duckdns.org is already current and has been installed."
+                    : $"Certificate issued for {domainLabel}.duckdns.org.",
                 Output = text,
                 CertPath = cert,
                 KeyPath = key,
