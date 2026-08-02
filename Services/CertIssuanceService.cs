@@ -119,6 +119,10 @@ public sealed class CertIssuanceService
             }
 
             var text = output.ToString();
+            // Keep the whole run somewhere readable: the status line only has room for a
+            // summary, and a failed ACME run is exactly when the detail is wanted.
+            SaveLog(text);
+
             if (proc.ExitCode != 0)
                 return Failure(output, FirstError(text) ?? $"Certificate issuance failed (exit {proc.ExitCode}).");
 
@@ -143,7 +147,80 @@ public sealed class CertIssuanceService
     }
 
     private static CertIssuanceResult Failure(StringBuilder output, string message)
-        => new() { Success = false, Message = message, Output = output.ToString() };
+    {
+        var text = output.ToString();
+        return new CertIssuanceResult
+        {
+            Success = false,
+            Message = Explain(message, text),
+            Output = text,
+        };
+    }
+
+    /// <summary>
+    /// The script's own failure line ends with "see the acme.sh output above", which is
+    /// true in a terminal and meaningless behind a button. Replace that pointer with the
+    /// output it was pointing at, and name the cause outright when acme.sh's wording
+    /// identifies one — a wrong DuckDNS token is by far the most common.
+    /// </summary>
+    private static string Explain(string message, string text)
+    {
+        var cause = Diagnose(text);
+        var trimmed = message.Replace(" (see the acme.sh output above)", "", StringComparison.OrdinalIgnoreCase);
+
+        var parts = new List<string> { trimmed };
+        if (cause.Length > 0)
+            parts.Add(cause);
+
+        var tail = Tail(text);
+        if (tail.Length > 0)
+            parts.Add("acme.sh said: " + tail);
+
+        if (text.Length > 0)
+            parts.Add($"full output in {LogPath}");
+
+        return string.Join(" — ", parts);
+    }
+
+    /// <summary>Turn the common acme.sh failures into something actionable.</summary>
+    private static string Diagnose(string text)
+    {
+        if (text.Contains("invalid domain", StringComparison.OrdinalIgnoreCase) ||
+            text.Contains("Error add txt for domain", StringComparison.OrdinalIgnoreCase) ||
+            text.Contains("invalid response from duckdns", StringComparison.OrdinalIgnoreCase))
+            return "DuckDNS refused the DNS record, which usually means the token or subdomain is wrong";
+
+        if (text.Contains("Timeout", StringComparison.OrdinalIgnoreCase) &&
+            text.Contains("dns", StringComparison.OrdinalIgnoreCase))
+            return "the DNS record did not propagate in time; retrying often succeeds";
+
+        if (text.Contains("rateLimited", StringComparison.OrdinalIgnoreCase) ||
+            text.Contains("too many certificates", StringComparison.OrdinalIgnoreCase))
+            return "Let's Encrypt is rate-limiting this name; wait before retrying";
+
+        if (text.Contains("Please add '--debug'", StringComparison.OrdinalIgnoreCase) &&
+            text.Contains("urn:ietf:params:acme:error:unauthorized", StringComparison.OrdinalIgnoreCase))
+            return "Let's Encrypt could not verify the DNS challenge";
+
+        return "";
+    }
+
+    /// <summary>Last few meaningful output lines, for a status line rather than a log pane.</summary>
+    private static string Tail(string text, int lines = 3)
+    {
+        var kept = text
+            .Split('\n')
+            .Select(l => l.Trim())
+            .Where(l => l.Length > 0 && !l.StartsWith("NS_CERT_FILE=", StringComparison.Ordinal)
+                                     && !l.StartsWith("NS_KEY_FILE=", StringComparison.Ordinal))
+            .ToList();
+
+        // The script's own "Error:" line is already the message; do not echo it twice.
+        while (kept.Count > 0 && kept[^1].StartsWith("Error:", StringComparison.OrdinalIgnoreCase))
+            kept.RemoveAt(kept.Count - 1);
+
+        return kept.Count == 0 ? "" : string.Join(" | ", kept.TakeLast(lines));
+    }
 
     private static string ValueOf(string text, string prefix)
     {
@@ -154,6 +231,23 @@ public sealed class CertIssuanceService
                 return t[prefix.Length..].Trim();
         }
         return "";
+    }
+
+    /// <summary>Path of the issuance transcript, named in the failure message so it can be found.</summary>
+    public static string LogPath => Path.Combine(AppPaths.DataDirectory, "logs", "cert-issue.log");
+
+    private static void SaveLog(string text)
+    {
+        try
+        {
+            var path = LogPath;
+            Directory.CreateDirectory(Path.GetDirectoryName(path)!);
+            File.WriteAllText(path, text);
+        }
+        catch
+        {
+            // A missing transcript must not turn a working issuance into a failure.
+        }
     }
 
     /// <summary>The script's own "Error: …" line says far more than an exit code.</summary>
