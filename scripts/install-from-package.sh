@@ -28,6 +28,7 @@ WEB_SERVICE=0
 WEB_PORT=18765
 SERVICE_USER=""
 NO_DESKTOP=0
+DESKTOP_SHORTCUT=0
 
 usage() {
   cat <<'EOF'
@@ -42,6 +43,7 @@ Install Network Sentinel from this package.
 
   --service-user NAME   Run the web service as this user (default: invoking user)
   --no-desktop          Skip .desktop menu entry
+  --desktop-shortcut    Also drop an icon on ~/Desktop (opt-in; desktops only)
   -h, --help            Show this help
 
 After --web-service:
@@ -75,6 +77,7 @@ while [[ $# -gt 0 ]]; do
       shift 2
       ;;
     --no-desktop) NO_DESKTOP=1; shift ;;
+    --desktop-shortcut) DESKTOP_SHORTCUT=1; shift ;;
     -h|--help) usage; exit 0 ;;
     *) echo "Unknown option: $1" >&2; usage >&2; exit 1 ;;
   esac
@@ -259,6 +262,28 @@ if [[ "$NO_DESKTOP" -eq 0 ]]; then
     mkdir -p "$APP_DIR"
     sed "s|^Exec=.*|Exec=${BINDIR}/networksentinel|" "$DESKTOP_SRC" > "${APP_DIR}/networksentinel.desktop" 2>/dev/null \
       || cp "$DESKTOP_SRC" "${APP_DIR}/networksentinel.desktop"
+
+    # Opt-in desktop icon. Installs for the invoking user even under sudo —
+    # root's Desktop is not where anyone would look for it.
+    if [[ "$DESKTOP_SHORTCUT" -eq 1 ]]; then
+      shortcut_home="$HOME"
+      [[ -n "${SUDO_USER:-}" ]] && shortcut_home="$(getent passwd "$SUDO_USER" | cut -d: -f6)"
+      # Honour a localised or relocated Desktop (xdg-user-dirs), else ~/Desktop.
+      desktop_dir="$(sudo -u "${SUDO_USER:-$USER}" xdg-user-dir DESKTOP 2>/dev/null || true)"
+      [[ -d "${desktop_dir:-}" ]] || desktop_dir="${shortcut_home}/Desktop"
+      if [[ -d "$desktop_dir" ]]; then
+        shortcut="${desktop_dir}/Network Sentinel.desktop"
+        cp "${APP_DIR}/networksentinel.desktop" "$shortcut"
+        # GNOME/COSMIC refuse to launch a desktop file that is not executable
+        # and not marked trusted; without both it shows as an inert text file.
+        chmod +x "$shortcut"
+        [[ -n "${SUDO_USER:-}" ]] && chown "$SUDO_USER" "$shortcut" 2>/dev/null || true
+        sudo -u "${SUDO_USER:-$USER}" gio set "$shortcut" metadata::trusted true 2>/dev/null || true
+        echo "  shortcut: $shortcut"
+      else
+        echo "  note: no Desktop directory found — skipped --desktop-shortcut" >&2
+      fi
+    fi
   fi
 fi
 
