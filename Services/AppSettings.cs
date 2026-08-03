@@ -83,6 +83,37 @@ public sealed class AppSettings
     /// </summary>
     public int AutoBlockExpiryMinutes { get; set; }
 
+    /// <summary>
+    /// Serve the web console over HTTPS in addition to HTTP. Needs <see cref="WebTlsCertPath"/>;
+    /// endpoint changes only take effect when the web console restarts.
+    /// </summary>
+    public bool WebHttpsEnabled { get; set; }
+
+    /// <summary>TCP port for the HTTPS endpoint. Ports below 1024 need elevation.</summary>
+    public int WebHttpsPort { get; set; } = 18443;
+
+    /// <summary>PEM fullchain (Let's Encrypt fullchain.cer) or a .pfx / .p12 bundle.</summary>
+    public string WebTlsCertPath { get; set; } = "";
+
+    /// <summary>PEM private key. Ignored for .pfx / .p12 certificates.</summary>
+    public string WebTlsKeyPath { get; set; } = "";
+
+    /// <summary>Password for a .pfx / .p12 certificate. Empty for PEM.</summary>
+    public string WebTlsPfxPassword { get; set; } = "";
+
+    /// <summary>
+    /// Redirect plain-HTTP requests to HTTPS when the request arrived by hostname.
+    /// Requests to a bare IP keep serving HTTP — the certificate only covers the name,
+    /// so redirecting those would trade a working page for a certificate warning.
+    /// </summary>
+    public bool WebHttpsRedirect { get; set; } = true;
+
+    /// <summary>
+    /// Address the Let's Encrypt account is registered against. Only read the first time
+    /// Posh-ACME is set up; kept so a retry does not ask for it again. Not a credential.
+    /// </summary>
+    public string AcmeAccountEmail { get; set; } = "";
+
     /// <summary>POST alerts to this webhook URL (ntfy / Slack / Discord / generic JSON). Empty = off.</summary>
     public string WebhookUrl { get; set; } = "";
 

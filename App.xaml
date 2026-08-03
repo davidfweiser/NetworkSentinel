@@ -13,6 +13,7 @@
             <conv:ThreatLevelToBrushConverter x:Key="ThreatBrush"/>
             <conv:BoolToVisibilityConverter x:Key="BoolToVis"/>
             <conv:MonitoringToTextConverter x:Key="MonitorText"/>
+            <conv:IssuingToTextConverter x:Key="IssueCertText"/>
             <conv:NavSelectedConverter x:Key="NavSelected"/>
             <conv:InvertBoolConverter x:Key="InvertBool"/>
             <conv:StringNotEmptyToVisibilityConverter x:Key="NotEmptyVis"/>

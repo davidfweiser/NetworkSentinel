@@ -115,6 +115,13 @@ if (Test-Path $uninstallSrc) {
     Copy-Item $uninstallSrc (Join-Path $stage "uninstall-web-service.ps1") -Force
 }
 
+# Ships beside the exe so the console's "Issue certificate" button can find it —
+# CertIssuanceService.FindScript looks next to the binary first.
+$certSrc = Join-Path $PSScriptRoot "issue-duckdns-cert.ps1"
+if (Test-Path $certSrc) {
+    Copy-Item $certSrc (Join-Path $stage "issue-duckdns-cert.ps1") -Force
+}
+
 # Double-click friendly launcher inside the zip
 $cmdLauncher = @"
 @echo off

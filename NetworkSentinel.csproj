@@ -22,6 +22,14 @@
   </ItemGroup>
 
   <ItemGroup>
+    <!-- Kestrel backs the headless web console (-w). HttpListener can serve TLS on Windows,
+         but only against a certificate imported into the machine store and bound to the port
+         with `netsh http add sslcert` — per-port, admin-only, and re-done at every renewal.
+         Kestrel reads the PEM/.pfx straight off disk, which is what ACME renewal produces. -->
+    <FrameworkReference Include="Microsoft.AspNetCore.App" />
+  </ItemGroup>
+
+  <ItemGroup>
     <PackageReference Include="CommunityToolkit.Mvvm" Version="8.4.0" />
     <PackageReference Include="Spectre.Console" Version="0.49.1" />
     <!-- EventLogWatcher (Security channel 4625) for failed-logon burst detection. -->

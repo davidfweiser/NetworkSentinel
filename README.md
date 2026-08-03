@@ -137,6 +137,14 @@ dotnet run -c Release -- -w 18765
 
 # Set/reset the web console master password from the terminal
 dotnet run -c Release -- --set-master-password
+
+# Configure the DuckDNS hostname (token is prompted, not a flag)
+dotnet run -c Release -- --set-duckdns
+
+# Headless web UI over HTTPS as well as HTTP
+dotnet run -c Release -- -w --https `
+    --tls-cert "$env:ProgramData\NetworkSentinel\tls\myhost.duckdns.org.fullchain.cer" `
+    --tls-key  "$env:ProgramData\NetworkSentinel\tls\myhost.duckdns.org.key"
 ```
 
 Environment variables: `NETWORKSENTINEL_TUI=1`, `NETWORKSENTINEL_WEB=1`.
@@ -201,7 +209,7 @@ Re-running the installer **upgrades in place**: it stops the running task, repla
 | **Ports** | Local listeners; one-click **Block port** |
 | **Firewall** | Managed rules grouped as In/Out pairs; manual IP and port blocking; **Restore allowlisted** |
 | **Allowlist** | Add/remove trusted domains and IPs; refresh the feed |
-| **Settings** | Monitoring on/off, page refresh speed, geo lookups, failed-logon monitoring, closed-port scan detection, the intrusion detectors (threat intel, new-listener, process reputation, ARP watch, startup-item watch, exfiltration, honeypot), webhook alerts, auto-block + minimum severity + expiry, block direction (in/out), allowlist feed, **change master password**, **Remove all rules** |
+| **Settings** | Monitoring on/off, page refresh speed, geo lookups, failed-logon monitoring, closed-port scan detection, the intrusion detectors (threat intel, new-listener, process reputation, ARP watch, startup-item watch, exfiltration, honeypot), **HTTPS + DuckDNS remote access** (including **Issue certificate**), webhook alerts, auto-block + minimum severity + expiry, block direction (in/out), allowlist feed, **change master password**, **Remove all rules** |
 
 The console protects itself: it refuses to remove its own firewall access rule or block its own port (doing so would cut off your browser mid-request and look exactly like a crash).
 
@@ -278,6 +286,62 @@ The app starts **without** forcing UAC (so TUI/web work on servers). Desktop ins
 - Can't reach a browser yet (e.g. still opening the port in a cloud firewall), or lost the password? Set/reset it from the terminal instead — see below
 - Hash stored as PBKDF2-SHA256 (random salt, 200k iterations) in `%ProgramData%\NetworkSentinel\web-master.json` — never plain text
 - Session cookie until sign-out, browser close, or 12 hours idle
+- Failed attempts are throttled **per client IP**: five wrong guesses trigger a lockout that doubles with each further attempt (1 minute up to 1 hour), answered with `429` and a `Retry-After`. A fixed delay alone only slows one connection at a time — this caps a parallel guesser
+
+### HTTPS and remote access
+
+The console is served by **Kestrel** rather than `HttpListener`. On Windows `HttpListener` *can* do TLS, but only against a certificate imported into the machine store and bound to the port with `netsh http add sslcert` — per-port, admin-only, and redone at every renewal. Kestrel reads the PEM or `.pfx` straight off disk, which is exactly what an ACME renewal rewrites. It also removes the `netsh http add urlacl` reservation that binding to all interfaces used to need, so the console no longer falls back to localhost-only when it isn't elevated.
+
+HTTP and HTTPS are served side by side: the LAN keeps working on plain HTTP while requests that arrive **by hostname** are redirected to TLS — requests to a bare IP are left alone, since the certificate only covers the name and redirecting an IP would trade a working page for a certificate warning.
+
+```powershell
+.\NetworkSentinel.exe -w --https `
+    --tls-cert "$env:ProgramData\NetworkSentinel\tls\myhost.duckdns.org.fullchain.cer" `
+    --tls-key  "$env:ProgramData\NetworkSentinel\tls\myhost.duckdns.org.key"
+```
+
+| Flag | Meaning |
+|------|---------|
+| `--https` | Serve TLS in addition to HTTP |
+| `--https-port PORT` | TLS port (default **18443**; below 1024 needs Administrator) |
+| `--tls-cert PATH` | PEM fullchain, or a `.pfx` / `.p12` bundle |
+| `--tls-key PATH` | PEM private key (omit for `.pfx`) |
+| `--tls-password PW` | Password for a `.pfx` / `.p12` |
+| `--no-https` | Force plain HTTP for this run |
+
+Flags win over `settings.json` for that run **without overwriting it**, so `--https` is safe to try. The same values live under **Settings → Remote access** in *both* front-ends — the desktop app and the web console — so you never have to hand-edit a config file; endpoint changes take effect at the console's next restart. Certificate files are re-read when they change on disk (checked every 5 minutes), so an **ACME renewal applies without restarting** the console. Session cookies gain the `Secure` flag automatically when the request arrives over TLS.
+
+Already have a `.pfx` (an internal CA, or one exported from the certificate store)? Point `--tls-cert` at it, leave `--tls-key` empty, and pass `--tls-password` if it has one — none of the DuckDNS or Let's Encrypt machinery below is required.
+
+#### Free trusted certificate for a duckdns.org name
+
+[DuckDNS](https://www.duckdns.org) gives a free hostname that follows your public IP. The certificate comes from Let's Encrypt via a **DNS-01** challenge — proving control by writing a TXT record through the DuckDNS API, so **nothing has to be reachable on port 80**.
+
+Easiest route is either front-end: fill in the subdomain and token under **Settings → Remote access** (desktop app or web console), then press **Issue certificate**. It runs the same script below and fills the two path fields in for you. From a terminal:
+
+```powershell
+.\NetworkSentinel.exe --set-duckdns          # subdomain + token (token is prompted, not a flag)
+.\scripts\issue-duckdns-cert.ps1             # installs Posh-ACME if needed, issues + installs the cert
+```
+
+Entering the subdomain and token only sets up **dynamic DNS** — it keeps the name pointed at your current IP. Issuing the certificate is a separate step, whether you press the button or run the script.
+
+Issuance goes through [**Posh-ACME**](https://poshac.me), which ships a DuckDNS plugin — it is the Windows counterpart to `acme.sh` on the Linux build. The script installs it per-user from the PowerShell Gallery on first run (Windows PowerShell 5.1 still negotiates TLS 1.0 by default, so it enables TLS 1.2 and bootstraps the NuGet provider first). ACME state is kept in `%ProgramData%\NetworkSentinel\acme` rather than the calling account's profile, so the desktop app (your user) and the web service (SYSTEM) share one account and one certificate instead of issuing their own.
+
+The script is non-interactive when it has everything it needs, which is how the button drives it:
+
+```powershell
+$env:NS_ASSUME_YES = '1'; $env:NS_ACME_EMAIL = 'you@example.com'
+.\scripts\issue-duckdns-cert.ps1 myhost
+```
+
+`NS_ACME_EMAIL` is only used the first time, to register the Let's Encrypt account. Without a console the script never prompts — anything missing is a clear error instead of a hang.
+
+Unlike `acme.sh`, Posh-ACME does not install its own renewal job, so the script registers a **`NetworkSentinel-CertRenew` scheduled task** that runs `Submit-Renewal` daily as SYSTEM and re-copies the files into place. Registering it needs elevation; run the script from an elevated prompt (or press the button in the elevated desktop app) or renewal stays manual.
+
+The token is stored in `%ProgramData%\NetworkSentinel\duckdns.json`, is **never sent to the browser** (the settings page shows only whether one is saved), and is prompted for rather than passed as a flag so it stays out of shell history and the process list. Because `AppPaths` grants `BUILTIN\Users` Modify on the data directory so the GUI and the SYSTEM service can share state, that file and the `tls\` folder break inheritance and are restricted to **SYSTEM, Administrators, and the writer** — otherwise the token and private key would be readable by every local user. While the console runs it refreshes the A record every 5 minutes.
+
+> **Before you forward a port.** This console can add and remove firewall rules on this machine, and anyone who guesses the master password gets that control. A VPN or [Tailscale](https://tailscale.com) is the safer way to reach it from outside — `tailscale serve` even supplies a valid certificate with no port-forwarding at all. If you do forward a port, forward **only** the HTTPS one and use a long unique password.
 
 #### Set or reset the master password from the terminal
 
@@ -304,7 +368,32 @@ schtasks /Run /TN "NetworkSentinel-Web"
 | **Break-in Attempts** | Heuristic alerts with origin and method |
 | **Open Ports** | Listening TCP/UDP; optional inbound port block |
 | **Firewall & Block** | Manual IP/port rules, auto-block toggle, managed rule list |
-| **Settings** | Monitor poll interval, geo lookups, failed-logon monitoring, closed-port scan detection, allowlist feed, data folder |
+| **Settings** | Monitor poll interval, geo lookups, failed-logon monitoring, closed-port scan detection, **remote access (HTTPS + DuckDNS)**, allowlist feed, data folder |
+
+### Remote access from the desktop Settings
+
+**Settings → Remote access (web console)** configures HTTPS and DuckDNS without touching a config file or the command line:
+
+| Field | What goes in it |
+|-------|-----------------|
+| **DuckDNS subdomain** | Just the label — `myhost`, not `myhost.duckdns.org`. The checkbox arms the 5-minute refresh. |
+| **DuckDNS token** | Your token from duckdns.org, masked as you type. **Update now** tests it immediately and reports the result. |
+| **Serve the console over HTTPS** | On/off, with the TLS port beside it |
+| **Issue certificate** | Gets a free Let's Encrypt certificate for the DuckDNS name above and **fills in the two paths below**. The email box beside it is only used the first time, to register the account when Posh-ACME is installed. |
+| **Certificate** / **Private key** | Filled in by **Issue certificate**; still editable if your certificate lives elsewhere. Validated as you enter them |
+| **Redirect HTTP to HTTPS** | On by default |
+
+**Issue certificate** shells out to `issue-duckdns-cert.ps1` — both installers put a copy beside the binary so it works without a source tree. It runs the script non-interactively (`powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass`), so it needs the subdomain and token saved first; issuance waits on DNS propagation and takes a few minutes, during which the button reads *Issuing…*. Failures name the likely cause where the wording identifies one — a rejected DuckDNS token, slow propagation, a Let's Encrypt rate limit, a Gallery download that couldn't negotiate TLS 1.2 — quote the last few output lines, and point at the full transcript in `%ProgramData%\NetworkSentinel\logs\cert-issue.log`.
+
+> **A wrong DuckDNS token looks like a certificate problem.** Issuance proves control by writing a TXT record through the DuckDNS API, so a bad token fails at the DNS step, not the TLS one. If issuance fails, check that **Update now** reports OK before looking anywhere else.
+
+Pressing the button again when the certificate is still valid is safe: a certificate with more than 30 days left is reused rather than re-issued, and it is installed and the paths filled in as usual. To re-issue early — rarely needed, and rate-limited by Let's Encrypt — run the script with `NS_FORCE_RENEW=1`.
+
+The same button is in the **web console's** Settings tab. There it runs in the background and the page polls for the result, because holding an HTTP request open for the length of an ACME run would time out the browser. It needs an authenticated session like every other action, and only one run happens at a time — concurrent ACME runs for the same name fight over the same TXT record. Be aware of what the button is: an authenticated browser session can start a PowerShell script that, on first use, installs a module from the PowerShell Gallery and registers a Let's Encrypt account. That is a real capability to expose remotely — the master password is the only thing in front of it, so make it a long unique one, and prefer a VPN or Tailscale over a forwarded port.
+
+A status line at the top of the card shows certificate expiry, the live DuckDNS result, and the full console URL once both halves are configured. Certificate and port changes apply the next time the **web console** starts — the desktop app doesn't serve anything itself — but the **DuckDNS refresh runs in the desktop app too**, so the hostname stays current whenever either front-end is open.
+
+The token is written to `duckdns.json`, not `settings.json`; the GUI, TUI, and web console all read the same file.
 
 ### Auto-block
 1. Run elevated (Administrator).
@@ -357,9 +446,15 @@ schtasks /Run /TN "NetworkSentinel-Web"
 | `Services/GeoIpService.cs` | Reverse DNS + public geo lookup |
 | `Services/FirewallService.cs` | Windows Firewall rule create/list/remove (netsh, cached rule list); auto-block expiry sweep |
 | `Services/AppSettings.cs` | Auto-block preferences + suppress list (JSON on disk) |
+| `Services/DuckDnsUpdater.cs` | DuckDNS dynamic-DNS refresh loop; token file with an admins-only ACL |
+| `Services/TlsCertificateProvider.cs` | Loads the console's PEM/`.pfx` and re-reads it after an ACME renewal |
+| `Services/CertIssuanceService.cs` | Drives `issue-duckdns-cert.ps1` behind the **Issue certificate** button |
+| `Services/LoginThrottle.cs` | Per-client-IP lockout for the console's password endpoints |
 | `ViewModels/MainViewModel.cs` | UI state, commands, auto-block wiring |
-| `Web/WebApp.cs` | Headless web console (HTTP server + embedded single-page UI) |
+| `Web/WebApp.cs` | Headless web console (Kestrel HTTP/HTTPS host + embedded single-page UI) |
 | `Web/WebAuthStore.cs` | Master password hash + session tokens |
+| `Web/WebTlsOptions.cs` | TLS values from the command line, overlaid on the saved settings |
+| `scripts/issue-duckdns-cert.ps1` | Let's Encrypt DNS-01 issuance via Posh-ACME + renewal scheduled task |
 | `Tui/TuiApp.cs` | Terminal UI (Spectre.Console) |
 | `MainWindow.xaml` | Dashboard UI |
 | `Themes/` | Colors and control styles |

@@ -77,6 +77,13 @@ if (-not (Test-Path $InstalledExe)) {
     throw "Install copy failed - $InstalledExe missing."
 }
 
+# Ships beside the exe so Settings -> Remote access -> Issue certificate can find it;
+# CertIssuanceService.FindScript looks next to the binary first.
+$CertScript = Join-Path $PSScriptRoot "issue-duckdns-cert.ps1"
+if (Test-Path $CertScript) {
+    Copy-Item $CertScript (Join-Path $InstallDir "issue-duckdns-cert.ps1") -Force
+}
+
 # Prefer standalone .ico for shortcuts; fall back to the exe (embedded app icon).
 $IconPath = $InstalledExe
 $RootIcon = Join-Path $Root "Assets\icon.ico"
