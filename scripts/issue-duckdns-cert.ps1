@@ -392,6 +392,17 @@ function Test-AcmeTls {
     }
     catch {
         $msg = $_.Exception.GetBaseException().Message.Trim()
+
+        # WSAEACCES: a firewall rule on THIS machine denied the outbound connect.
+        # Network Sentinel's own auto-block is a real suspect here - threat feeds
+        # sometimes list the CDN ranges Let's Encrypt sits on, and blocking mid-run
+        # produces exactly this "worked, then forbidden" shape.
+        if ($msg -match 'forbidden by its access permissions') {
+            return "HTTPS to $HostName failed: $msg. A firewall rule on this machine is blocking the " +
+                   "outbound connection - check Network Sentinel's own Firewall tab for a block on that IP " +
+                   "(unblock it and add $HostName to the allowlist), then any other security product's rules"
+        }
+
         $issuer = $null
         try { if ($req -and $req.ServicePoint -and $req.ServicePoint.Certificate) { $issuer = $req.ServicePoint.Certificate.Issuer } } catch { }
         if ($issuer) {

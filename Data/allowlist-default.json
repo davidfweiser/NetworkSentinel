@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "description": "Built-in known-good domains and IPs that Network Sentinel must never block.",
+  "description": "Built-in known-good domains and IPs that Network Sentinel must never block. Includes the app's own infrastructure: ACME issuance (Let's Encrypt), DuckDNS refresh, threat-intel feeds, geo lookups, and the PowerShell Gallery the certificate script installs from - auto-blocking those turns the app against its own features.",
   "domains": [
     "github.com",
     "www.github.com",
@@ -95,7 +95,16 @@
     "chatgpt.com",
     "anthropic.com",
     "api.anthropic.com",
-    "claude.ai"
+    "claude.ai",
+
+    "acme-v02.api.letsencrypt.org",
+    "acme-staging-v02.api.letsencrypt.org",
+    "www.duckdns.org",
+    "duckdns.org",
+    "www.spamhaus.org",
+    "ipwho.is",
+    "www.powershellgallery.com",
+    "powershellgallery.com"
   ],
   "ips": [
     "1.1.1.1",
