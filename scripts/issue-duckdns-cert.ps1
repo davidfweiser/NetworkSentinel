@@ -289,7 +289,72 @@ if (-not (Get-Module -ListAvailable -Name Posh-ACME)) {
     }
 }
 
-Import-Module Posh-ACME -ErrorAction Stop
+# Posh-ACME's Private\InitTLS.ps1 compiles this same class at import time with no
+# explicit assembly references, and on some machines the C# compiler resolves
+# X509Chain against a .NET (Core) facade assembly instead of the Framework's
+# System.dll -- the compile dies with "This type has been forwarded to assembly
+# 'System.Security.Cryptography'" and takes Import-Module down with it. Compiling
+# the class here first, with an explicit full path to System.dll, satisfies the
+# module's `if (-not ...'CertValidation').Type)` guard so its own Add-Type never
+# runs. The C# must match the module's copy exactly (v4.33.1).
+function Initialize-CertValidationType {
+    if ($PSVersionTable.PSEdition -and $PSVersionTable.PSEdition -ne 'Desktop') { return }
+    if (([System.Management.Automation.PSTypeName]'CertValidation').Type) { return }
+    try {
+        Add-Type -ReferencedAssemblies ([System.Uri].Assembly.Location) -TypeDefinition @'
+using System.Net;
+using System.Net.Security;
+using System.Security.Cryptography.X509Certificates;
+public class CertValidation
+{
+    static bool IgnoreValidation(object o, X509Certificate c, X509Chain ch, SslPolicyErrors e) {
+        return true;
+    }
+    public static void Ignore() {
+        ServicePointManager.ServerCertificateValidationCallback += IgnoreValidation;
+    }
+    public static void Restore() {
+        ServicePointManager.ServerCertificateValidationCallback -= IgnoreValidation;
+    }
+}
+'@
+    }
+    catch {
+        # The tolerant import below still has a chance if this fails too.
+    }
+}
+
+Initialize-CertValidationType
+try {
+    Import-Module Posh-ACME -ErrorAction Stop
+}
+catch {
+    $importError = $_.Exception.Message.Trim()
+    # A failed private file surfaces as a terminating Write-Error from the psm1 even
+    # when every exported command is intact. The psm1 runs under the session's
+    # $ErrorActionPreference, not Import-Module's -ErrorAction, so this script's
+    # 'Stop' must be lowered for the retry or the module aborts partway again;
+    # -Force re-imports past whatever the failed attempt left registered.
+    $prevEap = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        Import-Module Posh-ACME -Force -ErrorAction SilentlyContinue -WarningAction SilentlyContinue
+    }
+    finally {
+        $ErrorActionPreference = $prevEap
+    }
+    $missing = @('Set-PAServer', 'Get-PAAccount', 'New-PAAccount', 'New-PACertificate', 'Get-PACertificate') |
+        Where-Object { -not (Get-Command $_ -ErrorAction SilentlyContinue) }
+    if ($missing) {
+        Die "Posh-ACME failed to load: $importError (missing: $($missing -join ', '))"
+    }
+    Say "Note: part of Posh-ACME failed to load and was worked around ($importError)"
+}
+
+# TLS 1.2 for the ACME calls. Posh-ACME normally arranges this in the same file
+# that fails on the machines above, so do not rely on it having run.
+[Net.ServicePointManager]::SecurityProtocol =
+    [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
 
 # Reports which layer is broken. Posh-ACME surfaces a connectivity failure as a
 # generic Write-Error, which on its own does not distinguish "blocked" from
@@ -446,16 +511,44 @@ Protect-Path $KeyFile
 # equivalent here. Needs elevation, so it is best-effort.
 $TaskName = 'NetworkSentinel-CertRenew'
 try {
-    $renewCommand = @"
-`$env:POSHACME_HOME = '$($env:POSHACME_HOME)'
+    # The renewal runs as SYSTEM and must not depend on Posh-ACME's import-time
+    # compile either, so the generated script pre-compiles CertValidation the same
+    # way the issuance path above does before importing.
+    $renewCommand = @'
+$env:POSHACME_HOME = '{{HOME}}'
 # The module may live with the app's data rather than in a profile module folder,
 # and this task runs as SYSTEM, so put that path on PSModulePath before importing.
-`$env:PSModulePath = '$ModuleRoot;' + `$env:PSModulePath
-Import-Module Posh-ACME
-Submit-Renewal -AllOrders
-Copy-Item -LiteralPath (Get-PACertificate -MainDomain '$Fqdn').FullChainFile -Destination '$CertFile' -Force
-Copy-Item -LiteralPath (Get-PACertificate -MainDomain '$Fqdn').KeyFile -Destination '$KeyFile' -Force
+$env:PSModulePath = '{{MODROOT}};' + $env:PSModulePath
+if (-not ([System.Management.Automation.PSTypeName]'CertValidation').Type) {
+    try {
+        Add-Type -ReferencedAssemblies ([System.Uri].Assembly.Location) -TypeDefinition @"
+using System.Net;
+using System.Net.Security;
+using System.Security.Cryptography.X509Certificates;
+public class CertValidation
+{
+    static bool IgnoreValidation(object o, X509Certificate c, X509Chain ch, SslPolicyErrors e) {
+        return true;
+    }
+    public static void Ignore() {
+        ServicePointManager.ServerCertificateValidationCallback += IgnoreValidation;
+    }
+    public static void Restore() {
+        ServicePointManager.ServerCertificateValidationCallback -= IgnoreValidation;
+    }
+}
 "@
+    } catch { }
+}
+Import-Module Posh-ACME
+[Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+Submit-Renewal -AllOrders
+Copy-Item -LiteralPath (Get-PACertificate -MainDomain '{{FQDN}}').FullChainFile -Destination '{{CERT}}' -Force
+Copy-Item -LiteralPath (Get-PACertificate -MainDomain '{{FQDN}}').KeyFile -Destination '{{KEY}}' -Force
+'@
+    $renewCommand = $renewCommand.Replace('{{HOME}}', $env:POSHACME_HOME).
+        Replace('{{MODROOT}}', $ModuleRoot).Replace('{{FQDN}}', $Fqdn).
+        Replace('{{CERT}}', $CertFile).Replace('{{KEY}}', $KeyFile)
     $renewScript = Join-Path $DataDir 'renew-cert.ps1'
     Set-Content -LiteralPath $renewScript -Value $renewCommand -Encoding UTF8
 

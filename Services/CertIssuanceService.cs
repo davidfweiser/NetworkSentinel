@@ -203,6 +203,15 @@ public sealed class CertIssuanceService
              text.Contains("duckdns", StringComparison.OrdinalIgnoreCase)))
             return "DuckDNS refused the DNS record, which usually means the token or subdomain is wrong";
 
+        // Posh-ACME compiles a helper class at import; on some machines the compiler
+        // resolves X509Chain against a .NET Core facade and the import dies. Current
+        // scripts pre-compile the class to sidestep this, so seeing it means the
+        // installed script predates that fix.
+        if (text.Contains("Failed to import function", StringComparison.OrdinalIgnoreCase) &&
+            text.Contains("has been forwarded to assembly", StringComparison.OrdinalIgnoreCase))
+            return "Posh-ACME's import-time compile failed on this machine; replace issue-duckdns-cert.ps1 " +
+                   "beside the app with the current version, which works around this";
+
         // The script falls back to downloading the .nupkg directly when PowerShellGet
         // cannot fetch it, so reaching this means the gallery itself was unreachable
         // rather than the package manager being the stock broken one.
