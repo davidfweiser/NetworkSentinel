@@ -225,6 +225,17 @@ public sealed class CertIssuanceService
         return "";
     }
 
+    /// <summary>
+    /// A PowerShell error record prints the failing text, then several lines of position
+    /// and classification detail. Those are always the last lines, so a naive tail shows
+    /// "+ CategoryInfo ..." and drops the sentence that says what went wrong.
+    /// </summary>
+    private static bool IsErrorDecoration(string line)
+        => line.StartsWith("+", StringComparison.Ordinal)
+           || line.StartsWith("At line:", StringComparison.OrdinalIgnoreCase)
+           || line.StartsWith("At C:\\", StringComparison.OrdinalIgnoreCase)
+           || line.All(c => c is '~' or '+' or ' ');
+
     /// <summary>Last few meaningful output lines, for a status line rather than a log pane.</summary>
     private static string Tail(string text, int lines = 3)
     {
@@ -232,7 +243,8 @@ public sealed class CertIssuanceService
             .Split('\n')
             .Select(l => l.Trim())
             .Where(l => l.Length > 0 && !l.StartsWith("NS_CERT_FILE=", StringComparison.Ordinal)
-                                     && !l.StartsWith("NS_KEY_FILE=", StringComparison.Ordinal))
+                                     && !l.StartsWith("NS_KEY_FILE=", StringComparison.Ordinal)
+                                     && !IsErrorDecoration(l))
             .ToList();
 
         // The script's own "Error:" line is already the message; do not echo it twice.

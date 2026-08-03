@@ -291,11 +291,44 @@ if (-not (Get-Module -ListAvailable -Name Posh-ACME)) {
 
 Import-Module Posh-ACME -ErrorAction Stop
 
+# Reports which layer is broken. Posh-ACME surfaces a connectivity failure as a
+# generic Write-Error, which on its own does not distinguish "blocked" from
+# "wrong credentials".
+function Test-Egress {
+    param([string]$HostName)
+    try {
+        $t = Test-NetConnection -ComputerName $HostName -Port 443 -WarningAction SilentlyContinue
+        if ($t.NameResolutionSucceeded -eq $false) { return "DNS does not resolve $HostName" }
+        if ($t.TcpTestSucceeded) { return "TCP 443 to $HostName is open" }
+        return "TCP 443 to $HostName is blocked"
+    }
+    catch { return "could not probe $HostName" }
+}
+
+$AcmeHost = 'acme-v02.api.letsencrypt.org'
+$OfflineAdvice = "DNS-01 needs no inbound port 80, but issuance still needs outbound HTTPS to Let's Encrypt. " +
+                 "If that is blocked here, issue the certificate on a machine that has access and copy the " +
+                 ".fullchain.cer and .key into $TlsDir, then point Settings -> Remote access at them."
+
+# Contacts the ACME directory, so this is the first thing to fail on a server with
+# filtered egress. Uncaught, it exits with a bare PowerShell error and no usable text.
+try {
+    Set-PAServer LE_PROD -ErrorAction Stop
+}
+catch {
+    Die "could not reach Let's Encrypt: $($_.Exception.Message.Trim()) [$(Test-Egress $AcmeHost)]. $OfflineAdvice"
+}
+
 # Let's Encrypt registers the account against this address. There is no way to skip
 # it on first run, so fail with the fix rather than registering a fake one.
 $AccountEmail = $env:NS_ACME_EMAIL
-Set-PAServer LE_PROD
-if (-not (Get-PAAccount)) {
+$existingAccount = $null
+try { $existingAccount = Get-PAAccount -ErrorAction Stop }
+catch {
+    Die "could not read the Let's Encrypt account: $($_.Exception.Message.Trim()) [$(Test-Egress $AcmeHost)]. $OfflineAdvice"
+}
+
+if (-not $existingAccount) {
     if ([string]::IsNullOrWhiteSpace($AccountEmail)) {
         if (-not (Interactive)) {
             Die "no Let's Encrypt account yet and no email was given - set NS_ACME_EMAIL to register the account"
@@ -303,7 +336,13 @@ if (-not (Get-PAAccount)) {
         $AccountEmail = Read-Host "Email for Let's Encrypt expiry notices"
     }
     if ([string]::IsNullOrWhiteSpace($AccountEmail)) { Die "an email is required to register an ACME account" }
-    New-PAAccount -Contact $AccountEmail -AcceptTOS | Out-Null
+
+    try {
+        New-PAAccount -Contact $AccountEmail -AcceptTOS -ErrorAction Stop | Out-Null
+    }
+    catch {
+        Die "could not register the Let's Encrypt account: $($_.Exception.Message.Trim()) [$(Test-Egress $AcmeHost)]. $OfflineAdvice"
+    }
 }
 
 # --- Issue -----------------------------------------------------------------
@@ -353,7 +392,11 @@ if (-not $reuse) {
     try {
         New-PACertificate @certParams | Out-Null
     } catch {
-        Die "certificate issuance failed: $($_.Exception.Message)"
+        # Two different remote hosts are involved: the TXT record is written through
+        # the DuckDNS API, and the order is placed with Let's Encrypt. Naming which
+        # one is unreachable saves guessing at the token.
+        Die ("certificate issuance failed: $($_.Exception.Message.Trim()) " +
+             "[$(Test-Egress $AcmeHost); $(Test-Egress 'www.duckdns.org')]. $OfflineAdvice")
     }
 
     $existing = Get-PACertificate -MainDomain $Fqdn -ErrorAction SilentlyContinue
