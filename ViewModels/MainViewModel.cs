@@ -827,7 +827,8 @@ public partial class MainViewModel : ObservableObject, IDisposable
     {
         if (value && string.IsNullOrWhiteSpace(TlsCertPath))
         {
-            SettingsMessage = @"Choose a certificate first — run scripts\issue-duckdns-cert.ps1 to get one.";
+            SettingsMessage = "No certificate yet — press Issue certificate below to get a free Let's Encrypt one " +
+                              "(it fills the paths in), or set the certificate path if you already have one.";
             HttpsEnabled = false;
             return;
         }

@@ -955,7 +955,8 @@ public sealed class WebApp : IDisposable
                         case "httpsEnabled":
                             if (on && string.IsNullOrWhiteSpace(_settings.WebTlsCertPath))
                                 return ActionResultDto.Fail(
-                                    "Set the certificate path first — see scripts\\issue-duckdns-cert.ps1 for a Let's Encrypt certificate.");
+                                    "No certificate yet — press Issue certificate above to get a free Let's Encrypt one " +
+                                    "(it fills the paths in), or set the certificate path if you already have one.");
                             _settings.WebHttpsEnabled = on;
                             label = on
                                 ? $"HTTPS enabled on port {_settings.WebHttpsPort} — restart the web console to apply."
