@@ -66,6 +66,29 @@ if (-not (Test-Path $PublishedExe)) {
     throw "Publish succeeded but $ExeName was not found in $PublishDir"
 }
 
+# A running instance locks its own DLLs. Check before the wipe below, not after:
+# deleting first and discovering the lock on the copy leaves a half-installed folder
+# while the old process keeps running from a deleted image. The app's shortcuts are
+# marked "Run as administrator", so a running copy is usually elevated and cannot be
+# stopped from an unelevated install - hence the explicit instruction rather than a
+# silently-ignored Stop-Process.
+$running = @(Get-Process -Name "NetworkSentinel" -ErrorAction SilentlyContinue)
+if ($running.Count -gt 0) {
+    Write-Host "Network Sentinel is running - closing it..." -ForegroundColor Yellow
+    foreach ($proc in $running) {
+        try { Stop-Process -Id $proc.Id -Force -ErrorAction Stop }
+        catch { Write-Host "  could not stop PID $($proc.Id): $($_.Exception.Message)" -ForegroundColor DarkYellow }
+    }
+    Start-Sleep -Milliseconds 800
+
+    $stillRunning = @(Get-Process -Name "NetworkSentinel" -ErrorAction SilentlyContinue)
+    if ($stillRunning.Count -gt 0) {
+        throw ("Network Sentinel is still running (PID $($stillRunning.Id -join ', ')) and its files are locked. " +
+               "Close the app window and re-run this script. Nothing has been changed. " +
+               "If it was started elevated, close it from that session or run this installer as Administrator.")
+    }
+}
+
 Write-Host "Copying files to install folder..." -ForegroundColor Yellow
 New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null
 
