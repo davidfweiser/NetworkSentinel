@@ -320,6 +320,8 @@ This publishes the app to `%LocalAppData%\Programs\NetworkSentinel\` and creates
 
 It also copies `scripts\issue-duckdns-cert.ps1` next to the executable. That is what **Settings → Remote access → Issue certificate** runs, so the button works from an installed copy with no source tree present — see [Remote access from the desktop Settings](#remote-access-from-the-desktop-settings).
 
+> **Moving the installed folder to another machine?** This publish is framework-dependent, and since 0.5.0 it needs the **ASP.NET Core 8 Runtime** (Kestrel) as well as the **.NET 8 Desktop Runtime** — the Desktop Runtime alone is no longer enough, and the app will not start without both. The build machine already has them, because the .NET SDK ships both shared frameworks, so installing from source here just works. Confirm elsewhere with `dotnet --list-runtimes`, or use the self-contained [server package](#server-package-no-compile-on-the-server), which needs no runtime at all.
+
 Uninstall shortcuts + install folder:
 
 ```powershell
