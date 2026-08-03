@@ -250,6 +250,14 @@ Open `http://localhost:18765/` (or `http://<server-ip>:18765/`). **First browser
 
 The installer also opens TCP **18443** so that turning HTTPS on later needs no second firewall change; pass `-HttpsPort 0` to skip it, or `-HttpsPort <n>` for a different one. Nothing listens there until you enable HTTPS — the scheduled task passes only `-w <port>`, and the TLS settings come from `settings.json`, so the GUI, TUI, and web console all drive it. See [HTTPS and remote access](#https-and-remote-access) for issuing a free certificate. Restart the task afterwards.
 
+> **Changing the HTTPS port later needs its own inbound rule.** The installer only opens the port it was told about, so pointing the console at a different one — say because another machine already uses 18443 — leaves connections dying at the firewall before Kestrel sees them. It looks exactly like a broken certificate. Add the rule, **inbound**; an outbound rule does nothing here, since browsers connect *in* and Windows allows outbound by default:
+>
+> ```powershell
+> netsh advfirewall firewall add rule name="NetworkSentinel-WebTls-19443" dir=in action=allow protocol=TCP localport=19443 enable=yes profile=any
+> ```
+>
+> The certificate covers the **hostname**, not a port, so any port serves it equally well. Testing from inside your own LAN can also fail on routers that will not hairpin traffic back through their public IP — try `https://<server-lan-ip>:<port>` (a name-mismatch warning there is expected and harmless), and confirm the real thing from a phone on cellular data.
+
 No URL ACL is reserved. That was an `HttpListener` requirement; Kestrel binds the socket directly. An uninstall clears any reservation an older install left behind.
 
 #### Upgrades and uninstall
@@ -396,7 +404,15 @@ Easiest route is either front-end: fill in the subdomain and token under **Setti
 
 Entering the subdomain and token only sets up **dynamic DNS** — it keeps the name pointed at your current IP. Issuing the certificate is a separate step, whether you press the button or run the script.
 
-Issuance goes through [**Posh-ACME**](https://poshac.me), which ships a DuckDNS plugin — it is the Windows counterpart to `acme.sh` on the Linux build. The script installs it per-user from the PowerShell Gallery on first run (Windows PowerShell 5.1 still negotiates TLS 1.0 by default, so it enables TLS 1.2 and bootstraps the NuGet provider first). ACME state is kept in `%ProgramData%\NetworkSentinel\acme` rather than the calling account's profile, so the desktop app (your user) and the web service (SYSTEM) share one account and one certificate instead of issuing their own.
+Issuance goes through [**Posh-ACME**](https://poshac.me), which ships a DuckDNS plugin — it is the Windows counterpart to `acme.sh` on the Linux build. On first run the script installs it into `%ProgramData%\NetworkSentinel\modules`, and keeps ACME state in `%ProgramData%\NetworkSentinel\acme`. Both live with the app's data rather than in a user profile, because issuance runs from the desktop app as the signed-in user while renewal runs from a SYSTEM scheduled task — a per-profile copy would be visible to only one of them, and they would end up with separate accounts and separate certificates.
+
+Getting the module installed is the step most likely to need help on a locked-down machine, so it has three routes, tried in order:
+
+1. `Save-Module` from the PowerShell Gallery — the normal path.
+2. A direct download of the `.nupkg`, which is just a zip. Windows ships PackageManagement/PowerShellGet **1.0.0.1 with no NuGet provider**, and bootstrapping one fails on plenty of otherwise healthy machines with `Unable to resolve package source` — this route needs none of that stack.
+3. A package you supply yourself — see [restricted networks](#issuance-on-a-restricted-network) below.
+
+The script also pre-compiles the small helper class Posh-ACME builds at import time. Left to the module, that compile resolves `X509Chain` against a .NET Core facade assembly on some machines and fails with *"This type has been forwarded to assembly 'System.Security.Cryptography'"*, taking the whole import down with it.
 
 The script is non-interactive when it has everything it needs, which is how the button drives it:
 
@@ -412,6 +428,45 @@ Unlike `acme.sh`, Posh-ACME does not install its own renewal job, so the script 
 The token is stored in `%ProgramData%\NetworkSentinel\duckdns.json`, is **never sent to the browser** (the settings page shows only whether one is saved), and is prompted for rather than passed as a flag so it stays out of shell history and the process list. Because `AppPaths` grants `BUILTIN\Users` Modify on the data directory so the GUI and the SYSTEM service can share state, that file and the `tls\` folder break inheritance and are restricted to **SYSTEM, Administrators, and the writer** — otherwise the token and private key would be readable by every local user. While the console runs it refreshes the A record every 5 minutes.
 
 > **Before you forward a port.** This console can add and remove firewall rules on this machine, and anyone who guesses the master password gets that control. A VPN or [Tailscale](https://tailscale.com) is the safer way to reach it from outside — `tailscale serve` even supplies a valid certificate with no port-forwarding at all. If you do forward a port, forward **only** the HTTPS one and use a long unique password.
+
+#### Issuance on a restricted network
+
+Issuance is the one feature that needs the server to reach **out**. DNS-01 means nothing has to be reachable *inbound* on port 80 — but the order still goes to Let's Encrypt, and the TXT record still goes to DuckDNS.
+
+| Host | Port | Needed for |
+|------|------|-----------|
+| `acme-v02.api.letsencrypt.org` | 443 out | Placing the certificate order — **issuance cannot work without this** |
+| `www.duckdns.org` | 443 out | Writing the DNS-01 TXT record, and the hostname refresh |
+| `www.powershellgallery.com` | 443 out | Installing Posh-ACME — first run only, and avoidable (below) |
+
+Two escape hatches, for when those cannot all be opened:
+
+- **Behind a proxy.** The download resolves the system proxy and authenticates with the process identity. Set `NS_PROXY` to override it. This matters more than it looks: `Invoke-WebRequest` resolves the *calling account's* proxy configuration, and issuance runs as **SYSTEM** from the web console, which does not inherit a signed-in user's settings — so it can fail on a machine where a browser reaches the gallery fine.
+- **No outbound access to the gallery.** Download `Posh-ACME.<version>.nupkg` on a machine that has access and copy it into `%ProgramData%\NetworkSentinel\` — it is picked up automatically, no restart and no elevation. `NS_POSHACME_NUPKG` names a path explicitly if you would rather keep it elsewhere.
+
+  ```powershell
+  # on a machine with internet
+  Invoke-WebRequest 'https://www.powershellgallery.com/api/v2/package/Posh-ACME' -OutFile Posh-ACME.nupkg
+  ```
+
+If Let's Encrypt itself is unreachable and cannot be opened, issue the certificate **on another machine** instead. DNS-01 proves control through the DuckDNS API, not through the server, so any machine with the same token can issue for the name — then copy the `.fullchain.cer` and `.key` into the server's `%ProgramData%\NetworkSentinel\tls\` and point **Settings → Remote access** at them. Renewal is manual that way, roughly every 60 days.
+
+#### If issuance fails
+
+Failures name the layer that broke rather than a generic error, and the full transcript is always written to `%ProgramData%\NetworkSentinel\logs\cert-issue.log`.
+
+| What it says | What it means |
+|--------------|---------------|
+| `TCP 443 to www.powershellgallery.com is blocked` | Only the module download is blocked — use a local package, above |
+| `could not reach Let's Encrypt` | The ACME endpoint is unreachable; check egress before anything else |
+| `It presented a certificate issued by: <not Let's Encrypt>` | SSL inspection is rewriting the connection — exempt the host, or trust the product's root CA |
+| `forbidden by its access permissions` | A firewall rule **on this machine** denied the outbound connect — check the console's own **Firewall** tab first |
+| `DuckDNS refused the DNS record` | Almost always a wrong token or subdomain — confirm **Update now** reports OK first |
+| `You cannot call a method on a null-valued expression` | Posh-ACME's error handler masking a lower-level failure; read the TLS probe verdict beside it, not this |
+
+> **A wrong DuckDNS token looks like a certificate problem.** Control is proved by writing a TXT record through the DuckDNS API, so a bad token fails at the DNS step, not the TLS one. If issuance fails, check that **Update now** reports OK before looking anywhere else.
+
+The app will not auto-block its own infrastructure: the ACME endpoints, DuckDNS, the threat-intel feeds, and the PowerShell Gallery ship in the built-in [allowlist](#known-good-allowlist-never-block). Without that, a threat feed listing the CDN range Let's Encrypt sits on could have the console firewall its own certificate renewal. Note that an existing `allowlist.json` survives upgrades, so a server installed before this change needs those names added by hand.
 
 #### Set or reset the master password from the terminal
 
