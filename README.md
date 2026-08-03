@@ -318,6 +318,8 @@ This publishes the app to `%LocalAppData%\Programs\NetworkSentinel\` and creates
 | **Start Menu** | Start → type **Network Sentinel** |
 | **Desktop** | `Network Sentinel` icon on your desktop |
 
+It also copies `scripts\issue-duckdns-cert.ps1` next to the executable. That is what **Settings → Remote access → Issue certificate** runs, so the button works from an installed copy with no source tree present — see [Remote access from the desktop Settings](#remote-access-from-the-desktop-settings).
+
 Uninstall shortcuts + install folder:
 
 ```powershell
