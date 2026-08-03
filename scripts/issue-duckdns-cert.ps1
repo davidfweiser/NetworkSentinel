@@ -171,14 +171,52 @@ if (-not (Get-Module -ListAvailable -Name Posh-ACME)) {
     # though the gallery was perfectly reachable. A .nupkg is a zip and Posh-ACME has
     # no dependencies, so fetching it directly needs none of that stack.
     if (-not $installed) {
-        Say "  Downloading Posh-ACME straight from the gallery instead..."
         $tmp = Join-Path ([IO.Path]::GetTempPath()) "posh-acme-$PID"
         try {
             New-Item -ItemType Directory -Force -Path $tmp | Out-Null
             # Expand-Archive insists on a .zip extension.
             $zip = Join-Path $tmp 'posh-acme.zip'
-            Invoke-WebRequest -Uri 'https://www.powershellgallery.com/api/v2/package/Posh-ACME' `
-                -OutFile $zip -UseBasicParsing -TimeoutSec 180
+
+            if ($env:NS_POSHACME_NUPKG -and (Test-Path -LiteralPath $env:NS_POSHACME_NUPKG)) {
+                # Escape hatch for a server with no outbound internet: download
+                # Posh-ACME.<version>.nupkg on a machine that does have it, copy it
+                # over, and point NS_POSHACME_NUPKG at the file.
+                Say "  Using the local package $($env:NS_POSHACME_NUPKG)"
+                Copy-Item -LiteralPath $env:NS_POSHACME_NUPKG -Destination $zip -Force
+            }
+            else {
+                Say "  Downloading Posh-ACME straight from the gallery instead..."
+
+                # A proxy is the usual reason this leg fails on a server. Invoke-WebRequest
+                # resolves the *calling account's* proxy configuration, and issuance runs as
+                # SYSTEM from the web console, which does not inherit the signed-in user's
+                # settings -- so the request dies with "Unable to connect to the remote
+                # server" on a machine where a browser reaches the gallery fine.
+                $web = @{
+                    Uri             = 'https://www.powershellgallery.com/api/v2/package/Posh-ACME'
+                    OutFile         = $zip
+                    UseBasicParsing = $true
+                    TimeoutSec      = 180
+                }
+                $proxyUrl = $env:NS_PROXY
+                if (-not $proxyUrl) {
+                    try {
+                        $resolved = [Net.WebRequest]::GetSystemWebProxy().GetProxy($web.Uri)
+                        # GetProxy echoes the target back when no proxy applies.
+                        if ($resolved -and $resolved.AbsoluteUri -notlike '*powershellgallery.com*') {
+                            $proxyUrl = $resolved.AbsoluteUri
+                        }
+                    }
+                    catch { }
+                }
+                if ($proxyUrl) {
+                    Say "  Using proxy $proxyUrl"
+                    $web['Proxy'] = $proxyUrl
+                    $web['ProxyUseDefaultCredentials'] = $true
+                }
+
+                Invoke-WebRequest @web
+            }
 
             $ext = Join-Path $tmp 'extract'
             Expand-Archive -LiteralPath $zip -DestinationPath $ext -Force
@@ -204,7 +242,29 @@ if (-not (Get-Module -ListAvailable -Name Posh-ACME)) {
             if ($installed) { Say "  Installed Posh-ACME $version to $ModuleRoot" }
         }
         catch {
-            Die "could not install Posh-ACME: $($_.Exception.Message)"
+            $why = $_.Exception.Message.Trim()
+
+            # "Unable to connect" is a connection-level failure, not a TLS one, and on a
+            # server it nearly always means egress is blocked or goes through a proxy.
+            # Say what to do about it rather than only quoting the exception.
+            $hint = ""
+            if ($why -match 'Unable to connect|remote name could not be resolved|timed out|forbidden|\(407\)') {
+                $probe = "cannot reach powershellgallery.com"
+                try {
+                    $tcp = Test-NetConnection -ComputerName 'www.powershellgallery.com' -Port 443 -WarningAction SilentlyContinue
+                    if ($tcp.NameResolutionSucceeded -eq $false) { $probe = "DNS does not resolve www.powershellgallery.com" }
+                    elseif ($tcp.TcpTestSucceeded) { $probe = "TCP 443 to www.powershellgallery.com is open, so this is a proxy or filtering problem" }
+                    else { $probe = "TCP 443 to www.powershellgallery.com is blocked" }
+                }
+                catch { }
+
+                $hint = " [$probe]. If this machine uses a proxy, set NS_PROXY (issuance runs as SYSTEM " +
+                        "from the web console and does not inherit your proxy settings). For a server with no " +
+                        "outbound internet, download Posh-ACME.<version>.nupkg elsewhere, copy it over, and set " +
+                        "NS_POSHACME_NUPKG to its path. Either can also be set machine-wide with setx /M."
+            }
+
+            Die "could not install Posh-ACME: $why$hint"
         }
         finally {
             Remove-Item -LiteralPath $tmp -Recurse -Force -ErrorAction SilentlyContinue
