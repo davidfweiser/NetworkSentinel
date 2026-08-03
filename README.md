@@ -192,15 +192,57 @@ powershell -ExecutionPolicy Bypass -File .\install-from-package.ps1
 powershell -ExecutionPolicy Bypass -File .\install-from-package.ps1 -Port 18765
 ```
 
-That copies files to `%ProgramData%\NetworkSentinel\`, opens the firewall port, reserves a URL ACL, and registers **Scheduled Task** `NetworkSentinel-Web` at startup:
+That copies files to `%ProgramData%\NetworkSentinel\`, opens the firewall port, and registers **Scheduled Task** `NetworkSentinel-Web`:
 
 ```text
 NetworkSentinel.exe -w 18765
 ```
 
+#### Starting at boot
+
+The task is what makes it survive a reboot, and it is configured for an unattended server:
+
+| Setting | Value | Why |
+|---------|-------|-----|
+| Trigger | **At startup** | Runs at boot — **no one has to log in** |
+| Principal | `SYSTEM`, **Highest** | Already elevated, so firewall rules work without a UAC prompt |
+| `-StartWhenAvailable` | on | Catches up if the machine was off at the scheduled moment |
+| `-RestartCount 3`, `-RestartInterval 1m` | on | Restarts the console if it exits unexpectedly |
+| `-AllowStartIfOnBatteries` | on | A laptop-as-server does not silently skip startup |
+
+Check it after install, and after the first reboot:
+
+```powershell
+schtasks /Query /TN "NetworkSentinel-Web" /V /FO LIST | findstr /C:"Status" /C:"Next Run" /C:"Last Result"
+```
+
+Restart it after changing HTTPS or certificate settings (Kestrel binds its endpoints at startup):
+
+```powershell
+schtasks /End /TN "NetworkSentinel-Web"
+schtasks /Run /TN "NetworkSentinel-Web"
+```
+
 Open `http://localhost:18765/` (or `http://<server-ip>:18765/`). **First browser visit creates a master password.** Change it anytime under **Settings → Master password**.
 
-Re-running the installer **upgrades in place**: it stops the running task, replaces the binaries, and restarts. Master password, settings, and allowlist are **preserved**. The web page header shows the running version (e.g. `v0.4.0`) — check it after an upgrade to confirm the new build is live.
+#### HTTPS on the server
+
+The installer also opens TCP **18443** so that turning HTTPS on later needs no second firewall change; pass `-HttpsPort 0` to skip it, or `-HttpsPort <n>` for a different one. Nothing listens there until you enable HTTPS — the scheduled task passes only `-w <port>`, and the TLS settings come from `settings.json`, so the GUI, TUI, and web console all drive it. See [HTTPS and remote access](#https-and-remote-access) for issuing a free certificate. Restart the task afterwards.
+
+No URL ACL is reserved. That was an `HttpListener` requirement; Kestrel binds the socket directly. An uninstall clears any reservation an older install left behind.
+
+#### Upgrades and uninstall
+
+Re-running the installer **upgrades in place**: it stops the running task, replaces the binaries, and restarts. `%ProgramData%\NetworkSentinel` is both the install folder and the data directory, so the installer removes **only the files the package ships** — the master password hash, settings, allowlist, logs, host history, threat log, `duckdns.json`, `tls\`, and `acme\` all survive. The web page header shows the running version (e.g. `v0.4.0`) — check it after an upgrade to confirm the new build is live.
+
+Uninstall keeps that same data by default so a reinstall picks up where you left off:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\uninstall-web-service.ps1
+powershell -ExecutionPolicy Bypass -File .\uninstall-web-service.ps1 -PurgeData   # settings, certs, ACME account too
+```
+
+`-PurgeData` also deletes the Posh-ACME account, which cannot be recovered — a reinstall registers a new one, counting against Let's Encrypt's rate limits.
 
 #### Web console tabs
 

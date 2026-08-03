@@ -20,6 +20,11 @@
 .PARAMETER Port
   Web listen port (default 18765).
 
+.PARAMETER HttpsPort
+  Also open the firewall for the TLS port (default 18443). Use 0 to skip.
+  HTTPS itself is switched on in Settings -> Remote access (it persists in
+  settings.json), not here -- this only makes the port reachable.
+
 .PARAMETER TaskName
   Scheduled task name (default NetworkSentinel-Web).
 
@@ -30,6 +35,7 @@
 param(
     [string]$PackagePath = "",
     [int]$Port = 18765,
+    [int]$HttpsPort = 18443,
     [string]$TaskName = "NetworkSentinel-Web",
     [bool]$StartNow = $true
 )
@@ -136,17 +142,28 @@ Start-Sleep -Milliseconds 400
 Write-Host "Copying files..." -ForegroundColor Yellow
 New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null
 
-# Keep operator data across upgrades (master password hash, settings, allowlist, logs).
+# This folder is both the install target and the app's data directory, so an upgrade
+# must replace only what the package ships. Enumerating the package and deleting just
+# those names keeps every operator file -- settings, master-password hash, allowlist,
+# logs, host history, threat log, duckdns.json, tls\, acme\ -- without needing a list
+# that has to be updated every time the app starts writing something new.
+$packageNames = @(Get-ChildItem -Path $SourceDir -Force | Select-Object -ExpandProperty Name)
+
+# Files the package may also ship a default copy of; an existing one always wins.
 $preserveNames = @(
     "logs",
     "settings.json",
     "web-master.json",
     "allowlist.json",
     "allowlist-resolved.json",
-    "auto-block-suppress.json"
+    "auto-block-suppress.json",
+    "duckdns.json",
+    "tls",
+    "acme"
 )
+
 Get-ChildItem $InstallDir -Force -ErrorAction SilentlyContinue |
-    Where-Object { $preserveNames -notcontains $_.Name } |
+    Where-Object { $packageNames -contains $_.Name -and $preserveNames -notcontains $_.Name } |
     Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
 
 # Copy package bits; do not overwrite preserved data files if the package also ships defaults.
@@ -163,28 +180,29 @@ if (-not (Test-Path $Exe)) {
     throw "Install copy failed - missing $Exe"
 }
 
-# URL ACL so HttpListener can bind all interfaces when not running as admin user
-try {
-    $url = "http://+:$Port/"
-    $existing = netsh http show urlacl url=$url 2>$null
-    if ("$existing" -notmatch [regex]::Escape($url)) {
-        Write-Host "Reserving URL ACL for $url ..." -ForegroundColor Yellow
-        netsh http add urlacl url=$url user="Everyone" | Out-Null
+# No URL ACL is reserved here. That was an HttpListener requirement; the console
+# now runs on Kestrel, which binds the socket directly. Any reservation an older
+# install left behind is cleaned up by uninstall-web-service.ps1.
+
+# Firewall inbound TCP for the web UI, and for the TLS port when one is wanted.
+function Add-InboundRule {
+    param([string]$Name, [int]$TcpPort, [string]$Description)
+    try {
+        netsh advfirewall firewall delete rule name="$Name" 2>$null | Out-Null
+        netsh advfirewall firewall add rule name="$Name" dir=in action=allow protocol=TCP localport=$TcpPort enable=yes profile=any description="$Description" | Out-Null
+        Write-Host "Firewall rule: $Name (TCP $TcpPort)" -ForegroundColor Yellow
+    }
+    catch {
+        Write-Host "Firewall note ($Name): $($_.Exception.Message)" -ForegroundColor DarkYellow
     }
 }
-catch {
-    Write-Host "URL ACL note: $($_.Exception.Message)" -ForegroundColor DarkYellow
-}
 
-# Firewall inbound TCP for web UI
-$fwName = "NetworkSentinel-Web-$Port"
-try {
-    netsh advfirewall firewall delete rule name="$fwName" 2>$null | Out-Null
-    netsh advfirewall firewall add rule name="$fwName" dir=in action=allow protocol=TCP localport=$Port enable=yes profile=any description="Network Sentinel headless web UI" | Out-Null
-    Write-Host "Firewall rule: $fwName" -ForegroundColor Yellow
-}
-catch {
-    Write-Host "Firewall note: $($_.Exception.Message)" -ForegroundColor DarkYellow
+Add-InboundRule -Name "NetworkSentinel-Web-$Port" -TcpPort $Port -Description "Network Sentinel headless web UI"
+
+# Opened up front so turning HTTPS on later in Settings does not also need a
+# firewall change. The port is only listened on once HTTPS is actually enabled.
+if ($HttpsPort -gt 0 -and $HttpsPort -ne $Port) {
+    Add-InboundRule -Name "NetworkSentinel-WebTls-$HttpsPort" -TcpPort $HttpsPort -Description "Network Sentinel web console (HTTPS)"
 }
 
 # Startup task (SYSTEM, highest)
@@ -216,9 +234,16 @@ if ($StartNow) {
 Write-Host ""
 Write-Host "Installed successfully (no compile required)." -ForegroundColor Green
 Write-Host "  App     : $Exe -w $Port"
-Write-Host "  Task    : $TaskName"
+Write-Host "  Task    : $TaskName  (runs as SYSTEM at boot, before anyone logs in)"
 Write-Host "  Open    : http://localhost:$Port/  or  http://<server-ip>:$Port/"
 Write-Host "  First browser visit creates a master password."
+if ($HttpsPort -gt 0 -and $HttpsPort -ne $Port) {
+    Write-Host ""
+    Write-Host "  HTTPS   : TCP $HttpsPort is open in the firewall but not served yet." -ForegroundColor Cyan
+    Write-Host "            Turn it on under Settings -> Remote access, or issue a free"
+    Write-Host "            certificate for a duckdns.org name there, then restart the task:"
+    Write-Host "              schtasks /End /TN `"$TaskName`"  &&  schtasks /Run /TN `"$TaskName`""
+}
 Write-Host ""
 Write-Host "Uninstall (Admin):"
 Write-Host "  powershell -ExecutionPolicy Bypass -File `"$(Join-Path $InstallDir 'uninstall-web-service.ps1')`" -Port $Port"
