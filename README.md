@@ -104,7 +104,10 @@ Auto-block never touches allowlisted IPs. A **manual** block of an allowlisted I
 ## Requirements
 
 - **Windows 10, 11, or Windows Server** (2019/2022+)
-- [.NET 8 Desktop Runtime](https://dotnet.microsoft.com/download) on the target machine (framework-dependent publish)
+- For a **framework-dependent** build (what `scripts\install.ps1` produces), the target machine needs **both**:
+  - [.NET 8 **Desktop** Runtime](https://dotnet.microsoft.com/download) — the WPF GUI
+  - [ASP.NET Core 8 Runtime](https://dotnet.microsoft.com/download) — Kestrel, which serves the web console. The Desktop Runtime alone is no longer enough; without this the app fails to start. Check with `dotnet --list-runtimes`.
+  - The default **server package** (`scripts\package-server.ps1`) is self-contained and needs neither.
 - [.NET 8 SDK](https://dotnet.microsoft.com/download) to build
 - **Administrator** rights to create or delete Windows Defender Firewall rules
 
@@ -272,7 +275,7 @@ Executable:
 bin\Release\net8.0-windows\NetworkSentinel.exe
 ```
 
-Publish (framework-dependent):
+Publish (framework-dependent — target needs the Desktop **and** ASP.NET Core 8 runtimes, see [Requirements](#requirements)):
 
 ```powershell
 dotnet publish -c Release -r win-x64 --self-contained false
