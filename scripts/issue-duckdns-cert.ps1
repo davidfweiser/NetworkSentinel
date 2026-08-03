@@ -375,13 +375,56 @@ $OfflineAdvice = "DNS-01 needs no inbound port 80, but issuance still needs outb
                  "If that is blocked here, issue the certificate on a machine that has access and copy the " +
                  ".fullchain.cer and .key into $TlsDir, then point Settings -> Remote access at them."
 
+# A TCP probe cannot tell an open path from an SSL-inspecting middlebox: the connect
+# succeeds, the TLS handshake dies. Fetch the ACME directory for real and, on failure,
+# name who actually presented the certificate -- a firewall product's CA in that field
+# is the smoking gun.
+function Test-AcmeTls {
+    param([string]$HostName = 'acme-v02.api.letsencrypt.org')
+    $req = $null
+    try {
+        $req = [Net.HttpWebRequest]::Create("https://$HostName/directory")
+        $req.Timeout = 20000
+        $res = $req.GetResponse()
+        $issuer = $req.ServicePoint.Certificate.Issuer
+        $res.Close()
+        return "HTTPS to $HostName works (certificate issued by: $issuer)"
+    }
+    catch {
+        $msg = $_.Exception.GetBaseException().Message.Trim()
+        $issuer = $null
+        try { if ($req -and $req.ServicePoint -and $req.ServicePoint.Certificate) { $issuer = $req.ServicePoint.Certificate.Issuer } } catch { }
+        if ($issuer) {
+            return "HTTPS to $HostName failed: $msg. It presented a certificate issued by: $issuer - " +
+                   "if that names a firewall or security product, SSL inspection is rewriting this connection; " +
+                   "exempt $HostName from inspection or add the product's root CA to this machine's Trusted Root store"
+        }
+        return "HTTPS to $HostName failed at the TLS layer: $msg"
+    }
+}
+
+# Posh-ACME's error handling can itself fail on a connection-level error ("You cannot
+# call a method on a null-valued expression"), burying the cause. Every ACME failure
+# goes through here so the TLS probe and the module's stack trace reach the log.
+function DieAcme {
+    param([string]$What, [System.Management.Automation.ErrorRecord]$Err)
+    $msg = $Err.Exception.Message.Trim()
+    if ($msg -match 'null-valued expression') {
+        $msg = "$msg (Posh-ACME's error handler tripped over a lower-level failure; the TLS probe is the real story)"
+    }
+    if ($Err.ScriptStackTrace) {
+        Say ("  where: " + ($Err.ScriptStackTrace -replace "\r?\n", ' <- '))
+    }
+    Die "$What`: $msg [$(Test-AcmeTls)]. $OfflineAdvice"
+}
+
 # Contacts the ACME directory, so this is the first thing to fail on a server with
 # filtered egress. Uncaught, it exits with a bare PowerShell error and no usable text.
 try {
     Set-PAServer LE_PROD -ErrorAction Stop
 }
 catch {
-    Die "could not reach Let's Encrypt: $($_.Exception.Message.Trim()) [$(Test-Egress $AcmeHost)]. $OfflineAdvice"
+    DieAcme "could not reach Let's Encrypt" $_
 }
 
 # Let's Encrypt registers the account against this address. There is no way to skip
@@ -390,7 +433,7 @@ $AccountEmail = $env:NS_ACME_EMAIL
 $existingAccount = $null
 try { $existingAccount = Get-PAAccount -ErrorAction Stop }
 catch {
-    Die "could not read the Let's Encrypt account: $($_.Exception.Message.Trim()) [$(Test-Egress $AcmeHost)]. $OfflineAdvice"
+    DieAcme "could not read the Let's Encrypt account" $_
 }
 
 if (-not $existingAccount) {
@@ -406,7 +449,7 @@ if (-not $existingAccount) {
         New-PAAccount -Contact $AccountEmail -AcceptTOS -ErrorAction Stop | Out-Null
     }
     catch {
-        Die "could not register the Let's Encrypt account: $($_.Exception.Message.Trim()) [$(Test-Egress $AcmeHost)]. $OfflineAdvice"
+        DieAcme "could not register the Let's Encrypt account" $_
     }
 }
 
@@ -460,8 +503,8 @@ if (-not $reuse) {
         # Two different remote hosts are involved: the TXT record is written through
         # the DuckDNS API, and the order is placed with Let's Encrypt. Naming which
         # one is unreachable saves guessing at the token.
-        Die ("certificate issuance failed: $($_.Exception.Message.Trim()) " +
-             "[$(Test-Egress $AcmeHost); $(Test-Egress 'www.duckdns.org')]. $OfflineAdvice")
+        Say "  DuckDNS side: $(Test-Egress 'www.duckdns.org')"
+        DieAcme "certificate issuance failed" $_
     }
 
     $existing = Get-PACertificate -MainDomain $Fqdn -ErrorAction SilentlyContinue
