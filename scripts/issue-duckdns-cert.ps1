@@ -68,6 +68,15 @@ try {
 $TlsDir = Join-Path $DataDir 'tls'
 $DuckDnsJson = Join-Path $DataDir 'duckdns.json'
 
+# Posh-ACME is kept with the app's own data rather than a profile module folder.
+# The desktop app runs as the signed-in user and the renewal task as SYSTEM; a
+# per-profile copy would mean installing it twice, and under SYSTEM the usual
+# Documents\WindowsPowerShell\Modules path may be OneDrive-redirected or absent.
+$ModuleRoot = Join-Path $DataDir 'modules'
+if ($env:PSModulePath -notlike "*$ModuleRoot*") {
+    $env:PSModulePath = "$ModuleRoot;$env:PSModulePath"
+}
+
 # Keep ACME state beside the app's own data instead of the calling account's profile.
 # The desktop GUI runs as the signed-in user and the web service as SYSTEM; a
 # per-profile store would mean each one issuing and renewing its own certificate.
@@ -124,7 +133,7 @@ if ([string]::IsNullOrWhiteSpace($Token)) { Die "no DuckDNS token given" }
 if (-not (Get-Module -ListAvailable -Name Posh-ACME)) {
     Say ""
     Say "Posh-ACME is not installed."
-    Say "It is the PowerShell ACME client; it installs to your user module folder."
+    Say "It is the PowerShell ACME client; it installs to $ModuleRoot."
 
     if (Interactive) {
         $reply = Read-Host "Install it now from the PowerShell Gallery? [y/N]"
@@ -133,20 +142,76 @@ if (-not (Get-Module -ListAvailable -Name Posh-ACME)) {
         Say "Installing it now (NS_ASSUME_YES)."
     }
 
-    try {
-        # PowerShell 5.1 still negotiates TLS 1.0 by default; the Gallery requires 1.2.
-        [Net.ServicePointManager]::SecurityProtocol =
-            [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+    # PowerShell 5.1 still negotiates TLS 1.0 by default; the Gallery requires 1.2.
+    [Net.ServicePointManager]::SecurityProtocol =
+        [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
 
+    $installed = $false
+
+    New-Item -ItemType Directory -Force -Path $ModuleRoot | Out-Null
+
+    # Preferred path, on machines whose PowerShellGet actually works.
+    # Save-Module rather than Install-Module -Scope CurrentUser: this has to be visible
+    # to both the desktop app (signed-in user) and the renewal task (SYSTEM), and a
+    # profile install would be found by only one of them.
+    try {
         if (-not (Get-PackageProvider -Name NuGet -ErrorAction SilentlyContinue)) {
-            Install-PackageProvider -Name NuGet -MinimumVersion 2.8.5.201 -Scope CurrentUser -Force | Out-Null
+            Install-PackageProvider -Name NuGet -MinimumVersion 2.8.5.201 -Scope CurrentUser -Force -ErrorAction Stop | Out-Null
         }
-        Install-Module -Name Posh-ACME -Scope CurrentUser -Force -AllowClobber -Repository PSGallery
-    } catch {
-        Die "could not install Posh-ACME: $($_.Exception.Message)"
+        Save-Module -Name Posh-ACME -Path $ModuleRoot -Repository PSGallery -Force -ErrorAction Stop
+        $installed = [bool](Get-Module -ListAvailable -Name Posh-ACME)
+    }
+    catch {
+        Say "  PowerShellGet could not fetch it: $($_.Exception.Message.Trim())"
     }
 
-    if (-not (Get-Module -ListAvailable -Name Posh-ACME)) {
+    # Fallback. Windows ships PackageManagement/PowerShellGet 1.0.0.1 with no NuGet
+    # provider, and bootstrapping one fails on plenty of otherwise healthy machines
+    # ("Unable to resolve package source ..."), which used to sink issuance even
+    # though the gallery was perfectly reachable. A .nupkg is a zip and Posh-ACME has
+    # no dependencies, so fetching it directly needs none of that stack.
+    if (-not $installed) {
+        Say "  Downloading Posh-ACME straight from the gallery instead..."
+        $tmp = Join-Path ([IO.Path]::GetTempPath()) "posh-acme-$PID"
+        try {
+            New-Item -ItemType Directory -Force -Path $tmp | Out-Null
+            # Expand-Archive insists on a .zip extension.
+            $zip = Join-Path $tmp 'posh-acme.zip'
+            Invoke-WebRequest -Uri 'https://www.powershellgallery.com/api/v2/package/Posh-ACME' `
+                -OutFile $zip -UseBasicParsing -TimeoutSec 180
+
+            $ext = Join-Path $tmp 'extract'
+            Expand-Archive -LiteralPath $zip -DestinationPath $ext -Force
+
+            $nuspec = Get-ChildItem -LiteralPath $ext -Filter '*.nuspec' | Select-Object -First 1
+            if (-not $nuspec) { throw "downloaded package contained no .nuspec" }
+            [xml]$meta = Get-Content -LiteralPath $nuspec.FullName
+            $version = $meta.package.metadata.version
+            if (-not $version) { throw "could not read a version out of the package" }
+
+            $dest = Join-Path $ModuleRoot "Posh-ACME\$version"
+            if (Test-Path $dest) { Remove-Item -LiteralPath $dest -Recurse -Force }
+            New-Item -ItemType Directory -Force -Path $dest | Out-Null
+
+            # Literal names, not -Exclude: '[Content_Types].xml' is a wildcard pattern
+            # to PowerShell and would not match the file it is named after.
+            $skip = @('_rels', 'package', '[Content_Types].xml')
+            Get-ChildItem -LiteralPath $ext -Force |
+                Where-Object { $skip -notcontains $_.Name -and $_.Extension -ne '.nuspec' } |
+                Copy-Item -Destination $dest -Recurse -Force
+
+            $installed = [bool](Get-Module -ListAvailable -Name Posh-ACME)
+            if ($installed) { Say "  Installed Posh-ACME $version to $ModuleRoot" }
+        }
+        catch {
+            Die "could not install Posh-ACME: $($_.Exception.Message)"
+        }
+        finally {
+            Remove-Item -LiteralPath $tmp -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+
+    if (-not $installed) {
         Die "Posh-ACME install did not produce a usable module"
     }
 }
@@ -267,6 +332,9 @@ $TaskName = 'NetworkSentinel-CertRenew'
 try {
     $renewCommand = @"
 `$env:POSHACME_HOME = '$($env:POSHACME_HOME)'
+# The module may live with the app's data rather than in a profile module folder,
+# and this task runs as SYSTEM, so put that path on PSModulePath before importing.
+`$env:PSModulePath = '$ModuleRoot;' + `$env:PSModulePath
 Import-Module Posh-ACME
 Submit-Renewal -AllOrders
 Copy-Item -LiteralPath (Get-PACertificate -MainDomain '$Fqdn').FullChainFile -Destination '$CertFile' -Force

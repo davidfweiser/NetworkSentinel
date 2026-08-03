@@ -203,9 +203,13 @@ public sealed class CertIssuanceService
              text.Contains("duckdns", StringComparison.OrdinalIgnoreCase)))
             return "DuckDNS refused the DNS record, which usually means the token or subdomain is wrong";
 
+        // The script falls back to downloading the .nupkg directly when PowerShellGet
+        // cannot fetch it, so reaching this means the gallery itself was unreachable
+        // rather than the package manager being the stock broken one.
         if (text.Contains("could not install Posh-ACME", StringComparison.OrdinalIgnoreCase) ||
             text.Contains("No match was found for the specified search criteria", StringComparison.OrdinalIgnoreCase))
-            return "Posh-ACME could not be downloaded from the PowerShell Gallery; check internet access and that TLS 1.2 is permitted";
+            return "Posh-ACME could not be downloaded from powershellgallery.com; check internet access, a proxy, " +
+                   "or whether outbound HTTPS is filtered";
 
         if (text.Contains("Timeout", StringComparison.OrdinalIgnoreCase) &&
             text.Contains("dns", StringComparison.OrdinalIgnoreCase))
