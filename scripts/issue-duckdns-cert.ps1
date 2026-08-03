@@ -177,12 +177,25 @@ if (-not (Get-Module -ListAvailable -Name Posh-ACME)) {
             # Expand-Archive insists on a .zip extension.
             $zip = Join-Path $tmp 'posh-acme.zip'
 
+            # Escape hatch for a server with no outbound internet: fetch
+            # Posh-ACME.<version>.nupkg on a machine that has access and copy it over.
+            # NS_POSHACME_NUPKG names it explicitly; otherwise it is enough to drop the
+            # file in the data directory or beside this script, so an operator who
+            # cannot set a machine variable and restart the service can still get there.
+            $localPkg = $null
             if ($env:NS_POSHACME_NUPKG -and (Test-Path -LiteralPath $env:NS_POSHACME_NUPKG)) {
-                # Escape hatch for a server with no outbound internet: download
-                # Posh-ACME.<version>.nupkg on a machine that does have it, copy it
-                # over, and point NS_POSHACME_NUPKG at the file.
-                Say "  Using the local package $($env:NS_POSHACME_NUPKG)"
-                Copy-Item -LiteralPath $env:NS_POSHACME_NUPKG -Destination $zip -Force
+                $localPkg = $env:NS_POSHACME_NUPKG
+            }
+            else {
+                $localPkg = Get-ChildItem -Path @($DataDir, $PSScriptRoot) -Filter 'Posh-ACME*.nupkg' `
+                    -File -ErrorAction SilentlyContinue |
+                    Sort-Object Name -Descending |
+                    Select-Object -First 1 -ExpandProperty FullName
+            }
+
+            if ($localPkg) {
+                Say "  Using the local package $localPkg"
+                Copy-Item -LiteralPath $localPkg -Destination $zip -Force
             }
             else {
                 Say "  Downloading Posh-ACME straight from the gallery instead..."
@@ -259,9 +272,9 @@ if (-not (Get-Module -ListAvailable -Name Posh-ACME)) {
                 catch { }
 
                 $hint = " [$probe]. If this machine uses a proxy, set NS_PROXY (issuance runs as SYSTEM " +
-                        "from the web console and does not inherit your proxy settings). For a server with no " +
-                        "outbound internet, download Posh-ACME.<version>.nupkg elsewhere, copy it over, and set " +
-                        "NS_POSHACME_NUPKG to its path. Either can also be set machine-wide with setx /M."
+                        "from the web console and does not inherit your proxy settings). If it has no outbound " +
+                        "internet, download Posh-ACME.<version>.nupkg on a machine that does and copy it into " +
+                        "$DataDir - it is picked up from there automatically, no restart needed."
             }
 
             Die "could not install Posh-ACME: $why$hint"
