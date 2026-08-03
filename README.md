@@ -10,13 +10,34 @@ Three ways to run it (same idea as the Linux build):
 | **Terminal UI (`--tui`)** | Server Core, RDP console, SSH-style workflows |
 | **Headless web UI (`-w`)** | Browser dashboard on a server (master-password protected) |
 
-> Awareness / monitoring tooling — not a full IDS/IPS replacement. Version **0.4.0**.
+> Awareness / monitoring tooling — not a full IDS/IPS replacement. Version **0.5.0**.
+
+---
+
+## What's new in 0.5.0
+
+Brings the Windows build level with the Linux and macOS 0.5.0 releases: the web console can now be reached from outside the LAN, over TLS, with a certificate it can issue itself.
+
+| Area | What changed |
+|------|--------------|
+| **HTTPS** | The console serves TLS alongside plain HTTP — see [HTTPS and remote access](#https-and-remote-access). Certificate files are re-read when they change, so a renewal applies **without a restart**. Requests arriving by hostname redirect to TLS; requests to a bare IP stay on HTTP, because the certificate only covers the name. |
+| **Kestrel** | `HttpListener` is gone. It can serve TLS on Windows, but only against a certificate in the machine store bound with `netsh http add sslcert` — admin-only, per-port, redone at every renewal. Kestrel reads the PEM or `.pfx` off disk, which is what a renewal rewrites. It also drops the `netsh http add urlacl` reservation that binding all interfaces used to need. |
+| **DuckDNS** | A free hostname that follows your public IP, refreshed every 5 minutes by whichever front-end is running. Configure it in **Settings → Remote access** or with `--set-duckdns`. |
+| **Issue certificate** | One button in the desktop app *and* the web console gets a free Let's Encrypt certificate for that name and fills in the paths. Uses a DNS-01 challenge through the DuckDNS API, so **nothing needs to be reachable on port 80**. Renewals run from a scheduled task. |
+| **Login lockout** | Five wrong master-password guesses lock that client IP out, doubling to an hour, answered with `429` + `Retry-After`. The old fixed delay only slowed one connection at a time; this caps a parallel guesser. |
+
+**Upgrading** is in place and now genuinely non-destructive: `%ProgramData%\NetworkSentinel` is both the install folder and the data directory, so the installer replaces **only files the package ships**. Settings, master password, allowlist, logs, host history, threat log, the DuckDNS token, `tls\`, and `acme\` all survive. Re-run the installer and confirm the web header reads `v0.5.0`.
+
+Two Windows-specific notes:
+
+- **Certificate issuance uses [Posh-ACME](https://poshac.me)**, not `acme.sh`. The script installs it per-user from the PowerShell Gallery on first run, and — unlike `acme.sh` — it does not register its own renewal job, so a `NetworkSentinel-CertRenew` scheduled task is created for that. Registering it needs elevation.
+- **A framework-dependent build now needs the ASP.NET Core 8 Runtime** as well as the Desktop Runtime; the Desktop Runtime alone is no longer enough. The server package is self-contained and needs neither. See [Requirements](#requirements).
 
 ---
 
 ## What's new in 0.4.0
 
-Brings the Windows build level with the Linux and macOS 0.4.0 releases.
+Brought the Windows build level with the Linux and macOS 0.4.0 releases.
 
 | Area | What changed |
 |------|--------------|
@@ -175,11 +196,11 @@ Self-contained by default — the server does **not** need the .NET SDK or a com
 
 ```powershell
 # Copy the .install.cmd to the server, then run it (UAC prompt if not elevated):
-.\NetworkSentinel-windows-server-x64-0.4.0.install.cmd
+.\NetworkSentinel-windows-server-x64-0.5.0.install.cmd
 # optional port:
-.\NetworkSentinel-windows-server-x64-0.4.0.install.cmd -Port 18765
+.\NetworkSentinel-windows-server-x64-0.5.0.install.cmd -Port 18765
 # unpack without installing:
-.\NetworkSentinel-windows-server-x64-0.4.0.install.cmd --extract-only
+.\NetworkSentinel-windows-server-x64-0.5.0.install.cmd --extract-only
 ```
 
 The one-file installer is a `.cmd`, not a `.ps1`: `cmd.exe` stops reading the script at `exit /b`, so the ZIP appended to it is never parsed. PowerShell tokenizes an entire `-File` script before running any of it, and the cost on appended binary is quadratic (16 MB ≈ 5½ minutes) before it fails to parse at all — so the shell-style "payload after exit" trick only works with a `cmd` entry point.
@@ -233,7 +254,7 @@ No URL ACL is reserved. That was an `HttpListener` requirement; Kestrel binds th
 
 #### Upgrades and uninstall
 
-Re-running the installer **upgrades in place**: it stops the running task, replaces the binaries, and restarts. `%ProgramData%\NetworkSentinel` is both the install folder and the data directory, so the installer removes **only the files the package ships** — the master password hash, settings, allowlist, logs, host history, threat log, `duckdns.json`, `tls\`, and `acme\` all survive. The web page header shows the running version (e.g. `v0.4.0`) — check it after an upgrade to confirm the new build is live.
+Re-running the installer **upgrades in place**: it stops the running task, replaces the binaries, and restarts. `%ProgramData%\NetworkSentinel` is both the install folder and the data directory, so the installer removes **only the files the package ships** — the master password hash, settings, allowlist, logs, host history, threat log, `duckdns.json`, `tls\`, and `acme\` all survive. The web page header shows the running version (e.g. `v0.5.0`) — check it after an upgrade to confirm the new build is live.
 
 Uninstall keeps that same data by default so a reinstall picks up where you left off:
 
