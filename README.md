@@ -92,6 +92,17 @@ Domains are DNS-resolved to current IPs. Auto-block never touches allowlisted IP
 
 The page header shows the running version (e.g. `v0.5.0`) — check it after an upgrade to confirm the new build is live.
 
+### Sleep / Wake
+
+The first button in the web console header is a single **Sleep ⇄ Wake** toggle:
+
+- **Sleep** stops *everything the console watches* — the connection/port poll plus the auth-log, closed-port probe, ARP, startup-item, exfiltration and honeypot watchers — and parks the page: the live tabs dim, a banner explains the state, and the browser drops its 2.5-second refresh so a sleeping console costs nothing on either end
+- **Wake** starts monitoring again from live data and restores the normal refresh
+- **Firewall blocks stay in force while asleep.** Sleeping stops watching; it never unblocks an address the machine is already protected from
+- The state is the server's, not the browser's: reload or open a second tab and you still see *Asleep*, and the **Settings → Live monitoring** switch is the same control. While asleep the page keeps a 30-second heartbeat so a wake from anywhere shows up here
+- Sleep is a runtime state — it is not written to `settings.json`, so restarting the service comes back up monitoring
+- Sleep applies to the process you pressed it in; a desktop or TUI instance is a separate process and keeps running (the TUI has its own `p` key for the same thing)
+
 ### Web UI security
 - First browser visit **creates a master password** (min. 8 characters)
 - Every later visit **requires that password**; change it under **Settings → Master password**

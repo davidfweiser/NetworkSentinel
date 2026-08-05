@@ -749,6 +749,38 @@ public sealed class WebApp : IDisposable
         return true;
     }
 
+    /// <summary>
+    /// Sleep / wake for the whole console. Stopping the monitor also stops every watcher it
+    /// owns (auth log, probe log, ARP, startup items, exfiltration, honeypot), so asleep really
+    /// means "nothing is being observed" rather than "the dashboard stopped updating".
+    /// Firewall rules are deliberately left in force — sleeping stops watching, it does not
+    /// unblock addresses the machine is already protected from.
+    /// </summary>
+    private ActionResultDto SetMonitoring(bool on)
+    {
+        if (on == _monitor.Stats.IsMonitoring)
+        {
+            _statusMessage = on
+                ? "Already awake — monitoring is running."
+                : "Already asleep — monitoring is stopped.";
+            return ActionResultDto.Success(_statusMessage);
+        }
+
+        if (on)
+        {
+            _monitor.Start();
+            _statusMessage = "Awake — monitoring resumed.";
+        }
+        else
+        {
+            _monitor.Stop();
+            _monitor.Stats.StatusText = "Asleep — monitoring stopped";
+            _statusMessage = "Asleep — monitoring stopped. Firewall blocks stay in force.";
+        }
+
+        return ActionResultDto.Success(_statusMessage);
+    }
+
     private ActionResultDto RunAction(ActionRequest req)
     {
         try
@@ -756,27 +788,16 @@ public sealed class WebApp : IDisposable
             switch (req.Action.Trim().ToLowerInvariant())
             {
                 case "pause":
-                    _monitor.Stop();
-                    _statusMessage = "Monitoring paused.";
-                    return ActionResultDto.Success(_statusMessage);
+                case "sleep":
+                    return SetMonitoring(false);
 
                 case "resume":
-                    _monitor.Start();
-                    _statusMessage = "Monitoring resumed.";
-                    return ActionResultDto.Success(_statusMessage);
+                case "wake":
+                    return SetMonitoring(true);
 
                 case "toggle_monitor":
-                    if (_monitor.Stats.IsMonitoring)
-                    {
-                        _monitor.Stop();
-                        _statusMessage = "Monitoring paused.";
-                    }
-                    else
-                    {
-                        _monitor.Start();
-                        _statusMessage = "Monitoring resumed.";
-                    }
-                    return ActionResultDto.Success(_statusMessage);
+                case "toggle_sleep":
+                    return SetMonitoring(!_monitor.Stats.IsMonitoring);
 
                 case "toggle_autoblock":
                     _autoBlockEnabled = !_autoBlockEnabled;
@@ -1757,6 +1778,28 @@ public sealed class WebApp : IDisposable
     border: none;
   }
   .actions button.danger { border-color: rgba(255,93,120,.4); color: #ffa8b6; }
+  /* Wake reads as the one thing worth pressing while the console is asleep. */
+  .actions button.wake {
+    color: var(--bg-deep); font-weight: 600;
+    background: linear-gradient(135deg, var(--amber), #f5843b);
+    border: none;
+  }
+  .sleep-banner {
+    display: flex; flex-wrap: wrap; align-items: center; gap: 10px 16px;
+    margin-bottom: 14px; padding: 12px 16px; border-radius: 10px;
+    background: rgba(245,185,59,.08); border: 1px solid rgba(245,185,59,.45);
+    color: #f6d089; font-size: .88rem;
+  }
+  .sleep-banner strong { color: var(--amber); letter-spacing: .04em; text-transform: uppercase; font-size: .78rem; }
+  .sleep-banner .spacer { flex: 1; }
+  .sleep-banner button {
+    appearance: none; border: none; border-radius: 8px; padding: 7px 14px; cursor: pointer;
+    font: inherit; font-size: .82rem; font-weight: 600; color: var(--bg-deep);
+    background: linear-gradient(135deg, var(--amber), #f5843b);
+  }
+  /* Dim the live data while asleep so stale rows can't be read as current traffic.
+     Settings stays at full strength — it holds the other way to wake the console. */
+  body.asleep main > section:not(#tab-settings) { opacity: .42; filter: grayscale(.55); }
   main { padding: 18px 22px 40px; max-width: 1720px; margin: 0 auto; }
   .status {
     margin-bottom: 14px; padding: 10px 14px; border-radius: 10px;
@@ -2045,7 +2088,7 @@ public sealed class WebApp : IDisposable
     <button data-tab="help">Help</button>
   </nav>
   <div class="actions">
-    <button id="btnMonitor" class="primary">Pause</button>
+    <button id="btnSleep" class="primary" title="Stop monitoring and put Network Sentinel to sleep">Sleep</button>
     <button id="btnAuto">Auto-block</button>
     <button id="btnLevel">Min: High</button>
     <button id="btnAuth">Authorize</button>
@@ -2055,6 +2098,12 @@ public sealed class WebApp : IDisposable
 </header>
 <main>
   <div class="status" id="status">Connecting…</div>
+  <div class="sleep-banner hidden" id="sleepBanner">
+    <strong>Asleep</strong>
+    <span>Monitoring is stopped — no connections, ports, or threats are being watched. Firewall blocks stay in force.</span>
+    <span class="spacer"></span>
+    <button type="button" id="btnWakeBanner">Wake up</button>
+  </div>
 
   <section id="tab-dashboard">
     <div class="cards" id="cards"></div>
@@ -2155,6 +2204,7 @@ public sealed class WebApp : IDisposable
         <li><strong>Allowlist</strong> — domains/IPs that are never blocked</li>
         <li><strong>Settings</strong> — auto-block behavior, block direction, geo lookups, refresh speed, and master password</li>
       </ul>
+      <p><strong>Sleep / Wake</strong> — the first button in the header stops every watcher (connections, listening ports, auth log, port-scan probes, ARP, startup items, exfiltration, honeypot) and parks the console. Press it again to wake up and start monitoring from live data. Firewall blocks stay in force while asleep — sleeping stops watching, it does not unblock anything. Sleep applies to this web service; a desktop or TUI instance is a separate process and keeps running.</p>
       <p class="muted">Firewall actions need root or an elevation helper (pkexec/sudo). Prefer running the web service as root once rather than elevating per action.</p>
       <p class="muted">Web access is gated by a master password (set on first visit; change it anytime under Settings). The password is stored only as a salted one-way hash. Sign out or close the browser to require it again.</p>
     </div>
@@ -2169,6 +2219,7 @@ public sealed class WebApp : IDisposable
   let lastError = '';
   let authMode = 'check'; // check | setup | login | ok
   let pollTimer = null;
+  let sleepTimer = null;
 
   const $ = (id) => document.getElementById(id);
   const esc = (s) => String(s ?? '').replace(/[&<>"']/g, c => (
@@ -2271,7 +2322,7 @@ public sealed class WebApp : IDisposable
   async function fetchState() {
     const res = await fetch('/api/state', { cache: 'no-store', credentials: 'same-origin' });
     if (res.status === 401) {
-      stopPolling();
+      stopAllTimers();
       const body = await res.json().catch(() => ({}));
       showAuth(body.configured === false ? 'setup' : 'login', 'Sign in required.');
       return false;
@@ -2290,7 +2341,7 @@ public sealed class WebApp : IDisposable
       body: JSON.stringify({ action, ...extra })
     });
     if (res.status === 401) {
-      stopPolling();
+      stopAllTimers();
       showAuth('login', 'Session expired. Sign in again.');
       return { ok: false, message: 'Authentication required.' };
     }
@@ -2339,6 +2390,53 @@ public sealed class WebApp : IDisposable
 
   function stopPolling() {
     if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
+  }
+
+  function stopSleepBeat() {
+    if (sleepTimer) { clearInterval(sleepTimer); sleepTimer = null; }
+  }
+
+  function stopAllTimers() {
+    stopPolling();
+    stopSleepBeat();
+  }
+
+  // Unknown state (nothing fetched yet) counts as awake — never park the page on a guess.
+  function isAsleep() {
+    return !!(state && state.settings && !state.settings.isMonitoring);
+  }
+
+  // Asleep, the server observes nothing, so there is no new data to draw: drop the fast
+  // poll. A slow heartbeat stays behind so a wake triggered elsewhere — another browser,
+  // a second tab, an API client — still reaches this page.
+  function syncSleepMode() {
+    if (isAsleep()) {
+      stopPolling();
+      if (!sleepTimer) sleepTimer = setInterval(sleepHeartbeat, 30000);
+    } else {
+      stopSleepBeat();
+      if (!pollTimer && !isFrozenTab()) startPolling();
+    }
+  }
+
+  async function sleepHeartbeat() {
+    if (isFrozenTab()) return;
+    try {
+      if (await fetchState()) render({ forceLists: true });
+    } catch { /* quiet while asleep — a lost server is not news here */ }
+  }
+
+  async function toggleSleep(force) {
+    const wantSleep = force === undefined ? !isAsleep() : !!force;
+    const btn = $('btnSleep');
+    btn.disabled = true;
+    try {
+      await apiAction(wantSleep ? 'sleep' : 'wake');
+      statusHoldUntil = Date.now() + 8000;
+    } finally {
+      btn.disabled = false;
+    }
+    syncSleepMode();
   }
 
   function saveScroll(id) {
@@ -2437,9 +2535,16 @@ public sealed class WebApp : IDisposable
       setStatus(state.statusMessage, false);
 
     const mon = !!(state.settings && state.settings.isMonitoring);
-    $('btnMonitor').textContent = mon ? 'Pause' : 'Resume';
+    const btnSleep = $('btnSleep');
+    btnSleep.textContent = mon ? 'Sleep' : 'Wake';
+    btnSleep.title = mon
+      ? 'Stop monitoring and put Network Sentinel to sleep'
+      : 'Wake Network Sentinel and start monitoring again';
+    btnSleep.classList.toggle('wake', !mon);
+    document.body.classList.toggle('asleep', !mon);
+    $('sleepBanner').classList.toggle('hidden', mon);
     $('monDot').className = 'dot ' + (mon ? 'on' : 'off');
-    $('monLabel').textContent = mon ? 'Monitoring' : 'Paused';
+    $('monLabel').textContent = mon ? 'Monitoring' : 'Asleep';
     $('fwPill').textContent = state.firewall?.isAdmin ? 'Firewall: ready' : 'Firewall: needs elevation';
     const ab = state.settings?.autoBlockEnabled;
     $('abPill').textContent = ab
@@ -2605,6 +2710,10 @@ public sealed class WebApp : IDisposable
       restoreScroll('tbl-allowlist', alScroll);
       renderSettings();
     }
+
+    // Every state update funnels through here, so this is where the page learns it is
+    // asleep — including a reload while asleep, or a sleep triggered from another tab.
+    syncSleepMode();
   }
 
   function notifPermText() {
@@ -2632,7 +2741,7 @@ public sealed class WebApp : IDisposable
 
     $('settingsPanel').innerHTML = `
       <div class="settings-group"><h3>Monitoring</h3>
-        ${row('Live monitoring', 'Watch connections, listening ports, and threats in real time.', sw('monitoring', s.isMonitoring))}
+        ${row('Live monitoring', 'Watch connections, listening ports, and threats in real time. Switching this off is the same as the Sleep button in the header — every watcher stops until you wake it again. Firewall blocks stay in force either way.', sw('monitoring', s.isMonitoring))}
         ${row('Page refresh speed', 'How often live tabs (Dashboard, Connections, Hosts…) update in this browser.', refreshSel)}
         ${row('Geo lookups', 'Resolve country and city for remote IPs (ipwho.is over HTTPS, ip-api.com fallback).', sw('geoLookupEnabled', s.geoLookupEnabled))}
         ${row('Auth-log monitoring', 'Watch system auth logs for failed SSH/PAM logons and alert on brute-force bursts. ' + (s.authLogStatus || ''), sw('authLogMonitorEnabled', s.authLogMonitorEnabled))}
@@ -2699,28 +2808,19 @@ public sealed class WebApp : IDisposable
     if (isFrozenTab()) {
       stopPolling();
       refreshFrozenTab();
-    } else if (!pollTimer) {
-      startPolling();
+    } else {
+      syncSleepMode();
     }
   });
 
-  $('btnMonitor').onclick = async () => {
-    await apiAction('toggle_monitor');
-    // Monitor Pause also stops background UI polling (user expectation).
-    if (state && state.settings && !state.settings.isMonitoring) {
-      stopPolling();
-      setStatus('Monitoring and live UI refresh paused. Open a tab or Resume to update.', false);
-      statusHoldUntil = Date.now() + 8000;
-    } else if (!isFrozenTab()) {
-      startPolling();
-    }
-  };
+  $('btnSleep').onclick = () => toggleSleep();
+  $('btnWakeBanner').onclick = () => toggleSleep(false);
   $('btnAuto').onclick = () => apiAction('toggle_autoblock');
   $('btnLevel').onclick = () => apiAction('cycle_min_level');
   $('btnAuth').onclick = () => apiAction('authorize');
   $('btnClear').onclick = () => apiAction('clear_threats');
   $('btnLogout').onclick = async () => {
-    stopPolling();
+    stopAllTimers();
     await fetch('/api/auth/logout', {
       method: 'POST',
       credentials: 'same-origin',
@@ -2771,7 +2871,7 @@ public sealed class WebApp : IDisposable
       if (key === 'criticalAlertsEnabled' && t.checked &&
           'Notification' in window && Notification.permission === 'default')
         Notification.requestPermission().then(() => renderSettings());
-      if (key === 'monitoring') apiAction('toggle_monitor');
+      if (key === 'monitoring') toggleSleep(!t.checked);
       else apiAction('set_setting', { name: key, value: t.checked ? 'true' : 'false' });
       return;
     }
@@ -2857,7 +2957,7 @@ public sealed class WebApp : IDisposable
         body: JSON.stringify({ currentPassword, newPassword, confirm })
       });
       if (res.status === 401) {
-        stopPolling();
+        stopAllTimers();
         showAuth('login', 'Session expired. Sign in again.');
         return;
       }
