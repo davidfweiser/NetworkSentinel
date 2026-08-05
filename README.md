@@ -10,7 +10,15 @@ Three ways to run it (same idea as the Linux build):
 | **Terminal UI (`--tui`)** | Server Core, RDP console, SSH-style workflows |
 | **Headless web UI (`-w`)** | Browser dashboard on a server (master-password protected) |
 
-> Awareness / monitoring tooling — not a full IDS/IPS replacement. Version **0.5.0**.
+> Awareness / monitoring tooling — not a full IDS/IPS replacement. Version **0.5.1**.
+
+---
+
+## What's new in 0.5.1
+
+The web console header's first button is now a single **Sleep ⇄ Wake** toggle. Sleeping stops *everything the console watches* — the connection and port poll plus the failed-logon, closed-port probe, ARP, startup-item, exfiltration and honeypot watchers — so asleep means nothing is being observed rather than a dashboard that stopped updating. Firewall blocks stay in force: sleeping stops watching, it never unblocks an address the machine is already protected from.
+
+The page follows the same state — live tabs dim, a banner explains what stopped, and the 2.5-second refresh drops to a 30-second heartbeat, so a wake from another tab or client still reaches the page. Sleep is server state, so a reload while asleep still shows *Asleep*, and **Settings → Live monitoring** is the same control. See [Sleep / Wake](#sleep--wake).
 
 ---
 
@@ -196,11 +204,11 @@ Self-contained by default — the server does **not** need the .NET SDK or a com
 
 ```powershell
 # Copy the .install.cmd to the server, then run it (UAC prompt if not elevated):
-.\NetworkSentinel-windows-server-x64-0.5.0.install.cmd
+.\NetworkSentinel-windows-server-x64-0.5.1.install.cmd
 # optional port:
-.\NetworkSentinel-windows-server-x64-0.5.0.install.cmd -Port 18765
+.\NetworkSentinel-windows-server-x64-0.5.1.install.cmd -Port 18765
 # unpack without installing:
-.\NetworkSentinel-windows-server-x64-0.5.0.install.cmd --extract-only
+.\NetworkSentinel-windows-server-x64-0.5.1.install.cmd --extract-only
 ```
 
 The one-file installer is a `.cmd`, not a `.ps1`: `cmd.exe` stops reading the script at `exit /b`, so the ZIP appended to it is never parsed. PowerShell tokenizes an entire `-File` script before running any of it, and the cost on appended binary is quadratic (16 MB ≈ 5½ minutes) before it fails to parse at all — so the shell-style "payload after exit" trick only works with a `cmd` entry point.
@@ -262,7 +270,7 @@ No URL ACL is reserved. That was an `HttpListener` requirement; Kestrel binds th
 
 #### Upgrades and uninstall
 
-Re-running the installer **upgrades in place**: it stops the running task, replaces the binaries, and restarts. `%ProgramData%\NetworkSentinel` is both the install folder and the data directory, so the installer removes **only the files the package ships** — the master password hash, settings, allowlist, logs, host history, threat log, `duckdns.json`, `tls\`, and `acme\` all survive. The web page header shows the running version (e.g. `v0.5.0`) — check it after an upgrade to confirm the new build is live.
+Re-running the installer **upgrades in place**: it stops the running task, replaces the binaries, and restarts. `%ProgramData%\NetworkSentinel` is both the install folder and the data directory, so the installer removes **only the files the package ships** — the master password hash, settings, allowlist, logs, host history, threat log, `duckdns.json`, `tls\`, and `acme\` all survive. The web page header shows the running version (e.g. `v0.5.1`) — check it after an upgrade to confirm the new build is live.
 
 Uninstall keeps that same data by default so a reinstall picks up where you left off:
 
@@ -286,6 +294,17 @@ powershell -ExecutionPolicy Bypass -File .\uninstall-web-service.ps1 -PurgeData 
 | **Settings** | Monitoring on/off, page refresh speed, geo lookups, failed-logon monitoring, closed-port scan detection, the intrusion detectors (threat intel, new-listener, process reputation, ARP watch, startup-item watch, exfiltration, honeypot), **HTTPS + DuckDNS remote access** (including **Issue certificate**), webhook alerts, auto-block + minimum severity + expiry, block direction (in/out), allowlist feed, **change master password**, **Remove all rules** |
 
 The console protects itself: it refuses to remove its own firewall access rule or block its own port (doing so would cut off your browser mid-request and look exactly like a crash).
+
+#### Sleep / Wake
+
+The first button in the web console header is a single **Sleep ⇄ Wake** toggle:
+
+- **Sleep** stops *everything the console watches* — the connection/port poll plus the failed-logon, closed-port probe, ARP, startup-item, exfiltration and honeypot watchers — and parks the page: the live tabs dim, a banner explains the state, and the browser drops its 2.5-second refresh so a sleeping console costs nothing on either end
+- **Wake** starts monitoring again from live data and restores the normal refresh
+- **Firewall blocks stay in force while asleep.** Sleeping stops watching; it never unblocks an address the machine is already protected from
+- The state is the server's, not the browser's: reload or open a second tab and you still see *Asleep*, and the **Settings → Live monitoring** switch is the same control. While asleep the page keeps a 30-second heartbeat so a wake from anywhere shows up here
+- Sleep is a runtime state — it is not written to `settings.json`, so restarting the service comes back up monitoring
+- Sleep applies to the process you pressed it in; a desktop or TUI instance is a separate process and keeps running (the TUI has its own `p` key for the same thing)
 
 Uninstall (Admin):
 
