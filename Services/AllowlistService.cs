@@ -61,7 +61,7 @@ public sealed class AllowlistService : IDisposable
 
     public async Task InitializeAsync(CancellationToken ct = default)
     {
-        LoadAllSources(includeRemote: false);
+        LoadAllSources();
         await ResolveDomainsAsync(force: true, ct);
         if (UseRemoteFeed)
         {
@@ -74,7 +74,7 @@ public sealed class AllowlistService : IDisposable
 
     public async Task RefreshAsync(CancellationToken ct = default)
     {
-        LoadAllSources(includeRemote: false);
+        LoadAllSources();
         if (UseRemoteFeed)
             await TryFetchRemoteAsync(ct);
         await ResolveDomainsAsync(force: true, ct);
@@ -249,7 +249,7 @@ public sealed class AllowlistService : IDisposable
         AppPaths.WriteAtomic(LocalDatabasePath, JsonSerializer.Serialize(seed, JsonOptions));
     }
 
-    private void LoadAllSources(bool includeRemote)
+    private void LoadAllSources()
     {
         var domains = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         var ips = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
@@ -278,26 +278,50 @@ public sealed class AllowlistService : IDisposable
         StatusText = $"Loaded allowlist · {domains.Count} domains · {ips.Count} static IPs.";
     }
 
+    private string RemoteCachePath => Path.Combine(
+        Path.GetDirectoryName(LocalDatabasePath)!,
+        "allowlist-remote-cache.json");
+
+    /// <summary>
+    /// Re-adds the last successfully fetched remote feed from its on-disk cache.
+    /// Every path through <see cref="TryFetchRemoteAsync"/> that does NOT complete a
+    /// live fetch must call this: the caller may just have rebuilt the sets from
+    /// local sources (<see cref="RefreshAsync"/> clears everything first), and
+    /// skipping the merge silently stripped every remote-feed entry from the
+    /// never-block set until the next live fetch — pressing Refresh twice inside
+    /// the rate-limit window was enough to lose the protection.
+    /// </summary>
+    private void MergeRemoteCache()
+        => Merge(LoadFromPath(RemoteCachePath), lockAddDomains: true, lockAddIps: true);
+
     private async Task TryFetchRemoteAsync(CancellationToken ct)
     {
         if (string.IsNullOrWhiteSpace(RemoteFeedUrl))
             return;
 
         if (DateTime.UtcNow - _lastRemoteFetchUtc < TimeSpan.FromMinutes(10))
+        {
+            MergeRemoteCache();
             return;
+        }
 
         try
         {
             using var response = await _http.GetAsync(RemoteFeedUrl, ct);
             if (!response.IsSuccessStatusCode)
             {
-                StatusText = $"Remote allowlist fetch failed ({(int)response.StatusCode}). Using local/built-in lists.";
+                MergeRemoteCache();
+                StatusText = $"Remote allowlist fetch failed ({(int)response.StatusCode}). Using cache/local lists.";
                 return;
             }
 
             await using var stream = await response.Content.ReadAsStreamAsync(ct);
             var file = await JsonSerializer.DeserializeAsync<AllowlistFile>(stream, JsonOptions, ct);
-            if (file == null) return;
+            if (file == null)
+            {
+                MergeRemoteCache();
+                return;
+            }
 
             lock (_gate)
             {
@@ -327,21 +351,12 @@ public sealed class AllowlistService : IDisposable
 
             _lastRemoteFetchUtc = DateTime.UtcNow;
             // Cache remote copy for offline
-            var cachePath = Path.Combine(
-                Path.GetDirectoryName(LocalDatabasePath)!,
-                "allowlist-remote-cache.json");
-            AppPaths.WriteAtomic(cachePath, JsonSerializer.Serialize(file, JsonOptions));
+            AppPaths.WriteAtomic(RemoteCachePath, JsonSerializer.Serialize(file, JsonOptions));
             RebuildEntryViews();
         }
         catch (Exception ex)
         {
-            // Try offline cache
-            var cachePath = Path.Combine(
-                Path.GetDirectoryName(LocalDatabasePath)!,
-                "allowlist-remote-cache.json");
-            Merge(LoadFromPath(cachePath),
-                lockAddDomains: true,
-                lockAddIps: true);
+            MergeRemoteCache();
             StatusText = $"Remote allowlist unavailable ({ex.Message}). Using cache/local lists.";
         }
     }
