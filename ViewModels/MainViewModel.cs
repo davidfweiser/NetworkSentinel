@@ -1278,11 +1278,13 @@ public partial class MainViewModel : ObservableObject, IDisposable
 
         if (!answer) return;
 
-        var result = _firewall.BlockPort(
+        // Off the UI thread: firewall calls shell out to pkexec/nft, and the
+        // password dialog would otherwise freeze the whole window.
+        var result = await Task.Run(() => _firewall.BlockPort(
             port.Port,
             port.Protocol,
             FirewallDirection.Inbound,
-            $"Port block · {port.ServiceHint} · {port.ProcessName}");
+            $"Port block · {port.ServiceHint} · {port.ProcessName}"));
 
         FirewallMessage = result.Message;
         await DialogService.ShowInfoAsync(result.Message, "Firewall");
@@ -1330,7 +1332,8 @@ public partial class MainViewModel : ObservableObject, IDisposable
         }
 
         var direction = ResolveDirection();
-        var result = _firewall.BlockPort(port, ManualBlockProtocol, direction, "Manual port block from Firewall tab");
+        var result = await Task.Run(() =>
+            _firewall.BlockPort(port, ManualBlockProtocol, direction, "Manual port block from Firewall tab"));
         FirewallMessage = result.Message;
         if (!result.Success)
             await DialogService.ShowWarningAsync(result.Message, "Firewall");
@@ -1357,7 +1360,7 @@ public partial class MainViewModel : ObservableObject, IDisposable
         var answer = await DialogService.ConfirmAsync($"Remove firewall rule?\n\n{name}", "Remove rule");
         if (!answer) return;
 
-        var result = _firewall.RemoveRule(name);
+        var result = await Task.Run(() => _firewall.RemoveRule(name));
         FirewallMessage = result.Message;
         SelectedFirewallRule = null;
         RefreshFirewallRules();
@@ -1378,7 +1381,7 @@ public partial class MainViewModel : ObservableObject, IDisposable
             "Remove all managed rules");
         if (!answer) return;
 
-        var result = _firewall.RemoveAllManagedRules();
+        var result = await Task.Run(() => _firewall.RemoveAllManagedRules());
         FirewallMessage = result.Message;
         RefreshFirewallRules();
         RefreshCollections();
@@ -1394,7 +1397,7 @@ public partial class MainViewModel : ObservableObject, IDisposable
             SyncAllowlistUi();
             if (IsAdmin)
             {
-                var restored = _firewall.UnblockAllowlistedAddresses();
+                var restored = await Task.Run(() => _firewall.UnblockAllowlistedAddresses());
                 FirewallMessage = restored.Message;
                 RefreshFirewallRules();
                 RefreshCollections();
@@ -1431,7 +1434,7 @@ public partial class MainViewModel : ObservableObject, IDisposable
             SyncAllowlistUi();
             if (IsAdmin)
             {
-                var restored = _firewall.UnblockAllowlistedAddresses();
+                var restored = await Task.Run(() => _firewall.UnblockAllowlistedAddresses());
                 if (restored.Success)
                     FirewallMessage = message + " · " + restored.Message;
                 RefreshFirewallRules();
@@ -1480,7 +1483,7 @@ public partial class MainViewModel : ObservableObject, IDisposable
             return;
         }
 
-        var result = _firewall.UnblockAllowlistedAddresses();
+        var result = await Task.Run(() => _firewall.UnblockAllowlistedAddresses());
         FirewallMessage = result.Message;
         await DialogService.ShowInfoAsync(result.Message, "Restore allowlisted");
         RefreshFirewallRules();
@@ -1552,7 +1555,7 @@ public partial class MainViewModel : ObservableObject, IDisposable
 
         if (!answer) return false;
 
-        var result = _firewall.BlockIp(normalized, direction, reason, overrideAllowlist);
+        var result = await Task.Run(() => _firewall.BlockIp(normalized, direction, reason, overrideAllowlist));
         if (result.Success)
         {
             // Blocking by hand is an explicit reversal of an earlier release.
@@ -1575,7 +1578,7 @@ public partial class MainViewModel : ObservableObject, IDisposable
             return;
         }
 
-        var result = _firewall.UnblockIp(ip);
+        var result = await Task.Run(() => _firewall.UnblockIp(ip));
         if (result.Success && FirewallService.TryNormalizeIp(ip, out var normalized, out _))
         {
             // Suppresses auto-block for 24 h so a deliberate release isn't undone
