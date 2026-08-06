@@ -4,6 +4,13 @@ on:
   push:
     branches: [main]
   pull_request:
+  # Lets the suite be run by hand from the Actions tab — useful when a push came
+  # from an integration token, which does not itself start a workflow run.
+  workflow_dispatch:
+
+# Build and test need nothing but the source.
+permissions:
+  contents: read
 
 jobs:
   build-and-test:
