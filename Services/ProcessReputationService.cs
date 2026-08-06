@@ -376,13 +376,17 @@ public sealed class ProcessReputationService
         foreach (var a in args) psi.ArgumentList.Add(a);
         using var p = Process.Start(psi);
         if (p == null) return 1;
-        p.StandardOutput.ReadToEnd();
-        p.StandardError.ReadToEnd();
+        // Drain both pipes concurrently: reading stdout to EOF before touching stderr
+        // deadlocks when the child fills the stderr buffer first, and the blocked read
+        // kept the WaitForExit timeout from ever engaging.
+        var stdoutTask = p.StandardOutput.ReadToEndAsync();
+        var stderrTask = p.StandardError.ReadToEndAsync();
         if (!p.WaitForExit(10_000))
         {
             try { p.Kill(entireProcessTree: true); } catch { /* ignore */ }
             return 1;
         }
+        try { Task.WaitAll(stdoutTask, stderrTask); } catch { /* pipes torn down */ }
         return p.ExitCode;
     }
 }

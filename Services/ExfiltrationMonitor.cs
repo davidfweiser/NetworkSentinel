@@ -309,13 +309,18 @@ public sealed class ExfiltrationMonitor : IDisposable
 
             using var p = Process.Start(psi);
             if (p == null) return null;
-            var output = p.StandardOutput.ReadToEnd();
-            p.StandardError.ReadToEnd();
+            // Both pipes drained concurrently — a chatty stderr could otherwise fill
+            // its buffer and deadlock against our blocking stdout read, and the
+            // WaitForExit timeout never engaged while stuck in ReadToEnd.
+            var stdoutTask = p.StandardOutput.ReadToEndAsync();
+            var stderrTask = p.StandardError.ReadToEndAsync();
             if (!p.WaitForExit(15_000))
             {
                 try { p.Kill(entireProcessTree: true); } catch { /* ignore */ }
                 return null;
             }
+            var output = stdoutTask.GetAwaiter().GetResult();
+            stderrTask.GetAwaiter().GetResult();
             return output.Length > 0 ? output : null;
         }
         catch

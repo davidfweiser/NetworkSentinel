@@ -725,7 +725,7 @@ public sealed class FirewallService
         // 1) pkexec — graphical polkit dialog, works under Wayland
         if (CommandExists("pkexec"))
         {
-            var r = RunDirect("pkexec", $"{Quote(resolved)} {args}");
+            var r = RunDirect("pkexec", $"{Quote(resolved)} {args}", InteractiveProcessTimeoutMs);
             if (r.Success || !LooksLikeMissingHelper(r.Message))
                 return r;
         }
@@ -741,7 +741,7 @@ public sealed class FirewallService
             if (!string.IsNullOrEmpty(Environment.GetEnvironmentVariable("SUDO_ASKPASS")) ||
                 !Console.IsInputRedirected)
             {
-                var interactive = RunDirect("sudo", $"{Quote(resolved)} {args}");
+                var interactive = RunDirect("sudo", $"{Quote(resolved)} {args}", InteractiveProcessTimeoutMs);
                 if (interactive.Success)
                     return interactive;
                 return interactive;
@@ -766,18 +766,18 @@ public sealed class FirewallService
     private static FirewallOperationResult RunPrivilegedBatch(string script)
     {
         if (geteuid() == 0)
-            return RunDirectArgs("/bin/sh", "-c", script);
+            return RunDirectArgs("/bin/sh", new[] { "-c", script });
 
         if (CommandExists("pkexec"))
         {
-            var r = RunDirectArgs("pkexec", "/bin/sh", "-c", script);
+            var r = RunDirectArgs("pkexec", new[] { "/bin/sh", "-c", script }, InteractiveProcessTimeoutMs);
             if (r.Success || !LooksLikeMissingHelper(r.Message))
                 return r;
         }
 
         if (CommandExists("sudo"))
         {
-            var cached = RunDirectArgs("sudo", "-n", "/bin/sh", "-c", script);
+            var cached = RunDirectArgs("sudo", new[] { "-n", "/bin/sh", "-c", script });
             if (cached.Success)
                 return cached;
 
@@ -816,26 +816,31 @@ public sealed class FirewallService
         }
     }
 
+    private const int DefaultProcessTimeoutMs = 30_000;
+
+    /// <summary>Paths that raise a password dialog include a human typing — allow minutes, not seconds.</summary>
+    private const int InteractiveProcessTimeoutMs = 300_000;
+
     /// <summary>
     /// Same as <see cref="RunDirect"/> but passes argv entries individually, so
     /// shell metacharacters in an argument survive verbatim. Required for the
     /// batched elevation path, where the payload is a shell script.
     /// </summary>
-    private static FirewallOperationResult RunDirectArgs(string file, params string[] argv)
+    private static FirewallOperationResult RunDirectArgs(string file, string[] argv, int timeoutMs = DefaultProcessTimeoutMs)
     {
         var psi = new ProcessStartInfo(file);
         foreach (var a in argv)
             psi.ArgumentList.Add(a);
-        return RunProcess(psi, file);
+        return RunProcess(psi, file, timeoutMs);
     }
 
-    private static FirewallOperationResult RunDirect(string file, string args)
+    private static FirewallOperationResult RunDirect(string file, string args, int timeoutMs = DefaultProcessTimeoutMs)
     {
         var psi = new ProcessStartInfo(file, args);
-        return RunProcess(psi, file);
+        return RunProcess(psi, file, timeoutMs);
     }
 
-    private static FirewallOperationResult RunProcess(ProcessStartInfo psi, string file)
+    private static FirewallOperationResult RunProcess(ProcessStartInfo psi, string file, int timeoutMs = DefaultProcessTimeoutMs)
     {
         try
         {
@@ -848,9 +853,21 @@ public sealed class FirewallService
             if (p == null)
                 return FirewallOperationResult.Fail($"Could not start {file}.");
 
-            string stdout = p.StandardOutput.ReadToEnd();
-            string stderr = p.StandardError.ReadToEnd();
-            p.WaitForExit(30000);
+            // Both pipes drained concurrently: reading stdout to EOF before touching
+            // stderr deadlocks when the child fills the stderr buffer first — and the
+            // blocked read meant the WaitForExit timeout below never engaged, so a
+            // hung nft/pkexec pinned the calling thread indefinitely.
+            var stdoutTask = p.StandardOutput.ReadToEndAsync();
+            var stderrTask = p.StandardError.ReadToEndAsync();
+
+            if (!p.WaitForExit(timeoutMs))
+            {
+                try { p.Kill(entireProcessTree: true); } catch { /* already gone */ }
+                return FirewallOperationResult.Fail($"{file} did not finish within {timeoutMs / 1000}s.");
+            }
+
+            string stdout = stdoutTask.GetAwaiter().GetResult();
+            string stderr = stderrTask.GetAwaiter().GetResult();
             string combined = (stdout + "\n" + stderr).Trim();
 
             if (p.ExitCode == 0)
@@ -1011,7 +1028,7 @@ public sealed class FirewallService
         if (geteuid() == 0) return true;
         try
         {
-            return CommandExists("sudo") && RunDirectArgs("sudo", "-n", "true").Success;
+            return CommandExists("sudo") && RunDirectArgs("sudo", new[] { "-n", "true" }).Success;
         }
         catch
         {
