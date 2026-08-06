@@ -47,9 +47,11 @@ public sealed class TuiApp : IDisposable
         RestoreAllowlisted
     }
 
-    private readonly NetworkMonitorService _monitor = new();
-    private readonly FirewallService _firewall = new();
-    private readonly AllowlistService _allowlist = new();
+    /// <summary>Owns and wires the shared service graph (see <see cref="SentinelCore"/>).</summary>
+    private readonly SentinelCore _core = new();
+    private readonly NetworkMonitorService _monitor;
+    private readonly FirewallService _firewall;
+    private readonly AllowlistService _allowlist;
     private readonly AppSettings _settings;
 
     /// <summary>The one enforcement engine, shared with the GUI and web console.</summary>
@@ -66,47 +68,14 @@ public sealed class TuiApp : IDisposable
 
     public TuiApp()
     {
-        _settings = AppSettings.Load();
-        _prevention = new PreventionService(_firewall, _allowlist, _settings);
-        if (_prevention.MinLevel is not (ThreatLevel.Medium or ThreatLevel.High or ThreatLevel.Critical))
-            _prevention.MinLevel = ThreatLevel.High;
+        _settings = _core.Settings;
+        _monitor = _core.Monitor;
+        _firewall = _core.Firewall;
+        _allowlist = _core.Allowlist;
+        _prevention = _core.Prevention;
 
-        _firewall.Allowlist = _allowlist;
-        _firewall.AutoBlockExpiry = _settings.AutoBlockExpiryMinutes > 0
-            ? TimeSpan.FromMinutes(_settings.AutoBlockExpiryMinutes)
-            : null;
-        _firewall.StartExpirySweep();
-        _monitor.GeoLookupsEnabled = _settings.GeoLookupEnabled;
-        _monitor.AuthMonitoringEnabled = _settings.AuthLogMonitorEnabled;
-        _monitor.ProbeMonitoringEnabled = _settings.ProbeLogEnabled;
-        _monitor.ThreatIntelEnabled = _settings.ThreatIntelEnabled;
-        _monitor.ProcessReputationEnabled = _settings.ProcessReputationEnabled;
-        _monitor.NewListenerAlertsEnabled = _settings.NewListenerAlertsEnabled;
-        _monitor.ArpWatchEnabled = _settings.ArpWatchEnabled;
-        _monitor.PersistenceWatchEnabled = _settings.PersistenceWatchEnabled;
-        _monitor.ExfilMonitorEnabled = _settings.ExfilMonitorEnabled;
-        _monitor.ExfilThresholdMb = _settings.ExfilMbPer10Min;
-        _monitor.HoneypotPorts = HoneypotService.ParsePorts(_settings.HoneypotPorts);
-        _monitor.HoneypotEnabled = _settings.HoneypotEnabled;
-        _monitor.ConntrackEventsEnabled = _settings.ConntrackEventsEnabled;
-        _monitor.SuricataEvePath = _settings.SuricataEvePath;
-        _monitor.SuricataMaxSeverity = _settings.SuricataMaxSeverity;
-        _monitor.SuricataIgnoredSids = _settings.SuricataIgnoredSids;
-        _monitor.SuricataEnabled = _settings.SuricataEnabled;
-        _monitor.WireGuardPeerMbPer10Min = _settings.WireGuardPeerMbPer10Min;
-        _monitor.WireGuardMonitorEnabled = _settings.WireGuardMonitorEnabled;
-        _monitor.DnsApprovedResolvers = _settings.DnsApprovedResolvers;
-        _monitor.DnsHygieneEnabled = _settings.DnsHygieneEnabled;
-        // Lets the DNS monitor see every allowlist answer and catch poisoning of the never-block list.
-        _allowlist.ResolutionObserver = _monitor.AllowlistResolutionObserver;
-        _monitor.WebhookUrl = _settings.WebhookUrl;
-        _monitor.WebhookMinLevel = _settings.GetWebhookMinLevel();
-        _monitor.IsIpAllowlisted = ip => _allowlist.IsAllowed(ip, out _);
-        // A WireGuard peer's public endpoint must never be auto-blocked — that kills the tunnel.
-        _prevention.IsProtectedAddress = _monitor.IsWireGuardPeerEndpoint;
-        if (_settings.ProbeLogEnabled && _firewall.IsRoot)
-            _ = Task.Run(() => _firewall.EnableProbeLogging());
-        _allowlist.UseRemoteFeed = _settings.AllowlistUseRemoteFeed;
+        // Graph construction and cross-wiring live in SentinelCore; only the TUI's
+        // own event handlers belong here.
         _monitor.Updated += OnMonitorUpdated;
         _monitor.ThreatsDetected += OnThreatsDetected;
     }
@@ -1442,7 +1411,6 @@ public sealed class TuiApp : IDisposable
     {
         _monitor.Updated -= OnMonitorUpdated;
         _monitor.ThreatsDetected -= OnThreatsDetected;
-        _monitor.Dispose();
-        _allowlist.Dispose();
+        _core.Dispose();
     }
 }
