@@ -277,21 +277,27 @@ public sealed class SuricataService : IDisposable
     /// Picks which end of the flow is the threat. Suricata's src_ip is the packet
     /// source, which for an outbound C2 callback is *this machine* — blocking that
     /// would firewall the host off from itself, so the remote end is whichever side
-    /// is not local.
+    /// is not local. "Local" must include this machine's own interface addresses,
+    /// not just private ranges: on a VPS or VPN server the host's address is public,
+    /// and a private-range check alone made an outbound alert name the host itself
+    /// as the threat.
     /// </summary>
     private static (string Ip, int Port, bool Inbound) ResolveRemote(string srcIp, int srcPort, string destIp, int destPort)
     {
-        var srcLocal = !string.IsNullOrEmpty(srcIp) && FirewallService.IsPrivateOrLocal(srcIp);
-        var destLocal = !string.IsNullOrEmpty(destIp) && FirewallService.IsPrivateOrLocal(destIp);
+        var srcLocal = !string.IsNullOrEmpty(srcIp) && IsThisMachineOrLan(srcIp);
+        var destLocal = !string.IsNullOrEmpty(destIp) && IsThisMachineOrLan(destIp);
 
         if (srcLocal && !destLocal)
             return (destIp, destPort, false);
         if (!srcLocal && destLocal)
             return (srcIp, srcPort, true);
 
-        // Both public or both private (LAN-to-LAN): the packet source is the actor.
+        // Both remote or both local (LAN-to-LAN): the packet source is the actor.
         return (srcIp, srcPort, true);
     }
+
+    private static bool IsThisMachineOrLan(string ip)
+        => FirewallService.IsPrivateOrLocal(ip) || LocalAddresses.IsOwnAddress(ip);
 
     /// <summary>
     /// Suricata counts severity down — 1 is most severe. Anything it rates 1 is the
