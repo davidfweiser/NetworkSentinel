@@ -106,6 +106,10 @@ public sealed class WebApp : IDisposable
         _monitor.SuricataEnabled = _settings.SuricataEnabled;
         _monitor.WireGuardPeerMbPer10Min = _settings.WireGuardPeerMbPer10Min;
         _monitor.WireGuardMonitorEnabled = _settings.WireGuardMonitorEnabled;
+        _monitor.DnsApprovedResolvers = _settings.DnsApprovedResolvers;
+        _monitor.DnsHygieneEnabled = _settings.DnsHygieneEnabled;
+        // Lets the DNS monitor see every allowlist answer and catch poisoning of the never-block list.
+        _allowlist.ResolutionObserver = _monitor.AllowlistResolutionObserver;
         _monitor.WebhookUrl = _settings.WebhookUrl;
         _monitor.WebhookMinLevel = _settings.GetWebhookMinLevel();
         _monitor.IsIpAllowlisted = ip => _allowlist.IsAllowed(ip, out _);
@@ -940,6 +944,24 @@ public sealed class WebApp : IDisposable
                             _settings.ConntrackEventsEnabled = on;
                             label = on ? $"Flow events: on ({_monitor.ConntrackStatus})" : "Flow events: off — timed polling only";
                             break;
+                        case "dnsHygieneEnabled":
+                            _monitor.DnsHygieneEnabled = on;
+                            _settings.DnsHygieneEnabled = on;
+                            label = on ? $"DNS hygiene: on ({_monitor.DnsHygieneStatus})" : "DNS hygiene monitoring: off";
+                            break;
+                        case "dnsApprovedResolvers":
+                        {
+                            var parsed = DnsHygieneMonitor.ParseResolvers(raw);
+                            if (!string.IsNullOrWhiteSpace(raw) && parsed.Count == 0)
+                                return ActionResultDto.Fail("Enter resolver IP addresses separated by commas, e.g. 10.8.0.1, 127.0.0.53.");
+                            var normalised = string.Join(",", parsed);
+                            _monitor.DnsApprovedResolvers = normalised;
+                            _settings.DnsApprovedResolvers = normalised;
+                            label = parsed.Count == 0
+                                ? "No approved resolvers set — every plaintext query is reported, and DoH cannot be recognised."
+                                : $"Approved resolvers: {normalised}";
+                            break;
+                        }
                         case "wireGuardMonitorEnabled":
                             _monitor.WireGuardMonitorEnabled = on;
                             _settings.WireGuardMonitorEnabled = on;
@@ -1373,6 +1395,9 @@ public sealed class WebApp : IDisposable
                 preventionDryRun = _prevention.DryRun,
                 conntrackEventsEnabled = _settings.ConntrackEventsEnabled,
                 conntrackStatus = _monitor.ConntrackStatus,
+                dnsHygieneEnabled = _settings.DnsHygieneEnabled,
+                dnsApprovedResolvers = _settings.DnsApprovedResolvers,
+                dnsHygieneStatus = DnsHygieneStatusText(),
                 wireGuardMonitorEnabled = _settings.WireGuardMonitorEnabled,
                 wireGuardPeerMbPer10Min = _settings.WireGuardPeerMbPer10Min,
                 wireGuardStatus = WireGuardStatusText(),
@@ -1502,6 +1527,15 @@ public sealed class WebApp : IDisposable
     /// The inbound allow rule for THIS console's port. Removing it over the web kills the
     /// user's own browser connection mid-request — indistinguishable from a server crash.
     /// </summary>
+    /// <summary>DNS hygiene state plus counters for the settings panel.</summary>
+    private string DnsHygieneStatusText()
+    {
+        if (!_settings.DnsHygieneEnabled)
+            return "Off — this console has no view of how the host resolves names.";
+        var (plain, enc) = _monitor.DnsCounters;
+        return $"{_monitor.DnsHygieneStatus} ({enc} encrypted / {plain} plaintext)";
+    }
+
     /// <summary>WireGuard monitor state for the settings panel.</summary>
     private string WireGuardStatusText()
         => _settings.WireGuardMonitorEnabled
@@ -2751,6 +2785,11 @@ public sealed class WebApp : IDisposable
         ${row('Exfiltration threshold (MB / 10 min)', 'Outbound megabytes to a single host before the alert fires.', txt('exfilMbPer10Min', s.exfilMbPer10Min ?? 250, '250'))}
         ${row('Honeypot decoy ports', 'Listen on decoy TCP ports nothing legitimate uses — any completed connection is a zero-false-positive Critical alert. ' + (s.honeypotStatus || ''), sw('honeypotEnabled', s.honeypotEnabled))}
         ${row('Decoy port list', 'Comma-separated TCP ports to bind as decoys. Ports already in use are skipped.', txt('honeypotPorts', s.honeypotPorts || '', '2323,3389,5900'))}
+      </div>
+      <div class="settings-group"><h3>DNS hygiene</h3>
+        <div class="settings-note">Almost nothing connects without resolving a name first, so DNS is where a compromise usually shows earliest — and it is a standard exfiltration channel the exfiltration monitor cannot see, since that counts TCP socket bytes and DNS is UDP. Reads kernel flow events, so it needs root. Port 53 is detected as plaintext and 853 as DoT; DoH is HTTPS and can only be recognised when you list the resolver below.</div>
+        ${row('DNS hygiene monitoring', 'Detect plaintext queries leaving the host, encrypted DNS silently falling back, queries to unapproved resolvers, VPN clients bypassing your resolver, and allowlisted domains moving networks. ' + (s.dnsHygieneStatus || ''), sw('dnsHygieneEnabled', s.dnsHygieneEnabled))}
+        ${row('Approved resolvers', 'Comma-separated resolver IPs this host is meant to use — for example the local resolver on your tunnel address. Queries anywhere else are flagged, and HTTPS to these addresses is counted as DoH instead of ordinary web traffic.', txt('dnsApprovedResolvers', s.dnsApprovedResolvers || '', '10.8.0.1, 127.0.0.53'))}
       </div>
       <div class="settings-group"><h3>VPN (WireGuard)</h3>
         <div class="settings-note">WireGuard uses one unconnected UDP socket, so its peers never appear as connections and nothing else on this page can see them. This reads WireGuard's own state instead. Needs root. Only public keys are read — the interface private key and peer preshared keys are discarded and never stored.</div>

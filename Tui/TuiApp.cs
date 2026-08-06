@@ -95,6 +95,10 @@ public sealed class TuiApp : IDisposable
         _monitor.SuricataEnabled = _settings.SuricataEnabled;
         _monitor.WireGuardPeerMbPer10Min = _settings.WireGuardPeerMbPer10Min;
         _monitor.WireGuardMonitorEnabled = _settings.WireGuardMonitorEnabled;
+        _monitor.DnsApprovedResolvers = _settings.DnsApprovedResolvers;
+        _monitor.DnsHygieneEnabled = _settings.DnsHygieneEnabled;
+        // Lets the DNS monitor see every allowlist answer and catch poisoning of the never-block list.
+        _allowlist.ResolutionObserver = _monitor.AllowlistResolutionObserver;
         _monitor.WebhookUrl = _settings.WebhookUrl;
         _monitor.WebhookMinLevel = _settings.GetWebhookMinLevel();
         _monitor.IsIpAllowlisted = ip => _allowlist.IsAllowed(ip, out _);

@@ -30,7 +30,8 @@ public enum ThreatType
     PersistenceChange,
     DataExfiltration,
     SignatureMatch,
-    VpnPeerChange
+    VpnPeerChange,
+    DnsAnomaly
 }
 
 public enum TcpConnectionState
@@ -290,6 +291,7 @@ public sealed class ThreatEvent : INotifyPropertyChanged
         ThreatType.DataExfiltration => "Data Exfiltration",
         ThreatType.SignatureMatch => "Signature Match",
         ThreatType.VpnPeerChange => "VPN Peer Change",
+        ThreatType.DnsAnomaly => "DNS Anomaly",
         _ => Type.ToString()
     };
 }

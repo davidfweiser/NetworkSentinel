@@ -103,6 +103,21 @@ public sealed class AppSettings
     /// </summary>
     public int WireGuardPeerMbPer10Min { get; set; }
 
+    /// <summary>
+    /// Watch DNS hygiene: plaintext queries leaving the host, encrypted DNS silently
+    /// falling back to plaintext, queries to unapproved resolvers, VPN clients bypassing
+    /// the resolver, and allowlisted domains resolving into unfamiliar networks.
+    /// Driven by conntrack flow events, so it needs root.
+    /// </summary>
+    public bool DnsHygieneEnabled { get; set; }
+
+    /// <summary>
+    /// Comma-separated resolver IPs this host is meant to use. Queries anywhere else are
+    /// flagged, and 443 traffic to these addresses is recognised as DoH (which is otherwise
+    /// indistinguishable from ordinary HTTPS).
+    /// </summary>
+    public string DnsApprovedResolvers { get; set; } = "";
+
     /// <summary>Ingest Suricata's EVE JSON alerts as threat events (payload inspection / signatures).</summary>
     public bool SuricataEnabled { get; set; }
 

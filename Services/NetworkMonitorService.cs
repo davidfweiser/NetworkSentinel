@@ -19,6 +19,7 @@ public sealed class NetworkMonitorService : IDisposable
     private readonly ExfiltrationMonitor _exfil = new();
     private readonly SuricataService _suricata = new();
     private readonly WireGuardMonitor _wireGuard = new();
+    private readonly DnsHygieneMonitor _dns = new();
     private readonly ConntrackEventSource _conntrack = new();
     private readonly WebhookNotifier _webhook = new();
     private readonly HostHistoryStore _history = new();
@@ -257,6 +258,47 @@ public sealed class NetworkMonitorService : IDisposable
         }
     }
 
+    private bool _dnsHygieneEnabled;
+
+    /// <summary>
+    /// Watch how this machine resolves names: plaintext egress, encrypted DNS silently
+    /// falling back, queries to unapproved resolvers, VPN clients bypassing the resolver,
+    /// and allowlisted domains being poisoned. Driven by conntrack events, so it needs root.
+    /// </summary>
+    public bool DnsHygieneEnabled
+    {
+        get => _dnsHygieneEnabled;
+        set
+        {
+            if (_dnsHygieneEnabled == value) return;
+            _dnsHygieneEnabled = value;
+            if (Stats.IsMonitoring)
+            {
+                if (value) _dns.Start();
+                else _dns.Stop();
+            }
+        }
+    }
+
+    /// <summary>Resolvers this host is meant to use, comma separated. Also identifies DoH endpoints on 443.</summary>
+    public string DnsApprovedResolvers
+    {
+        get => _dns.ApprovedResolvers;
+        set => _dns.ApprovedResolvers = value;
+    }
+
+    public string DnsHygieneStatus => _dns.Status;
+
+    /// <summary>Plaintext vs. encrypted DNS flows observed.</summary>
+    public (long Plaintext, long Encrypted) DnsCounters => _dns.Counters;
+
+    /// <summary>
+    /// Lets the allowlist report each resolution to the DNS monitor. The front-end wires
+    /// this to its AllowlistService instance.
+    /// </summary>
+    public Action<string, IReadOnlyCollection<string>> AllowlistResolutionObserver
+        => (domain, ips) => _dns.ObserveAllowlistResolution(domain, ips, DateTime.Now);
+
     private bool _wireGuardEnabled;
 
     /// <summary>
@@ -418,6 +460,13 @@ public sealed class NetworkMonitorService : IDisposable
         if (_honeypotEnabled) _honeypot.Start(_honeypotPorts);
         if (_suricataEnabled) _suricata.Start();
         if (_wireGuardEnabled) _wireGuard.Start();
+        if (_dnsHygieneEnabled)
+        {
+            // Peer allowed-IPs tell the DNS monitor whether a query came from a tunnel
+            // client, which is what separates a client leak from this host's own traffic.
+            _dns.IsVpnClientAddress = IsWireGuardClientAddress;
+            _dns.Start();
+        }
         if (_conntrackEventsEnabled)
         {
             _conntrack.FlowCreated += OnFlowCreated;
@@ -443,6 +492,7 @@ public sealed class NetworkMonitorService : IDisposable
         _honeypot.Stop();
         _suricata.Stop();
         _wireGuard.Stop();
+        _dns.Stop();
         _conntrack.FlowCreated -= OnFlowCreated;
         _conntrack.Stop();
         _history.Save();
@@ -468,8 +518,62 @@ public sealed class NetworkMonitorService : IDisposable
     /// the shape every scan, brute-force and exploit attempt takes. Ordinary outbound
     /// client traffic keeps the normal cadence, so a busy machine doesn't poll flat out.
     /// </summary>
+    /// <summary>
+    /// True when the address falls inside some WireGuard peer's AllowedIPs — i.e. the
+    /// traffic came out of the tunnel rather than from this host.
+    /// </summary>
+    private bool IsWireGuardClientAddress(string ip)
+    {
+        if (string.IsNullOrEmpty(ip) || !System.Net.IPAddress.TryParse(ip, out var address))
+            return false;
+
+        foreach (var peer in _wireGuard.Peers)
+        {
+            foreach (var cidr in peer.AllowedIps.Split(',', StringSplitOptions.RemoveEmptyEntries))
+            {
+                if (CidrContains(cidr.Trim(), address))
+                    return true;
+            }
+        }
+        return false;
+    }
+
+    /// <summary>Prefix-length containment test for an AllowedIPs entry like "10.8.0.0/24".</summary>
+    private static bool CidrContains(string cidr, System.Net.IPAddress address)
+    {
+        var slash = cidr.IndexOf('/');
+        if (slash <= 0) return false;
+        if (!System.Net.IPAddress.TryParse(cidr[..slash], out var network)) return false;
+        if (!int.TryParse(cidr[(slash + 1)..], out var bits)) return false;
+        if (network.AddressFamily != address.AddressFamily) return false;
+
+        var netBytes = network.GetAddressBytes();
+        var addrBytes = address.GetAddressBytes();
+        if (bits < 0 || bits > netBytes.Length * 8) return false;
+
+        var whole = bits / 8;
+        for (var i = 0; i < whole; i++)
+        {
+            if (netBytes[i] != addrBytes[i]) return false;
+        }
+
+        var remainder = bits % 8;
+        if (remainder == 0) return true;
+
+        var mask = (byte)(0xFF << (8 - remainder));
+        return (netBytes[whole] & mask) == (addrBytes[whole] & mask);
+    }
+
     private void OnFlowCreated(ConntrackFlow flow)
     {
+        // The DNS monitor needs every flow, not only the ones worth waking the poll for:
+        // a query to an external resolver never lands on a port this machine serves.
+        if (_dnsHygieneEnabled)
+        {
+            try { _dns.ObserveFlow(flow, DateTime.Now); }
+            catch { /* a watcher must never break the event reader */ }
+        }
+
         if (!_liveListeningPorts.Contains(flow.DestinationPort))
             return;
         if (flow.SourceAddress is "127.0.0.1" or "::1")
@@ -656,6 +760,9 @@ public sealed class NetworkMonitorService : IDisposable
 
             if (_wireGuardEnabled)
                 newThreats.AddRange(_wireGuard.DrainPending());
+
+            if (_dnsHygieneEnabled)
+                newThreats.AddRange(_dns.DrainPending());
 
             if (ThreatIntelEnabled)
                 CheckThreatIntel(activeByIp.Keys, now, newThreats);
@@ -1016,6 +1123,7 @@ public sealed class NetworkMonitorService : IDisposable
         _honeypot.Dispose();
         _suricata.Dispose();
         _wireGuard.Dispose();
+        _dns.Dispose();
         _conntrack.Dispose();
         _intel.Dispose();
         _webhook.Dispose();
