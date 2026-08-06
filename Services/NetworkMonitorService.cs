@@ -519,6 +519,30 @@ public sealed class NetworkMonitorService : IDisposable
     /// client traffic keeps the normal cadence, so a busy machine doesn't poll flat out.
     /// </summary>
     /// <summary>
+    /// True when the address is a current WireGuard peer's public endpoint — the address
+    /// its encrypted tunnel packets arrive from. Blocking an endpoint kills that client's
+    /// VPN, so the prevention engine consults this before auto-blocking: WireGuard's own
+    /// alerts carry the endpoint as the threat source (for geo enrichment), and any other
+    /// detector can flag the same address when a peer's traffic trips a heuristic.
+    /// Only meaningful while WireGuard monitoring is enabled; with no peer data it simply
+    /// never matches.
+    /// </summary>
+    public bool IsWireGuardPeerEndpoint(string ip)
+    {
+        if (string.IsNullOrEmpty(ip) || !FirewallService.TryNormalizeIp(ip, out var normalized, out _))
+            return false;
+
+        foreach (var peer in _wireGuard.Peers)
+        {
+            if (string.IsNullOrEmpty(peer.EndpointIp)) continue;
+            if (FirewallService.TryNormalizeIp(peer.EndpointIp, out var endpoint, out _) &&
+                string.Equals(endpoint, normalized, StringComparison.OrdinalIgnoreCase))
+                return true;
+        }
+        return false;
+    }
+
+    /// <summary>
     /// True when the address falls inside some WireGuard peer's AllowedIPs — i.e. the
     /// traffic came out of the tunnel rather than from this host.
     /// </summary>

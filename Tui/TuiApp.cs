@@ -102,6 +102,8 @@ public sealed class TuiApp : IDisposable
         _monitor.WebhookUrl = _settings.WebhookUrl;
         _monitor.WebhookMinLevel = _settings.GetWebhookMinLevel();
         _monitor.IsIpAllowlisted = ip => _allowlist.IsAllowed(ip, out _);
+        // A WireGuard peer's public endpoint must never be auto-blocked — that kills the tunnel.
+        _prevention.IsProtectedAddress = _monitor.IsWireGuardPeerEndpoint;
         if (_settings.ProbeLogEnabled && _firewall.IsRoot)
             _ = Task.Run(() => _firewall.EnableProbeLogging());
         _allowlist.UseRemoteFeed = _settings.AllowlistUseRemoteFeed;

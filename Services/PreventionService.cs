@@ -55,7 +55,8 @@ public sealed class PreventionResult
 ///
 /// Ordered gates, cheapest first — a threat must clear all of them:
 ///   severity ≥ MinLevel → not informational-only → routable public IP →
-///   not allowlisted → not protected → not already blocked →
+///   not allowlisted → not this machine's own address → not a protected
+///   endpoint (WireGuard peers) → not operator-protected → not already blocked →
 ///   not suppressed by a manual unblock → not attempted in the last RetryAfter.
 ///
 /// In <see cref="DryRun"/> mode every gate still runs and decisions are still
@@ -116,6 +117,17 @@ public sealed class PreventionService
     /// first.
     /// </summary>
     public bool DryRun { get; set; }
+
+    /// <summary>
+    /// Extra never-auto-block guard on top of the allowlist and the operator shield.
+    /// The frontends wire this to the monitor's WireGuard peer-endpoint check: a peer's
+    /// endpoint is the public address its encrypted tunnel packets come from, so a
+    /// detector that flags it (a "new peer" alert, a per-peer transfer alert, Suricata
+    /// on the tunnel port) would otherwise cut that client's VPN dead. Like the operator
+    /// shield, this only stops the machine deciding on its own — manual blocking is
+    /// deliberately unaffected.
+    /// </summary>
+    public Func<string, bool>? IsProtectedAddress { get; set; }
 
     /// <summary>Addresses currently blocked by rules this app owns.</summary>
     public IReadOnlySet<string> BlockedIps
@@ -271,6 +283,15 @@ public sealed class PreventionService
             return false;
 
         if (_allowlist.IsAllowed(normalized, out _))
+            return false;
+
+        // Never the machine's own interface addresses: a detector that attributes a
+        // threat to the wrong end of a flow (a public-IP host especially) must not be
+        // able to firewall the box off from itself.
+        if (LocalAddresses.IsOwnAddress(normalized))
+            return false;
+
+        if (IsProtectedAddress is { } externallyProtected && externallyProtected(normalized))
             return false;
 
         lock (_gate)
