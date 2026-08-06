@@ -498,13 +498,21 @@ public sealed class FirewallService
         }
         else
         {
+            // iptables is IPv4-only; an IPv6 address needs ip6tables or the rule is
+            // rejected outright (and the block silently never happened).
+            var isV6 = IPAddress.TryParse(ip, out var parsed) &&
+                       parsed.AddressFamily == System.Net.Sockets.AddressFamily.InterNetworkV6;
+            var tool = isV6 ? "ip6tables" : "iptables";
+            if (isV6 && !CommandExists("ip6tables"))
+                return FirewallOperationResult.Fail($"Cannot block IPv6 address {ip}: ip6tables is not installed (and nft is unavailable).");
+
             var table = isInbound ? "INPUT" : "OUTPUT";
             var flag = isInbound ? "-s" : "-d";
-            var r = RunPrivileged("iptables",
+            var r = RunPrivileged(tool,
                 $"-A {table} {flag} {ip} -j DROP -m comment --comment \"{Escape(name)}\"");
             applied = r.Success
-                ? FirewallOperationResult.Ok($"Rule “{name}” applied (iptables).")
-                : FirewallOperationResult.Fail($"Failed iptables add {name}: {r.Message}");
+                ? FirewallOperationResult.Ok($"Rule “{name}” applied ({tool}).")
+                : FirewallOperationResult.Fail($"Failed {tool} add {name}: {r.Message}");
         }
 
         if (applied.Success)
@@ -595,8 +603,9 @@ public sealed class FirewallService
         }
         else
         {
-            removed |= DeleteIptablesByComment("INPUT", name);
-            removed |= DeleteIptablesByComment("OUTPUT", name);
+            var tool = IptablesToolFor(name);
+            removed |= DeleteIptablesByComment(tool, "INPUT", name);
+            removed |= DeleteIptablesByComment(tool, "OUTPUT", name);
         }
 
         // Ledger is always updated so UI stays consistent even if kernel rule was already gone.
@@ -608,9 +617,21 @@ public sealed class FirewallService
             : FirewallOperationResult.Fail($"No rule named “{name}”.");
     }
 
-    private bool DeleteIptablesByComment(string table, string name)
+    /// <summary>
+    /// Which iptables-family binary owns a managed rule: IPv6 IP-block rules live in
+    /// ip6tables, everything else in iptables. Keeps list/delete from prompting for
+    /// elevation against a table the rule can't be in.
+    /// </summary>
+    private static string IptablesToolFor(string ruleName)
+        => TryExtractIpFromManagedRule(ruleName, null, out var ip)
+           && IPAddress.TryParse(ip, out var address)
+           && address.AddressFamily == System.Net.Sockets.AddressFamily.InterNetworkV6
+            ? "ip6tables"
+            : "iptables";
+
+    private bool DeleteIptablesByComment(string tool, string table, string name)
     {
-        var list = RunPrivileged("iptables", $"-L {table} -n --line-numbers");
+        var list = RunPrivileged(tool, $"-L {table} -n --line-numbers");
         if (!list.Success) return false;
 
         var lines = list.Message.Split('\n')
@@ -624,7 +645,7 @@ public sealed class FirewallService
         bool any = false;
         foreach (var num in lines)
         {
-            if (RunPrivileged("iptables", $"-D {table} {num}").Success)
+            if (RunPrivileged(tool, $"-D {table} {num}").Success)
                 any = true;
         }
         return any;
@@ -923,6 +944,15 @@ public sealed class FirewallService
                     if (!input.Success || !output.Success)
                         return FirewallOperationResult.Fail("Could not list iptables rules — reconciliation skipped.");
                     dump = input.Message + "\n" + output.Message;
+
+                    if (ledger.Any(r => IptablesToolFor(r.Name) == "ip6tables") && CommandExists("ip6tables"))
+                    {
+                        var input6 = RunPrivileged("ip6tables", "-L INPUT -n");
+                        var output6 = RunPrivileged("ip6tables", "-L OUTPUT -n");
+                        if (!input6.Success || !output6.Success)
+                            return FirewallOperationResult.Fail("Could not list ip6tables rules — reconciliation skipped.");
+                        dump += "\n" + input6.Message + "\n" + output6.Message;
+                    }
                 }
             }
             finally
@@ -1101,6 +1131,16 @@ public sealed class FirewallService
             error = $"Invalid IP address: {ip}";
             return false;
         }
+
+        // ::ffff:a.b.c.d is how dual-stack sockets report IPv4 peers — rules and
+        // bookkeeping should use the IPv4 form so both spellings mean one address.
+        if (address.IsIPv4MappedToIPv6)
+            address = address.MapToIPv4();
+
+        // Drop any IPv6 zone id (fe80::1%eth0 parses fine but nft/ip6tables reject
+        // it in a rule, and two zone spellings of one address must compare equal).
+        if (address.AddressFamily == System.Net.Sockets.AddressFamily.InterNetworkV6 && address.ScopeId != 0)
+            address = new IPAddress(address.GetAddressBytes());
 
         normalized = address.ToString();
         return true;
