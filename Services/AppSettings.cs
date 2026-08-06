@@ -212,7 +212,10 @@ public sealed class AppSettings
     {
         try
         {
-            AppPaths.WriteAtomic(SettingsPath, JsonSerializer.Serialize(this, JsonOptions));
+            // Owner-only like web-master.json and duckdns.json: settings.json can hold
+            // the .pfx password and the webhook URL, which are secrets too.
+            AppPaths.WriteAtomic(SettingsPath, JsonSerializer.Serialize(this, JsonOptions),
+                UnixFileMode.UserRead | UnixFileMode.UserWrite);
         }
         catch
         {

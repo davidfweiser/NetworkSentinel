@@ -310,9 +310,14 @@ public sealed class WebApp : IDisposable
         Console.WriteLine();
         Console.WriteLine("  Open the URL above in your browser.");
         if (_auth.IsConfigured)
+        {
             Console.WriteLine("  Master password required on every login.");
+        }
         else
+        {
             Console.WriteLine("  First visit: create a master password in the browser.");
+            Console.WriteLine($"  Setup code (asked for when setting up from another machine): {_setupCode}");
+        }
         Console.WriteLine("  Press Ctrl+C to stop.");
         Console.WriteLine();
     }
@@ -352,7 +357,12 @@ public sealed class WebApp : IDisposable
         {
             try
             {
-                WriteJson(ctx.Response, 500, new { ok = false, message = ex.Message });
+                // Exception text can name paths, hosts, or backend detail — an
+                // authenticated admin may see it, an anonymous client gets a
+                // generic body.
+                var authed = false;
+                try { authed = _auth.IsSessionValid(GetSessionToken(ctx.Request)); } catch { /* treat as anonymous */ }
+                WriteJson(ctx.Response, 500, new { ok = false, message = authed ? ex.Message : "Internal error." });
             }
             catch
             {
@@ -368,6 +378,10 @@ public sealed class WebApp : IDisposable
         res.Headers["Cache-Control"] = "no-store";
         res.Headers["X-Content-Type-Options"] = "nosniff";
         res.Headers["Referrer-Policy"] = "same-origin";
+        // An admin console has no business inside a frame — every action is one click.
+        res.Headers["X-Frame-Options"] = "DENY";
+        if (req.IsHttps)
+            res.Headers["Strict-Transport-Security"] = "max-age=31536000";
 
         if (TryRedirectToHttps(ctx))
             return;
@@ -391,7 +405,8 @@ public sealed class WebApp : IDisposable
                 ok = true,
                 configured = _auth.IsConfigured,
                 authenticated = authed,
-                minPasswordLength = WebAuthStore.MinPasswordLength
+                minPasswordLength = WebAuthStore.MinPasswordLength,
+                setupCodeRequired = !_auth.IsConfigured && !IsLoopbackClient(ctx)
             });
             return;
         }
@@ -408,6 +423,22 @@ public sealed class WebApp : IDisposable
 
             if (IsLockedOut(ctx, res))
                 return;
+
+            // Remote first-visit setup must quote the code printed on the server
+            // console; without it, the first scanner to find the port would claim
+            // the master password. Local setup needs nothing.
+            if (!IsLoopbackClient(ctx) && !SetupCodeMatches(authReq.SetupCode))
+            {
+                Thread.Sleep(400);
+                _loginThrottle.RecordFailure(ClientAddress(ctx));
+                WriteJson(res, 403, new
+                {
+                    ok = false,
+                    message = "Setup code required (or wrong). It is printed where the console runs — " +
+                              "the terminal, or `journalctl -u networksentinel-web` under systemd."
+                });
+                return;
+            }
 
             if (!_auth.TrySetup(authReq.Password ?? "", authReq.Confirm ?? authReq.Password ?? "", out var setupMsg))
             {
@@ -718,6 +749,33 @@ public sealed class WebApp : IDisposable
     /// <summary>Remote address for throttling. Kestrel gives the real peer — no proxy is assumed.</summary>
     private static string ClientAddress(HttpContext ctx)
         => ctx.Connection.RemoteIpAddress?.ToString() ?? "unknown";
+
+    /// <summary>IsLoopback handles the IPv4-mapped form Kestrel reports for dual-stack sockets.</summary>
+    private static bool IsLoopbackClient(HttpContext ctx)
+        => ctx.Connection.RemoteIpAddress is { } ip && IPAddress.IsLoopback(ip);
+
+    /// <summary>
+    /// One-time code for first-visit password setup from a non-loopback client.
+    /// The console binds all interfaces before any password exists, so without
+    /// this, whoever reached the port first owned the box — full firewall control
+    /// behind a password *they* chose. The code is printed where the console runs
+    /// (terminal / journal), which only the machine's operator can read; setup
+    /// from localhost needs nothing.
+    /// </summary>
+    private readonly string _setupCode = GenerateSetupCode();
+
+    private static string GenerateSetupCode()
+    {
+        var raw = Convert.ToHexString(System.Security.Cryptography.RandomNumberGenerator.GetBytes(4));
+        return $"{raw[..4]}-{raw[4..]}";
+    }
+
+    private bool SetupCodeMatches(string? supplied)
+    {
+        var a = Encoding.UTF8.GetBytes((supplied ?? "").Trim().Replace("-", "").ToUpperInvariant());
+        var b = Encoding.UTF8.GetBytes(_setupCode.Replace("-", "").ToUpperInvariant());
+        return a.Length == b.Length && System.Security.Cryptography.CryptographicOperations.FixedTimeEquals(a, b);
+    }
 
     /// <summary>Writes a 429 and returns true when this client is currently locked out.</summary>
     private bool IsLockedOut(HttpContext ctx, HttpResponse res)
@@ -1703,6 +1761,7 @@ public sealed class WebApp : IDisposable
         public string? CurrentPassword { get; set; }
         public string? NewPassword { get; set; }
         public string? Confirm { get; set; }
+        public string? SetupCode { get; set; }
     }
 
     private sealed class ActionResultDto
@@ -2071,6 +2130,10 @@ public sealed class WebApp : IDisposable
       <div id="setupFields" class="hidden">
         <label for="pwConfirm">Confirm master password</label>
         <input id="pwConfirm" type="password" name="confirm" autocomplete="new-password" minlength="8" />
+        <div id="setupCodeField" class="hidden">
+          <label for="setupCode">Setup code</label>
+          <input id="setupCode" type="text" name="setupCode" autocomplete="one-time-code" spellcheck="false" placeholder="XXXX-XXXX" />
+        </div>
       </div>
       <p class="auth-error" id="authError"></p>
       <button type="submit" class="submit" id="authSubmit">Continue</button>
@@ -2228,6 +2291,7 @@ public sealed class WebApp : IDisposable
   let tab = 'dashboard';
   let lastError = '';
   let authMode = 'check'; // check | setup | login | ok
+  let needSetupCode = false;
   let pollTimer = null;
   let sleepTimer = null;
 
@@ -2256,6 +2320,7 @@ public sealed class WebApp : IDisposable
     shell.classList.add('hidden');
     const setup = mode === 'setup';
     $('setupFields').classList.toggle('hidden', !setup);
+    $('setupCodeField').classList.toggle('hidden', !(setup && needSetupCode));
     $('authLead').textContent = setup
       ? 'Create a master password to protect this console. You will need it every time you open the web UI.'
       : 'Enter the master password to continue.';
@@ -2263,7 +2328,9 @@ public sealed class WebApp : IDisposable
     $('pw').autocomplete = setup ? 'new-password' : 'current-password';
     $('authSubmit').textContent = setup ? 'Create password & sign in' : 'Sign in';
     $('authHint').textContent = setup
-      ? 'Minimum 8 characters. Stored only as a one-way hash on this machine.'
+      ? (needSetupCode
+          ? 'Minimum 8 characters. The setup code is printed where the console runs (terminal, or journalctl -u networksentinel-web).'
+          : 'Minimum 8 characters. Stored only as a one-way hash on this machine.')
       : 'Session ends when you sign out, close the browser, or after 12 hours idle.';
     $('authError').textContent = message || '';
     $('pw').value = '';
@@ -2301,6 +2368,7 @@ public sealed class WebApp : IDisposable
     try {
       const res = await fetch('/api/auth/status', { cache: 'no-store', credentials: 'same-origin' });
       const data = await res.json();
+      needSetupCode = !!data.setupCodeRequired;
       if (!data.configured) {
         showAuth('setup');
         return false;
@@ -3090,7 +3158,7 @@ public sealed class WebApp : IDisposable
         method: 'POST',
         credentials: 'same-origin',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(setup ? { password, confirm } : { password })
+        body: JSON.stringify(setup ? { password, confirm, setupCode: $('setupCode').value } : { password })
       });
       const data = await res.json().catch(() => ({ ok: false, message: 'Bad response' }));
       if (!res.ok || !data.ok) {

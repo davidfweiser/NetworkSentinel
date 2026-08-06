@@ -37,10 +37,16 @@ public static class AppPaths
     /// orphans). The rename is atomic on the same filesystem, which a sibling path
     /// guarantees.
     /// </summary>
-    public static void WriteAtomic(string path, string contents)
+    /// <param name="unixMode">
+    /// Optional owner-only style permissions, applied to the temp file before the
+    /// rename so the target never exists with looser permissions.
+    /// </param>
+    public static void WriteAtomic(string path, string contents, UnixFileMode? unixMode = null)
     {
         var tmp = path + ".tmp";
         File.WriteAllText(tmp, contents);
+        if (unixMode.HasValue && !OperatingSystem.IsWindows())
+            File.SetUnixFileMode(tmp, unixMode.Value);
         File.Move(tmp, path, overwrite: true);
     }
 }
