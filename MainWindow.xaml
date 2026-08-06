@@ -1167,6 +1167,115 @@
 
                                 <Border Style="{StaticResource Card}" Margin="0,0,0,14">
                                     <StackPanel>
+                                        <TextBlock Text="Prevention and deep inspection" FontWeight="Bold" FontSize="15"/>
+                                        <TextBlock Text="How fast this machine reacts, what it can see inside traffic, and what it is allowed to drop. Everything here needs administrator rights."
+                                                   Foreground="{StaticResource TextSecondaryBrush}" FontSize="12"
+                                                   Margin="0,4,0,14" TextWrapping="Wrap"/>
+
+                                        <Grid Margin="0,0,0,14">
+                                            <Grid.ColumnDefinitions>
+                                                <ColumnDefinition Width="*"/>
+                                                <ColumnDefinition Width="Auto"/>
+                                            </Grid.ColumnDefinitions>
+                                            <StackPanel Margin="0,0,16,0">
+                                                <TextBlock Text="Auto-block dry run" FontWeight="Bold" FontSize="13"/>
+                                                <TextBlock Text="Run every auto-block gate and report what would have been dropped, without writing a firewall rule. The safe way to promote a new detection source — a fresh Suricata ruleset especially — from alerting to blocking."
+                                                           Foreground="{StaticResource TextSecondaryBrush}" FontSize="11"
+                                                           Margin="0,2,0,0" TextWrapping="Wrap"/>
+                                            </StackPanel>
+                                            <CheckBox Grid.Column="1" VerticalAlignment="Center"
+                                                      Style="{StaticResource ModernCheckBox}"
+                                                      IsChecked="{Binding PreventionDryRun}"/>
+                                        </Grid>
+
+                                        <Grid Margin="0,0,0,14">
+                                            <Grid.ColumnDefinitions>
+                                                <ColumnDefinition Width="*"/>
+                                                <ColumnDefinition Width="Auto"/>
+                                            </Grid.ColumnDefinitions>
+                                            <StackPanel Margin="0,0,16,0">
+                                                <TextBlock Text="Kernel flow events" FontWeight="Bold" FontSize="13"/>
+                                                <TextBlock Text="Sample the moment the kernel reports a new connection instead of waiting out the poll interval, using the Microsoft-Windows-Kernel-Network ETW provider. Also the only source of UDP peer addresses, which DNS hygiene needs. Falls back to timed polling when unavailable."
+                                                           Foreground="{StaticResource TextSecondaryBrush}" FontSize="11"
+                                                           Margin="0,2,0,0" TextWrapping="Wrap"/>
+                                                <TextBlock Text="{Binding FlowEventsStatusText}" FontSize="11" Margin="0,4,0,0"
+                                                           Foreground="{StaticResource TextMutedBrush}" TextWrapping="Wrap"/>
+                                            </StackPanel>
+                                            <CheckBox Grid.Column="1" VerticalAlignment="Center"
+                                                      Style="{StaticResource ModernCheckBox}"
+                                                      IsChecked="{Binding FlowEventsEnabled}"/>
+                                        </Grid>
+
+                                        <Grid Margin="0,0,0,14">
+                                            <Grid.ColumnDefinitions>
+                                                <ColumnDefinition Width="*"/>
+                                                <ColumnDefinition Width="Auto"/>
+                                                <ColumnDefinition Width="Auto"/>
+                                            </Grid.ColumnDefinitions>
+                                            <StackPanel Margin="0,0,16,0">
+                                                <TextBlock Text="Suricata signature alerts" FontWeight="Bold" FontSize="13"/>
+                                                <TextBlock Text="Read Suricata's EVE JSON log and turn signature matches into threats, which then flow through the allowlist, geo enrichment, webhooks and auto-block like any other detection. Connection heuristics see who is talking; this is what sees what is being said. Suricata is not bundled — install it and point this at its eve.json."
+                                                           Foreground="{StaticResource TextSecondaryBrush}" FontSize="11"
+                                                           Margin="0,2,0,0" TextWrapping="Wrap"/>
+                                                <TextBlock Text="{Binding SuricataStatusText}" FontSize="11" Margin="0,4,0,0"
+                                                           Foreground="{StaticResource TextMutedBrush}" TextWrapping="Wrap"/>
+                                            </StackPanel>
+                                            <TextBox Grid.Column="1" Width="200" VerticalAlignment="Center" Margin="0,0,12,0"
+                                                     Style="{StaticResource ModernTextBox}"
+                                                     Text="{Binding SuricataEvePathText, UpdateSourceTrigger=LostFocus}"/>
+                                            <CheckBox Grid.Column="2" VerticalAlignment="Center"
+                                                      Style="{StaticResource ModernCheckBox}"
+                                                      IsChecked="{Binding SuricataEnabled}"/>
+                                        </Grid>
+
+                                        <Grid Margin="0,0,0,14">
+                                            <Grid.ColumnDefinitions>
+                                                <ColumnDefinition Width="*"/>
+                                                <ColumnDefinition Width="Auto"/>
+                                                <ColumnDefinition Width="Auto"/>
+                                            </Grid.ColumnDefinitions>
+                                            <StackPanel Margin="0,0,16,0">
+                                                <TextBlock Text="WireGuard peers" FontWeight="Bold" FontSize="13"/>
+                                                <TextBlock Text="Watch peers via wg.exe. WireGuard uses a single unconnected UDP socket, so no VPN client ever becomes a tracked connection and none of this is otherwise visible. Alerts on a peer key that was not in the baseline, an endpoint moving country, and peer removal. The box sets the per-peer transfer alert in MB per 10 minutes (0 = off, because a VPN user streaming video legitimately moves gigabytes)."
+                                                           Foreground="{StaticResource TextSecondaryBrush}" FontSize="11"
+                                                           Margin="0,2,0,0" TextWrapping="Wrap"/>
+                                                <TextBlock Text="{Binding WireGuardStatusText}" FontSize="11" Margin="0,4,0,0"
+                                                           Foreground="{StaticResource TextMutedBrush}" TextWrapping="Wrap"/>
+                                            </StackPanel>
+                                            <TextBox Grid.Column="1" Width="70" VerticalAlignment="Center" Margin="0,0,12,0"
+                                                     Style="{StaticResource ModernTextBox}"
+                                                     Text="{Binding WireGuardPeerMbText, UpdateSourceTrigger=LostFocus}"/>
+                                            <CheckBox Grid.Column="2" VerticalAlignment="Center"
+                                                      Style="{StaticResource ModernCheckBox}"
+                                                      IsChecked="{Binding WireGuardMonitorEnabled}"/>
+                                        </Grid>
+
+                                        <Grid>
+                                            <Grid.ColumnDefinitions>
+                                                <ColumnDefinition Width="*"/>
+                                                <ColumnDefinition Width="Auto"/>
+                                                <ColumnDefinition Width="Auto"/>
+                                            </Grid.ColumnDefinitions>
+                                            <StackPanel Margin="0,0,16,0">
+                                                <TextBlock Text="DNS hygiene" FontWeight="Bold" FontSize="13"/>
+                                                <TextBlock Text="Watch how names get resolved: plaintext queries leaving the machine, encrypted DNS silently falling back to plaintext, queries to resolvers you did not approve, and allowlisted domains resolving into unfamiliar networks — the shape of a poisoning attack aimed at the never-block list. Needs kernel flow events. List your resolver IPs in the box; without them DoH on 443 is indistinguishable from ordinary web traffic."
+                                                           Foreground="{StaticResource TextSecondaryBrush}" FontSize="11"
+                                                           Margin="0,2,0,0" TextWrapping="Wrap"/>
+                                                <TextBlock Text="{Binding DnsHygieneStatusText}" FontSize="11" Margin="0,4,0,0"
+                                                           Foreground="{StaticResource TextMutedBrush}" TextWrapping="Wrap"/>
+                                            </StackPanel>
+                                            <TextBox Grid.Column="1" Width="200" VerticalAlignment="Center" Margin="0,0,12,0"
+                                                     Style="{StaticResource ModernTextBox}"
+                                                     Text="{Binding DnsApprovedResolversText, UpdateSourceTrigger=LostFocus}"/>
+                                            <CheckBox Grid.Column="2" VerticalAlignment="Center"
+                                                      Style="{StaticResource ModernCheckBox}"
+                                                      IsChecked="{Binding DnsHygieneEnabled}"/>
+                                        </Grid>
+                                    </StackPanel>
+                                </Border>
+
+                                <Border Style="{StaticResource Card}" Margin="0,0,0,14">
+                                    <StackPanel>
                                         <TextBlock Text="Remote access (web console)" FontWeight="Bold" FontSize="15"/>
                                         <TextBlock Text="Reach the browser console from outside this machine over HTTPS. These settings configure the headless web console (--web); this app saves them and keeps the DuckDNS hostname current."
                                                    Foreground="{StaticResource TextSecondaryBrush}" FontSize="12"

@@ -99,6 +99,102 @@ Heuristics flag patterns such as:
 
 Each alert includes **source IP**, **method**, and **where it’s coming from** (DNS + best-effort geo). Threat events and the host/listener baseline **persist across restarts** (`threat-log.jsonl`, `host-history.json`).
 
+### Prevention engine
+
+Every automatic block — from any detector, in any of the three frontends — goes through **one** enforcement engine (`PreventionService`). It used to be three near-identical copies of the same logic in the GUI, TUI and web console, each with its own blocked-IP cache and retry map. Detection sources keep multiplying; the decision to drop traffic must not.
+
+Gates, in order — a threat must clear all of them before a rule is written:
+
+| Gate | Why |
+|------|-----|
+| Severity ≥ minimum | The configured `Medium`/`High`/`Critical` threshold |
+| Not `New Remote Host` | First contact is not evidence of anything |
+| Routable public address | LAN and loopback are never auto-blocked |
+| Not allowlisted | Known-good stays reachable |
+| Not protected | See lockout protection below |
+| Not already blocked | No duplicate rules |
+| Not suppressed | An address you deliberately released stays released for 24 h |
+| Not retried too soon | A failed block backs off for 10 minutes |
+
+- **Dry run** (**Settings → Prevention and deep inspection → Auto-block dry run**, or `s` in the TUI) runs every gate and reports what it *would* have dropped, without writing a single rule. Blocking turns a false positive from noise into an outage, so a new detection source — a fresh Suricata ruleset especially — belongs here first. The console shows `Would block …` lines exactly where it would otherwise show `Auto-blocked …`.
+- **Lockout protection** — the address of whoever is signed into the web console is shielded from auto-block for a rolling 30 minutes. Prevention that firewalls the operator away from the box it protects has done more damage than the attack it stopped. Manual blocking is deliberately unaffected, and the shield lapses on its own once you stop working.
+- Direction fallback is now consistent: with neither **Block inbound** nor **Block outbound** ticked, all three frontends block **both** (the GUI used to block inbound only).
+
+### Kernel flow events
+
+Polling the TCP/UDP tables can only ever describe the moment they were read — on the default 1.2 s cycle an attacker gets a free window before anything is sampled. Network Sentinel also subscribes to the **`Microsoft-Windows-Kernel-Network` ETW provider** and takes its snapshot *because something happened* rather than because a timer fired.
+
+- Reaction to an inbound connection on a served port drops from up to a full poll interval to well under a second
+- The heuristics are unchanged — they are snapshot-based by design, and a snapshot is still what they consume. Only the *timing* of the snapshot changes
+- A 150 ms floor coalesces bursts, so a port scan of a thousand ports does not become a thousand snapshots
+- Only flows aimed at a port this machine actually serves cut the interval short, so ordinary outbound client traffic doesn't make a busy machine poll flat out
+- It is also the **only source of UDP peer addresses**. `GetExtendedUdpTable` reports unconnected sockets with no remote address, so a DNS query has no representation in the socket table at all — DNS hygiene below is fed entirely from here
+- Event payloads are decoded through **TDH against the provider's own schema**, looked up by field name rather than by hard-coded offsets. A wrong offset would not throw; it would yield a plausible but wrong address that the prevention engine then firewalls. If the schema is not what is expected, the event is dropped rather than guessed at
+- Starting a real-time ETW session needs **Administrator**. Without it the session fails to start, the console explains why, and the timer cadence continues — no functionality is lost, only reaction time
+
+### Signature detection — Suricata
+
+Connection heuristics see *who* is talking and *how often*; they can never see *what is being said*. That gap is closed by attaching **Suricata** rather than writing a detection engine: protocol decoders, stream reassembly and the target-based defragmentation that stops an attacker evading inspection are a multi-year project whose failure mode is a bypass nobody notices. Suricata already does all of it, and already has ET Open rules maintained full time.
+
+So Network Sentinel is the **manager**, not the engine — Suricata decides what matched, this app decides what happens next:
+
+| | |
+|---|---|
+| **Input** | Suricata's EVE JSON (`C:\Program Files\Suricata\log\eve.json` by default; set `eve-log` to enabled in `suricata.yaml`) |
+| **Severity mapping** | Suricata counts down — sev 1 → **Critical**, 2 → **High**, 3 → **Medium**, 4 → **Low**. A sev-1 match therefore clears the default `High` auto-block threshold |
+| **Threat source** | The *remote* end of the flow, not the packet source — for an outbound C2 callback the attacker is the destination, and blocking the source would firewall the host off from itself |
+| **Noise control** | A maximum severity number, a per-signature mute list (`sids`), and a 2-minute per-signature-per-peer cooldown so one rule matching every packet can't bury every other alert |
+| **IPS mode** | When Suricata dropped the packet itself, the alert detail says `already dropped by Suricata` |
+
+Alerts arrive as ordinary `Signature Match` threat events, so the whole existing pipeline applies unchanged: the threat list, the persistent log, geo/origin enrichment, webhooks, the allowlist, and auto-block. Log rotation is handled — the tailer reopens rather than sitting on a stale handle.
+
+Suricata is **not bundled**; install and run it yourself, then switch on **Settings → Suricata signature alerts**. The log directory under `Program Files` is not world-readable, so this usually needs Administrator.
+
+### VPN peer monitoring — WireGuard
+
+WireGuard is invisible to everything else in this app. It uses a single **unconnected** UDP socket, so the socket table files it as a UDP endpoint with no peer and **no VPN client ever becomes a tracked connection** — nothing reaches the intrusion heuristics, the Remote Computers list, threat intel, or the prevention engine. On a VPN server that is a hole straight through the middle of the monitoring.
+
+This reads WireGuard's own state (`wg show all dump`, via the `wg.exe` that WireGuard for Windows installs) instead:
+
+| Detection | Level | Why |
+|-----------|-------|-----|
+| **New peer** | High | A peer entry grants standing access to your network. If you didn't add it, someone with Administrator rights edited the WireGuard config |
+| **Endpoint moved** | Low | Roaming between wifi and cellular is ordinary WireGuard behaviour — the value is the geo lookup patched into the alert's origin. The same key appearing from another country is not roaming |
+| **Peer removed** | Low | Expected after revoking access; unexpected means the config changed underneath you |
+| **Per-peer transfer** | High | Optional (0 = off). Forwarded tunnel traffic has no local socket, so the exfiltration monitor cannot see it — this is the only place it is counted |
+
+- The first run adopts the existing peer list silently; the baseline persists in `wireguard-peers.json`, so a restart doesn't re-alert on peers you already know.
+- **Key material never leaves the parser.** `wg show ... dump` prints the interface *private* key and each peer's *preshared* key. Both are dropped at parse time — they are never stored, logged, shown in the console, written to the baseline file, or sent to a webhook. Only public keys are used.
+- The web console shows a live peer table under **Settings → VPN (WireGuard)**: peer key (hover for the full key), interface, endpoint, allowed IPs, last handshake, and Rx/Tx. It is **read-only by design** — revoking a peer is a WireGuard configuration change, not something a monitoring console should do behind your back.
+- Needs **Administrator**; `wg.exe` cannot read the WireGuard service's device state otherwise. Without it the setting explains why rather than failing quietly.
+- Per-peer transfer alerting is **off by default**: a VPN user streaming video legitimately moves gigabytes, so any threshold low enough to catch a slow leak would fire constantly on normal use.
+
+> Tunnel addresses are RFC1918, so auto-block will never act on a VPN client — by design, since blocking a tunnel IP would be both ineffective and confusing. Cutting off a peer belongs in WireGuard's own configuration (`wg set <iface> peer <key> remove`), not in a monitoring console acting behind your back.
+
+### DNS hygiene
+
+Almost nothing connects without resolving a name first, so DNS is where a compromise usually shows earliest — and it is a standard exfiltration channel the exfiltration monitor cannot see, since that counts TCP socket bytes and DNS is UDP. Until now this app had no view of DNS at all.
+
+| Detection | Level | Why |
+|-----------|-------|-----|
+| **Plaintext DNS egress** | Medium | Queries leaving on port 53 can be read *and rewritten* by anything on the path |
+| **Encrypted DNS stopped** | High | Resolvers usually fall back to plaintext rather than fail, so a blocked port 853 or an expired certificate silently removes the protection you configured. Nobody notices this one |
+| **Unapproved resolver** | High | Something changed the resolver configuration, or answers are being redirected |
+| **VPN client bypassing your resolver** | Medium | A tunnel client querying externally in the clear defeats the thing the VPN was for |
+| **Allowlisted domain moved networks** | High | See below — this one is about protecting Network Sentinel itself |
+
+**Why the allowlist matters here.** `AllowlistService` resolves allowlisted domains over whatever DNS the host is using, and the prevention engine **never auto-blocks a resolved allowlist address**. Poison the host's DNS and an attacker's address is written into the allowlist under a trusted domain's name — permanently immune to blocking, by design. The drift detector compares every answer against the networks that domain has resolved into before (a /24 for IPv4, /48 for IPv6) and alerts only when the new answer shares *nothing* with that history, so ordinary CDN rotation stays quiet. The history persists in `dns-domain-networks.json`, because a restart that silently re-seeded would adopt a poisoned answer as the new truth.
+
+**What it can and cannot see.** Port 53 is plaintext and detected wherever it goes. Port 853 is DoT and recognised as encrypted. **DoH is HTTPS on 443 and is indistinguishable from ordinary web traffic** — it is only counted as encrypted DNS when the destination is a resolver you list under **Approved resolvers**. Without that list a DoH setup looks like no DNS at all rather than like a leak.
+
+Flows come from the ETW flow event source, so this covers traffic the socket tables never show — most importantly UDP peers, which have no remote address in the UDP table at all. That needs **Administrator**; without it the status says so and no detection runs.
+
+> **One difference from the Linux build.** `Microsoft-Windows-Kernel-Network` reports *this host's own* socket activity. The Linux port reads conntrack, which also sees **forwarded** packets, so it catches a VPN client querying an external resolver as that traffic is routed through. On Windows that traffic never touches a local socket, so the **VPN client bypassing your resolver** detection only fires when the query terminates on this machine. The other four detections are unaffected.
+
+> **The arrangement to aim for.** Windows 11 and Server 2022 can encrypt DNS themselves — `netsh dns add encryption server=<resolver> dohtemplate=<url>`, then set the adapter to DoH. Queries to a local address are never flagged, because a local resolver forwarding upstream over DoT/DoH is the wanted design: you keep full visibility here while the network sees nothing. Pointing everything straight at an external DoH endpoint hides your queries from your ISP *and* from this program — and from Suricata's DNS rules.
+
+Network Sentinel does not configure your resolver. Getting that wrong costs name resolution for the host and every VPN client at the same time, possibly while you are remote and depending on that tunnel to fix it. Detection and enforcement are what this program is for.
+
 ### Remote alerting (webhook)
 Set **Settings → Webhook URL** to push Critical threats off the machine — the payload adapts automatically: **ntfy** (plain text + `Title`/`Priority` headers), **Slack** (`{"text": …}`), **Discord** (`{"content": …}`), anything else gets a generic JSON document. Per-source/type cooldown stops a burst from flooding the channel.
 
@@ -291,7 +387,7 @@ powershell -ExecutionPolicy Bypass -File .\uninstall-web-service.ps1 -PurgeData 
 | **Ports** | Local listeners; one-click **Block port** |
 | **Firewall** | Managed rules grouped as In/Out pairs; manual IP and port blocking; **Restore allowlisted** |
 | **Allowlist** | Add/remove trusted domains and IPs; refresh the feed |
-| **Settings** | Monitoring on/off, page refresh speed, geo lookups, failed-logon monitoring, closed-port scan detection, the intrusion detectors (threat intel, new-listener, process reputation, ARP watch, startup-item watch, exfiltration, honeypot), **HTTPS + DuckDNS remote access** (including **Issue certificate**), webhook alerts, auto-block + minimum severity + expiry, block direction (in/out), allowlist feed, **change master password**, **Remove all rules** |
+| **Settings** | Monitoring on/off, page refresh speed, geo lookups, failed-logon monitoring, closed-port scan detection, the intrusion detectors (threat intel, new-listener, process reputation, ARP watch, startup-item watch, exfiltration, honeypot), **kernel flow events**, **DNS hygiene** (with approved resolvers), **WireGuard peer monitoring**, **Suricata signature ingestion** (EVE path), **auto-block dry run**, **HTTPS + DuckDNS remote access** (including **Issue certificate**), webhook alerts, auto-block + minimum severity + expiry, block direction (in/out), allowlist feed, **change master password**, **Remove all rules** |
 
 The console protects itself: it refuses to remove its own firewall access rule or block its own port (doing so would cut off your browser mid-request and look exactly like a crash).
 
@@ -574,6 +670,7 @@ The token is written to `duckdns.json`, not `settings.json`; the GUI, TUI, and w
 | Path | Role |
 |------|------|
 | `Native/IpHelper.cs` | P/Invoke into Windows IP Helper API |
+| `Native/FlowEvents.cs` | Real-time ETW session on `Microsoft-Windows-Kernel-Network`; TDH schema-driven payload decoding |
 | `Services/NetworkMonitorService.cs` | Polling loop, host tracking, stats |
 | `Services/IntrusionDetector.cs` | Heuristic threat engine |
 | `Services/AuthLogMonitor.cs` | Failed-logon detection from the Windows Security event log |
@@ -585,6 +682,10 @@ The token is written to `duckdns.json`, not `settings.json`; the GUI, TUI, and w
 | `Services/ArpWatchService.cs` | Gateway MAC watch from the IP Helper route/neighbour tables |
 | `Services/PersistenceWatcher.cs` | Startup folder, scheduled task, and Run-key watch |
 | `Services/ExfiltrationMonitor.cs` | TCP ESTATS per-connection byte sampling |
+| `Services/PreventionService.cs` | The single auto-block enforcement engine: gates, dry run, operator shield |
+| `Services/SuricataService.cs` | Tails Suricata EVE JSON and converts alerts to threat events |
+| `Services/WireGuardMonitor.cs` | WireGuard peer baseline, endpoint drift, per-peer transfer |
+| `Services/DnsHygieneMonitor.cs` | Plaintext/encrypted DNS, unapproved resolvers, allowlist resolution drift |
 | `Services/HostHistoryStore.cs` | Persistent host + listener baseline, threat log |
 | `Services/WebhookNotifier.cs` | ntfy / Slack / Discord / generic JSON alerts |
 | `Services/GeoIpService.cs` | Reverse DNS + public geo lookup |

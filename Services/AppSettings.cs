@@ -77,6 +77,60 @@ public sealed class AppSettings
     public string HoneypotPorts { get; set; } = "2323,3389,5900";
 
     /// <summary>
+    /// Decide and report auto-blocks without writing firewall rules. The safe way to
+    /// promote a new detection source (a fresh Suricata ruleset especially) from
+    /// alerting to blocking: watch what it would have dropped before it drops anything.
+    /// </summary>
+    public bool PreventionDryRun { get; set; }
+
+    /// <summary>
+    /// Subscribe to kernel flow events (ETW, Microsoft-Windows-Kernel-Network) so the
+    /// monitor samples the moment a flow appears instead of on the next timer tick.
+    /// Needs Administrator; falls back to timed polling with no loss of function.
+    /// </summary>
+    public bool FlowEventsEnabled { get; set; } = true;
+
+    /// <summary>
+    /// Watch WireGuard peers via `wg show`. WireGuard's single unconnected UDP socket is
+    /// invisible to the connection heuristics, so without this a VPN server has no view of
+    /// who is connected. Needs Administrator.
+    /// </summary>
+    public bool WireGuardMonitorEnabled { get; set; }
+
+    /// <summary>
+    /// Megabytes sent to one WireGuard peer within 10 minutes before alerting (0 = off).
+    /// Off by default — a VPN user streaming video legitimately moves gigabytes.
+    /// </summary>
+    public int WireGuardPeerMbPer10Min { get; set; }
+
+    /// <summary>
+    /// Watch DNS hygiene: plaintext queries leaving the host, encrypted DNS silently
+    /// falling back to plaintext, queries to unapproved resolvers, VPN clients bypassing
+    /// the resolver, and allowlisted domains resolving into unfamiliar networks.
+    /// Driven by ETW flow events, so it needs Administrator.
+    /// </summary>
+    public bool DnsHygieneEnabled { get; set; }
+
+    /// <summary>
+    /// Comma-separated resolver IPs this host is meant to use. Queries anywhere else are
+    /// flagged, and 443 traffic to these addresses is recognised as DoH (which is otherwise
+    /// indistinguishable from ordinary HTTPS).
+    /// </summary>
+    public string DnsApprovedResolvers { get; set; } = "";
+
+    /// <summary>Ingest Suricata's EVE JSON alerts as threat events (payload inspection / signatures).</summary>
+    public bool SuricataEnabled { get; set; }
+
+    /// <summary>Path to Suricata's EVE JSON log.</summary>
+    public string SuricataEvePath { get; set; } = SuricataService.DefaultEvePath;
+
+    /// <summary>Highest Suricata severity number to accept — Suricata counts down, so 1 is most severe.</summary>
+    public int SuricataMaxSeverity { get; set; } = 3;
+
+    /// <summary>Comma-separated Suricata signature IDs to ignore (per-rule mute for false positives).</summary>
+    public string SuricataIgnoredSids { get; set; } = "";
+
+    /// <summary>
     /// Minutes before auto-created block rules expire (0 = never). An expired rule stops
     /// counting as blocking immediately; the netsh rule itself is dropped by the background
     /// sweep on its next pass.

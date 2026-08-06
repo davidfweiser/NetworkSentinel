@@ -81,6 +81,12 @@ public sealed class AllowlistService : IDisposable
         StatusText = $"Allowlist refreshed · {_domains.Count} domains · {_ipToReason.Count} IPs protected · {DateTime.Now:HH:mm:ss}.";
     }
 
+    /// <summary>
+    /// Optional watcher invoked with (domain, resolved IPs) after each refresh.
+    /// Set by the monitor so DNS poisoning of the never-block list can be detected.
+    /// </summary>
+    public Action<string, IReadOnlyCollection<string>>? ResolutionObserver { get; set; }
+
     public bool IsAllowed(string ip, out string reason)
     {
         reason = "";
@@ -450,6 +456,19 @@ public sealed class AllowlistService : IDisposable
             {
                 foreach (var (domain, ips) in resolvedNow)
                     _domainIps[domain] = new HashSet<string>(ips, StringComparer.OrdinalIgnoreCase);
+
+                // Report every fresh answer to whoever is watching for poisoning. An
+                // allowlisted address is never auto-blocked, so a hijacked lookup here
+                // would grant an attacker permanent immunity — the DNS monitor compares
+                // each answer against the networks the domain has used before.
+                if (ResolutionObserver is { } observe)
+                {
+                    foreach (var (domain, ips) in resolvedNow)
+                    {
+                        try { observe(domain, ips); }
+                        catch { /* a watcher must never break allowlist refresh */ }
+                    }
+                }
 
                 // Drop cached IPs only for domains removed from the allowlist
                 foreach (var gone in _domainIps.Keys.Where(d => !_domains.Contains(d)).ToList())

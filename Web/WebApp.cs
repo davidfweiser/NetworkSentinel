@@ -44,18 +44,12 @@ public sealed class WebApp : IDisposable
     private readonly AllowlistService _allowlist = new();
     private readonly WebAuthStore _auth = new();
     private readonly AppSettings _settings;
-    private readonly object _autoBlockGate = new();
-    private readonly Dictionary<string, DateTime> _autoBlockAttempted = new(StringComparer.OrdinalIgnoreCase);
-    /// <summary>
-    /// IPs the user explicitly unblocked/removed. Auto-block must not recreate rules for these
-    /// until the user manually blocks again (or the suppress window expires).
-    /// </summary>
-    private readonly Dictionary<string, DateTime> _autoBlockSuppressedUntil = new(StringComparer.OrdinalIgnoreCase);
+
+    /// <summary>The one enforcement engine, shared with the GUI and TUI.</summary>
+    private readonly PreventionService _prevention;
+
     /// <summary>Stand-in shown in the settings page where a DuckDNS token is stored but must not be sent.</summary>
     private const string TokenPlaceholder = "••••••••";
-
-    private static readonly TimeSpan AutoBlockRetryAfter = TimeSpan.FromMinutes(10);
-    private static readonly TimeSpan ManualUnblockSuppressFor = TimeSpan.FromHours(24);
 
     private readonly int _port;
     private readonly bool _bindAll;
@@ -68,13 +62,6 @@ public sealed class WebApp : IDisposable
     private bool _httpsActive;
     private CancellationTokenSource? _cts;
     private string _statusMessage = "Web UI ready — monitoring started.";
-    private bool _autoBlockEnabled;
-    private string _autoBlockMinLevel;
-    private bool _blockInbound;
-    private bool _blockOutbound;
-    private HashSet<string> _blockedIps = new(StringComparer.OrdinalIgnoreCase);
-    private DateTime _blockedIpsRefreshedAt = DateTime.MinValue;
-    private bool _blockedIpsRefreshInFlight;
     private readonly string _appVersion = FormatAppVersion();
 
     public int Port => _port;
@@ -88,12 +75,9 @@ public sealed class WebApp : IDisposable
         _port = ResolvePort(requestedPort);
         _settings = AppSettings.Load();
         ApplyTlsOverrides(tlsOverrides);
-        _autoBlockEnabled = _settings.AutoBlockEnabled;
-        _autoBlockMinLevel = _settings.AutoBlockMinLevel;
-        if (_autoBlockMinLevel is not (nameof(ThreatLevel.Medium) or nameof(ThreatLevel.High) or nameof(ThreatLevel.Critical)))
-            _autoBlockMinLevel = nameof(ThreatLevel.High);
-        _blockInbound = _settings.AutoBlockInbound;
-        _blockOutbound = _settings.AutoBlockOutbound;
+        _prevention = new PreventionService(_firewall, _allowlist, _settings);
+        if (_prevention.MinLevel is not (ThreatLevel.Medium or ThreatLevel.High or ThreatLevel.Critical))
+            _prevention.MinLevel = ThreatLevel.High;
 
         _firewall.Allowlist = _allowlist;
         _firewall.AutoBlockExpiry = _settings.AutoBlockExpiryMinutes > 0
@@ -112,6 +96,16 @@ public sealed class WebApp : IDisposable
         _monitor.ExfilThresholdMb = _settings.ExfilMbPer10Min;
         _monitor.HoneypotPorts = HoneypotService.ParsePorts(_settings.HoneypotPorts);
         _monitor.HoneypotEnabled = _settings.HoneypotEnabled;
+        _monitor.FlowEventsEnabled = _settings.FlowEventsEnabled;
+        _monitor.SuricataEvePath = _settings.SuricataEvePath;
+        _monitor.SuricataMaxSeverity = _settings.SuricataMaxSeverity;
+        _monitor.SuricataIgnoredSids = _settings.SuricataIgnoredSids;
+        _monitor.SuricataEnabled = _settings.SuricataEnabled;
+        _monitor.WireGuardPeerMbPer10Min = _settings.WireGuardPeerMbPer10Min;
+        _monitor.WireGuardMonitorEnabled = _settings.WireGuardMonitorEnabled;
+        _monitor.DnsApprovedResolvers = _settings.DnsApprovedResolvers;
+        _monitor.DnsHygieneEnabled = _settings.DnsHygieneEnabled;
+        _allowlist.ResolutionObserver = _monitor.AllowlistResolutionObserver;
         _monitor.WebhookUrl = _settings.WebhookUrl;
         _monitor.WebhookMinLevel = _settings.GetWebhookMinLevel();
         _monitor.IsIpAllowlisted = ip => _allowlist.IsAllowed(ip, out _);
@@ -158,7 +152,6 @@ public sealed class WebApp : IDisposable
             Console.Error.WriteLine(_statusMessage);
         }
 
-        LoadPersistedAutoBlockSuppressions();
         RefreshBlockedIps(force: true);
         _monitor.Start();
         StartDuckDns();
@@ -491,6 +484,12 @@ public sealed class WebApp : IDisposable
             return;
         }
 
+        // Every authenticated request refreshes a 30-minute shield on the operator's own
+        // address. Prevention that firewalls the admin away from the box it protects has
+        // done more damage than the attack it stopped, and a fresh signature ruleset is
+        // exactly when that happens. Manual blocking is deliberately unaffected.
+        _prevention.Protect(ClientAddress(ctx));
+
         if (req.Method == "POST" && path == "/api/auth/change-password")
         {
             var body = ReadBody(req);
@@ -803,25 +802,25 @@ public sealed class WebApp : IDisposable
                     return SetMonitoring(!_monitor.Stats.IsMonitoring);
 
                 case "toggle_autoblock":
-                    _autoBlockEnabled = !_autoBlockEnabled;
-                    _settings.AutoBlockEnabled = _autoBlockEnabled;
+                    _prevention.Enabled = !_prevention.Enabled;
+                    _settings.AutoBlockEnabled = _prevention.Enabled;
                     _settings.Save();
-                    _statusMessage = _autoBlockEnabled
-                        ? $"Auto-block ON (≥ {_autoBlockMinLevel})" +
+                    _statusMessage = _prevention.Enabled
+                        ? $"Auto-block ON (≥ {_prevention.MinLevel})" +
                           (_firewall.IsAdministrator ? "" : " — need Administrator for firewall changes")
                         : "Auto-block OFF";
                     return ActionResultDto.Success(_statusMessage);
 
                 case "cycle_min_level":
-                    _autoBlockMinLevel = _autoBlockMinLevel switch
+                    _prevention.MinLevel = _prevention.MinLevel switch
                     {
-                        nameof(ThreatLevel.Medium) => nameof(ThreatLevel.High),
-                        nameof(ThreatLevel.High) => nameof(ThreatLevel.Critical),
-                        _ => nameof(ThreatLevel.Medium)
+                        ThreatLevel.Medium => ThreatLevel.High,
+                        ThreatLevel.High => ThreatLevel.Critical,
+                        _ => ThreatLevel.Medium
                     };
-                    _settings.AutoBlockMinLevel = _autoBlockMinLevel;
+                    _settings.SetMinLevel(_prevention.MinLevel);
                     _settings.Save();
-                    _statusMessage = $"Auto-block minimum severity: {_autoBlockMinLevel}";
+                    _statusMessage = $"Auto-block minimum severity: {_prevention.MinLevel}";
                     return ActionResultDto.Success(_statusMessage);
 
                 case "set_min_level":
@@ -829,10 +828,10 @@ public sealed class WebApp : IDisposable
                     var level = (req.Value ?? "").Trim();
                     if (level is not (nameof(ThreatLevel.Medium) or nameof(ThreatLevel.High) or nameof(ThreatLevel.Critical)))
                         return ActionResultDto.Fail("Level must be Medium, High, or Critical.");
-                    _autoBlockMinLevel = level;
+                    _prevention.MinLevel = Enum.Parse<ThreatLevel>(level);
                     _settings.AutoBlockMinLevel = level;
                     _settings.Save();
-                    _statusMessage = $"Auto-block minimum severity: {_autoBlockMinLevel}";
+                    _statusMessage = $"Auto-block minimum severity: {_prevention.MinLevel}";
                     return ActionResultDto.Success(_statusMessage);
                 }
 
@@ -850,19 +849,26 @@ public sealed class WebApp : IDisposable
                     switch (key)
                     {
                         case "autoBlockEnabled":
-                            _autoBlockEnabled = on;
+                            _prevention.Enabled = on;
                             _settings.AutoBlockEnabled = on;
-                            label = on ? $"Auto-block ON (≥ {_autoBlockMinLevel})" : "Auto-block OFF";
+                            label = on ? $"Auto-block ON (≥ {_prevention.MinLevel})" : "Auto-block OFF";
                             break;
                         case "blockInbound":
-                            _blockInbound = on;
+                            _prevention.BlockInbound = on;
                             _settings.AutoBlockInbound = on;
                             label = $"Block inbound: {(on ? "on" : "off")}";
                             break;
                         case "blockOutbound":
-                            _blockOutbound = on;
+                            _prevention.BlockOutbound = on;
                             _settings.AutoBlockOutbound = on;
                             label = $"Block outbound: {(on ? "on" : "off")}";
+                            break;
+                        case "preventionDryRun":
+                            _prevention.DryRun = on;
+                            _settings.PreventionDryRun = on;
+                            label = on
+                                ? "Dry run: on — auto-block reports what it would drop, without writing rules"
+                                : "Dry run: off — auto-block writes firewall rules";
                             break;
                         case "geoLookupEnabled":
                             _monitor.GeoLookupsEnabled = on;
@@ -954,6 +960,54 @@ public sealed class WebApp : IDisposable
                                 : $"Decoy ports saved ({_settings.HoneypotPorts}) — enable the honeypot to arm them.";
                             break;
                         }
+                        case "flowEventsEnabled":
+                            _monitor.FlowEventsEnabled = on;
+                            _settings.FlowEventsEnabled = on;
+                            label = on
+                                ? $"Kernel flow events: on ({_monitor.FlowEventsStatus})"
+                                : "Kernel flow events: off — sampling on the poll timer only";
+                            break;
+                        case "suricataEnabled":
+                            _monitor.SuricataEnabled = on;
+                            _settings.SuricataEnabled = on;
+                            label = on ? $"Suricata ingestion: on ({_monitor.SuricataStatus})" : "Suricata ingestion: off";
+                            break;
+                        case "suricataEvePath":
+                        {
+                            var path = string.IsNullOrWhiteSpace(raw) ? SuricataService.DefaultEvePath : raw;
+                            _settings.SuricataEvePath = path;
+                            _monitor.SuricataEvePath = path;
+                            label = _settings.SuricataEnabled
+                                ? _monitor.SuricataStatus
+                                : $"EVE log path saved ({path}) — enable Suricata ingestion to read it.";
+                            break;
+                        }
+                        case "wireGuardMonitorEnabled":
+                            _monitor.WireGuardMonitorEnabled = on;
+                            _settings.WireGuardMonitorEnabled = on;
+                            label = on ? $"WireGuard peers: on ({_monitor.WireGuardStatus})" : "WireGuard peer monitoring: off";
+                            break;
+                        case "wireGuardPeerMbPer10Min":
+                            if (!int.TryParse(raw, out var peerMb) || peerMb < 0)
+                                return ActionResultDto.Fail("Per-peer threshold must be a whole number of megabytes (0 = off).");
+                            _settings.WireGuardPeerMbPer10Min = peerMb;
+                            _monitor.WireGuardPeerMbPer10Min = peerMb;
+                            label = peerMb == 0
+                                ? "Per-peer transfer alerts off — a VPN user streaming video legitimately moves gigabytes."
+                                : $"Alert when one WireGuard peer receives more than {peerMb} MB in 10 minutes.";
+                            break;
+                        case "dnsHygieneEnabled":
+                            _monitor.DnsHygieneEnabled = on;
+                            _settings.DnsHygieneEnabled = on;
+                            label = on ? $"DNS hygiene: on ({_monitor.DnsHygieneStatus})" : "DNS hygiene monitoring: off";
+                            break;
+                        case "dnsApprovedResolvers":
+                            _settings.DnsApprovedResolvers = raw;
+                            _monitor.DnsApprovedResolvers = raw;
+                            label = string.IsNullOrEmpty(raw)
+                                ? "No approved resolvers set — DoH cannot be recognised and every resolver looks acceptable."
+                                : $"Approved resolvers: {raw}";
+                            break;
                         case "webhookUrl":
                             _monitor.WebhookUrl = raw;
                             _settings.WebhookUrl = raw;
@@ -1120,7 +1174,7 @@ public sealed class WebApp : IDisposable
                     if (r.Success)
                     {
                         foreach (var ip in blockedBefore)
-                            SuppressAutoBlock(ip);
+                            _prevention.NoteUnblocked(ip);
                         RefreshBlockedIps(force: true);
                     }
                     _statusMessage = r.Message;
@@ -1145,8 +1199,8 @@ public sealed class WebApp : IDisposable
                     if (r.Success)
                     {
                         var key = FirewallService.TryNormalizeIp(ip, out var normalized, out _) ? normalized : ip;
-                        ClearAutoBlockSuppress(key);
-                        lock (_autoBlockGate) _blockedIps.Add(key);
+                        _prevention.ClearSuppression(key);
+                        _prevention.NoteBlocked(key);
                         RefreshBlockedIps(force: true);
                     }
                     _statusMessage = r.Message;
@@ -1165,8 +1219,7 @@ public sealed class WebApp : IDisposable
                     {
                         if (FirewallService.TryNormalizeIp(ip, out var normalized, out _))
                         {
-                            SuppressAutoBlock(normalized);
-                            lock (_autoBlockGate) _blockedIps.Remove(normalized);
+                            _prevention.NoteUnblocked(normalized);
                         }
                         RefreshBlockedIps(force: true);
                     }
@@ -1259,7 +1312,7 @@ public sealed class WebApp : IDisposable
                     {
                         // Keep auto-block from immediately recreating the same IP block.
                         if (FirewallService.TryExtractIpFromManagedRule(name, null, out var removedIp))
-                            SuppressAutoBlock(removedIp);
+                            _prevention.NoteUnblocked(removedIp);
 
                         try { RefreshBlockedIps(force: true); }
                         catch { /* ignore */ }
@@ -1281,7 +1334,7 @@ public sealed class WebApp : IDisposable
     private object BuildState()
     {
         RefreshBlockedIps(force: false);
-        var blocked = _blockedIps;
+        var blocked = _prevention.BlockedIps;
         var stats = _monitor.Stats;
 
         return new
@@ -1298,10 +1351,11 @@ public sealed class WebApp : IDisposable
             },
             settings = new
             {
-                autoBlockEnabled = _autoBlockEnabled,
-                autoBlockMinLevel = _autoBlockMinLevel,
-                blockInbound = _blockInbound,
-                blockOutbound = _blockOutbound,
+                autoBlockEnabled = _prevention.Enabled,
+                autoBlockMinLevel = _prevention.MinLevel.ToString(),
+                blockInbound = _prevention.BlockInbound,
+                blockOutbound = _prevention.BlockOutbound,
+                preventionDryRun = _prevention.DryRun,
                 geoLookupEnabled = _settings.GeoLookupEnabled,
                 authLogMonitorEnabled = _settings.AuthLogMonitorEnabled,
                 authLogStatus = _monitor.AuthLogStatus,
@@ -1323,6 +1377,18 @@ public sealed class WebApp : IDisposable
                 honeypotEnabled = _settings.HoneypotEnabled,
                 honeypotPorts = _settings.HoneypotPorts,
                 honeypotStatus = _monitor.HoneypotStatus,
+                flowEventsEnabled = _settings.FlowEventsEnabled,
+                flowEventsStatus = _monitor.FlowEventsStatus,
+                suricataEnabled = _settings.SuricataEnabled,
+                suricataEvePath = _settings.SuricataEvePath,
+                suricataStatus = _monitor.SuricataStatus,
+                wireGuardMonitorEnabled = _settings.WireGuardMonitorEnabled,
+                wireGuardPeerMbPer10Min = _settings.WireGuardPeerMbPer10Min,
+                wireGuardStatus = WireGuardStatusText(),
+                wireGuardPeers = WireGuardPeerRows(),
+                dnsHygieneEnabled = _settings.DnsHygieneEnabled,
+                dnsApprovedResolvers = _settings.DnsApprovedResolvers,
+                dnsHygieneStatus = _monitor.DnsHygieneStatus,
                 webhookUrl = _settings.WebhookUrl,
                 webhookStatus = _monitor.WebhookStatus,
                 autoBlockExpiryMinutes = _settings.AutoBlockExpiryMinutes,
@@ -1436,6 +1502,30 @@ public sealed class WebApp : IDisposable
         };
     }
 
+    /// <summary>WireGuard monitor state for the settings panel.</summary>
+    private string WireGuardStatusText()
+        => _settings.WireGuardMonitorEnabled
+            ? _monitor.WireGuardStatus
+            : "Off — WireGuard peers are invisible to the connection heuristics until this is on.";
+
+    /// <summary>
+    /// Peer rows for the console. Only public keys are exposed: the interface private key
+    /// and each peer's preshared key are dropped in <see cref="WireGuardMonitor.ParseDump"/>
+    /// and never reach this class, so there is nothing secret here to leak to a browser.
+    /// </summary>
+    private object[] WireGuardPeerRows()
+        => _monitor.WireGuardPeers.Select(p => (object)new
+        {
+            iface = p.Interface,
+            shortKey = p.ShortKey,
+            publicKey = p.PublicKey,
+            endpoint = p.Endpoint,
+            allowedIps = p.AllowedIps,
+            handshake = p.HandshakeText,
+            rxMb = p.TransferRx / 1_000_000,
+            txMb = p.TransferTx / 1_000_000
+        }).ToArray();
+
     /// <summary>
     /// The inbound allow rule for THIS console's port. Removing it over the web kills the
     /// user's own browser connection mid-request — indistinguishable from a server crash.
@@ -1443,164 +1533,36 @@ public sealed class WebApp : IDisposable
     private bool IsOwnWebRule(string name)
         => string.Equals(name, $"{FirewallService.RulePrefix}-Web-{_port}", StringComparison.OrdinalIgnoreCase);
 
-    private FirewallDirection ResolveDirection()
-    {
-        if (_blockInbound && _blockOutbound) return FirewallDirection.Both;
-        if (_blockInbound) return FirewallDirection.Inbound;
-        if (_blockOutbound) return FirewallDirection.Outbound;
-        return FirewallDirection.Both;
-    }
+    private FirewallDirection ResolveDirection() => _prevention.ResolveDirection();
 
     private void OnMonitorUpdated() => RefreshBlockedIps(force: false);
 
     private void OnThreatsDetected(IReadOnlyList<ThreatEvent> threats)
     {
-        if (!_autoBlockEnabled || threats.Count == 0)
+        if (!_prevention.Enabled || threats.Count == 0)
             return;
 
-        _ = Task.Run(() =>
-        {
-            try { ProcessAutoBlocks(threats); }
-            catch (Exception ex) { _statusMessage = $"Auto-block error: {ex.Message}"; }
-        });
-    }
-
-    private void ProcessAutoBlocks(IReadOnlyList<ThreatEvent> threats)
-    {
-        if (!_autoBlockEnabled)
-            return;
-
-        if (!_firewall.IsAdministrator)
-        {
-            _statusMessage = "Auto-block ON, but not elevated — run as Administrator.";
-            return;
-        }
-
-        var minLevel = Enum.TryParse<ThreatLevel>(_autoBlockMinLevel, true, out var level)
-            ? level
-            : ThreatLevel.High;
-        var direction = ResolveDirection();
-        var messages = new List<string>();
-
-        foreach (var threat in threats)
-        {
-            if (threat.Level < minLevel)
-                continue;
-            if (threat.Type == ThreatType.NewRemoteHost)
-                continue;
-            if (!FirewallService.TryNormalizeIp(threat.SourceIp, out var ip, out _))
-                continue;
-            if (FirewallService.IsPrivateOrLocal(ip))
-                continue;
-            if (_allowlist.IsAllowed(ip, out _))
-                continue;
-
-            lock (_autoBlockGate)
-            {
-                if (_blockedIps.Contains(ip))
-                    continue;
-                if (_autoBlockSuppressedUntil.TryGetValue(ip, out var until) && DateTime.UtcNow < until)
-                    continue;
-                if (_autoBlockAttempted.TryGetValue(ip, out var lastAttempt) &&
-                    DateTime.UtcNow - lastAttempt < AutoBlockRetryAfter)
-                    continue;
-                _autoBlockAttempted[ip] = DateTime.UtcNow;
-            }
-
-            var reason = $"Auto-block · {threat.LevelText} · {threat.TypeText}: {threat.Title}";
-            var result = _firewall.BlockIp(ip, direction, reason, expiresAfter: _firewall.AutoBlockExpiry);
-            if (result.Success)
-            {
-                lock (_autoBlockGate) _blockedIps.Add(ip);
-                messages.Add($"Auto-blocked {ip}");
-            }
-            else
-            {
-                messages.Add($"Auto-block failed {ip}: {result.Message}");
-                lock (_autoBlockGate) _autoBlockAttempted.Remove(ip);
-            }
-        }
-
-        if (messages.Count > 0)
-        {
-            _statusMessage = string.Join(" · ", messages);
-            RefreshBlockedIps(force: true);
-        }
-    }
-
-    private void RefreshBlockedIps(bool force)
-    {
-        if (_blockedIpsRefreshInFlight)
-            return;
-        if (!force && DateTime.UtcNow - _blockedIpsRefreshedAt < TimeSpan.FromSeconds(15))
-            return;
-
-        _blockedIpsRefreshInFlight = true;
         _ = Task.Run(() =>
         {
             try
             {
-                var set = _firewall.GetBlockedIps();
-                _blockedIps = set;
-                _blockedIpsRefreshedAt = DateTime.UtcNow;
-                foreach (var host in _monitor.RemoteHosts)
-                    host.IsBlocked = set.Contains(host.IpAddress);
+                var result = _prevention.Apply(threats);
+                if (!result.HasMessages)
+                    return;
+                _statusMessage = result.Summary;
+                if (result.RulesChanged)
+                    RefreshBlockedIps(force: true);
             }
-            catch
-            {
-                // keep previous set
-            }
-            finally
-            {
-                _blockedIpsRefreshInFlight = false;
-            }
+            catch (Exception ex) { _statusMessage = $"Auto-block error: {ex.Message}"; }
         });
     }
 
-    private void SuppressAutoBlock(string ip)
-    {
-        var until = DateTime.UtcNow.Add(ManualUnblockSuppressFor);
-        lock (_autoBlockGate)
+    private void RefreshBlockedIps(bool force)
+        => _prevention.RefreshBlockedIps(force, set =>
         {
-            _blockedIps.Remove(ip);
-            // Leave a long cooldown marker so concurrent threat handlers also skip briefly.
-            _autoBlockAttempted[ip] = DateTime.UtcNow;
-            _autoBlockSuppressedUntil[ip] = until;
-        }
-
-        _settings.AutoBlockSuppressedUntil[ip] = until;
-        PruneExpiredSuppressions(_settings.AutoBlockSuppressedUntil);
-        _settings.Save();
-    }
-
-    private void ClearAutoBlockSuppress(string ip)
-    {
-        lock (_autoBlockGate)
-            _autoBlockSuppressedUntil.Remove(ip);
-
-        if (_settings.AutoBlockSuppressedUntil.Remove(ip))
-            _settings.Save();
-    }
-
-    private void LoadPersistedAutoBlockSuppressions()
-    {
-        lock (_autoBlockGate)
-        {
-            _autoBlockSuppressedUntil.Clear();
-            foreach (var kv in _settings.AutoBlockSuppressedUntil)
-            {
-                if (kv.Value > DateTime.UtcNow)
-                    _autoBlockSuppressedUntil[kv.Key] = kv.Value;
-            }
-        }
-    }
-
-    private static void PruneExpiredSuppressions(Dictionary<string, DateTime> map)
-    {
-        var now = DateTime.UtcNow;
-        foreach (var key in map.Where(kv => kv.Value <= now).Select(kv => kv.Key).ToList())
-            map.Remove(key);
-    }
+            foreach (var host in _monitor.RemoteHosts)
+                host.IsBlocked = set.Contains(host.IpAddress);
+        });
 
     /// <summary>
     /// Picks a free port from preferred uncommon high ports, or an OS ephemeral port.
@@ -2743,6 +2705,25 @@ public sealed class WebApp : IDisposable
       .map(l => `<option ${s.autoBlockMinLevel === l ? 'selected' : ''}>${l}</option>`).join('')}</select>`;
     const refreshSel = `<select data-set-refresh>${[['1000', '1 second'], ['2500', '2.5 seconds'], ['5000', '5 seconds'], ['10000', '10 seconds']]
       .map(([v, l]) => `<option value="${v}" ${String(getRefreshMs()) === v ? 'selected' : ''}>${l}</option>`).join('')}</select>`;
+    // Peer list is read-only: revoking a peer is `wg set <iface> peer <key> remove`,
+    // a WireGuard config change, not something this console should do behind your back.
+    // Only the public key is ever sent here — see WireGuardPeerRows.
+    const wgPeerTable = (peers) => {
+      if (!s.wireGuardMonitorEnabled) return '';
+      if (!peers || !peers.length) return '<div class="settings-note">No peers reported.</div>';
+      const rows = peers.map(p => `
+        <tr>
+          <td title="${esc(p.publicKey || '')}"><code>${esc(p.shortKey || '')}</code></td>
+          <td>${esc(p.iface || '')}</td>
+          <td>${esc(p.endpoint || '—')}</td>
+          <td>${esc(p.allowedIps || '—')}</td>
+          <td>${esc(p.handshake || '—')}</td>
+          <td>${esc(String(p.rxMb ?? 0))} / ${esc(String(p.txMb ?? 0))} MB</td>
+        </tr>`).join('');
+      return `<div data-scroll style="overflow-x:auto"><table><thead><tr>
+          <th>Peer</th><th>Interface</th><th>Endpoint</th><th>Allowed IPs</th><th>Last handshake</th><th>Rx / Tx</th>
+        </tr></thead><tbody>${rows}</tbody></table></div>`;
+    };
 
     $('settingsPanel').innerHTML = `
       <div class="settings-group"><h3>Monitoring</h3>
@@ -2763,6 +2744,20 @@ public sealed class WebApp : IDisposable
         ${row('Exfiltration threshold (MB / 10 min)', 'Outbound megabytes to a single host before the alert fires.', txt('exfilMbPer10Min', s.exfilMbPer10Min ?? 250, '250'))}
         ${row('Honeypot decoy ports', 'Listen on decoy TCP ports nothing legitimate uses — any completed connection is a zero-false-positive Critical alert. ' + (s.honeypotStatus || ''), sw('honeypotEnabled', s.honeypotEnabled))}
         ${row('Decoy port list', 'Comma-separated TCP ports to bind as decoys. Ports already in use are skipped.', txt('honeypotPorts', s.honeypotPorts || '', '2323,3389,5900'))}
+      </div>
+      <div class="settings-group"><h3>Prevention and deep inspection</h3>
+        ${row('Auto-block dry run', 'Run every auto-block gate and report what would have been dropped, without writing a firewall rule. The safe way to promote a new detection source — a fresh Suricata ruleset especially — from alerting to blocking.', sw('preventionDryRun', s.preventionDryRun))}
+        ${row('Kernel flow events', 'Sample the moment the kernel reports a new connection instead of waiting out the poll interval, using the Microsoft-Windows-Kernel-Network ETW provider. Also the only source of UDP peer addresses, which DNS hygiene needs. Falls back to timed polling when unavailable. ' + (s.flowEventsStatus || ''), sw('flowEventsEnabled', s.flowEventsEnabled))}
+        ${row('Suricata signature alerts', 'Read Suricata\'s EVE JSON log and turn signature matches into threats, which then flow through the allowlist, geo enrichment, webhooks and auto-block like any other detection. Suricata is not bundled — install it and point the path below at its eve.json. ' + (s.suricataStatus || ''), sw('suricataEnabled', s.suricataEnabled))}
+        ${row('Suricata EVE log path', 'Full path to Suricata\'s eve.json.', txt('suricataEvePath', s.suricataEvePath || '', 'C:\\\\Program Files\\\\Suricata\\\\log\\\\eve.json'))}
+        ${row('DNS hygiene','Watch how names get resolved: plaintext queries leaving the machine, encrypted DNS silently falling back, queries to resolvers you did not approve, and allowlisted domains resolving into unfamiliar networks — the shape of a poisoning attack aimed at the never-block list. Needs kernel flow events. ' + (s.dnsHygieneStatus || ''), sw('dnsHygieneEnabled', s.dnsHygieneEnabled))}
+        ${row('Approved resolvers', 'Comma-separated resolver IPs this host is meant to use. Queries anywhere else are flagged, and 443 traffic to these addresses is recognised as DoH — without them, DoH is indistinguishable from ordinary web traffic.', txt('dnsApprovedResolvers', s.dnsApprovedResolvers || '', '1.1.1.1, 9.9.9.9'))}
+      </div>
+      <div class="settings-group"><h3>VPN (WireGuard)</h3>
+        <div class="settings-note">WireGuard uses one unconnected UDP socket, so its peers never appear as connections and nothing else on this page can see them. This reads WireGuard's own state via wg.exe instead. Needs Administrator. Only public keys are read — the interface private key and peer preshared keys are discarded at parse time and never stored, logged, or sent here.</div>
+        ${row('WireGuard peer monitoring', 'Watch peers for new keys, endpoint moves, and removals. ' + (s.wireGuardStatus || ''), sw('wireGuardMonitorEnabled', s.wireGuardMonitorEnabled))}
+        ${row('Per-peer transfer alert (MB / 10 min)', 'Alert when this much data is sent to a single peer within 10 minutes. 0 disables it — a VPN user streaming video legitimately moves gigabytes. Forwarded tunnel traffic has no local socket, so this is the only place it is counted.', txt('wireGuardPeerMbPer10Min', s.wireGuardPeerMbPer10Min ?? 0, '0'))}
+        ${wgPeerTable(s.wireGuardPeers)}
       </div>
       <div class="settings-group"><h3>Alerting</h3>
         ${row('Webhook URL', 'POST Critical threats to a webhook — ntfy, Slack, and Discord formats are detected automatically; anything else gets generic JSON. Empty = off. ' + (s.webhookStatus && s.webhookUrl ? s.webhookStatus : ''), txt('webhookUrl', s.webhookUrl || '', 'https://ntfy.sh/your-topic'))}

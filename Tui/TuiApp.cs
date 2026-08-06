@@ -51,11 +51,9 @@ public sealed class TuiApp : IDisposable
     private readonly FirewallService _firewall = new();
     private readonly AllowlistService _allowlist = new();
     private readonly AppSettings _settings;
-    private readonly object _autoBlockGate = new();
-    private readonly Dictionary<string, DateTime> _autoBlockAttempted = new(StringComparer.OrdinalIgnoreCase);
-    private readonly Dictionary<string, DateTime> _autoBlockSuppressedUntil = new(StringComparer.OrdinalIgnoreCase);
-    private static readonly TimeSpan AutoBlockRetryAfter = TimeSpan.FromMinutes(10);
-    private static readonly TimeSpan ManualUnblockSuppressFor = TimeSpan.FromHours(24);
+
+    /// <summary>The one enforcement engine, shared with the GUI and web console.</summary>
+    private readonly PreventionService _prevention;
 
     private View _view = View.Dashboard;
     private string _filter = "";
@@ -63,25 +61,15 @@ public sealed class TuiApp : IDisposable
     private int _selectedIndex;
     private int _scrollOffset;
     private bool _running = true;
-    private bool _autoBlockEnabled;
-    private string _autoBlockMinLevel;
-    private bool _blockInbound;
-    private bool _blockOutbound;
-    private HashSet<string> _blockedIps = new(StringComparer.OrdinalIgnoreCase);
-    private DateTime _blockedIpsRefreshedAt = DateTime.MinValue;
-    private bool _blockedIpsRefreshInFlight;
     private PromptKind _pendingPrompt = PromptKind.None;
     private string _appVersion = FormatAppVersion();
 
     public TuiApp()
     {
         _settings = AppSettings.Load();
-        _autoBlockEnabled = _settings.AutoBlockEnabled;
-        _autoBlockMinLevel = _settings.AutoBlockMinLevel;
-        if (_autoBlockMinLevel is not (nameof(ThreatLevel.Medium) or nameof(ThreatLevel.High) or nameof(ThreatLevel.Critical)))
-            _autoBlockMinLevel = nameof(ThreatLevel.High);
-        _blockInbound = _settings.AutoBlockInbound;
-        _blockOutbound = _settings.AutoBlockOutbound;
+        _prevention = new PreventionService(_firewall, _allowlist, _settings);
+        if (_prevention.MinLevel is not (ThreatLevel.Medium or ThreatLevel.High or ThreatLevel.Critical))
+            _prevention.MinLevel = ThreatLevel.High;
 
         _firewall.Allowlist = _allowlist;
         _firewall.AutoBlockExpiry = _settings.AutoBlockExpiryMinutes > 0
@@ -100,6 +88,16 @@ public sealed class TuiApp : IDisposable
         _monitor.ExfilThresholdMb = _settings.ExfilMbPer10Min;
         _monitor.HoneypotPorts = HoneypotService.ParsePorts(_settings.HoneypotPorts);
         _monitor.HoneypotEnabled = _settings.HoneypotEnabled;
+        _monitor.FlowEventsEnabled = _settings.FlowEventsEnabled;
+        _monitor.SuricataEvePath = _settings.SuricataEvePath;
+        _monitor.SuricataMaxSeverity = _settings.SuricataMaxSeverity;
+        _monitor.SuricataIgnoredSids = _settings.SuricataIgnoredSids;
+        _monitor.SuricataEnabled = _settings.SuricataEnabled;
+        _monitor.WireGuardPeerMbPer10Min = _settings.WireGuardPeerMbPer10Min;
+        _monitor.WireGuardMonitorEnabled = _settings.WireGuardMonitorEnabled;
+        _monitor.DnsApprovedResolvers = _settings.DnsApprovedResolvers;
+        _monitor.DnsHygieneEnabled = _settings.DnsHygieneEnabled;
+        _allowlist.ResolutionObserver = _monitor.AllowlistResolutionObserver;
         _monitor.WebhookUrl = _settings.WebhookUrl;
         _monitor.WebhookMinLevel = _settings.GetWebhookMinLevel();
         _monitor.IsIpAllowlisted = ip => _allowlist.IsAllowed(ip, out _);
@@ -107,7 +105,6 @@ public sealed class TuiApp : IDisposable
         if (_settings.ProbeLogEnabled && _firewall.IsAdministrator)
             _ = Task.Run(() => _firewall.EnableProbeLogging());
         _allowlist.UseRemoteFeed = _settings.AllowlistUseRemoteFeed;
-        LoadPersistedAutoBlockSuppressions();
         _monitor.Updated += OnMonitorUpdated;
         _monitor.ThreatsDetected += OnThreatsDetected;
     }
@@ -204,14 +201,19 @@ public sealed class TuiApp : IDisposable
 
     private void OnThreatsDetected(IReadOnlyList<ThreatEvent> threats)
     {
-        if (!_autoBlockEnabled || threats.Count == 0)
+        if (!_prevention.Enabled || threats.Count == 0)
             return;
 
         _ = Task.Run(() =>
         {
             try
             {
-                ProcessAutoBlocks(threats);
+                var result = _prevention.Apply(threats);
+                if (!result.HasMessages)
+                    return;
+                _statusMessage = result.Summary;
+                if (result.RulesChanged)
+                    RefreshBlockedIps(force: true);
             }
             catch (Exception ex)
             {
@@ -220,105 +222,14 @@ public sealed class TuiApp : IDisposable
         });
     }
 
-    private void ProcessAutoBlocks(IReadOnlyList<ThreatEvent> threats)
-    {
-        if (!_autoBlockEnabled)
-            return;
-
-        if (!_firewall.IsAdministrator)
-        {
-            _statusMessage = "Auto-block ON, but not elevated — run as Administrator.";
-            return;
-        }
-
-        var minLevel = Enum.TryParse<ThreatLevel>(_autoBlockMinLevel, true, out var level)
-            ? level
-            : ThreatLevel.High;
-        var direction = ResolveDirection();
-        var messages = new List<string>();
-
-        foreach (var threat in threats)
-        {
-            if (threat.Level < minLevel)
-                continue;
-            if (threat.Type == ThreatType.NewRemoteHost)
-                continue;
-            if (!FirewallService.TryNormalizeIp(threat.SourceIp, out var ip, out _))
-                continue;
-            if (FirewallService.IsPrivateOrLocal(ip))
-                continue;
-            if (_allowlist.IsAllowed(ip, out _))
-                continue;
-
-            lock (_autoBlockGate)
-            {
-                if (_blockedIps.Contains(ip))
-                    continue;
-                if (_autoBlockSuppressedUntil.TryGetValue(ip, out var until) && DateTime.UtcNow < until)
-                    continue;
-                if (_autoBlockAttempted.TryGetValue(ip, out var lastAttempt) &&
-                    DateTime.UtcNow - lastAttempt < AutoBlockRetryAfter)
-                    continue;
-                _autoBlockAttempted[ip] = DateTime.UtcNow;
-            }
-
-            var reason = $"Auto-block · {threat.LevelText} · {threat.TypeText}: {threat.Title}";
-            var result = _firewall.BlockIp(ip, direction, reason, expiresAfter: _firewall.AutoBlockExpiry);
-            if (result.Success)
-            {
-                lock (_autoBlockGate) _blockedIps.Add(ip);
-                messages.Add($"Auto-blocked {ip}");
-            }
-            else
-            {
-                messages.Add($"Auto-block failed {ip}: {result.Message}");
-                lock (_autoBlockGate) _autoBlockAttempted.Remove(ip);
-            }
-        }
-
-        if (messages.Count > 0)
-        {
-            _statusMessage = string.Join(" · ", messages);
-            RefreshBlockedIps(force: true);
-        }
-    }
-
-    private FirewallDirection ResolveDirection()
-    {
-        if (_blockInbound && _blockOutbound) return FirewallDirection.Both;
-        if (_blockInbound) return FirewallDirection.Inbound;
-        if (_blockOutbound) return FirewallDirection.Outbound;
-        return FirewallDirection.Both;
-    }
+    private FirewallDirection ResolveDirection() => _prevention.ResolveDirection();
 
     private void RefreshBlockedIps(bool force)
-    {
-        if (_blockedIpsRefreshInFlight)
-            return;
-        if (!force && DateTime.UtcNow - _blockedIpsRefreshedAt < TimeSpan.FromSeconds(15))
-            return;
-
-        _blockedIpsRefreshInFlight = true;
-        _ = Task.Run(() =>
+        => _prevention.RefreshBlockedIps(force, set =>
         {
-            try
-            {
-                var set = _firewall.GetBlockedIps();
-                _blockedIps = set;
-                _blockedIpsRefreshedAt = DateTime.UtcNow;
-                foreach (var host in _monitor.RemoteHosts)
-                    host.IsBlocked = _blockedIps.Contains(host.IpAddress);
-            }
-            catch
-            {
-                // keep previous set
-            }
-            finally
-            {
-                _blockedIpsRefreshInFlight = false;
-            }
+            foreach (var host in _monitor.RemoteHosts)
+                host.IsBlocked = set.Contains(host.IpAddress);
         });
-    }
 
     private void HandleInput()
     {
@@ -415,6 +326,9 @@ public sealed class TuiApp : IDisposable
                 break;
             case ConsoleKey.U:
                 _pendingPrompt = PromptKind.Authorize;
+                break;
+            case ConsoleKey.S:
+                ToggleDryRun();
                 break;
             case ConsoleKey.B:
                 _pendingPrompt = PromptKind.Block;
@@ -590,26 +504,40 @@ public sealed class TuiApp : IDisposable
 
     private void ToggleAutoBlock()
     {
-        _autoBlockEnabled = !_autoBlockEnabled;
-        _settings.AutoBlockEnabled = _autoBlockEnabled;
+        _prevention.Enabled = !_prevention.Enabled;
+        _settings.AutoBlockEnabled = _prevention.Enabled;
         _settings.Save();
-        _statusMessage = _autoBlockEnabled
-            ? $"Auto-block ON (≥ {_autoBlockMinLevel})" +
+        _statusMessage = _prevention.Enabled
+            ? $"Auto-block ON (≥ {_prevention.MinLevel})" +
               (_firewall.IsAdministrator ? "" : " — need Administrator for firewall changes")
             : "Auto-block OFF";
     }
 
+    /// <summary>
+    /// Dry run decides and reports blocks without writing rules — the safe way to watch a
+    /// new detection source before letting it drop traffic.
+    /// </summary>
+    private void ToggleDryRun()
+    {
+        _prevention.DryRun = !_prevention.DryRun;
+        _settings.PreventionDryRun = _prevention.DryRun;
+        _settings.Save();
+        _statusMessage = _prevention.DryRun
+            ? "Dry run ON — auto-block reports what it would drop, without writing rules."
+            : "Dry run OFF — auto-block writes firewall rules.";
+    }
+
     private void CycleMinLevel()
     {
-        _autoBlockMinLevel = _autoBlockMinLevel switch
+        _prevention.MinLevel = _prevention.MinLevel switch
         {
-            nameof(ThreatLevel.Medium) => nameof(ThreatLevel.High),
-            nameof(ThreatLevel.High) => nameof(ThreatLevel.Critical),
-            _ => nameof(ThreatLevel.Medium)
+            ThreatLevel.Medium => ThreatLevel.High,
+            ThreatLevel.High => ThreatLevel.Critical,
+            _ => ThreatLevel.Medium
         };
-        _settings.AutoBlockMinLevel = _autoBlockMinLevel;
+        _settings.SetMinLevel(_prevention.MinLevel);
         _settings.Save();
-        _statusMessage = $"Auto-block minimum severity: {_autoBlockMinLevel}";
+        _statusMessage = $"Auto-block minimum severity: {_prevention.MinLevel}";
     }
 
     private void RunPromptFilter()
@@ -680,8 +608,8 @@ public sealed class TuiApp : IDisposable
         if (result.Success)
         {
             var key = FirewallService.TryNormalizeIp(ip.Trim(), out var n, out _) ? n : ip.Trim();
-            ClearAutoBlockSuppress(key);
-            lock (_autoBlockGate) _blockedIps.Add(key);
+            _prevention.ClearSuppression(key);
+            _prevention.NoteBlocked(key);
             RefreshBlockedIps(force: true);
         }
     }
@@ -710,52 +638,8 @@ public sealed class TuiApp : IDisposable
         var result = _firewall.UnblockIp(ip.Trim());
         _statusMessage = result.Message;
         if (result.Success && FirewallService.TryNormalizeIp(ip.Trim(), out var normalized, out _))
-            SuppressAutoBlock(normalized);
+            _prevention.NoteUnblocked(normalized);
         RefreshBlockedIps(force: true);
-    }
-
-    private void SuppressAutoBlock(string ip)
-    {
-        var until = DateTime.UtcNow.Add(ManualUnblockSuppressFor);
-        lock (_autoBlockGate)
-        {
-            _blockedIps.Remove(ip);
-            _autoBlockAttempted[ip] = DateTime.UtcNow;
-            _autoBlockSuppressedUntil[ip] = until;
-        }
-
-        _settings.AutoBlockSuppressedUntil[ip] = until;
-        PruneExpiredSuppressions(_settings.AutoBlockSuppressedUntil);
-        _settings.Save();
-    }
-
-    private void ClearAutoBlockSuppress(string ip)
-    {
-        lock (_autoBlockGate)
-            _autoBlockSuppressedUntil.Remove(ip);
-
-        if (_settings.AutoBlockSuppressedUntil.Remove(ip))
-            _settings.Save();
-    }
-
-    private void LoadPersistedAutoBlockSuppressions()
-    {
-        lock (_autoBlockGate)
-        {
-            _autoBlockSuppressedUntil.Clear();
-            foreach (var kv in _settings.AutoBlockSuppressedUntil)
-            {
-                if (kv.Value > DateTime.UtcNow)
-                    _autoBlockSuppressedUntil[kv.Key] = kv.Value;
-            }
-        }
-    }
-
-    private static void PruneExpiredSuppressions(Dictionary<string, DateTime> map)
-    {
-        var now = DateTime.UtcNow;
-        foreach (var key in map.Where(kv => kv.Value <= now).Select(kv => kv.Key).ToList())
-            map.Remove(key);
     }
 
     private string? TryGetSelectedIp()
@@ -976,10 +860,10 @@ public sealed class TuiApp : IDisposable
     {
         var stats = _monitor.Stats;
         var mon = stats.IsMonitoring ? "[green]LIVE[/]" : "[yellow]PAUSED[/]";
-        var auto = _autoBlockEnabled
-            ? $"[red]AUTO ≥ {_autoBlockMinLevel}[/]"
+        var auto = _prevention.Enabled
+            ? $"[red]AUTO ≥ {_prevention.MinLevel}[/]"
             : "[grey]auto off[/]";
-        var blocked = _blockedIps.Count;
+        var blocked = _prevention.BlockedCount;
 
         var grid = new Grid().AddColumns(5);
         grid.AddRow(
@@ -1069,7 +953,7 @@ public sealed class TuiApp : IDisposable
             var geoW = Math.Max(10, TermWidth / 8);
             foreach (var h in hosts)
             {
-                h.IsBlocked = _blockedIps.Contains(h.IpAddress);
+                h.IsBlocked = _prevention.IsBlocked(h.IpAddress);
                 hostTable.AddRow(
                     Markup.Escape(h.IpAddress),
                     Markup.Escape(Truncate(h.HostName, hostW)),
@@ -1194,7 +1078,7 @@ public sealed class TuiApp : IDisposable
             for (var i = visible.start; i < visible.end; i++)
             {
                 var h = rows[i];
-                h.IsBlocked = _blockedIps.Contains(h.IpAddress);
+                h.IsBlocked = _prevention.IsBlocked(h.IpAddress);
                 var sel = i == _selectedIndex ? "[cyan]▶[/]" : " ";
                 table.AddRow(
                     sel,
@@ -1306,10 +1190,11 @@ public sealed class TuiApp : IDisposable
 
         var info = new Markup(
             $"[bold]Privilege[/]: {Markup.Escape(_firewall.PrivilegeText)}\n" +
-            $"[bold]Auto-block[/]: {(_autoBlockEnabled ? $"[red]ON ≥ {_autoBlockMinLevel}[/]" : "[grey]off[/]")}  " +
-            $"in={_blockInbound} out={_blockOutbound}\n" +
+            $"[bold]Auto-block[/]: {(_prevention.Enabled ? $"[red]ON ≥ {_prevention.MinLevel}[/]" : "[grey]off[/]")}" +
+            $"{(_prevention.DryRun ? " [yellow](dry run)[/]" : "")}  " +
+            $"in={_prevention.BlockInbound} out={_prevention.BlockOutbound}\n" +
             $"[bold]Allowlist[/]: {Markup.Escape(Truncate(_allowlist.StatusText, 70))}  [dim](view 7 · n add)[/]\n" +
-            $"[bold]Blocked IPs (managed)[/]: {_blockedIps.Count}");
+            $"[bold]Blocked IPs (managed)[/]: {_prevention.BlockedCount}");
 
         var table = new Table().Expand().Border(TableBorder.Simple);
         table.AddColumns("", "Kind", "Dir", "Target", "Name");
@@ -1405,6 +1290,7 @@ public sealed class TuiApp : IDisposable
         table.AddRow("p", "Pause / resume monitoring");
         table.AddRow("a", "Toggle auto-block");
         table.AddRow("m", "Cycle auto-block min severity");
+        table.AddRow("s", "Toggle auto-block dry run (report, don't block)");
         table.AddRow("b", "Block selected IP (or prompt)");
         table.AddRow("x", "Unblock selected IP (or prompt)");
         table.AddRow("u", "Relaunch as Administrator (UAC)");

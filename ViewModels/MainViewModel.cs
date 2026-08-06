@@ -19,16 +19,8 @@ public partial class MainViewModel : ObservableObject, IDisposable
     private readonly DuckDnsUpdater _duckDns = new();
     private readonly AppSettings _settings;
     private readonly DispatcherTimer _clockTimer;
-    private readonly object _autoBlockGate = new();
-    // Attempt markers expire so a failed auto-block can be retried later.
-    private readonly Dictionary<string, DateTime> _autoBlockAttempted = new(StringComparer.OrdinalIgnoreCase);
-    // After the user removes/unblocks a rule, do not auto-recreate it for a while.
-    private readonly Dictionary<string, DateTime> _autoBlockSuppressedUntil = new(StringComparer.OrdinalIgnoreCase);
-    private static readonly TimeSpan AutoBlockRetryAfter = TimeSpan.FromMinutes(10);
-    private static readonly TimeSpan ManualUnblockSuppressFor = TimeSpan.FromHours(24);
-    private HashSet<string> _blockedIps = new(StringComparer.OrdinalIgnoreCase);
-    private DateTime _blockedIpsRefreshedAt = DateTime.MinValue;
-    private bool _blockedIpsRefreshInFlight;
+    /// <summary>The one enforcement engine, shared with the TUI and web console.</summary>
+    private readonly PreventionService _prevention;
     private int _monitorRefreshQueued;
     private bool _suppressProbeLogHandler;
 
@@ -56,6 +48,8 @@ public partial class MainViewModel : ObservableObject, IDisposable
     [ObservableProperty] private string _manualBlockProtocol = "TCP";
     [ObservableProperty] private bool _blockInbound = true;
     [ObservableProperty] private bool _blockOutbound = true;
+    /// <summary>Report what auto-block would drop without writing any firewall rule.</summary>
+    [ObservableProperty] private bool _preventionDryRun;
     [ObservableProperty] private FirewallRuleInfo? _selectedFirewallRule;
     [ObservableProperty] private AllowlistEntryView? _selectedAllowlistEntry;
     [ObservableProperty] private RemoteHost? _selectedHost;
@@ -88,6 +82,17 @@ public partial class MainViewModel : ObservableObject, IDisposable
     [ObservableProperty] private string _persistenceWatchStatusText = "";
     [ObservableProperty] private string _exfilStatusText = "";
     [ObservableProperty] private string _honeypotStatusText = "";
+    [ObservableProperty] private bool _flowEventsEnabled = true;
+    [ObservableProperty] private string _flowEventsStatusText = "";
+    [ObservableProperty] private bool _suricataEnabled;
+    [ObservableProperty] private string _suricataEvePathText = "";
+    [ObservableProperty] private string _suricataStatusText = "";
+    [ObservableProperty] private bool _wireGuardMonitorEnabled;
+    [ObservableProperty] private string _wireGuardPeerMbText = "0";
+    [ObservableProperty] private string _wireGuardStatusText = "";
+    [ObservableProperty] private bool _dnsHygieneEnabled;
+    [ObservableProperty] private string _dnsApprovedResolversText = "";
+    [ObservableProperty] private string _dnsHygieneStatusText = "";
     [ObservableProperty] private string _webhookStatusText = "";
 
     // ── Remote access (web console HTTPS + DuckDNS) ────────────────────────────
@@ -167,6 +172,12 @@ public partial class MainViewModel : ObservableObject, IDisposable
             _autoBlockMinLevel = nameof(ThreatLevel.High);
         _blockInbound = _settings.AutoBlockInbound;
         _blockOutbound = _settings.AutoBlockOutbound;
+        _preventionDryRun = _settings.PreventionDryRun;
+
+        _prevention = new PreventionService(_firewall, _allowlist, _settings)
+        {
+            MinLevel = ParseMinLevel(_autoBlockMinLevel)
+        };
 
         // Assign backing fields, not properties: the generated setters would fire the
         // OnXChanged handlers below and re-save settings (or re-elevate) during startup.
@@ -185,6 +196,13 @@ public partial class MainViewModel : ObservableObject, IDisposable
         _exfilThresholdMbText = _settings.ExfilMbPer10Min.ToString();
         _honeypotEnabled = _settings.HoneypotEnabled;
         _honeypotPortsText = _settings.HoneypotPorts;
+        _flowEventsEnabled = _settings.FlowEventsEnabled;
+        _suricataEnabled = _settings.SuricataEnabled;
+        _suricataEvePathText = _settings.SuricataEvePath;
+        _wireGuardMonitorEnabled = _settings.WireGuardMonitorEnabled;
+        _wireGuardPeerMbText = _settings.WireGuardPeerMbPer10Min.ToString();
+        _dnsHygieneEnabled = _settings.DnsHygieneEnabled;
+        _dnsApprovedResolversText = _settings.DnsApprovedResolvers;
         _webhookUrl = _settings.WebhookUrl;
         _selectedAutoBlockExpiry = ExpiryMinutesToLabel(_settings.AutoBlockExpiryMinutes);
 
@@ -219,13 +237,22 @@ public partial class MainViewModel : ObservableObject, IDisposable
         _monitor.ExfilThresholdMb = _settings.ExfilMbPer10Min;
         _monitor.HoneypotPorts = HoneypotService.ParsePorts(_settings.HoneypotPorts);
         _monitor.HoneypotEnabled = _settings.HoneypotEnabled;
+        _monitor.FlowEventsEnabled = _settings.FlowEventsEnabled;
+        _monitor.SuricataEvePath = _settings.SuricataEvePath;
+        _monitor.SuricataMaxSeverity = _settings.SuricataMaxSeverity;
+        _monitor.SuricataIgnoredSids = _settings.SuricataIgnoredSids;
+        _monitor.SuricataEnabled = _settings.SuricataEnabled;
+        _monitor.WireGuardPeerMbPer10Min = _settings.WireGuardPeerMbPer10Min;
+        _monitor.WireGuardMonitorEnabled = _settings.WireGuardMonitorEnabled;
+        _monitor.DnsApprovedResolvers = _settings.DnsApprovedResolvers;
+        _monitor.DnsHygieneEnabled = _settings.DnsHygieneEnabled;
+        _allowlist.ResolutionObserver = _monitor.AllowlistResolutionObserver;
         _monitor.WebhookUrl = _settings.WebhookUrl;
         _monitor.WebhookMinLevel = _settings.GetWebhookMinLevel();
         _monitor.IsIpAllowlisted = ip => _allowlist.IsAllowed(ip, out _);
         if (_settings.ProbeLogEnabled && _firewall.IsAdministrator)
             _ = Task.Run(() => _firewall.EnableProbeLogging());
         _allowlist.UseRemoteFeed = _settings.AllowlistUseRemoteFeed;
-        LoadPersistedAutoBlockSuppressions();
         _monitor.Updated += OnMonitorUpdated;
         _monitor.ThreatsDetected += OnThreatsDetected;
         _monitor.Start();
@@ -319,7 +346,7 @@ public partial class MainViewModel : ObservableObject, IDisposable
                 _ = Task.Run(() => _notifier.NotifyCritical(critical));
         }
 
-        if (!AutoBlockEnabled)
+        if (!_prevention.Enabled)
             return;
 
         // Run auto-block on the thread pool — firewall COM/netsh calls must
@@ -328,7 +355,28 @@ public partial class MainViewModel : ObservableObject, IDisposable
         {
             try
             {
-                ProcessAutoBlocks(threats);
+                var result = _prevention.Apply(threats);
+                if (!result.HasMessages)
+                    return;
+
+                var dispatcher = Application.Current?.Dispatcher;
+                dispatcher?.BeginInvoke(() =>
+                {
+                    if (result.StatusMessage is { } status)
+                    {
+                        AutoBlockStatusText = status;
+                        FirewallMessage = "Auto-block skipped: not running as Administrator.";
+                        return;
+                    }
+
+                    FirewallMessage = result.Summary;
+                    UpdateAutoBlockStatusText();
+                    if (result.RulesChanged)
+                    {
+                        RefreshFirewallRules();
+                        RefreshCollections();
+                    }
+                });
             }
             catch (Exception ex)
             {
@@ -342,86 +390,6 @@ public partial class MainViewModel : ObservableObject, IDisposable
         });
     }
 
-    private void ProcessAutoBlocks(IReadOnlyList<ThreatEvent> threats)
-    {
-        if (!AutoBlockEnabled)
-            return;
-
-        if (!_firewall.IsAdministrator)
-        {
-            var d = Application.Current?.Dispatcher;
-            d?.BeginInvoke(() =>
-            {
-                AutoBlockStatusText = "Auto-block is ON, but Administrator rights are required — click Run as Admin.";
-                FirewallMessage = "Auto-block skipped: not running as Administrator.";
-            });
-            return;
-        }
-
-        var minLevel = ParseMinLevel(AutoBlockMinLevel);
-        var direction = ResolveDirection();
-        var messages = new List<string>();
-
-        foreach (var threat in threats)
-        {
-            if (threat.Level < minLevel)
-                continue;
-
-            // Never auto-block mere first-seen noise.
-            if (threat.Type == ThreatType.NewRemoteHost)
-                continue;
-
-            if (!FirewallService.TryNormalizeIp(threat.SourceIp, out var ip, out _))
-                continue;
-
-            if (FirewallService.IsPrivateOrLocal(ip))
-                continue;
-
-            // Never auto-block known-good services (GitHub, Grok/xAI, Microsoft, …)
-            if (_allowlist.IsAllowed(ip, out _))
-                continue;
-
-            lock (_autoBlockGate)
-            {
-                // Use the cached blocked set — enumerating firewall rules per
-                // threat (IsIpBlocked) is far too slow for this path.
-                if (_blockedIps.Contains(ip))
-                    continue;
-                if (_autoBlockSuppressedUntil.TryGetValue(ip, out var until) && DateTime.UtcNow < until)
-                    continue;
-                if (_autoBlockAttempted.TryGetValue(ip, out var lastAttempt) &&
-                    DateTime.UtcNow - lastAttempt < AutoBlockRetryAfter)
-                    continue;
-                _autoBlockAttempted[ip] = DateTime.UtcNow;
-            }
-
-            var reason = $"Auto-block · {threat.LevelText} · {threat.TypeText}: {threat.Title}";
-            var result = _firewall.BlockIp(ip, direction, reason, expiresAfter: _firewall.AutoBlockExpiry);
-            if (result.Success)
-            {
-                lock (_autoBlockGate) _blockedIps.Add(ip);
-                messages.Add($"Auto-blocked {ip} ({threat.LevelText}: {threat.Title})");
-            }
-            else
-            {
-                messages.Add($"Auto-block failed for {ip}: {result.Message}");
-                lock (_autoBlockGate) _autoBlockAttempted.Remove(ip);
-            }
-        }
-
-        if (messages.Count == 0)
-            return;
-
-        var dispatcher = Application.Current?.Dispatcher;
-        dispatcher?.BeginInvoke(() =>
-        {
-            FirewallMessage = string.Join(" · ", messages);
-            UpdateAutoBlockStatusText();
-            RefreshFirewallRules();
-            RefreshCollections();
-        });
-    }
-
     private void RefreshCollections()
     {
         // Blocked set refreshes on a background thread at most every 15s —
@@ -429,7 +397,7 @@ public partial class MainViewModel : ObservableObject, IDisposable
         RefreshBlockedIpsInBackground();
 
         foreach (var host in _monitor.RemoteHosts)
-            host.IsBlocked = _blockedIps.Contains(host.IpAddress);
+            host.IsBlocked = _prevention.IsBlocked(host.IpAddress);
 
         Sync(Connections, FilterConnections(_monitor.Connections));
         Sync(ListeningPorts, _monitor.ListeningPorts);
@@ -447,7 +415,7 @@ public partial class MainViewModel : ObservableObject, IDisposable
         UpdateActivityLegend(activity);
 
         var high = Stats.HighThreats;
-        var blocked = _blockedIps.Count;
+        var blocked = _prevention.BlockedCount;
         var auto = AutoBlockEnabled ? $"Auto-block ON (≥{AutoBlockMinLevel})" : "Auto-block OFF";
         HeroSubtitle = high > 0
             ? $"{high} high/critical · {blocked} blocked · {auto}"
@@ -489,37 +457,15 @@ public partial class MainViewModel : ObservableObject, IDisposable
     }
 
     private void RefreshBlockedIpsInBackground(bool force = false)
-    {
-        if (_blockedIpsRefreshInFlight)
-            return;
-        if (!force && DateTime.UtcNow - _blockedIpsRefreshedAt < TimeSpan.FromSeconds(15))
-            return;
-
-        _blockedIpsRefreshInFlight = true;
-        _ = Task.Run(() =>
+        => _prevention.RefreshBlockedIps(force, set =>
         {
-            HashSet<string>? set = null;
-            try { set = _firewall.GetBlockedIps(); }
-            catch { /* keep previous set */ }
-
-            var dispatcher = Application.Current?.Dispatcher;
-            if (dispatcher == null)
+            // IsBlocked feeds bound rows, so the mutation belongs on the UI thread.
+            Application.Current?.Dispatcher.BeginInvoke(() =>
             {
-                _blockedIpsRefreshInFlight = false;
-                return;
-            }
-
-            dispatcher.BeginInvoke(() =>
-            {
-                _blockedIpsRefreshInFlight = false;
-                _blockedIpsRefreshedAt = DateTime.UtcNow;
-                if (set == null) return;
-                _blockedIps = set;
                 foreach (var host in _monitor.RemoteHosts)
-                    host.IsBlocked = _blockedIps.Contains(host.IpAddress);
+                    host.IsBlocked = set.Contains(host.IpAddress);
             });
         });
-    }
 
     private static ThreatLevel ParseMinLevel(string value)
         => Enum.TryParse<ThreatLevel>(value, true, out var level) ? level : ThreatLevel.High;
@@ -549,7 +495,16 @@ public partial class MainViewModel : ObservableObject, IDisposable
         _settings.AutoBlockMinLevel = AutoBlockMinLevel;
         _settings.AutoBlockInbound = BlockInbound;
         _settings.AutoBlockOutbound = BlockOutbound;
+        _settings.PreventionDryRun = PreventionDryRun;
         _settings.Save();
+
+        // The bound properties are the UI's copy; the engine is the one that decides.
+        _prevention.Enabled = AutoBlockEnabled;
+        _prevention.MinLevel = ParseMinLevel(AutoBlockMinLevel);
+        _prevention.BlockInbound = BlockInbound;
+        _prevention.BlockOutbound = BlockOutbound;
+        _prevention.DryRun = PreventionDryRun;
+
         UpdateAutoBlockStatusText();
     }
 
@@ -573,6 +528,14 @@ public partial class MainViewModel : ObservableObject, IDisposable
     partial void OnAutoBlockMinLevelChanged(string value) => PersistSettings();
     partial void OnBlockInboundChanged(bool value) => PersistSettings();
     partial void OnBlockOutboundChanged(bool value) => PersistSettings();
+
+    partial void OnPreventionDryRunChanged(bool value)
+    {
+        PersistSettings();
+        FirewallMessage = value
+            ? "Dry run ON — auto-block reports what it would drop, without writing rules."
+            : "Dry run OFF — auto-block writes firewall rules.";
+    }
 
     private IEnumerable<NetworkConnection> FilterConnections(IReadOnlyList<NetworkConnection> source)
     {
@@ -1061,6 +1024,78 @@ public partial class MainViewModel : ObservableObject, IDisposable
         return string.Join("  ·  ", parts);
     }
 
+    partial void OnFlowEventsEnabledChanged(bool value)
+    {
+        _monitor.FlowEventsEnabled = value;
+        _settings.FlowEventsEnabled = value;
+        _settings.Save();
+        SettingsMessage = value ? _monitor.FlowEventsStatus : "Kernel flow events: off — timed polling only";
+    }
+
+    partial void OnSuricataEnabledChanged(bool value)
+    {
+        _monitor.SuricataEvePath = SuricataEvePathText;
+        _monitor.SuricataEnabled = value;
+        _settings.SuricataEnabled = value;
+        _settings.Save();
+        SettingsMessage = value ? _monitor.SuricataStatus : "Suricata ingestion: off";
+    }
+
+    partial void OnSuricataEvePathTextChanged(string value)
+    {
+        var path = string.IsNullOrWhiteSpace(value) ? SuricataService.DefaultEvePath : value.Trim();
+        _settings.SuricataEvePath = path;
+        _settings.Save();
+        _monitor.SuricataEvePath = path;
+        SettingsMessage = SuricataEnabled
+            ? _monitor.SuricataStatus
+            : $"EVE log path saved ({path}) — enable Suricata ingestion to read it.";
+    }
+
+    partial void OnWireGuardMonitorEnabledChanged(bool value)
+    {
+        _monitor.WireGuardMonitorEnabled = value;
+        _settings.WireGuardMonitorEnabled = value;
+        _settings.Save();
+        SettingsMessage = value ? _monitor.WireGuardStatus : "WireGuard peer monitoring: off";
+    }
+
+    partial void OnWireGuardPeerMbTextChanged(string value)
+    {
+        if (!int.TryParse(value?.Trim(), out var mb) || mb < 0)
+        {
+            SettingsMessage = "Enter the per-peer transfer threshold in whole megabytes (0 = off).";
+            return;
+        }
+
+        _settings.WireGuardPeerMbPer10Min = mb;
+        _settings.Save();
+        _monitor.WireGuardPeerMbPer10Min = mb;
+        SettingsMessage = mb == 0
+            ? "Per-peer transfer alerts off — a VPN user streaming video legitimately moves gigabytes."
+            : $"Alert when one WireGuard peer receives more than {mb} MB in 10 minutes.";
+    }
+
+    partial void OnDnsHygieneEnabledChanged(bool value)
+    {
+        _monitor.DnsApprovedResolvers = DnsApprovedResolversText;
+        _monitor.DnsHygieneEnabled = value;
+        _settings.DnsHygieneEnabled = value;
+        _settings.Save();
+        SettingsMessage = value ? _monitor.DnsHygieneStatus : "DNS hygiene monitoring: off";
+    }
+
+    partial void OnDnsApprovedResolversTextChanged(string value)
+    {
+        var cleaned = value?.Trim() ?? "";
+        _settings.DnsApprovedResolvers = cleaned;
+        _settings.Save();
+        _monitor.DnsApprovedResolvers = cleaned;
+        SettingsMessage = string.IsNullOrEmpty(cleaned)
+            ? "No approved resolvers set — DoH cannot be recognised and every resolver looks acceptable."
+            : $"Approved resolvers: {cleaned}";
+    }
+
     partial void OnHoneypotEnabledChanged(bool value)
     {
         _monitor.HoneypotPorts = HoneypotService.ParsePorts(HoneypotPortsText);
@@ -1143,6 +1178,12 @@ public partial class MainViewModel : ObservableObject, IDisposable
         PersistenceWatchStatusText = PersistenceWatchEnabled ? _monitor.PersistenceWatchStatus : "Disabled.";
         ExfilStatusText = ExfilMonitorEnabled ? _monitor.ExfilStatus : "Disabled.";
         HoneypotStatusText = HoneypotEnabled ? _monitor.HoneypotStatus : "Disabled — no decoy ports are bound.";
+        FlowEventsStatusText = FlowEventsEnabled
+            ? _monitor.FlowEventsStatus
+            : "Disabled — sampling on the poll timer only.";
+        SuricataStatusText = SuricataEnabled ? _monitor.SuricataStatus : "Disabled.";
+        WireGuardStatusText = WireGuardMonitorEnabled ? _monitor.WireGuardStatus : "Disabled.";
+        DnsHygieneStatusText = DnsHygieneEnabled ? _monitor.DnsHygieneStatus : "Disabled.";
         // Only meaningful once a URL is configured; otherwise it always reads "idle".
         WebhookStatusText = string.IsNullOrWhiteSpace(WebhookUrl) ? "" : _monitor.WebhookStatus;
 
@@ -1225,8 +1266,7 @@ public partial class MainViewModel : ObservableObject, IDisposable
         FirewallStatusText = _firewall.PrivilegeText;
         try
         {
-            _blockedIps = _firewall.GetBlockedIps();
-            _blockedIpsRefreshedAt = DateTime.UtcNow;
+            _prevention.RefreshBlockedIpsNow();
             var rules = _firewall.GetManagedRules();
             FirewallRules.Clear();
             foreach (var rule in rules)
@@ -1238,9 +1278,9 @@ public partial class MainViewModel : ObservableObject, IDisposable
         }
 
         foreach (var host in RemoteHosts)
-            host.IsBlocked = _blockedIps.Contains(host.IpAddress);
+            host.IsBlocked = _prevention.IsBlocked(host.IpAddress);
         foreach (var host in _monitor.RemoteHosts)
-            host.IsBlocked = _blockedIps.Contains(host.IpAddress);
+            host.IsBlocked = _prevention.IsBlocked(host.IpAddress);
     }
 
     [RelayCommand]
@@ -1424,7 +1464,7 @@ public partial class MainViewModel : ObservableObject, IDisposable
         {
             var remote = rule.RemoteAddresses;
             if (FirewallService.TryExtractIpFromManagedRule(name, remote, out var removedIp))
-                SuppressAutoBlock(removedIp);
+                _prevention.NoteUnblocked(removedIp);
         }
         SelectedFirewallRule = null;
         RefreshFirewallRules();
@@ -1636,58 +1676,14 @@ public partial class MainViewModel : ObservableObject, IDisposable
             MessageBox.Show(result.Message, "Firewall", MessageBoxButton.OK, MessageBoxImage.Warning);
         else
         {
-            ClearAutoBlockSuppress(normalized);
-            lock (_autoBlockGate) _blockedIps.Add(normalized);
+            _prevention.ClearSuppression(normalized);
+            _prevention.NoteBlocked(normalized);
             MessageBox.Show(result.Message, "Firewall", MessageBoxButton.OK, MessageBoxImage.Information);
         }
 
         RefreshFirewallRules();
         RefreshCollections();
         return result.Success;
-    }
-
-    private void SuppressAutoBlock(string ip)
-    {
-        var until = DateTime.UtcNow.Add(ManualUnblockSuppressFor);
-        lock (_autoBlockGate)
-        {
-            _blockedIps.Remove(ip);
-            _autoBlockAttempted[ip] = DateTime.UtcNow;
-            _autoBlockSuppressedUntil[ip] = until;
-        }
-
-        _settings.AutoBlockSuppressedUntil[ip] = until;
-        PruneExpiredSuppressions(_settings.AutoBlockSuppressedUntil);
-        _settings.Save();
-    }
-
-    private void ClearAutoBlockSuppress(string ip)
-    {
-        lock (_autoBlockGate)
-            _autoBlockSuppressedUntil.Remove(ip);
-
-        if (_settings.AutoBlockSuppressedUntil.Remove(ip))
-            _settings.Save();
-    }
-
-    private void LoadPersistedAutoBlockSuppressions()
-    {
-        lock (_autoBlockGate)
-        {
-            _autoBlockSuppressedUntil.Clear();
-            foreach (var kv in _settings.AutoBlockSuppressedUntil)
-            {
-                if (kv.Value > DateTime.UtcNow)
-                    _autoBlockSuppressedUntil[kv.Key] = kv.Value;
-            }
-        }
-    }
-
-    private static void PruneExpiredSuppressions(Dictionary<string, DateTime> map)
-    {
-        var now = DateTime.UtcNow;
-        foreach (var key in map.Where(kv => kv.Value <= now).Select(kv => kv.Key).ToList())
-            map.Remove(key);
     }
 
     private void UnblockIpInternal(string ip)
@@ -1700,7 +1696,7 @@ public partial class MainViewModel : ObservableObject, IDisposable
 
         var result = _firewall.UnblockIp(ip);
         if (result.Success && FirewallService.TryNormalizeIp(ip, out var normalized, out _))
-            SuppressAutoBlock(normalized);
+            _prevention.NoteUnblocked(normalized);
         FirewallMessage = result.Message;
         if (!result.Success)
             MessageBox.Show(result.Message, "Firewall", MessageBoxButton.OK, MessageBoxImage.Warning);
@@ -1711,12 +1707,12 @@ public partial class MainViewModel : ObservableObject, IDisposable
         RefreshCollections();
     }
 
-    private FirewallDirection ResolveDirection()
-    {
-        if (BlockInbound && BlockOutbound) return FirewallDirection.Both;
-        if (BlockOutbound) return FirewallDirection.Outbound;
-        return FirewallDirection.Inbound;
-    }
+    /// <summary>
+    /// Delegated to the engine so all three front-ends agree. Note the fail-safe changed:
+    /// with neither direction ticked this used to block inbound only, while the TUI and web
+    /// console blocked both. Both is now the shared answer.
+    /// </summary>
+    private FirewallDirection ResolveDirection() => _prevention.ResolveDirection();
 
     private void PromptElevation()
     {

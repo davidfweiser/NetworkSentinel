@@ -17,6 +17,10 @@ public sealed class NetworkMonitorService : IDisposable
     private readonly ArpWatchService _arpWatch = new();
     private readonly PersistenceWatcher _persistenceWatch = new();
     private readonly ExfiltrationMonitor _exfil = new();
+    private readonly SuricataService _suricata = new();
+    private readonly WireGuardMonitor _wireGuard = new();
+    private readonly DnsHygieneMonitor _dns = new();
+    private readonly FlowEventSource _flowEvents = new();
     private readonly WebhookNotifier _webhook = new();
     private readonly HostHistoryStore _history = new();
     private readonly object _sync = new();
@@ -33,6 +37,13 @@ public sealed class NetworkMonitorService : IDisposable
     private CancellationTokenSource? _cts;
     private Task? _loop;
     private bool _firstPass = true;
+
+    /// <summary>
+    /// Set by the flow event source to cut the poll delay short. Initialised
+    /// unsignalled: the loop polls once, then waits for either the interval or a
+    /// kernel event, whichever comes first.
+    /// </summary>
+    private readonly SemaphoreSlim _pollWake = new(0, 1);
 
     /// <summary>
     /// First-seen-host threats raised by <see cref="UpsertHost"/> this poll. They are
@@ -247,6 +258,159 @@ public sealed class NetworkMonitorService : IDisposable
         }
     }
 
+    private bool _suricataEnabled;
+
+    /// <summary>Ingest Suricata EVE JSON alerts (signature / payload inspection).</summary>
+    public bool SuricataEnabled
+    {
+        get => _suricataEnabled;
+        set
+        {
+            if (_suricataEnabled == value) return;
+            _suricataEnabled = value;
+            if (Stats.IsMonitoring)
+            {
+                if (value) _suricata.Start();
+                else _suricata.Stop();
+            }
+        }
+    }
+
+    /// <summary>Path to Suricata's EVE JSON log (applied on next start).</summary>
+    public string SuricataEvePath
+    {
+        get => _suricata.EvePath;
+        set
+        {
+            var path = string.IsNullOrWhiteSpace(value) ? SuricataService.DefaultEvePath : value.Trim();
+            if (_suricata.EvePath == path) return;
+            _suricata.EvePath = path;
+            if (Stats.IsMonitoring && _suricataEnabled)
+            {
+                _suricata.Stop();
+                _suricata.Start();
+            }
+        }
+    }
+
+    /// <summary>Highest Suricata severity number to accept (Suricata counts down: 1 is most severe).</summary>
+    public int SuricataMaxSeverity
+    {
+        get => _suricata.MaxSeverity;
+        set => _suricata.MaxSeverity = Math.Clamp(value, 1, 4);
+    }
+
+    /// <summary>Suricata signature IDs to ignore (comma separated).</summary>
+    public string SuricataIgnoredSids
+    {
+        get => string.Join(",", _suricata.IgnoredSids);
+        set => _suricata.IgnoredSids = SuricataService.ParseSids(value);
+    }
+
+    public string SuricataStatus => _suricata.Status;
+
+    /// <summary>Alerts read vs. accepted, so the console can show the feed is alive.</summary>
+    public (long Seen, long Accepted) SuricataCounters => _suricata.Counters;
+
+    private bool _flowEventsEnabled = true;
+
+    /// <summary>
+    /// Sample as soon as the kernel reports a new flow instead of waiting out the poll
+    /// interval. Needs Administrator; degrades to timed polling when it can't subscribe.
+    /// </summary>
+    public bool FlowEventsEnabled
+    {
+        get => _flowEventsEnabled;
+        set
+        {
+            if (_flowEventsEnabled == value) return;
+            _flowEventsEnabled = value;
+            if (Stats.IsMonitoring)
+            {
+                if (value) _flowEvents.Start();
+                else _flowEvents.Stop();
+            }
+        }
+    }
+
+    public string FlowEventsStatus => _flowEvents.Status;
+
+    /// <summary>True when flow events are actually driving the loop (not degraded to polling).</summary>
+    public bool FlowEventsActive => _flowEvents.IsActive;
+
+    private bool _wireGuardEnabled;
+
+    /// <summary>
+    /// Watch WireGuard peers. WireGuard's single unconnected UDP socket is invisible to
+    /// the connection heuristics, so without this a VPN server cannot see who is connected.
+    /// </summary>
+    public bool WireGuardMonitorEnabled
+    {
+        get => _wireGuardEnabled;
+        set
+        {
+            if (_wireGuardEnabled == value) return;
+            _wireGuardEnabled = value;
+            if (Stats.IsMonitoring)
+            {
+                if (value) _wireGuard.Start();
+                else _wireGuard.Stop();
+            }
+        }
+    }
+
+    /// <summary>Megabytes sent to one WireGuard peer within 10 minutes before alerting (0 = off).</summary>
+    public int WireGuardPeerMbPer10Min
+    {
+        get => _wireGuard.TransferMbPer10Min;
+        set => _wireGuard.TransferMbPer10Min = Math.Max(0, value);
+    }
+
+    public string WireGuardStatus => _wireGuard.Status;
+
+    public IReadOnlyList<WireGuardPeer> WireGuardPeers => _wireGuard.Peers;
+
+    private bool _dnsHygieneEnabled;
+
+    /// <summary>
+    /// Watch how this machine resolves names: plaintext egress, encrypted DNS silently
+    /// falling back, queries to unapproved resolvers, VPN clients bypassing the resolver,
+    /// and allowlisted domains being poisoned. Driven by flow events, so it needs Administrator.
+    /// </summary>
+    public bool DnsHygieneEnabled
+    {
+        get => _dnsHygieneEnabled;
+        set
+        {
+            if (_dnsHygieneEnabled == value) return;
+            _dnsHygieneEnabled = value;
+            if (Stats.IsMonitoring)
+            {
+                if (value) _dns.Start();
+                else _dns.Stop();
+            }
+        }
+    }
+
+    /// <summary>Resolvers this host is meant to use, comma separated. Also identifies DoH endpoints on 443.</summary>
+    public string DnsApprovedResolvers
+    {
+        get => _dns.ApprovedResolvers;
+        set => _dns.ApprovedResolvers = value;
+    }
+
+    public string DnsHygieneStatus => _dns.Status;
+
+    /// <summary>Plaintext vs. encrypted DNS flows observed.</summary>
+    public (long Plaintext, long Encrypted) DnsCounters => _dns.Counters;
+
+    /// <summary>
+    /// Lets the allowlist report each resolution to the DNS monitor. The front-end wires
+    /// this to its AllowlistService instance.
+    /// </summary>
+    public Action<string, IReadOnlyCollection<string>> AllowlistResolutionObserver
+        => (domain, ips) => _dns.ObserveAllowlistResolution(domain, ips, DateTime.Now);
+
     /// <summary>Webhook URL for pushed alerts (ntfy / Slack / Discord / generic JSON). Empty = off.</summary>
     public string WebhookUrl { get; set; } = "";
 
@@ -293,6 +457,20 @@ public sealed class NetworkMonitorService : IDisposable
         if (_persistenceWatchEnabled) _persistenceWatch.Start();
         if (_exfilEnabled) _exfil.Start();
         if (_honeypotEnabled) _honeypot.Start(_honeypotPorts);
+        if (_suricataEnabled) _suricata.Start();
+        if (_wireGuardEnabled) _wireGuard.Start();
+        if (_dnsHygieneEnabled)
+        {
+            // Peer allowed-IPs tell the DNS monitor whether a query came from a tunnel
+            // client, which is what separates a client leak from this host's own traffic.
+            _dns.IsVpnClientAddress = IsWireGuardClientAddress;
+            _dns.Start();
+        }
+        if (_flowEventsEnabled)
+        {
+            _flowEvents.FlowCreated += OnFlowCreated;
+            _flowEvents.Start();
+        }
         _loop = Task.Run(() => RunAsync(_cts.Token));
     }
 
@@ -311,9 +489,104 @@ public sealed class NetworkMonitorService : IDisposable
         _persistenceWatch.Stop();
         _exfil.Stop();
         _honeypot.Stop();
+        _suricata.Stop();
+        _wireGuard.Stop();
+        _dns.Stop();
+        _flowEvents.FlowCreated -= OnFlowCreated;
+        _flowEvents.Stop();
         _history.Save();
         Stats.IsMonitoring = false;
         Stats.StatusText = "Monitoring paused";
+    }
+
+    /// <summary>
+    /// Shortest gap between two polls when kernel events are driving the loop. A port
+    /// scan is thousands of flows in a second; without a floor, each one would trigger
+    /// its own snapshot and the detector would spend the attack rereading the tables.
+    /// </summary>
+    private const int MinEventPollIntervalMs = 150;
+
+    /// <summary>
+    /// Ports we were listening on as of the last poll, used to decide whether a flow
+    /// event is worth waking for. Swapped wholesale, never mutated in place.
+    /// </summary>
+    private volatile HashSet<int> _liveListeningPorts = new();
+
+    /// <summary>
+    /// True when the address falls inside some WireGuard peer's AllowedIPs — i.e. the
+    /// traffic came out of the tunnel rather than from this host.
+    /// </summary>
+    private bool IsWireGuardClientAddress(string ip)
+    {
+        if (string.IsNullOrEmpty(ip) || !System.Net.IPAddress.TryParse(ip, out var address))
+            return false;
+
+        foreach (var peer in _wireGuard.Peers)
+        {
+            foreach (var cidr in peer.AllowedIps.Split(',', StringSplitOptions.RemoveEmptyEntries))
+            {
+                if (CidrContains(cidr.Trim(), address))
+                    return true;
+            }
+        }
+        return false;
+    }
+
+    /// <summary>Prefix-length containment test for an AllowedIPs entry like "10.8.0.0/24".</summary>
+    private static bool CidrContains(string cidr, System.Net.IPAddress address)
+    {
+        var slash = cidr.IndexOf('/');
+        if (slash <= 0) return false;
+        if (!System.Net.IPAddress.TryParse(cidr[..slash], out var network)) return false;
+        if (!int.TryParse(cidr[(slash + 1)..], out var bits)) return false;
+        if (network.AddressFamily != address.AddressFamily) return false;
+
+        var netBytes = network.GetAddressBytes();
+        var addrBytes = address.GetAddressBytes();
+        if (bits < 0 || bits > netBytes.Length * 8) return false;
+
+        var whole = bits / 8;
+        for (var i = 0; i < whole; i++)
+        {
+            if (netBytes[i] != addrBytes[i]) return false;
+        }
+
+        var remainder = bits % 8;
+        if (remainder == 0) return true;
+
+        var mask = (byte)(0xFF << (8 - remainder));
+        return (netBytes[whole] & mask) == (addrBytes[whole] & mask);
+    }
+
+    /// <summary>
+    /// Wakes the poll loop for inbound flows that landed on a port this machine serves —
+    /// the shape every scan, brute-force and exploit attempt takes. Ordinary outbound
+    /// client traffic keeps the normal cadence, so a busy machine doesn't poll flat out.
+    /// </summary>
+    private void OnFlowCreated(FlowEvent flow)
+    {
+        // The DNS monitor needs every flow, not only the ones worth waking the poll for:
+        // a query to an external resolver never lands on a port this machine serves.
+        if (_dnsHygieneEnabled)
+        {
+            try { _dns.ObserveFlow(flow, DateTime.Now); }
+            catch { /* a watcher must never break the event reader */ }
+        }
+
+        if (!_liveListeningPorts.Contains(flow.DestinationPort))
+            return;
+        if (flow.SourceAddress is "127.0.0.1" or "::1")
+            return;
+
+        try
+        {
+            if (_pollWake.CurrentCount == 0)
+                _pollWake.Release();
+        }
+        catch (SemaphoreFullException)
+        {
+            // Another event already queued the wake — one poll covers both.
+        }
     }
 
     private async Task RunAsync(CancellationToken ct)
@@ -331,13 +604,40 @@ public sealed class NetworkMonitorService : IDisposable
 
             try
             {
-                await Task.Delay(PollIntervalMs, ct);
+                await WaitForNextCycleAsync(ct);
             }
-            catch (TaskCanceledException)
+            catch (OperationCanceledException)
             {
                 break;
             }
         }
+    }
+
+    /// <summary>
+    /// Waits out the poll interval, but returns early when the kernel reports an inbound
+    /// flow. Polling alone can only ever describe the moment the tables were read; this is
+    /// what turns "sample every 1.2 s" into "sample because something just happened".
+    /// </summary>
+    private async Task WaitForNextCycleAsync(CancellationToken ct)
+    {
+        var floor = Math.Min(MinEventPollIntervalMs, PollIntervalMs);
+        await Task.Delay(floor, ct);
+
+        var remaining = PollIntervalMs - floor;
+        if (remaining <= 0)
+        {
+            DrainWake();
+            return;
+        }
+
+        // Returns true on an event, false on timeout — both mean "poll now".
+        await _pollWake.WaitAsync(remaining, ct);
+    }
+
+    /// <summary>Consumes a pending wake so a stale signal can't skip the next interval.</summary>
+    private void DrainWake()
+    {
+        while (_pollWake.CurrentCount > 0 && _pollWake.Wait(0)) { }
     }
 
     private void PollOnce()
@@ -444,6 +744,10 @@ public sealed class NetworkMonitorService : IDisposable
                 host.PortsTouched = host.LocalPortsContacted.Count;
             }
 
+            // Publish for the flow-event wake filter: only flows aimed at a port we
+            // actually serve are worth cutting the poll interval short for.
+            _liveListeningPorts = new HashSet<int>(listeningTcpPorts);
+
             // Intrusion heuristics
             var activeConns = _connections.Values.ToList();
             newThreats.AddRange(_detector.Analyze(activeConns, _hosts, listeningTcpPorts, listeningUdpPorts, now));
@@ -461,6 +765,15 @@ public sealed class NetworkMonitorService : IDisposable
             newThreats.AddRange(_arpWatch.DrainPending());
             newThreats.AddRange(_persistenceWatch.DrainPending());
             newThreats.AddRange(_exfil.DrainPending());
+
+            if (_suricataEnabled)
+                newThreats.AddRange(_suricata.DrainPending());
+
+            if (_wireGuardEnabled)
+                newThreats.AddRange(_wireGuard.DrainPending());
+
+            if (_dnsHygieneEnabled)
+                newThreats.AddRange(_dns.DrainPending());
 
             if (ThreatIntelEnabled)
                 CheckThreatIntel(activeByIp.Keys, now, newThreats);
@@ -840,6 +1153,10 @@ public sealed class NetworkMonitorService : IDisposable
         _persistenceWatch.Dispose();
         _exfil.Dispose();
         _honeypot.Dispose();
+        _suricata.Dispose();
+        _wireGuard.Dispose();
+        _dns.Dispose();
+        _flowEvents.Dispose();
         _intel.Dispose();
         _webhook.Dispose();
         _history.Save();
