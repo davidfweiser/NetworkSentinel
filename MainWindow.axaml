@@ -413,6 +413,12 @@
                     <ComboBox Width="120" ItemsSource="{Binding AutoBlockLevelOptions}"
                               SelectedItem="{Binding AutoBlockMinLevel}" IsEnabled="{Binding AutoBlockEnabled}"/>
                   </StackPanel>
+                  <CheckBox Content="Dry run — report blocks without writing firewall rules"
+                            IsChecked="{Binding PreventionDryRun}" IsEnabled="{Binding AutoBlockEnabled}"
+                            Margin="0,8,0,0"/>
+                  <TextBlock Text="Blocking turns a false positive into an outage. Run a new detection source here first and watch what it would have dropped before arming it."
+                             Foreground="{DynamicResource TextMutedBrush}" FontSize="11"
+                             TextWrapping="Wrap" Margin="0,2,0,0"/>
                 </StackPanel>
                 <StackPanel Grid.Column="1" VerticalAlignment="Center" Margin="16,0,0,0" Spacing="8">
                   <Button Classes="primary" Content="Toggle Auto-block" Command="{Binding ToggleAutoBlockCommand}" MinWidth="150"/>

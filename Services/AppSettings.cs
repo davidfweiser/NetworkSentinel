@@ -77,6 +77,32 @@ public sealed class AppSettings
     public string HoneypotPorts { get; set; } = "2323,3389,5900";
 
     /// <summary>
+    /// Decide and report auto-blocks without writing firewall rules. The safe way to
+    /// promote a new detection source (a fresh Suricata ruleset especially) from
+    /// alerting to blocking: watch what it would have dropped before it drops anything.
+    /// </summary>
+    public bool PreventionDryRun { get; set; }
+
+    /// <summary>
+    /// Subscribe to kernel conntrack NEW events so the monitor samples the moment a flow
+    /// appears instead of on the next timer tick. Needs root (CAP_NET_ADMIN); falls back
+    /// to timed polling with no loss of function when unavailable.
+    /// </summary>
+    public bool ConntrackEventsEnabled { get; set; } = true;
+
+    /// <summary>Ingest Suricata's EVE JSON alerts as threat events (payload inspection / signatures).</summary>
+    public bool SuricataEnabled { get; set; }
+
+    /// <summary>Path to Suricata's EVE JSON log.</summary>
+    public string SuricataEvePath { get; set; } = SuricataService.DefaultEvePath;
+
+    /// <summary>Highest Suricata severity number to accept — Suricata counts down, so 1 is most severe.</summary>
+    public int SuricataMaxSeverity { get; set; } = 3;
+
+    /// <summary>Comma-separated Suricata signature IDs to ignore (per-rule mute for false positives).</summary>
+    public string SuricataIgnoredSids { get; set; } = "";
+
+    /// <summary>
     /// Minutes before auto-created block rules expire (0 = never). An expired rule stops
     /// counting as blocking immediately; the kernel rule itself is dropped by the background
     /// sweep as soon as it can elevate without a prompt (root or cached sudo).

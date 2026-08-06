@@ -28,7 +28,8 @@ public enum ThreatType
     HoneypotHit,
     ArpSpoof,
     PersistenceChange,
-    DataExfiltration
+    DataExfiltration,
+    SignatureMatch
 }
 
 public enum TcpConnectionState
@@ -286,6 +287,7 @@ public sealed class ThreatEvent : INotifyPropertyChanged
         ThreatType.ArpSpoof => "ARP Spoofing",
         ThreatType.PersistenceChange => "Persistence Change",
         ThreatType.DataExfiltration => "Data Exfiltration",
+        ThreatType.SignatureMatch => "Signature Match",
         _ => Type.ToString()
     };
 }

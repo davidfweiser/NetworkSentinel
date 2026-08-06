@@ -10,9 +10,9 @@ Three ways to run it:
 | **Terminal UI (`--tui`)** | SSH / keyboard-first |
 | **Headless web UI (`-w`)** | Browser on a server (master-password protected) |
 
-> Awareness / monitoring tooling — not a full IDS/IPS replacement.
+> **Host-based** intrusion detection and prevention. It detects on its own heuristics and, with Suricata attached (0.6.0), on signature/payload inspection — then enforces in the kernel via `nftables`. It is not an inline network appliance: it protects the machine it runs on, not a segment, and it does not sit in the forwarding path.
 
-Linux port of the original Windows WPF Network Sentinel. Platform layers use `/proc/net`, `ss`, `nftables`/`iptables` (elevated via **pkexec**), and XDG data paths. Version **0.5.0**.
+Linux port of the original Windows WPF Network Sentinel. Platform layers use `/proc/net`, `ss`, conntrack netlink, `nftables`/`iptables` (elevated via **pkexec**), and XDG data paths. Version **0.6.0**.
 
 ---
 
@@ -54,6 +54,55 @@ Each alert includes **source IP**, **method**, and **where it’s coming from** 
 ### Remote alerting (webhook)
 Set **Settings → Webhook URL** to push Critical threats off the machine — the payload adapts automatically: **ntfy** (plain text + `Title`/`Priority` headers), **Slack** (`{"text": …}`), **Discord** (`{"content": …}`), anything else gets a generic JSON document. Per-source/type cooldown stops a burst from flooding the channel.
 
+### Prevention engine (0.6.0)
+
+Every automatic block — from any detector, in any of the three frontends — goes through **one** enforcement engine (`PreventionService`). It used to be three near-identical copies of the same logic in the GUI, TUI and web console, and they had drifted: only the web console honoured the manual-unblock suppression list, so releasing an address in the GUI or TUI could be silently undone by the next detection. Detection sources keep multiplying; the decision to drop traffic must not.
+
+Gates, in order — a threat must clear all of them before a rule is written:
+
+| Gate | Why |
+|------|-----|
+| Severity ≥ minimum | The configured `Medium`/`High`/`Critical` threshold |
+| Not `New Remote Host` | First contact is not evidence of anything |
+| Routable public address | LAN and loopback are never auto-blocked |
+| Not allowlisted | Known-good stays reachable |
+| Not protected | See lockout protection below |
+| Not already blocked | No duplicate rules |
+| Not suppressed | An address you deliberately released stays released for 24 h |
+| Not retried too soon | A failed block backs off for 10 minutes |
+
+- **Dry run** (**Settings → Auto-block → Dry run**) runs every gate and reports what it *would* have dropped, without writing a single rule. Blocking turns a false positive from noise into an outage, so a new detection source — a fresh Suricata ruleset especially — belongs here first. The console shows `Would block …` lines exactly where it would otherwise show `Auto-blocked …`.
+- **Lockout protection** — the address of whoever is signed into the web console is shielded from auto-block for a rolling 30 minutes. Prevention that firewalls the operator away from the box it protects has done more damage than the attack it stopped. Manual blocking is deliberately unaffected, and the shield lapses on its own once you stop working.
+- Direction fallback is now consistent: with neither **Block inbound** nor **Block outbound** ticked, all three frontends block **both** (the GUI used to block inbound only).
+
+### Signature detection — Suricata (0.6.0)
+
+Connection heuristics see *who* is talking and *how often*; they can never see *what is being said*. That gap is closed by attaching **Suricata** rather than writing a detection engine: protocol decoders, stream reassembly and the target-based defragmentation that stops an attacker evading inspection are a multi-year project whose failure mode is a bypass nobody notices. Suricata already does all of it, already runs inline via NFQUEUE, and already has ET Open rules maintained full time.
+
+So Network Sentinel is the **manager**, not the engine — Suricata decides what matched, this app decides what happens next:
+
+| | |
+|---|---|
+| **Input** | Suricata's EVE JSON (`/var/log/suricata/eve.json` by default; set `eve-log` to enabled in `suricata.yaml`) |
+| **Severity mapping** | Suricata counts down — sev 1 → **Critical**, 2 → **High**, 3 → **Medium**, 4 → **Low**. A sev-1 match therefore clears the default `High` auto-block threshold |
+| **Threat source** | The *remote* end of the flow, not the packet source — for an outbound C2 callback the attacker is the destination, and blocking the source would firewall the host off from itself |
+| **Noise control** | A maximum severity number, a per-signature mute list (`sids`), and a 2-minute per-signature-per-peer cooldown so one rule matching every packet can't bury every other alert |
+| **IPS mode** | When Suricata dropped the packet itself, the alert detail says `already dropped by Suricata` |
+
+Alerts arrive as ordinary `Signature Match` threat events, so the whole existing pipeline applies unchanged: the threat list, the persistent log, geo/origin enrichment, webhooks, the allowlist, and auto-block. Log rotation is handled — the tailer reopens rather than sitting on a deleted inode.
+
+Suricata is **not bundled**; install and run it yourself, then switch on **Settings → Signatures (Suricata)**. Reading `eve.json` needs group access (`suricata`) or root.
+
+### Kernel flow events (0.6.0)
+
+Polling `/proc/net` can only ever describe the moment the file was read — on the default 1.2 s cycle an attacker gets a free window before anything is sampled. Network Sentinel now also subscribes to **conntrack `NEW` events** over `NETLINK_NETFILTER` and takes its snapshot *because something happened* rather than because a timer fired.
+
+- Reaction to an inbound connection on a served port drops from up to a full poll interval to well under a second
+- The heuristics are unchanged — they are snapshot-based by design, and a snapshot is still what they consume. Only the *timing* of the snapshot changes
+- A 150 ms floor coalesces bursts, so a port scan of a thousand ports does not become a thousand snapshots
+- Only flows aimed at a port this machine actually serves cut the interval short, so ordinary outbound client traffic doesn't make a busy machine poll flat out
+- Subscribing needs **root** (`CAP_NET_ADMIN`). Without it the bind fails, the console explains why, and the timer cadence continues — no functionality is lost, only reaction time
+
 ### Firewall & block
 - **Block / unblock** remote IPs (inbound, outbound, or both)
 - **Block local ports** (TCP/UDP)
@@ -88,9 +137,9 @@ Domains are DNS-resolved to current IPs. Auto-block never touches allowlisted IP
 | **Ports** | Local listeners; one-click **Block port** |
 | **Firewall** | Managed rules grouped as In/Out pairs; manual IP and port blocking; **Restore allowlisted** |
 | **Allowlist** | Add/remove trusted domains and IPs; refresh the feed |
-| **Settings** | Monitoring on/off, poll interval, geo lookups, auth-log and closed-port scan detection, the 0.4.0 detectors (threat intel, new-listener alerts, process reputation, ARP/gateway watch, startup-item watch, exfiltration threshold, honeypot ports), **HTTPS + DuckDNS remote access** (including **Issue certificate**), webhook URL, auto-block + minimum severity + expiry, block direction (in/out), allowlist feed, **change master password**, **Remove all rules** |
+| **Settings** | Monitoring on/off, poll interval, geo lookups, auth-log and closed-port scan detection, the 0.4.0 detectors (threat intel, new-listener alerts, process reputation, ARP/gateway watch, startup-item watch, exfiltration threshold, honeypot ports), **kernel flow events**, **Suricata signature ingestion** (EVE path, maximum severity, muted sids), **auto-block dry run**, **HTTPS + DuckDNS remote access** (including **Issue certificate**), webhook URL, auto-block + minimum severity + expiry, block direction (in/out), allowlist feed, **change master password**, **Remove all rules** |
 
-The page header shows the running version (e.g. `v0.5.0`) — check it after an upgrade to confirm the new build is live.
+The page header shows the running version (e.g. `v0.6.0`) — check it after an upgrade to confirm the new build is live.
 
 ### Sleep / Wake
 
@@ -385,6 +434,7 @@ If there is **no** `DISPLAY` / `WAYLAND_DISPLAY` (typical SSH session), the app 
 | `p` | Pause / resume monitoring |
 | `a` | Toggle auto-block |
 | `m` | Cycle auto-block minimum severity |
+| `s` | Toggle auto-block **dry run** (report what would be blocked, write nothing) |
 | `b` / `x` | Block / unblock selected IP (or prompt) |
 | `n` / `+` | **Add domain or IP to allowlist** (never block) |
 | `d` | Remove selected allowlist Domain/IP (on Allowlist view) |

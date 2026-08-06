@@ -17,6 +17,8 @@ public sealed class NetworkMonitorService : IDisposable
     private readonly ArpWatchService _arpWatch = new();
     private readonly PersistenceWatcher _persistenceWatch = new();
     private readonly ExfiltrationMonitor _exfil = new();
+    private readonly SuricataService _suricata = new();
+    private readonly ConntrackEventSource _conntrack = new();
     private readonly WebhookNotifier _webhook = new();
     private readonly HostHistoryStore _history = new();
     private readonly object _sync = new();
@@ -33,6 +35,13 @@ public sealed class NetworkMonitorService : IDisposable
     private CancellationTokenSource? _cts;
     private Task? _loop;
     private bool _firstPass = true;
+
+    /// <summary>
+    /// Set by the conntrack event source to cut the poll delay short. Initialised
+    /// unsignalled: the loop polls once, then waits for either the interval or a
+    /// kernel event, whichever comes first.
+    /// </summary>
+    private readonly SemaphoreSlim _pollWake = new(0, 1);
 
     /// <summary>
     /// First-seen-host threats raised by <see cref="UpsertHost"/> this poll. They are
@@ -247,6 +256,86 @@ public sealed class NetworkMonitorService : IDisposable
         }
     }
 
+    private bool _suricataEnabled;
+
+    /// <summary>Ingest Suricata EVE JSON alerts (signature / payload inspection).</summary>
+    public bool SuricataEnabled
+    {
+        get => _suricataEnabled;
+        set
+        {
+            if (_suricataEnabled == value) return;
+            _suricataEnabled = value;
+            if (Stats.IsMonitoring)
+            {
+                if (value) _suricata.Start();
+                else _suricata.Stop();
+            }
+        }
+    }
+
+    /// <summary>Path to Suricata's EVE JSON log (applied on next start).</summary>
+    public string SuricataEvePath
+    {
+        get => _suricata.EvePath;
+        set
+        {
+            var path = string.IsNullOrWhiteSpace(value) ? SuricataService.DefaultEvePath : value.Trim();
+            if (_suricata.EvePath == path) return;
+            _suricata.EvePath = path;
+            if (Stats.IsMonitoring && _suricataEnabled)
+            {
+                _suricata.Stop();
+                _suricata.Start();
+            }
+        }
+    }
+
+    /// <summary>Highest Suricata severity number to accept (Suricata counts down: 1 is most severe).</summary>
+    public int SuricataMaxSeverity
+    {
+        get => _suricata.MaxSeverity;
+        set => _suricata.MaxSeverity = Math.Clamp(value, 1, 4);
+    }
+
+    /// <summary>Suricata signature IDs to ignore (comma separated).</summary>
+    public string SuricataIgnoredSids
+    {
+        get => string.Join(",", _suricata.IgnoredSids);
+        set => _suricata.IgnoredSids = SuricataService.ParseSids(value);
+    }
+
+    public string SuricataStatus => _suricata.Status;
+
+    /// <summary>Alerts read vs. accepted, so the console can show the feed is alive.</summary>
+    public (long Seen, long Accepted) SuricataCounters => _suricata.Counters;
+
+    private bool _conntrackEventsEnabled = true;
+
+    /// <summary>
+    /// Sample as soon as the kernel reports a new flow instead of waiting out the poll
+    /// interval. Needs root; degrades to timed polling when it can't subscribe.
+    /// </summary>
+    public bool ConntrackEventsEnabled
+    {
+        get => _conntrackEventsEnabled;
+        set
+        {
+            if (_conntrackEventsEnabled == value) return;
+            _conntrackEventsEnabled = value;
+            if (Stats.IsMonitoring)
+            {
+                if (value) _conntrack.Start();
+                else _conntrack.Stop();
+            }
+        }
+    }
+
+    public string ConntrackStatus => _conntrack.Status;
+
+    /// <summary>True when flow events are actually driving the loop (not degraded to polling).</summary>
+    public bool ConntrackActive => _conntrack.IsActive;
+
     /// <summary>Webhook URL for pushed alerts (ntfy / Slack / Discord / generic JSON). Empty = off.</summary>
     public string WebhookUrl { get; set; } = "";
 
@@ -293,6 +382,12 @@ public sealed class NetworkMonitorService : IDisposable
         if (_persistenceWatchEnabled) _persistenceWatch.Start();
         if (_exfilEnabled) _exfil.Start();
         if (_honeypotEnabled) _honeypot.Start(_honeypotPorts);
+        if (_suricataEnabled) _suricata.Start();
+        if (_conntrackEventsEnabled)
+        {
+            _conntrack.FlowCreated += OnFlowCreated;
+            _conntrack.Start();
+        }
         _loop = Task.Run(() => RunAsync(_cts.Token));
     }
 
@@ -311,9 +406,48 @@ public sealed class NetworkMonitorService : IDisposable
         _persistenceWatch.Stop();
         _exfil.Stop();
         _honeypot.Stop();
+        _suricata.Stop();
+        _conntrack.FlowCreated -= OnFlowCreated;
+        _conntrack.Stop();
         _history.Save();
         Stats.IsMonitoring = false;
         Stats.StatusText = "Monitoring paused";
+    }
+
+    /// <summary>
+    /// Shortest gap between two polls when kernel events are driving the loop. A port
+    /// scan is thousands of flows in a second; without a floor, each one would trigger
+    /// its own snapshot and the detector would spend the attack rereading /proc.
+    /// </summary>
+    private const int MinEventPollIntervalMs = 150;
+
+    /// <summary>
+    /// Ports we were listening on as of the last poll, used to decide whether a conntrack
+    /// event is worth waking for. Swapped wholesale, never mutated in place.
+    /// </summary>
+    private volatile HashSet<int> _liveListeningPorts = new();
+
+    /// <summary>
+    /// Wakes the poll loop for inbound flows that landed on a port this machine serves —
+    /// the shape every scan, brute-force and exploit attempt takes. Ordinary outbound
+    /// client traffic keeps the normal cadence, so a busy machine doesn't poll flat out.
+    /// </summary>
+    private void OnFlowCreated(ConntrackFlow flow)
+    {
+        if (!_liveListeningPorts.Contains(flow.DestinationPort))
+            return;
+        if (flow.SourceAddress is "127.0.0.1" or "::1")
+            return;
+
+        try
+        {
+            if (_pollWake.CurrentCount == 0)
+                _pollWake.Release();
+        }
+        catch (SemaphoreFullException)
+        {
+            // Another event already queued the wake — one poll covers both.
+        }
     }
 
     private async Task RunAsync(CancellationToken ct)
@@ -331,13 +465,40 @@ public sealed class NetworkMonitorService : IDisposable
 
             try
             {
-                await Task.Delay(PollIntervalMs, ct);
+                await WaitForNextCycleAsync(ct);
             }
-            catch (TaskCanceledException)
+            catch (OperationCanceledException)
             {
                 break;
             }
         }
+    }
+
+    /// <summary>
+    /// Waits out the poll interval, but returns early when the kernel reports an inbound
+    /// flow. Polling alone can only ever describe the moment the file was read; this is
+    /// what turns "sample every 1.2 s" into "sample because something just happened".
+    /// </summary>
+    private async Task WaitForNextCycleAsync(CancellationToken ct)
+    {
+        var floor = Math.Min(MinEventPollIntervalMs, PollIntervalMs);
+        await Task.Delay(floor, ct);
+
+        var remaining = PollIntervalMs - floor;
+        if (remaining <= 0)
+        {
+            DrainWake();
+            return;
+        }
+
+        // Returns true on an event, false on timeout — both mean "poll now".
+        await _pollWake.WaitAsync(remaining, ct);
+    }
+
+    /// <summary>Consumes a pending wake so a stale signal can't skip the next interval.</summary>
+    private void DrainWake()
+    {
+        while (_pollWake.CurrentCount > 0 && _pollWake.Wait(0)) { }
     }
 
     private void PollOnce()
@@ -432,6 +593,10 @@ public sealed class NetworkMonitorService : IDisposable
                 host.PortsTouched = host.LocalPortsContacted.Count;
             }
 
+            // Publish for the conntrack wake filter: only flows aimed at a port we
+            // actually serve are worth cutting the poll interval short for.
+            _liveListeningPorts = new HashSet<int>(listeningTcpPorts);
+
             // Intrusion heuristics
             var activeConns = _connections.Values.ToList();
             newThreats.AddRange(_detector.Analyze(activeConns, _hosts, listeningTcpPorts, listeningUdpPorts, now));
@@ -449,6 +614,9 @@ public sealed class NetworkMonitorService : IDisposable
             newThreats.AddRange(_arpWatch.DrainPending());
             newThreats.AddRange(_persistenceWatch.DrainPending());
             newThreats.AddRange(_exfil.DrainPending());
+
+            if (_suricataEnabled)
+                newThreats.AddRange(_suricata.DrainPending());
 
             if (ThreatIntelEnabled)
                 CheckThreatIntel(activeByIp.Keys, now, newThreats);
@@ -807,6 +975,8 @@ public sealed class NetworkMonitorService : IDisposable
         _persistenceWatch.Dispose();
         _exfil.Dispose();
         _honeypot.Dispose();
+        _suricata.Dispose();
+        _conntrack.Dispose();
         _intel.Dispose();
         _webhook.Dispose();
         _history.Save();
