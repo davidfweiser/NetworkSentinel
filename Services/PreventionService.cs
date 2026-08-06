@@ -72,6 +72,14 @@ public sealed class PreventionService
     /// <summary>A manual unblock suppresses auto-block for this address for this long.</summary>
     public static readonly TimeSpan ManualUnblockSuppressFor = TimeSpan.FromHours(24);
 
+    /// <summary>
+    /// How long auto-block stands down after elevation itself fails. Elevation failure
+    /// is never per-address — a dismissed pkexec dialog or missing sudo rule fails for
+    /// every IP — so without a global pause each threat in each poll batch would raise
+    /// its own prompt (or log its own failure, headless) until the user gave in.
+    /// </summary>
+    public static readonly TimeSpan ElevationFailureBackoff = TimeSpan.FromMinutes(5);
+
     private static readonly TimeSpan BlockedIpsMaxAge = TimeSpan.FromSeconds(15);
 
     private readonly FirewallService _firewall;
@@ -86,6 +94,7 @@ public sealed class PreventionService
     private HashSet<string> _blockedIps = new(StringComparer.OrdinalIgnoreCase);
     private DateTime _blockedIpsRefreshedAt = DateTime.MinValue;
     private bool _refreshInFlight;
+    private DateTime _elevationBackoffUntil = DateTime.MinValue;
 
     public PreventionService(FirewallService firewall, AllowlistService allowlist, AppSettings settings)
     {
@@ -210,6 +219,20 @@ public sealed class PreventionService
             };
         }
 
+        // Dry run never elevates, so it keeps reporting through a backoff window.
+        if (!DryRun)
+        {
+            bool backedOff;
+            lock (_gate) backedOff = DateTime.UtcNow < _elevationBackoffUntil;
+            if (backedOff)
+            {
+                // Only worth a status line when something would actually have been acted on.
+                return threats.Any(t => t.Level >= MinLevel && t.Type != ThreatType.NewRemoteHost)
+                    ? new PreventionResult { StatusMessage = "Auto-block paused: firewall elevation failed — retrying in a few minutes." }
+                    : PreventionResult.Empty;
+            }
+        }
+
         var direction = ResolveDirection();
         var decisions = new List<PreventionDecision>();
 
@@ -246,8 +269,9 @@ public sealed class PreventionService
             }
             else
             {
-                // Clear the attempt marker so the retry window doesn't hide a transient failure.
-                lock (_gate) _attempted.Remove(ip);
+                // Keep the attempt marker so this address backs off for RetryAfter.
+                // Clearing it (as this used to) meant the very next poll batch retried,
+                // and with interactive elevation that was a pkexec prompt per poll.
                 decisions.Add(new PreventionDecision
                 {
                     Ip = ip,
@@ -255,11 +279,34 @@ public sealed class PreventionService
                     Message = $"Auto-block failed for {ip}: {result.Message}",
                     Threat = threat
                 });
+
+                if (LooksLikeElevationFailure(result.Message))
+                {
+                    // Elevation failures are global, not per-address — stop trying the
+                    // rest of the batch and stand down for the backoff window.
+                    lock (_gate) _elevationBackoffUntil = DateTime.UtcNow.Add(ElevationFailureBackoff);
+                    break;
+                }
             }
         }
 
         return decisions.Count == 0 ? PreventionResult.Empty : new PreventionResult { Decisions = decisions };
     }
+
+    /// <summary>
+    /// Matches the failure text of every no-privilege path out of
+    /// <see cref="FirewallService"/>: a dismissed or unauthorized polkit dialog,
+    /// sudo without a usable rule, or no elevation helper at all.
+    /// </summary>
+    private static bool LooksLikeElevationFailure(string message)
+        => message.Contains("Need admin rights", StringComparison.OrdinalIgnoreCase)
+           || message.Contains("No elevation helper", StringComparison.OrdinalIgnoreCase)
+           || message.Contains("No silent elevation", StringComparison.OrdinalIgnoreCase)
+           || message.Contains("No way to elevate", StringComparison.OrdinalIgnoreCase)
+           || message.Contains("dismissed", StringComparison.OrdinalIgnoreCase)
+           || message.Contains("Not authorized", StringComparison.OrdinalIgnoreCase)
+           || message.Contains("incorrect password", StringComparison.OrdinalIgnoreCase)
+           || message.Contains("a password is required", StringComparison.OrdinalIgnoreCase);
 
     /// <summary>
     /// The gate stack. Claims the attempt slot as a side effect when a threat passes, so two
