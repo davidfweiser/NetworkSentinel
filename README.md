@@ -64,8 +64,10 @@ Gates, in order — a threat must clear all of them before a rule is written:
 |------|-----|
 | Severity ≥ minimum | The configured `Medium`/`High`/`Critical` threshold |
 | Not `New Remote Host` | First contact is not evidence of anything |
-| Routable public address | LAN and loopback are never auto-blocked |
+| Routable public address | LAN, loopback, CGNAT (100.64/10 — Tailscale and many VPN tunnels) and multicast are never auto-blocked |
 | Not allowlisted | Known-good stays reachable |
+| Not this machine | A detector that attributes a threat to the wrong end of a flow can never firewall the host off from itself — matters most on a VPS whose own address is public |
+| Not a WireGuard peer endpoint | A peer's public endpoint is where its tunnel packets come from; blocking it kills that client's VPN (peer data comes from WireGuard monitoring, so enable it on a VPN server) |
 | Not protected | See lockout protection below |
 | Not already blocked | No duplicate rules |
 | Not suppressed | An address you deliberately released stays released for 24 h |
@@ -118,7 +120,7 @@ This reads WireGuard's own state (`wg show all dump`) instead:
 - Needs **root** (`CAP_NET_ADMIN`); `wg show` cannot read device state otherwise. Without it the setting explains why rather than failing quietly.
 - Per-peer transfer alerting is **off by default**: a VPN user streaming video legitimately moves gigabytes, so any threshold low enough to catch a slow leak would fire constantly on normal use.
 
-> Tunnel addresses are RFC1918, so auto-block will never act on a VPN client — by design, since blocking a tunnel IP would be both ineffective and confusing. Cutting off a peer belongs in WireGuard's own configuration.
+> Tunnel addresses are private-range (RFC1918 or CGNAT 100.64/10), so auto-block will never act on a VPN client's tunnel IP — by design, since blocking a tunnel IP would be both ineffective and confusing. A peer's **public endpoint** is protected too: while WireGuard monitoring is on, the prevention engine refuses to auto-block any current peer's endpoint address, so a peer alert (or any other detector tripping on peer traffic) cannot cut a client's tunnel dead. Cutting off a peer belongs in WireGuard's own configuration.
 
 ### Signature detection — Suricata (0.6.0)
 
@@ -153,6 +155,7 @@ Polling `/proc/net` can only ever describe the moment the file was read — on t
 - **Block local ports** (TCP/UDP)
 - Dedicated **nftables** table `inet networksentinel` when `nft` is available; otherwise **iptables** with `NetworkSentinel-*` comments
 - Only manages rules owned by this app; other firewall rules are left alone
+- The rule ledger is **reconciled with the kernel at startup**: nft/iptables rules don't survive a reboot while the ledger file does, so entries with no live kernel rule are dropped instead of masquerading as active blocks (runs only when elevation is silent — root or passwordless/cached sudo — never a startup password prompt)
 - Block rules are created as an `-In`/`-Out` pair and **removed together** in one click
 - **Auto-block** on/off with minimum severity (`Medium` / `High` / `Critical`)
 - Removing/unblocking a rule **suppresses auto-block for that IP for 24 h** (persisted), so removed rules stay gone across restarts

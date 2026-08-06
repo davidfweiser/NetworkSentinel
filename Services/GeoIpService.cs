@@ -236,11 +236,18 @@ public sealed class GeoIpService : IDisposable
             if (bytes[0] == 192 && bytes[1] == 168) return true;
             if (bytes[0] == 169 && bytes[1] == 254) return true;
             if (bytes[0] == 0) return true;
+            // 100.64.0.0/10 (RFC 6598 CGNAT) — Tailscale and many VPN tunnel subnets
+            // live here. Not routable on the public internet, so blocking it would only
+            // ever cut off a tunnel peer.
+            if (bytes[0] == 100 && bytes[1] >= 64 && bytes[1] <= 127) return true;
+            // Multicast / reserved / broadcast — not a peer anything could block.
+            if (bytes[0] >= 224) return true;
         }
         if (address.AddressFamily == AddressFamily.InterNetworkV6)
         {
             if (address.IsIPv6LinkLocal || address.IsIPv6SiteLocal || address.IsIPv6UniqueLocal)
                 return true;
+            if (address.IsIPv6Multicast) return true;
             if (address.Equals(IPAddress.IPv6Any)) return true;
         }
         return false;
