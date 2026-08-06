@@ -29,7 +29,8 @@ public enum ThreatType
     ArpSpoof,
     PersistenceChange,
     DataExfiltration,
-    SignatureMatch
+    SignatureMatch,
+    VpnPeerChange
 }
 
 public enum TcpConnectionState
@@ -288,6 +289,7 @@ public sealed class ThreatEvent : INotifyPropertyChanged
         ThreatType.PersistenceChange => "Persistence Change",
         ThreatType.DataExfiltration => "Data Exfiltration",
         ThreatType.SignatureMatch => "Signature Match",
+        ThreatType.VpnPeerChange => "VPN Peer Change",
         _ => Type.ToString()
     };
 }

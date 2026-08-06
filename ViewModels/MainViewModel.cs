@@ -228,6 +228,8 @@ public partial class MainViewModel : ObservableObject, IDisposable
         _monitor.SuricataMaxSeverity = _settings.SuricataMaxSeverity;
         _monitor.SuricataIgnoredSids = _settings.SuricataIgnoredSids;
         _monitor.SuricataEnabled = _settings.SuricataEnabled;
+        _monitor.WireGuardPeerMbPer10Min = _settings.WireGuardPeerMbPer10Min;
+        _monitor.WireGuardMonitorEnabled = _settings.WireGuardMonitorEnabled;
         _monitor.WebhookUrl = _settings.WebhookUrl;
         _monitor.WebhookMinLevel = _settings.GetWebhookMinLevel();
         _monitor.IsIpAllowlisted = ip => _allowlist.IsAllowed(ip, out _);

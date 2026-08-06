@@ -90,6 +90,19 @@ public sealed class AppSettings
     /// </summary>
     public bool ConntrackEventsEnabled { get; set; } = true;
 
+    /// <summary>
+    /// Watch WireGuard peers via `wg show`. WireGuard's single unconnected UDP socket is
+    /// invisible to the connection heuristics, so without this a VPN server has no view of
+    /// who is connected. Needs root.
+    /// </summary>
+    public bool WireGuardMonitorEnabled { get; set; }
+
+    /// <summary>
+    /// Megabytes sent to one WireGuard peer within 10 minutes before alerting (0 = off).
+    /// Off by default — a VPN user streaming video legitimately moves gigabytes.
+    /// </summary>
+    public int WireGuardPeerMbPer10Min { get; set; }
+
     /// <summary>Ingest Suricata's EVE JSON alerts as threat events (payload inspection / signatures).</summary>
     public bool SuricataEnabled { get; set; }
 

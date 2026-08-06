@@ -18,6 +18,7 @@ public sealed class NetworkMonitorService : IDisposable
     private readonly PersistenceWatcher _persistenceWatch = new();
     private readonly ExfiltrationMonitor _exfil = new();
     private readonly SuricataService _suricata = new();
+    private readonly WireGuardMonitor _wireGuard = new();
     private readonly ConntrackEventSource _conntrack = new();
     private readonly WebhookNotifier _webhook = new();
     private readonly HostHistoryStore _history = new();
@@ -256,6 +257,39 @@ public sealed class NetworkMonitorService : IDisposable
         }
     }
 
+    private bool _wireGuardEnabled;
+
+    /// <summary>
+    /// Watch WireGuard peers. WireGuard's unconnected UDP socket never becomes a tracked
+    /// connection, so on a VPN server this is the only view of who is attached.
+    /// </summary>
+    public bool WireGuardMonitorEnabled
+    {
+        get => _wireGuardEnabled;
+        set
+        {
+            if (_wireGuardEnabled == value) return;
+            _wireGuardEnabled = value;
+            if (Stats.IsMonitoring)
+            {
+                if (value) _wireGuard.Start();
+                else _wireGuard.Stop();
+            }
+        }
+    }
+
+    /// <summary>Megabytes sent to one WireGuard peer within 10 minutes before alerting (0 = off).</summary>
+    public int WireGuardPeerMbPer10Min
+    {
+        get => _wireGuard.TransferMbPer10Min;
+        set => _wireGuard.TransferMbPer10Min = Math.Clamp(value, 0, 1_000_000);
+    }
+
+    public string WireGuardStatus => _wireGuard.Status;
+
+    /// <summary>Current WireGuard peers (public keys only — no private or preshared key material).</summary>
+    public IReadOnlyList<WireGuardPeer> WireGuardPeers => _wireGuard.Peers;
+
     private bool _suricataEnabled;
 
     /// <summary>Ingest Suricata EVE JSON alerts (signature / payload inspection).</summary>
@@ -383,6 +417,7 @@ public sealed class NetworkMonitorService : IDisposable
         if (_exfilEnabled) _exfil.Start();
         if (_honeypotEnabled) _honeypot.Start(_honeypotPorts);
         if (_suricataEnabled) _suricata.Start();
+        if (_wireGuardEnabled) _wireGuard.Start();
         if (_conntrackEventsEnabled)
         {
             _conntrack.FlowCreated += OnFlowCreated;
@@ -407,6 +442,7 @@ public sealed class NetworkMonitorService : IDisposable
         _exfil.Stop();
         _honeypot.Stop();
         _suricata.Stop();
+        _wireGuard.Stop();
         _conntrack.FlowCreated -= OnFlowCreated;
         _conntrack.Stop();
         _history.Save();
@@ -617,6 +653,9 @@ public sealed class NetworkMonitorService : IDisposable
 
             if (_suricataEnabled)
                 newThreats.AddRange(_suricata.DrainPending());
+
+            if (_wireGuardEnabled)
+                newThreats.AddRange(_wireGuard.DrainPending());
 
             if (ThreatIntelEnabled)
                 CheckThreatIntel(activeByIp.Keys, now, newThreats);
@@ -976,6 +1015,7 @@ public sealed class NetworkMonitorService : IDisposable
         _exfil.Dispose();
         _honeypot.Dispose();
         _suricata.Dispose();
+        _wireGuard.Dispose();
         _conntrack.Dispose();
         _intel.Dispose();
         _webhook.Dispose();

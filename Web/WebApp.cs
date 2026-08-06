@@ -104,6 +104,8 @@ public sealed class WebApp : IDisposable
         _monitor.SuricataMaxSeverity = _settings.SuricataMaxSeverity;
         _monitor.SuricataIgnoredSids = _settings.SuricataIgnoredSids;
         _monitor.SuricataEnabled = _settings.SuricataEnabled;
+        _monitor.WireGuardPeerMbPer10Min = _settings.WireGuardPeerMbPer10Min;
+        _monitor.WireGuardMonitorEnabled = _settings.WireGuardMonitorEnabled;
         _monitor.WebhookUrl = _settings.WebhookUrl;
         _monitor.WebhookMinLevel = _settings.GetWebhookMinLevel();
         _monitor.IsIpAllowlisted = ip => _allowlist.IsAllowed(ip, out _);
@@ -938,6 +940,20 @@ public sealed class WebApp : IDisposable
                             _settings.ConntrackEventsEnabled = on;
                             label = on ? $"Flow events: on ({_monitor.ConntrackStatus})" : "Flow events: off — timed polling only";
                             break;
+                        case "wireGuardMonitorEnabled":
+                            _monitor.WireGuardMonitorEnabled = on;
+                            _settings.WireGuardMonitorEnabled = on;
+                            label = on ? $"WireGuard peers: on ({_monitor.WireGuardStatus})" : "WireGuard peer monitoring: off";
+                            break;
+                        case "wireGuardPeerMbPer10Min":
+                            if (!int.TryParse(raw, out var wgMb) || wgMb < 0)
+                                return ActionResultDto.Fail("Enter 0 to disable, or a positive number of megabytes.");
+                            _monitor.WireGuardPeerMbPer10Min = wgMb;
+                            _settings.WireGuardPeerMbPer10Min = wgMb;
+                            label = wgMb == 0
+                                ? "Per-peer transfer alerts off"
+                                : $"Per-peer transfer alert threshold: {wgMb} MB / 10 min";
+                            break;
                         case "suricataEnabled":
                             _monitor.SuricataEnabled = on;
                             _settings.SuricataEnabled = on;
@@ -1357,6 +1373,10 @@ public sealed class WebApp : IDisposable
                 preventionDryRun = _prevention.DryRun,
                 conntrackEventsEnabled = _settings.ConntrackEventsEnabled,
                 conntrackStatus = _monitor.ConntrackStatus,
+                wireGuardMonitorEnabled = _settings.WireGuardMonitorEnabled,
+                wireGuardPeerMbPer10Min = _settings.WireGuardPeerMbPer10Min,
+                wireGuardStatus = WireGuardStatusText(),
+                wireGuardPeers = WireGuardPeerRows(),
                 suricataEnabled = _settings.SuricataEnabled,
                 suricataEvePath = _settings.SuricataEvePath,
                 suricataMaxSeverity = _settings.SuricataMaxSeverity,
@@ -1482,6 +1502,29 @@ public sealed class WebApp : IDisposable
     /// The inbound allow rule for THIS console's port. Removing it over the web kills the
     /// user's own browser connection mid-request — indistinguishable from a server crash.
     /// </summary>
+    /// <summary>WireGuard monitor state for the settings panel.</summary>
+    private string WireGuardStatusText()
+        => _settings.WireGuardMonitorEnabled
+            ? _monitor.WireGuardStatus
+            : "Off — WireGuard peers are invisible to the connection heuristics until this is on.";
+
+    /// <summary>
+    /// Peer rows for the console. Only public keys are exposed: the private and preshared
+    /// keys in `wg show ... dump` are dropped at parse time and never reach this class.
+    /// </summary>
+    private object[] WireGuardPeerRows()
+        => _monitor.WireGuardPeers.Select(p => (object)new
+        {
+            iface = p.Interface,
+            shortKey = p.ShortKey,
+            publicKey = p.PublicKey,
+            endpoint = p.Endpoint,
+            allowedIps = p.AllowedIps,
+            handshake = p.HandshakeText,
+            rxMb = p.TransferRx / 1_000_000,
+            txMb = p.TransferTx / 1_000_000
+        }).ToArray();
+
     /// <summary>Suricata feed state plus counters, so the console shows the feed is alive.</summary>
     private string SuricataStatusText()
     {
@@ -2669,6 +2712,24 @@ public sealed class WebApp : IDisposable
       .map(l => `<option ${s.autoBlockMinLevel === l ? 'selected' : ''}>${l}</option>`).join('')}</select>`;
     const refreshSel = `<select data-set-refresh>${[['1000', '1 second'], ['2500', '2.5 seconds'], ['5000', '5 seconds'], ['10000', '10 seconds']]
       .map(([v, l]) => `<option value="${v}" ${String(getRefreshMs()) === v ? 'selected' : ''}>${l}</option>`).join('')}</select>`;
+    // Peer list is read-only: revoking a peer is `wg set <iface> peer <key> remove`,
+    // a WireGuard config change, not something this console should do behind your back.
+    const wgPeerTable = (peers) => {
+      if (!s.wireGuardMonitorEnabled) return '';
+      if (!peers || !peers.length) return '<div class="settings-note">No peers reported.</div>';
+      const rows = peers.map(p => `
+        <tr>
+          <td title="${esc(p.publicKey || '')}"><code>${esc(p.shortKey || '')}</code></td>
+          <td>${esc(p.iface || '')}</td>
+          <td>${esc(p.endpoint || '—')}</td>
+          <td>${esc(p.allowedIps || '—')}</td>
+          <td>${esc(p.handshake || '—')}</td>
+          <td>${esc(String(p.rxMb ?? 0))} / ${esc(String(p.txMb ?? 0))} MB</td>
+        </tr>`).join('');
+      return `<div data-scroll style="overflow-x:auto"><table><thead><tr>
+          <th>Peer</th><th>Interface</th><th>Endpoint</th><th>Allowed IPs</th><th>Last handshake</th><th>Rx / Tx</th>
+        </tr></thead><tbody>${rows}</tbody></table></div>`;
+    };
 
     $('settingsPanel').innerHTML = `
       <div class="settings-group"><h3>Monitoring</h3>
@@ -2690,6 +2751,12 @@ public sealed class WebApp : IDisposable
         ${row('Exfiltration threshold (MB / 10 min)', 'Outbound megabytes to a single host before the alert fires.', txt('exfilMbPer10Min', s.exfilMbPer10Min ?? 250, '250'))}
         ${row('Honeypot decoy ports', 'Listen on decoy TCP ports nothing legitimate uses — any completed connection is a zero-false-positive Critical alert. ' + (s.honeypotStatus || ''), sw('honeypotEnabled', s.honeypotEnabled))}
         ${row('Decoy port list', 'Comma-separated TCP ports to bind as decoys. Ports already in use are skipped.', txt('honeypotPorts', s.honeypotPorts || '', '2323,3389,5900'))}
+      </div>
+      <div class="settings-group"><h3>VPN (WireGuard)</h3>
+        <div class="settings-note">WireGuard uses one unconnected UDP socket, so its peers never appear as connections and nothing else on this page can see them. This reads WireGuard's own state instead. Needs root. Only public keys are read — the interface private key and peer preshared keys are discarded and never stored.</div>
+        ${row('WireGuard peer monitoring', 'Watch peers for new keys, endpoint moves, and removals. ' + (s.wireGuardStatus || ''), sw('wireGuardMonitorEnabled', s.wireGuardMonitorEnabled))}
+        ${row('Per-peer transfer alert (MB / 10 min)', 'Alert when this much data is sent to a single peer within 10 minutes. 0 disables it — a VPN user streaming video legitimately moves gigabytes. Forwarded tunnel traffic has no local socket, so this is the only place it is counted.', txt('wireGuardPeerMbPer10Min', s.wireGuardPeerMbPer10Min ?? 0, '0'))}
+        ${wgPeerTable(s.wireGuardPeers)}
       </div>
       <div class="settings-group"><h3>Signatures (Suricata)</h3>
         <div class="settings-note">Connection heuristics see who is talking and how often, never what is being said. Suricata inspects the payload — run it alongside Network Sentinel and its alerts appear here as threats, with auto-block, the allowlist and webhooks all applying as usual.</div>
