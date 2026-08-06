@@ -862,9 +862,94 @@ public sealed class FirewallService
     /// </summary>
     public void StartExpirySweep()
     {
+        if (_expiryTimer == null)
+        {
+            // One-time startup pass, off the caller's thread: the ledger survives a
+            // reboot but kernel rules don't, so reconcile before the first sweep.
+            _ = Task.Run(() => ReconcileLedgerWithKernel());
+        }
         _expiryTimer ??= new Timer(_ => TrySweepExpired(), null,
             TimeSpan.FromMinutes(1), TimeSpan.FromMinutes(1));
     }
+
+    /// <summary>
+    /// Drops ledger entries whose kernel rule no longer exists. nft/iptables rules
+    /// do not survive a reboot while firewall-rules.json does, so after a restart
+    /// the app reported addresses as blocked — and the auto-block "already blocked"
+    /// gate skipped re-blocking a still-active attacker — with no rule in the
+    /// kernel. The same divergence appears when an admin flushes the firewall
+    /// externally. Listing the live rules needs elevation, so this only acts when
+    /// that can happen silently (root, or cached/passwordless sudo) — never a
+    /// prompt from startup. When it can't, the ledger is left alone and the next
+    /// process start retries.
+    /// </summary>
+    public FirewallOperationResult ReconcileLedgerWithKernel()
+    {
+        try
+        {
+            var ledger = LoadLedger();
+            if (ledger.Count == 0)
+                return FirewallOperationResult.Ok("Ledger empty — nothing to reconcile.");
+
+            if (!CanElevateSilently())
+                return FirewallOperationResult.Fail("Cannot list kernel rules without prompting — reconciliation skipped.");
+
+            string dump;
+            _silentElevationOnly = true;
+            try
+            {
+                if (BackendIsNft())
+                {
+                    var list = RunPrivileged("nft", $"list table {NftTable}");
+                    if (list.Success)
+                    {
+                        dump = list.Message;
+                    }
+                    else if (LooksLikeMissingTable(list.Message))
+                    {
+                        // The managed table is gone entirely — the post-reboot case.
+                        // Every ledger entry is stale.
+                        dump = "";
+                    }
+                    else
+                    {
+                        return FirewallOperationResult.Fail($"Could not list nft rules: {list.Message}");
+                    }
+                }
+                else
+                {
+                    var input = RunPrivileged("iptables", "-L INPUT -n");
+                    var output = RunPrivileged("iptables", "-L OUTPUT -n");
+                    if (!input.Success || !output.Success)
+                        return FirewallOperationResult.Fail("Could not list iptables rules — reconciliation skipped.");
+                    dump = input.Message + "\n" + output.Message;
+                }
+            }
+            finally
+            {
+                _silentElevationOnly = false;
+            }
+
+            // Rule names carry an -In/-Out suffix, so no managed name is a prefix of
+            // another and a plain containment test against the dump is exact enough.
+            var stale = ledger.Where(r => !dump.Contains(r.Name, StringComparison.Ordinal)).ToList();
+            if (stale.Count == 0)
+                return FirewallOperationResult.Ok("Ledger matches kernel rules.");
+
+            ledger.RemoveAll(r => stale.Any(s => string.Equals(s.Name, r.Name, StringComparison.OrdinalIgnoreCase)));
+            SaveLedger(ledger);
+            return FirewallOperationResult.Ok(
+                $"Dropped {stale.Count} ledger entr{(stale.Count == 1 ? "y" : "ies")} with no matching kernel rule.");
+        }
+        catch (Exception ex)
+        {
+            return FirewallOperationResult.Fail($"Reconcile failed: {ex.Message}");
+        }
+    }
+
+    private static bool LooksLikeMissingTable(string message)
+        => message.Contains("No such file or directory", StringComparison.OrdinalIgnoreCase)
+           || message.Contains("does not exist", StringComparison.OrdinalIgnoreCase);
 
     private void TrySweepExpired()
     {
