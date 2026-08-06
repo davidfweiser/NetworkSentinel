@@ -80,6 +80,16 @@ public sealed class NetworkMonitorService : IDisposable
 
         Stats.ThreatsToday = _threatsTodayCount;
         Stats.HighThreats = _highThreatCount;
+
+        // Wired once for the life of the service, not inside Start(): the enabled-flag
+        // setters call the sources' Start() directly for runtime toggles, and wiring
+        // only from Start() left a feature switched on mid-session running with no
+        // event handler attached — conntrack events flowed to nobody, and DNS hygiene
+        // couldn't tell tunnel-client queries from the host's own.
+        _conntrack.FlowCreated += OnFlowCreated;
+        // Peer allowed-IPs tell the DNS monitor whether a query came from a tunnel
+        // client, which is what separates a client leak from this host's own traffic.
+        _dns.IsVpnClientAddress = IsWireGuardClientAddress;
     }
 
     /// <summary>Enables/disables the external geo-IP web lookup (reverse DNS still runs).</summary>
@@ -460,18 +470,8 @@ public sealed class NetworkMonitorService : IDisposable
         if (_honeypotEnabled) _honeypot.Start(_honeypotPorts);
         if (_suricataEnabled) _suricata.Start();
         if (_wireGuardEnabled) _wireGuard.Start();
-        if (_dnsHygieneEnabled)
-        {
-            // Peer allowed-IPs tell the DNS monitor whether a query came from a tunnel
-            // client, which is what separates a client leak from this host's own traffic.
-            _dns.IsVpnClientAddress = IsWireGuardClientAddress;
-            _dns.Start();
-        }
-        if (_conntrackEventsEnabled)
-        {
-            _conntrack.FlowCreated += OnFlowCreated;
-            _conntrack.Start();
-        }
+        if (_dnsHygieneEnabled) _dns.Start();
+        if (_conntrackEventsEnabled) _conntrack.Start();
         _loop = Task.Run(() => RunAsync(_cts.Token));
     }
 
@@ -493,7 +493,6 @@ public sealed class NetworkMonitorService : IDisposable
         _suricata.Stop();
         _wireGuard.Stop();
         _dns.Stop();
-        _conntrack.FlowCreated -= OnFlowCreated;
         _conntrack.Stop();
         _history.Save();
         Stats.IsMonitoring = false;
@@ -1139,6 +1138,7 @@ public sealed class NetworkMonitorService : IDisposable
     public void Dispose()
     {
         Stop();
+        _conntrack.FlowCreated -= OnFlowCreated;
         _authLog.Dispose();
         _probeLog.Dispose();
         _arpWatch.Dispose();
