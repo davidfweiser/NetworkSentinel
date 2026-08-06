@@ -28,4 +28,19 @@ public static class AppPaths
             return dir;
         }
     }
+
+    /// <summary>
+    /// Writes a file via a temp sibling + rename, so a crash mid-write can never leave
+    /// a truncated file. That matters here because every JSON store in the app treats
+    /// an unparsable file as empty — a torn settings.json or firewall ledger silently
+    /// discarded real state (for the ledger: while the kernel rules lived on as
+    /// orphans). The rename is atomic on the same filesystem, which a sibling path
+    /// guarantees.
+    /// </summary>
+    public static void WriteAtomic(string path, string contents)
+    {
+        var tmp = path + ".tmp";
+        File.WriteAllText(tmp, contents);
+        File.Move(tmp, path, overwrite: true);
+    }
 }

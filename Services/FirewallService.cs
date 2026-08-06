@@ -1051,7 +1051,7 @@ public sealed class FirewallService
     {
         try
         {
-            File.WriteAllText(LedgerPath, JsonSerializer.Serialize(rules, JsonOptions));
+            AppPaths.WriteAtomic(LedgerPath, JsonSerializer.Serialize(rules, JsonOptions));
         }
         catch
         {

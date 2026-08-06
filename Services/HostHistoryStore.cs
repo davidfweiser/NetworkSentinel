@@ -177,7 +177,7 @@ public sealed class HostHistoryStore
                 _lastSaveUtc = DateTime.UtcNow;
             }
 
-            File.WriteAllText(HistoryPath, JsonSerializer.Serialize(file, JsonOptions));
+            AppPaths.WriteAtomic(HistoryPath, JsonSerializer.Serialize(file, JsonOptions));
         }
         catch
         {
@@ -210,7 +210,8 @@ public sealed class HostHistoryStore
             if (info.Length > ThreatLogRotateBytes)
             {
                 var keep = File.ReadAllLines(ThreatLogPath);
-                File.WriteAllLines(ThreatLogPath, keep.TakeLast(ThreatLogKeepOnRotate));
+                AppPaths.WriteAtomic(ThreatLogPath,
+                    string.Join(Environment.NewLine, keep.TakeLast(ThreatLogKeepOnRotate)) + Environment.NewLine);
             }
         }
         catch

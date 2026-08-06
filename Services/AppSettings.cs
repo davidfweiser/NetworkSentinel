@@ -212,7 +212,7 @@ public sealed class AppSettings
     {
         try
         {
-            File.WriteAllText(SettingsPath, JsonSerializer.Serialize(this, JsonOptions));
+            AppPaths.WriteAtomic(SettingsPath, JsonSerializer.Serialize(this, JsonOptions));
         }
         catch
         {

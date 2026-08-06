@@ -517,7 +517,7 @@ public sealed class WireGuardMonitor : IDisposable
         {
             Dictionary<string, string> snapshot;
             lock (_gate) snapshot = new Dictionary<string, string>(_baseline, StringComparer.Ordinal);
-            File.WriteAllText(BaselinePath, JsonSerializer.Serialize(snapshot));
+            AppPaths.WriteAtomic(BaselinePath, JsonSerializer.Serialize(snapshot));
         }
         catch
         {
