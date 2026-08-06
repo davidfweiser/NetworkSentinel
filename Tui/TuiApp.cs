@@ -601,17 +601,44 @@ public sealed class TuiApp : IDisposable
             return;
         }
 
-        if (!Confirm($"Block {ip.Trim()} (inbound+outbound)?"))
+        // Same pre-flight the GUI and web console do, so all three frontends agree.
+        if (!FirewallService.TryNormalizeIp(ip, out var normalized, out var error))
+        {
+            _statusMessage = error;
+            return;
+        }
+
+        if (FirewallService.IsPrivateOrLocal(normalized))
+        {
+            _statusMessage = "Private/local addresses are not blocked (would break LAN).";
+            return;
+        }
+
+        var overrideAllowlist = false;
+        if (_allowlist.IsAllowed(normalized, out var allowReason))
+        {
+            if (!Confirm($"{normalized} is protected by the allowlist ({allowReason}). Block it anyway?"))
+            {
+                _statusMessage = $"Protected by allowlist — not blocked: {normalized} ({allowReason}).";
+                return;
+            }
+            overrideAllowlist = true;
+        }
+
+        if (!Confirm($"Block {normalized} ({ResolveDirection()})?"))
         {
             _statusMessage = "Block cancelled.";
             return;
         }
 
-        var result = _firewall.BlockIp(ip.Trim(), ResolveDirection(), "TUI block");
+        var result = _firewall.BlockIp(normalized, ResolveDirection(), "TUI block", overrideAllowlist);
         _statusMessage = result.Message;
         if (result.Success)
         {
-            _prevention.NoteBlocked(ip.Trim());
+            // Blocking by hand is an explicit reversal of an earlier release —
+            // without this, a prior manual unblock kept suppressing auto-block.
+            _prevention.ClearSuppression(normalized);
+            _prevention.NoteBlocked(normalized);
             RefreshBlockedIps(force: true);
         }
     }
@@ -638,6 +665,13 @@ public sealed class TuiApp : IDisposable
         }
 
         var result = _firewall.UnblockIp(ip.Trim());
+        if (result.Success && FirewallService.TryNormalizeIp(ip, out var normalized, out _))
+        {
+            // Suppresses auto-block for 24 h so a deliberate release isn't undone by
+            // the next detection — the GUI and web console already did this; the TUI
+            // was the one frontend where auto-block could re-block seconds later.
+            _prevention.NoteUnblocked(normalized);
+        }
         _statusMessage = result.Message;
         RefreshBlockedIps(force: true);
     }
@@ -1409,5 +1443,6 @@ public sealed class TuiApp : IDisposable
         _monitor.Updated -= OnMonitorUpdated;
         _monitor.ThreatsDetected -= OnThreatsDetected;
         _monitor.Dispose();
+        _allowlist.Dispose();
     }
 }
