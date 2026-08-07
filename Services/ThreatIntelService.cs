@@ -227,7 +227,7 @@ public sealed class ThreatIntelService : IDisposable
                     Feed = e.Feed
                 }).ToList()
             };
-            File.WriteAllText(CachePath, JsonSerializer.Serialize(cache, JsonOptions));
+            AppPaths.WriteAtomic(CachePath, JsonSerializer.Serialize(cache, JsonOptions));
         }
         catch
         {

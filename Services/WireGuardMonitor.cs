@@ -386,14 +386,20 @@ public sealed class WireGuardMonitor : IDisposable
                 return false;
             }
 
-            output = proc.StandardOutput.ReadToEnd();
-            var stderr = proc.StandardError.ReadToEnd();
+            // Both pipes drained concurrently — a chatty stderr could otherwise fill
+            // its buffer and deadlock against our blocking stdout read, and the
+            // WaitForExit timeout never engaged while stuck in ReadToEnd.
+            var stdoutTask = proc.StandardOutput.ReadToEndAsync();
+            var stderrTask = proc.StandardError.ReadToEndAsync();
             if (!proc.WaitForExit(5000))
             {
                 try { proc.Kill(entireProcessTree: true); } catch { /* already gone */ }
                 error = "`wg show` timed out";
                 return false;
             }
+
+            output = stdoutTask.GetAwaiter().GetResult();
+            var stderr = stderrTask.GetAwaiter().GetResult();
 
             if (proc.ExitCode != 0)
             {
@@ -542,7 +548,7 @@ public sealed class WireGuardMonitor : IDisposable
         {
             Dictionary<string, string> snapshot;
             lock (_gate) snapshot = new Dictionary<string, string>(_baseline, StringComparer.Ordinal);
-            File.WriteAllText(BaselinePath, JsonSerializer.Serialize(snapshot));
+            AppPaths.WriteAtomic(BaselinePath, JsonSerializer.Serialize(snapshot));
         }
         catch
         {

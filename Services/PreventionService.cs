@@ -55,7 +55,8 @@ public sealed class PreventionResult
 ///
 /// Ordered gates, cheapest first — a threat must clear all of them:
 ///   severity ≥ MinLevel → not informational-only → routable public IP →
-///   not allowlisted → not protected → not already blocked →
+///   not allowlisted → not this machine's own address → not a protected
+///   endpoint (WireGuard peers) → not operator-protected → not already blocked →
 ///   not suppressed by a manual unblock → not attempted in the last RetryAfter.
 ///
 /// In <see cref="DryRun"/> mode every gate still runs and decisions are still
@@ -65,11 +66,30 @@ public sealed class PreventionResult
 /// </summary>
 public sealed class PreventionService
 {
-    /// <summary>How long to wait before retrying an IP whose block attempt failed.</summary>
+    /// <summary>How long an address stays claimed once a batch decides to block it.</summary>
     public static readonly TimeSpan RetryAfter = TimeSpan.FromMinutes(10);
+
+    /// <summary>
+    /// How long an address waits after a block attempt that failed for a reason that
+    /// is not about elevation — a netsh call killed by the process timeout, a rule
+    /// store briefly locked by another writer, a transient RPC error from the firewall
+    /// service. Deliberately short: the full <see cref="RetryAfter"/> left an actively
+    /// hammering attacker un-blocked for ten minutes over one transient error, while
+    /// retrying on every ~2 s poll spawns a subprocess per poll for a failure that may
+    /// never clear.
+    /// </summary>
+    public static readonly TimeSpan FailedAttemptRetryAfter = TimeSpan.FromSeconds(45);
 
     /// <summary>A manual unblock suppresses auto-block for this address for this long.</summary>
     public static readonly TimeSpan ManualUnblockSuppressFor = TimeSpan.FromHours(24);
+
+    /// <summary>
+    /// How long auto-block stands down after elevation itself fails. Elevation failure
+    /// is never per-address — an unelevated process fails for every IP alike — so
+    /// without a global pause each threat in each poll batch would log its own identical
+    /// failure until the operator relaunched as Administrator.
+    /// </summary>
+    public static readonly TimeSpan ElevationFailureBackoff = TimeSpan.FromMinutes(5);
 
     private static readonly TimeSpan BlockedIpsMaxAge = TimeSpan.FromSeconds(15);
 
@@ -78,13 +98,22 @@ public sealed class PreventionService
     private readonly AppSettings _settings;
 
     private readonly object _gate = new();
-    private readonly Dictionary<string, DateTime> _attempted = new(StringComparer.OrdinalIgnoreCase);
+
+    /// <summary>
+    /// Address → UTC time it becomes eligible again. Claimed when a batch decides to
+    /// act (so two concurrent batches can't both block the same IP), then either
+    /// cleared on success or shortened to <see cref="FailedAttemptRetryAfter"/> on a
+    /// recoverable failure. Absolute rather than "time of last attempt" so the wait
+    /// can differ by outcome.
+    /// </summary>
+    private readonly Dictionary<string, DateTime> _skipUntil = new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<string, DateTime> _suppressedUntil = new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<string, DateTime> _protectedUntil = new(StringComparer.OrdinalIgnoreCase);
 
     private HashSet<string> _blockedIps = new(StringComparer.OrdinalIgnoreCase);
     private DateTime _blockedIpsRefreshedAt = DateTime.MinValue;
     private bool _refreshInFlight;
+    private DateTime _elevationBackoffUntil = DateTime.MinValue;
 
     public PreventionService(FirewallService firewall, AllowlistService allowlist, AppSettings settings)
     {
@@ -116,6 +145,17 @@ public sealed class PreventionService
     /// first.
     /// </summary>
     public bool DryRun { get; set; }
+
+    /// <summary>
+    /// Extra never-auto-block guard on top of the allowlist and the operator shield.
+    /// The frontends wire this to the monitor's WireGuard peer-endpoint check: a peer's
+    /// endpoint is the public address its encrypted tunnel packets come from, so a
+    /// detector that flags it (a "new peer" alert, a per-peer transfer alert, Suricata
+    /// on the tunnel port) would otherwise cut that client's VPN dead. Like the operator
+    /// shield, this only stops the machine deciding on its own — manual blocking is
+    /// deliberately unaffected.
+    /// </summary>
+    public Func<string, bool>? IsProtectedAddress { get; set; }
 
     /// <summary>Addresses currently blocked by rules this app owns.</summary>
     public IReadOnlySet<string> BlockedIps
@@ -198,12 +238,26 @@ public sealed class PreventionService
             };
         }
 
+        // Dry run never elevates, so it keeps reporting through a backoff window.
+        if (!DryRun)
+        {
+            bool backedOff;
+            lock (_gate) backedOff = DateTime.UtcNow < _elevationBackoffUntil;
+            if (backedOff)
+            {
+                // Only worth a status line when something would actually have been acted on.
+                return threats.Any(t => t.Level >= MinLevel && t.Type != ThreatType.NewRemoteHost)
+                    ? new PreventionResult { StatusMessage = "Auto-block paused: firewall elevation failed — retrying in a few minutes." }
+                    : PreventionResult.Empty;
+            }
+        }
+
         var direction = ResolveDirection();
         var decisions = new List<PreventionDecision>();
 
         foreach (var threat in threats)
         {
-            if (!ShouldConsider(threat, out var ip))
+            if (!ShouldConsider(threat, claimSlot: !DryRun, out var ip))
                 continue;
 
             if (DryRun)
@@ -223,7 +277,12 @@ public sealed class PreventionService
 
             if (result.Success)
             {
-                lock (_gate) _blockedIps.Add(ip);
+                // The "already blocked" gate takes over from here.
+                lock (_gate)
+                {
+                    _blockedIps.Add(ip);
+                    _skipUntil.Remove(ip);
+                }
                 decisions.Add(new PreventionDecision
                 {
                     Ip = ip,
@@ -234,8 +293,6 @@ public sealed class PreventionService
             }
             else
             {
-                // Clear the attempt marker so the retry window doesn't hide a transient failure.
-                lock (_gate) _attempted.Remove(ip);
                 decisions.Add(new PreventionDecision
                 {
                     Ip = ip,
@@ -243,6 +300,21 @@ public sealed class PreventionService
                     Message = $"Auto-block failed for {ip}: {result.Message}",
                     Threat = threat
                 });
+
+                if (LooksLikeElevationFailure(result.Message))
+                {
+                    // Elevation failures are global, not per-address — stop trying the
+                    // rest of the batch and stand down for the backoff window. That
+                    // pause, not the per-address claim, is what stops an identical
+                    // failure per poll, so the address keeps its full claim here.
+                    lock (_gate) _elevationBackoffUntil = DateTime.UtcNow.Add(ElevationFailureBackoff);
+                    break;
+                }
+
+                // Anything else is per-address and may well be transient (a killed netsh,
+                // a briefly locked rule store). Retry soon rather than leaving an active
+                // attacker un-blocked for the full RetryAfter.
+                lock (_gate) _skipUntil[ip] = DateTime.UtcNow.Add(FailedAttemptRetryAfter);
             }
         }
 
@@ -250,10 +322,23 @@ public sealed class PreventionService
     }
 
     /// <summary>
-    /// The gate stack. Claims the attempt slot as a side effect when a threat passes, so two
-    /// concurrent batches naming the same IP can't both try to block it.
+    /// Matches the failure text of every no-privilege path out of
+    /// <see cref="FirewallService"/>: this process not being elevated, and netsh or the
+    /// firewall service itself refusing the operation for want of Administrator rights.
     /// </summary>
-    private bool ShouldConsider(ThreatEvent threat, out string ip)
+    private static bool LooksLikeElevationFailure(string message)
+        => message.Contains("Administrator rights are required", StringComparison.OrdinalIgnoreCase)
+           || message.Contains("requires elevation", StringComparison.OrdinalIgnoreCase)
+           || message.Contains("Access is denied", StringComparison.OrdinalIgnoreCase)
+           || message.Contains("relaunch as Administrator", StringComparison.OrdinalIgnoreCase)
+           || message.Contains("Not elevated", StringComparison.OrdinalIgnoreCase);
+
+    /// <summary>
+    /// The gate stack. When <paramref name="claimSlot"/> is set, a passing threat claims the
+    /// address as a side effect, so two concurrent batches naming the same IP can't both try
+    /// to block it. Dry run passes false — it decides but never acts.
+    /// </summary>
+    private bool ShouldConsider(ThreatEvent threat, bool claimSlot, out string ip)
     {
         ip = "";
 
@@ -273,6 +358,15 @@ public sealed class PreventionService
         if (_allowlist.IsAllowed(normalized, out _))
             return false;
 
+        // Never the machine's own interface addresses: a detector that attributes a
+        // threat to the wrong end of a flow (a public-IP host especially) must not be
+        // able to firewall the box off from itself.
+        if (LocalAddresses.IsOwnAddress(normalized))
+            return false;
+
+        if (IsProtectedAddress is { } externallyProtected && externallyProtected(normalized))
+            return false;
+
         lock (_gate)
         {
             if (_protectedUntil.TryGetValue(normalized, out var protectedUntil) && DateTime.UtcNow < protectedUntil)
@@ -281,10 +375,14 @@ public sealed class PreventionService
                 return false;
             if (_suppressedUntil.TryGetValue(normalized, out var until) && DateTime.UtcNow < until)
                 return false;
-            if (_attempted.TryGetValue(normalized, out var last) && DateTime.UtcNow - last < RetryAfter)
+            if (_skipUntil.TryGetValue(normalized, out var eligibleAt) && DateTime.UtcNow < eligibleAt)
                 return false;
 
-            _attempted[normalized] = DateTime.UtcNow;
+            // Dry run writes no rule, so it must not consume the address's turn either:
+            // burning the slot here meant every address the operator had just watched
+            // in dry run was skipped for RetryAfter once they switched blocking on.
+            if (claimSlot)
+                _skipUntil[normalized] = DateTime.UtcNow.Add(RetryAfter);
         }
 
         ip = normalized;
@@ -349,6 +447,24 @@ public sealed class PreventionService
         return set;
     }
 
+    /// <summary>
+    /// Lifts the elevation stand-down after the operator has authorized elevation.
+    /// The backoff is set when a firewall write is refused for want of Administrator
+    /// rights, and it used to expire only with time — so acting on "Authorize elevation"
+    /// changed nothing for the next five minutes, and the console kept reporting
+    /// auto-block as paused. The corrective action has to actually correct it.
+    /// </summary>
+    public void NoteElevationAuthorized()
+    {
+        lock (_gate)
+        {
+            _elevationBackoffUntil = DateTime.MinValue;
+            // Addresses parked by the failures that led here deserve the retry too.
+            foreach (var key in _skipUntil.Keys.ToList())
+                _skipUntil.Remove(key);
+        }
+    }
+
     /// <summary>Record a block made outside the engine (a manual click) so it isn't retried.</summary>
     public void NoteBlocked(string ip)
     {
@@ -370,11 +486,11 @@ public sealed class PreventionService
         lock (_gate)
         {
             _blockedIps.Remove(normalized);
-            _attempted.Remove(normalized);
+            _skipUntil.Remove(normalized);
             if (!suppress)
                 return;
             // Leave a cooldown marker so a concurrent batch also skips this address.
-            _attempted[normalized] = DateTime.UtcNow;
+            _skipUntil[normalized] = DateTime.UtcNow.Add(RetryAfter);
             _suppressedUntil[normalized] = until;
         }
 

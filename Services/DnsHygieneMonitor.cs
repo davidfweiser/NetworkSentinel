@@ -502,7 +502,7 @@ public sealed class DnsHygieneMonitor : IDisposable
             Dictionary<string, List<string>> snapshot;
             lock (_gate)
                 snapshot = _domainNetworks.ToDictionary(kv => kv.Key, kv => kv.Value.ToList());
-            File.WriteAllText(StatePath, JsonSerializer.Serialize(snapshot));
+            AppPaths.WriteAtomic(StatePath, JsonSerializer.Serialize(snapshot));
         }
         catch
         {

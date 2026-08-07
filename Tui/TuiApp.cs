@@ -47,9 +47,11 @@ public sealed class TuiApp : IDisposable
         RestoreAllowlisted
     }
 
-    private readonly NetworkMonitorService _monitor = new();
-    private readonly FirewallService _firewall = new();
-    private readonly AllowlistService _allowlist = new();
+    /// <summary>Owns and wires the shared service graph (see <see cref="SentinelCore"/>).</summary>
+    private readonly SentinelCore _core = new();
+    private readonly NetworkMonitorService _monitor;
+    private readonly FirewallService _firewall;
+    private readonly AllowlistService _allowlist;
     private readonly AppSettings _settings;
 
     /// <summary>The one enforcement engine, shared with the GUI and web console.</summary>
@@ -66,45 +68,14 @@ public sealed class TuiApp : IDisposable
 
     public TuiApp()
     {
-        _settings = AppSettings.Load();
-        _prevention = new PreventionService(_firewall, _allowlist, _settings);
-        if (_prevention.MinLevel is not (ThreatLevel.Medium or ThreatLevel.High or ThreatLevel.Critical))
-            _prevention.MinLevel = ThreatLevel.High;
+        _settings = _core.Settings;
+        _monitor = _core.Monitor;
+        _firewall = _core.Firewall;
+        _allowlist = _core.Allowlist;
+        _prevention = _core.Prevention;
 
-        _firewall.Allowlist = _allowlist;
-        _firewall.AutoBlockExpiry = _settings.AutoBlockExpiryMinutes > 0
-            ? TimeSpan.FromMinutes(_settings.AutoBlockExpiryMinutes)
-            : null;
-        _firewall.StartExpirySweep();
-        _monitor.GeoLookupsEnabled = _settings.GeoLookupEnabled;
-        _monitor.AuthMonitoringEnabled = _settings.AuthLogMonitorEnabled;
-        _monitor.ProbeMonitoringEnabled = _settings.ProbeLogEnabled;
-        _monitor.ThreatIntelEnabled = _settings.ThreatIntelEnabled;
-        _monitor.ProcessReputationEnabled = _settings.ProcessReputationEnabled;
-        _monitor.NewListenerAlertsEnabled = _settings.NewListenerAlertsEnabled;
-        _monitor.ArpWatchEnabled = _settings.ArpWatchEnabled;
-        _monitor.PersistenceWatchEnabled = _settings.PersistenceWatchEnabled;
-        _monitor.ExfilMonitorEnabled = _settings.ExfilMonitorEnabled;
-        _monitor.ExfilThresholdMb = _settings.ExfilMbPer10Min;
-        _monitor.HoneypotPorts = HoneypotService.ParsePorts(_settings.HoneypotPorts);
-        _monitor.HoneypotEnabled = _settings.HoneypotEnabled;
-        _monitor.FlowEventsEnabled = _settings.FlowEventsEnabled;
-        _monitor.SuricataEvePath = _settings.SuricataEvePath;
-        _monitor.SuricataMaxSeverity = _settings.SuricataMaxSeverity;
-        _monitor.SuricataIgnoredSids = _settings.SuricataIgnoredSids;
-        _monitor.SuricataEnabled = _settings.SuricataEnabled;
-        _monitor.WireGuardPeerMbPer10Min = _settings.WireGuardPeerMbPer10Min;
-        _monitor.WireGuardMonitorEnabled = _settings.WireGuardMonitorEnabled;
-        _monitor.DnsApprovedResolvers = _settings.DnsApprovedResolvers;
-        _monitor.DnsHygieneEnabled = _settings.DnsHygieneEnabled;
-        _allowlist.ResolutionObserver = _monitor.AllowlistResolutionObserver;
-        _monitor.WebhookUrl = _settings.WebhookUrl;
-        _monitor.WebhookMinLevel = _settings.GetWebhookMinLevel();
-        _monitor.IsIpAllowlisted = ip => _allowlist.IsAllowed(ip, out _);
-        _monitor.PollIntervalMs = _settings.MonitorPollMs;
-        if (_settings.ProbeLogEnabled && _firewall.IsAdministrator)
-            _ = Task.Run(() => _firewall.EnableProbeLogging());
-        _allowlist.UseRemoteFeed = _settings.AllowlistUseRemoteFeed;
+        // Graph construction and cross-wiring live in SentinelCore; only the TUI's
+        // own event handlers belong here.
         _monitor.Updated += OnMonitorUpdated;
         _monitor.ThreatsDetected += OnThreatsDetected;
     }
@@ -573,6 +544,13 @@ public sealed class TuiApp : IDisposable
         }
 
         var result = _firewall.AuthorizeElevation();
+        if (result.Success)
+        {
+            // Windows elevates by relaunching, so the elevated work happens in the new
+            // process. Clearing the stand-down here only stops this instance reporting
+            // auto-block as paused while the operator moves to the elevated window.
+            _prevention.NoteElevationAuthorized();
+        }
         _statusMessage = result.Message;
     }
 
@@ -597,19 +575,52 @@ public sealed class TuiApp : IDisposable
             return;
         }
 
-        if (!Confirm($"Block {ip.Trim()} (inbound+outbound)?"))
+        // Same pre-flight the GUI and web console do, so all three frontends agree.
+        if (!FirewallService.TryNormalizeIp(ip, out var normalized, out var error))
+        {
+            _statusMessage = error;
+            return;
+        }
+
+        if (FirewallService.IsNeverBlockable(normalized))
+        {
+            _statusMessage = "Private/local addresses are not blocked (would break LAN).";
+            return;
+        }
+
+        // Auto-block never touches CGNAT; a manual block may, once confirmed.
+        if (GeoIpService.IsCarrierGradeNat(normalized) &&
+            !Confirm($"{normalized} is carrier-NAT (100.64.0.0/10) — blocking it cuts off that tunnel peer. Block it anyway?"))
         {
             _statusMessage = "Block cancelled.";
             return;
         }
 
-        var result = _firewall.BlockIp(ip.Trim(), ResolveDirection(), "TUI block");
+        var overrideAllowlist = false;
+        if (_allowlist.IsAllowed(normalized, out var allowReason))
+        {
+            if (!Confirm($"{normalized} is protected by the allowlist ({allowReason}). Block it anyway?"))
+            {
+                _statusMessage = $"Protected by allowlist — not blocked: {normalized} ({allowReason}).";
+                return;
+            }
+            overrideAllowlist = true;
+        }
+
+        if (!Confirm($"Block {normalized} ({ResolveDirection()})?"))
+        {
+            _statusMessage = "Block cancelled.";
+            return;
+        }
+
+        var result = _firewall.BlockIp(normalized, ResolveDirection(), "TUI block", overrideAllowlist);
         _statusMessage = result.Message;
         if (result.Success)
         {
-            var key = FirewallService.TryNormalizeIp(ip.Trim(), out var n, out _) ? n : ip.Trim();
-            _prevention.ClearSuppression(key);
-            _prevention.NoteBlocked(key);
+            // Blocking by hand is an explicit reversal of an earlier release —
+            // without this, a prior manual unblock kept suppressing auto-block.
+            _prevention.ClearSuppression(normalized);
+            _prevention.NoteBlocked(normalized);
             RefreshBlockedIps(force: true);
         }
     }
@@ -1408,6 +1419,6 @@ public sealed class TuiApp : IDisposable
     {
         _monitor.Updated -= OnMonitorUpdated;
         _monitor.ThreatsDetected -= OnThreatsDetected;
-        _monitor.Dispose();
+        _core.Dispose();
     }
 }

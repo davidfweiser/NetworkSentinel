@@ -10,7 +10,27 @@ Three ways to run it (same idea as the Linux build):
 | **Terminal UI (`--tui`)** | Server Core, RDP console, SSH-style workflows |
 | **Headless web UI (`-w`)** | Browser dashboard on a server (master-password protected) |
 
-> Awareness / monitoring tooling — not a full IDS/IPS replacement. Version **0.5.1**.
+> Awareness / monitoring tooling — not a full IDS/IPS replacement. Version **0.6.2**.
+
+---
+
+## What's new in 0.6.2
+
+Brings the Windows build level with the Linux 0.6.2 release — the prevention engine's safety rails, and the composition root behind them.
+
+| Area | What changed |
+|------|--------------|
+| **Never block yourself** | Two new auto-block gates: this machine's own interface addresses, and any current **WireGuard peer endpoint**. A detector that attributes a threat to the wrong end of a flow could previously firewall the host off from itself — most likely on a cloud VM, whose own address is public and so passes the "routable public address" gate. Manual blocking is deliberately unaffected. |
+| **Retry that fits the failure** | An address is claimed for 10 minutes once a batch acts on it, but a block that fails for a reason *other* than elevation now retries after **45 s** — one transient error used to leave an actively hammering host alone for ten minutes. Elevation failures instead pause auto-block globally for 5 minutes, since they are never per-address. Dry run no longer consumes an address's retry slot, so reviewing a batch in dry run and then switching blocking on no longer skips exactly the attackers you just reviewed. |
+| **Carrier-grade NAT** | 100.64/10 (Tailscale, many VPN tunnels) is out of auto-block, but can still be blocked **manually** behind a confirmation naming what it costs. Only LAN/loopback/link-local/multicast are refused outright — a hostile tunnel peer is a real case. |
+| **Web console** | First-visit password setup **from another machine** now requires a one-time setup code printed where the console runs. The console binds all interfaces before any password exists, so without it whoever reached the port first could claim the master password and with it firewall control. Setup from localhost is unchanged. Also adds `X-Frame-Options`/HSTS, and stops returning raw exception text to anonymous clients. |
+| **Durability** | Every JSON store is written via temp-sibling + rename, so a crash mid-write can no longer truncate a file that the loader would then treat as empty. The expiry ledger is reconciled with the firewall at startup: a rule deleted via wf.msc or Group Policy used to leave its entry behind forever, with the sweep retrying a delete every minute. |
+| **Connection identity** | The PID is no longer part of a connection's identity. It flips 0 → real once the owning process resolves, so every new connection changed identity one poll in — counted twice by the host stats and seen twice by the intrusion heuristics, effectively halving their rate thresholds. |
+| **`SentinelCore`** | The GUI, TUI and web console each built the monitor/firewall/allowlist/prevention graph with a copied wiring block, and the copies had drifted. One composition root now owns construction and disposal; the TUI and web console pick up the configured poll interval and allowlist disposal they were missing. |
+
+A test project (`Tests\NetworkSentinel.Tests`, 68 tests) and a CI workflow arrive with it.
+
+**Upgrading** is in place and non-destructive, as in 0.5.x. Re-run the installer and confirm the web header reads `v0.6.2`.
 
 ---
 
@@ -109,12 +129,14 @@ Gates, in order — a threat must clear all of them before a rule is written:
 |------|-----|
 | Severity ≥ minimum | The configured `Medium`/`High`/`Critical` threshold |
 | Not `New Remote Host` | First contact is not evidence of anything |
-| Routable public address | LAN and loopback are never auto-blocked |
+| Routable public address | LAN, loopback, CGNAT (100.64/10 — Tailscale and many VPN tunnels) and multicast are never auto-blocked. CGNAT can still be blocked **manually**, behind a confirmation — a hostile tunnel peer is a real case, and only LAN/loopback/link-local/multicast are refused outright |
 | Not allowlisted | Known-good stays reachable |
+| Not this machine | A detector that attributes a threat to the wrong end of a flow can never firewall the host off from itself — matters most on a cloud VM whose own address is public |
+| Not a WireGuard peer endpoint | A peer's public endpoint is where its tunnel packets come from; blocking it kills that client's VPN (peer data comes from WireGuard monitoring, so enable it on a VPN server) |
 | Not protected | See lockout protection below |
 | Not already blocked | No duplicate rules |
 | Not suppressed | An address you deliberately released stays released for 24 h |
-| Not retried too soon | A failed block backs off for 10 minutes |
+| Not retried too soon | An address is claimed for 10 minutes once a batch acts on it. A block that fails for a reason other than elevation (a timed-out `netsh`, a briefly locked rule store) retries after **45 s** instead — one transient error should not leave an active attacker alone for ten minutes. Elevation failures pause auto-block globally for 5 minutes |
 
 - **Dry run** (**Settings → Prevention and deep inspection → Auto-block dry run**, or `s` in the TUI) runs every gate and reports what it *would* have dropped, without writing a single rule. Blocking turns a false positive from noise into an outage, so a new detection source — a fresh Suricata ruleset especially — belongs here first. The console shows `Would block …` lines exactly where it would otherwise show `Auto-blocked …`.
 - **Lockout protection** — the address of whoever is signed into the web console is shielded from auto-block for a rolling 30 minutes. Prevention that firewalls the operator away from the box it protects has done more damage than the attack it stopped. Manual blocking is deliberately unaffected, and the shield lapses on its own once you stop working.
@@ -169,7 +191,7 @@ This reads WireGuard's own state (`wg show all dump`, via the `wg.exe` that Wire
 - Needs **Administrator**; `wg.exe` cannot read the WireGuard service's device state otherwise. Without it the setting explains why rather than failing quietly.
 - Per-peer transfer alerting is **off by default**: a VPN user streaming video legitimately moves gigabytes, so any threshold low enough to catch a slow leak would fire constantly on normal use.
 
-> Tunnel addresses are RFC1918, so auto-block will never act on a VPN client — by design, since blocking a tunnel IP would be both ineffective and confusing. Cutting off a peer belongs in WireGuard's own configuration (`wg set <iface> peer <key> remove`), not in a monitoring console acting behind your back.
+> Tunnel addresses are private-range (RFC1918 or CGNAT 100.64/10), so auto-block will never act on a VPN client's tunnel IP — by design, since blocking a tunnel IP would be both ineffective and confusing. A peer's **public endpoint** is protected too: while WireGuard monitoring is on, the prevention engine refuses to auto-block any current peer's endpoint address, so a peer alert (or any other detector tripping on peer traffic) cannot cut a client's tunnel dead. Cutting off a peer belongs in WireGuard's own configuration (`wg set <iface> peer <key> remove`), not in a monitoring console acting behind your back.
 
 ### DNS hygiene
 
@@ -206,6 +228,7 @@ Set **Settings → Webhook URL** to push Critical threats off the machine — th
 - **Auto-block** on/off with minimum severity (`Medium` / `High` / `Critical`)
 - Removing/unblocking a rule **suppresses auto-block for that IP for 24 h** (persisted), so removed rules stay gone across restarts
 - **Auto-block expiry** (1 h … 7 days, off by default) — an expired address stops counting as blocked immediately; the `netsh` rule itself is deleted by a background sweep, which needs the app to be running elevated. Manual blocks are always permanent
+- The expiry side-file is **reconciled with the firewall at startup**: a rule deleted outside the app (wf.msc, Group Policy, another administrator) would otherwise leave its expiry entry behind forever, and the sweep would retry a delete every minute for a rule that is already gone. Listing rules needs no elevation, so this never raises a UAC prompt at startup
 - Settings stored machine-wide in `%ProgramData%\NetworkSentinel\settings.json` — shared by the GUI, TUI, and the web service (which runs as SYSTEM); falls back to `%LocalAppData%` if ProgramData is not writable
 - **Run as Admin** when elevation is required
 
@@ -300,11 +323,11 @@ Self-contained by default — the server does **not** need the .NET SDK or a com
 
 ```powershell
 # Copy the .install.cmd to the server, then run it (UAC prompt if not elevated):
-.\NetworkSentinel-windows-server-x64-0.5.1.install.cmd
+.\NetworkSentinel-windows-server-x64-0.6.2.install.cmd
 # optional port:
-.\NetworkSentinel-windows-server-x64-0.5.1.install.cmd -Port 18765
+.\NetworkSentinel-windows-server-x64-0.6.2.install.cmd -Port 18765
 # unpack without installing:
-.\NetworkSentinel-windows-server-x64-0.5.1.install.cmd --extract-only
+.\NetworkSentinel-windows-server-x64-0.6.2.install.cmd --extract-only
 ```
 
 The one-file installer is a `.cmd`, not a `.ps1`: `cmd.exe` stops reading the script at `exit /b`, so the ZIP appended to it is never parsed. PowerShell tokenizes an entire `-File` script before running any of it, and the cost on appended binary is quadratic (16 MB ≈ 5½ minutes) before it fails to parse at all — so the shell-style "payload after exit" trick only works with a `cmd` entry point.
@@ -366,7 +389,7 @@ No URL ACL is reserved. That was an `HttpListener` requirement; Kestrel binds th
 
 #### Upgrades and uninstall
 
-Re-running the installer **upgrades in place**: it stops the running task, replaces the binaries, and restarts. `%ProgramData%\NetworkSentinel` is both the install folder and the data directory, so the installer removes **only the files the package ships** — the master password hash, settings, allowlist, logs, host history, threat log, `duckdns.json`, `tls\`, and `acme\` all survive. The web page header shows the running version (e.g. `v0.5.1`) — check it after an upgrade to confirm the new build is live.
+Re-running the installer **upgrades in place**: it stops the running task, replaces the binaries, and restarts. `%ProgramData%\NetworkSentinel` is both the install folder and the data directory, so the installer removes **only the files the package ships** — the master password hash, settings, allowlist, logs, host history, threat log, `duckdns.json`, `tls\`, and `acme\` all survive. The web page header shows the running version (e.g. `v0.6.2`) — check it after an upgrade to confirm the new build is live.
 
 Uninstall keeps that same data by default so a reinstall picks up where you left off:
 
@@ -475,6 +498,7 @@ The app starts **without** forcing UAC (so TUI/web work on servers). Desktop ins
 
 ### Web UI security
 - First browser visit **creates a master password** (min. 8 characters)
+- Creating it from **another machine** additionally asks for a one-time **setup code**, printed where the console runs (the terminal, or the service log when it runs as a scheduled task). Without this, whoever reached the port first — the console binds all interfaces before any password exists — could claim the master password and with it firewall control. Setup from localhost needs no code
 - Later visits require that password; change it under **Settings → Master password**
 - Can't reach a browser yet (e.g. still opening the port in a cloud firewall), or lost the password? Set/reset it from the terminal instead — see below
 - Hash stored as PBKDF2-SHA256 (random salt, 200k iterations) in `%ProgramData%\NetworkSentinel\web-master.json` — never plain text

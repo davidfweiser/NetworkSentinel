@@ -1,0 +1,31 @@
+name: CI
+
+on:
+  push:
+    # The Windows line lives on `windows`; `main` on this remote is the Linux product.
+    branches: [windows]
+  pull_request:
+  # Lets the suite be run by hand from the Actions tab — useful when a push came
+  # from an integration token, which does not itself start a workflow run.
+  workflow_dispatch:
+
+# Build and test need nothing but the source.
+permissions:
+  contents: read
+
+jobs:
+  build-and-test:
+    # WPF: net8.0-windows will not build on a Linux runner.
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 8.0.x
+
+      - name: Build app
+        run: dotnet build NetworkSentinel.csproj -c Release
+
+      - name: Run tests
+        run: dotnet test Tests/NetworkSentinel.Tests -c Release
