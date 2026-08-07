@@ -80,6 +80,16 @@ public sealed class NetworkMonitorService : IDisposable
 
         Stats.ThreatsToday = _threatsTodayCount;
         Stats.HighThreats = _highThreatCount;
+
+        // Wired once for the life of the service, not inside Start(): the enabled-flag
+        // setters call the sources' Start() directly for runtime toggles, and wiring
+        // only from Start() left a feature switched on mid-session running with no
+        // event handler attached — flow events went to nobody, and DNS hygiene
+        // couldn't tell tunnel-client queries from the host's own.
+        _flowEvents.FlowCreated += OnFlowCreated;
+        // Peer allowed-IPs tell the DNS monitor whether a query came from a tunnel
+        // client, which is what separates a client leak from this host's own traffic.
+        _dns.IsVpnClientAddress = IsWireGuardClientAddress;
     }
 
     /// <summary>Enables/disables the external geo-IP web lookup (reverse DNS still runs).</summary>
@@ -459,18 +469,8 @@ public sealed class NetworkMonitorService : IDisposable
         if (_honeypotEnabled) _honeypot.Start(_honeypotPorts);
         if (_suricataEnabled) _suricata.Start();
         if (_wireGuardEnabled) _wireGuard.Start();
-        if (_dnsHygieneEnabled)
-        {
-            // Peer allowed-IPs tell the DNS monitor whether a query came from a tunnel
-            // client, which is what separates a client leak from this host's own traffic.
-            _dns.IsVpnClientAddress = IsWireGuardClientAddress;
-            _dns.Start();
-        }
-        if (_flowEventsEnabled)
-        {
-            _flowEvents.FlowCreated += OnFlowCreated;
-            _flowEvents.Start();
-        }
+        if (_dnsHygieneEnabled) _dns.Start();
+        if (_flowEventsEnabled) _flowEvents.Start();
         _loop = Task.Run(() => RunAsync(_cts.Token));
     }
 
@@ -492,7 +492,6 @@ public sealed class NetworkMonitorService : IDisposable
         _suricata.Stop();
         _wireGuard.Stop();
         _dns.Stop();
-        _flowEvents.FlowCreated -= OnFlowCreated;
         _flowEvents.Stop();
         _history.Save();
         Stats.IsMonitoring = false;
@@ -511,6 +510,30 @@ public sealed class NetworkMonitorService : IDisposable
     /// event is worth waking for. Swapped wholesale, never mutated in place.
     /// </summary>
     private volatile HashSet<int> _liveListeningPorts = new();
+
+    /// <summary>
+    /// True when the address is a current WireGuard peer's public endpoint — the address
+    /// its encrypted tunnel packets arrive from. Blocking an endpoint kills that client's
+    /// VPN, so the prevention engine consults this before auto-blocking: WireGuard's own
+    /// alerts carry the endpoint as the threat source (for geo enrichment), and any other
+    /// detector can flag the same address when a peer's traffic trips a heuristic.
+    /// Only meaningful while WireGuard monitoring is enabled; with no peer data it simply
+    /// never matches.
+    /// </summary>
+    public bool IsWireGuardPeerEndpoint(string ip)
+    {
+        if (string.IsNullOrEmpty(ip) || !FirewallService.TryNormalizeIp(ip, out var normalized, out _))
+            return false;
+
+        foreach (var peer in _wireGuard.Peers)
+        {
+            if (string.IsNullOrEmpty(peer.EndpointIp)) continue;
+            if (FirewallService.TryNormalizeIp(peer.EndpointIp, out var endpoint, out _) &&
+                string.Equals(endpoint, normalized, StringComparison.OrdinalIgnoreCase))
+                return true;
+        }
+        return false;
+    }
 
     /// <summary>
     /// True when the address falls inside some WireGuard peer's AllowedIPs — i.e. the
@@ -706,7 +729,14 @@ public sealed class NetworkMonitorService : IDisposable
                 if (_connections.TryGetValue(polled.Key, out var existing))
                 {
                     existing.LastSeen = now;
-                    existing.ProcessName = polled.ProcessName;
+                    existing.State = polled.State;
+                    // Only upgrade process identity — a transient lookup miss
+                    // (pid 0) must not downgrade an already-resolved name to unknown.
+                    if (polled.ProcessId != 0 || existing.ProcessId == 0)
+                    {
+                        existing.ProcessId = polled.ProcessId;
+                        existing.ProcessName = polled.ProcessName;
+                    }
                     tracked = existing;
                     isNewConnection = false;
                 }
@@ -1147,6 +1177,7 @@ public sealed class NetworkMonitorService : IDisposable
     public void Dispose()
     {
         Stop();
+        _flowEvents.FlowCreated -= OnFlowCreated;
         _authLog.Dispose();
         _probeLog.Dispose();
         _arpWatch.Dispose();

@@ -12,9 +12,11 @@ namespace NetworkSentinel.ViewModels;
 
 public partial class MainViewModel : ObservableObject, IDisposable
 {
-    private readonly NetworkMonitorService _monitor = new();
-    private readonly FirewallService _firewall = new();
-    private readonly AllowlistService _allowlist = new();
+    /// <summary>Owns and wires the shared service graph (see <see cref="SentinelCore"/>).</summary>
+    private readonly SentinelCore _core = new();
+    private readonly NetworkMonitorService _monitor;
+    private readonly FirewallService _firewall;
+    private readonly AllowlistService _allowlist;
     private readonly DesktopNotifier _notifier = new();
     private readonly DuckDnsUpdater _duckDns = new();
     private readonly AppSettings _settings;
@@ -165,19 +167,21 @@ public partial class MainViewModel : ObservableObject, IDisposable
 
     public MainViewModel()
     {
-        _settings = AppSettings.Load();
+        _settings = _core.Settings;
+        _monitor = _core.Monitor;
+        _firewall = _core.Firewall;
+        _allowlist = _core.Allowlist;
+        _prevention = _core.Prevention;
         _autoBlockEnabled = _settings.AutoBlockEnabled;
         _autoBlockMinLevel = _settings.AutoBlockMinLevel;
         if (!AutoBlockLevelOptions.Contains(_autoBlockMinLevel))
             _autoBlockMinLevel = nameof(ThreatLevel.High);
+        // The list may have corrected an out-of-range persisted value; the engine
+        // must enforce what the UI shows, not what was on disk.
+        _prevention.MinLevel = ParseMinLevel(_autoBlockMinLevel);
         _blockInbound = _settings.AutoBlockInbound;
         _blockOutbound = _settings.AutoBlockOutbound;
         _preventionDryRun = _settings.PreventionDryRun;
-
-        _prevention = new PreventionService(_firewall, _allowlist, _settings)
-        {
-            MinLevel = ParseMinLevel(_autoBlockMinLevel)
-        };
 
         // Assign backing fields, not properties: the generated setters would fire the
         // OnXChanged handlers below and re-save settings (or re-elevate) during startup.
@@ -221,38 +225,8 @@ public partial class MainViewModel : ObservableObject, IDisposable
             _duckDns.Start();
         _remoteAccessStatus = BuildRemoteAccessStatus();
 
-        _firewall.Allowlist = _allowlist;
-        _firewall.AutoBlockExpiry = ExpiryMinutesToSpan(_settings.AutoBlockExpiryMinutes);
-        _firewall.StartExpirySweep();
-        _monitor.GeoLookupsEnabled = _settings.GeoLookupEnabled;
-        _monitor.AuthMonitoringEnabled = _settings.AuthLogMonitorEnabled;
-        _monitor.ProbeMonitoringEnabled = _settings.ProbeLogEnabled;
-        _monitor.PollIntervalMs = _settings.MonitorPollMs;
-        _monitor.ThreatIntelEnabled = _settings.ThreatIntelEnabled;
-        _monitor.ProcessReputationEnabled = _settings.ProcessReputationEnabled;
-        _monitor.NewListenerAlertsEnabled = _settings.NewListenerAlertsEnabled;
-        _monitor.ArpWatchEnabled = _settings.ArpWatchEnabled;
-        _monitor.PersistenceWatchEnabled = _settings.PersistenceWatchEnabled;
-        _monitor.ExfilMonitorEnabled = _settings.ExfilMonitorEnabled;
-        _monitor.ExfilThresholdMb = _settings.ExfilMbPer10Min;
-        _monitor.HoneypotPorts = HoneypotService.ParsePorts(_settings.HoneypotPorts);
-        _monitor.HoneypotEnabled = _settings.HoneypotEnabled;
-        _monitor.FlowEventsEnabled = _settings.FlowEventsEnabled;
-        _monitor.SuricataEvePath = _settings.SuricataEvePath;
-        _monitor.SuricataMaxSeverity = _settings.SuricataMaxSeverity;
-        _monitor.SuricataIgnoredSids = _settings.SuricataIgnoredSids;
-        _monitor.SuricataEnabled = _settings.SuricataEnabled;
-        _monitor.WireGuardPeerMbPer10Min = _settings.WireGuardPeerMbPer10Min;
-        _monitor.WireGuardMonitorEnabled = _settings.WireGuardMonitorEnabled;
-        _monitor.DnsApprovedResolvers = _settings.DnsApprovedResolvers;
-        _monitor.DnsHygieneEnabled = _settings.DnsHygieneEnabled;
-        _allowlist.ResolutionObserver = _monitor.AllowlistResolutionObserver;
-        _monitor.WebhookUrl = _settings.WebhookUrl;
-        _monitor.WebhookMinLevel = _settings.GetWebhookMinLevel();
-        _monitor.IsIpAllowlisted = ip => _allowlist.IsAllowed(ip, out _);
-        if (_settings.ProbeLogEnabled && _firewall.IsAdministrator)
-            _ = Task.Run(() => _firewall.EnableProbeLogging());
-        _allowlist.UseRemoteFeed = _settings.AllowlistUseRemoteFeed;
+        // Graph construction and cross-wiring live in SentinelCore; only the GUI's
+        // own event handlers and presentation wiring belong here.
         _monitor.Updated += OnMonitorUpdated;
         _monitor.ThreatsDetected += OnThreatsDetected;
         _monitor.Start();
@@ -1316,28 +1290,28 @@ public partial class MainViewModel : ObservableObject, IDisposable
     }
 
     [RelayCommand]
-    private void BlockHost(RemoteHost? host)
+    private async Task BlockHost(RemoteHost? host)
     {
         if (host == null) return;
-        BlockIpInternal(host.IpAddress, $"Remote host block · {host.GeoSummary}");
+        await BlockIpInternal(host.IpAddress, $"Remote host block · {host.GeoSummary}");
     }
 
     [RelayCommand]
-    private void UnblockHost(RemoteHost? host)
+    private async Task UnblockHost(RemoteHost? host)
     {
         if (host == null) return;
-        UnblockIpInternal(host.IpAddress);
+        await UnblockIpInternal(host.IpAddress);
     }
 
     [RelayCommand]
-    private void BlockThreatIp(ThreatEvent? threat)
+    private async Task BlockThreatIp(ThreatEvent? threat)
     {
         if (threat == null) return;
-        BlockIpInternal(threat.SourceIp, $"Threat block · {threat.TypeText}: {threat.Title}");
+        await BlockIpInternal(threat.SourceIp, $"Threat block · {threat.TypeText}: {threat.Title}");
     }
 
     [RelayCommand]
-    private void BlockConnectionIp(NetworkConnection? connection)
+    private async Task BlockConnectionIp(NetworkConnection? connection)
     {
         if (connection == null) return;
         if (string.IsNullOrWhiteSpace(connection.RemoteAddress) ||
@@ -1347,11 +1321,11 @@ public partial class MainViewModel : ObservableObject, IDisposable
             return;
         }
 
-        BlockIpInternal(connection.RemoteAddress, $"Session block · {connection.ProcessName} {connection.DisplayRemote}");
+        await BlockIpInternal(connection.RemoteAddress, $"Session block · {connection.ProcessName} {connection.DisplayRemote}");
     }
 
     [RelayCommand]
-    private void BlockSelectedPort(ListeningPort? port)
+    private async Task BlockSelectedPort(ListeningPort? port)
     {
         if (port == null) return;
 
@@ -1371,11 +1345,13 @@ public partial class MainViewModel : ObservableObject, IDisposable
 
         if (answer != MessageBoxResult.Yes) return;
 
-        var result = _firewall.BlockPort(
+        // Off the UI thread: firewall calls shell out to netsh, which can take
+        // seconds against a large rule set and would otherwise freeze the window.
+        var result = await Task.Run(() => _firewall.BlockPort(
             port.Port,
             port.Protocol,
             FirewallDirection.Inbound,
-            $"Port block · {port.ServiceHint} · {port.ProcessName}");
+            $"Port block · {port.ServiceHint} · {port.ProcessName}"));
 
         FirewallMessage = result.Message;
         if (!result.Success)
@@ -1387,7 +1363,7 @@ public partial class MainViewModel : ObservableObject, IDisposable
     }
 
     [RelayCommand]
-    private void BlockManualIp()
+    private async Task BlockManualIp()
     {
         if (string.IsNullOrWhiteSpace(ManualBlockIp))
         {
@@ -1395,12 +1371,12 @@ public partial class MainViewModel : ObservableObject, IDisposable
             return;
         }
 
-        if (BlockIpInternal(ManualBlockIp.Trim(), "Manual block from Firewall tab"))
+        if (await BlockIpInternal(ManualBlockIp.Trim(), "Manual block from Firewall tab"))
             ManualBlockIp = "";
     }
 
     [RelayCommand]
-    private void UnblockManualIp()
+    private async Task UnblockManualIp()
     {
         if (string.IsNullOrWhiteSpace(ManualBlockIp))
         {
@@ -1408,11 +1384,11 @@ public partial class MainViewModel : ObservableObject, IDisposable
             return;
         }
 
-        UnblockIpInternal(ManualBlockIp.Trim());
+        await UnblockIpInternal(ManualBlockIp.Trim());
     }
 
     [RelayCommand]
-    private void BlockManualPort()
+    private async Task BlockManualPort()
     {
         if (!int.TryParse(ManualBlockPort, out var port))
         {
@@ -1427,7 +1403,8 @@ public partial class MainViewModel : ObservableObject, IDisposable
         }
 
         var direction = ResolveDirection();
-        var result = _firewall.BlockPort(port, ManualBlockProtocol, direction, "Manual port block from Firewall tab");
+        var result = await Task.Run(() =>
+            _firewall.BlockPort(port, ManualBlockProtocol, direction, "Manual port block from Firewall tab"));
         FirewallMessage = result.Message;
         if (!result.Success)
             MessageBox.Show(result.Message, "Firewall", MessageBoxButton.OK, MessageBoxImage.Warning);
@@ -1435,7 +1412,7 @@ public partial class MainViewModel : ObservableObject, IDisposable
     }
 
     [RelayCommand]
-    private void RemoveSelectedRule(FirewallRuleInfo? rule = null)
+    private async Task RemoveSelectedRule(FirewallRuleInfo? rule = null)
     {
         rule ??= SelectedFirewallRule;
         if (rule == null)
@@ -1458,7 +1435,7 @@ public partial class MainViewModel : ObservableObject, IDisposable
             MessageBoxImage.Question);
         if (answer != MessageBoxResult.Yes) return;
 
-        var result = _firewall.RemoveRule(name);
+        var result = await Task.Run(() => _firewall.RemoveRule(name));
         FirewallMessage = result.Message;
         if (result.Success)
         {
@@ -1472,7 +1449,7 @@ public partial class MainViewModel : ObservableObject, IDisposable
     }
 
     [RelayCommand]
-    private void RemoveAllManagedRules()
+    private async Task RemoveAllManagedRules()
     {
         if (!IsAdmin)
         {
@@ -1487,7 +1464,7 @@ public partial class MainViewModel : ObservableObject, IDisposable
             MessageBoxImage.Warning);
         if (answer != MessageBoxResult.Yes) return;
 
-        var result = _firewall.RemoveAllManagedRules();
+        var result = await Task.Run(() => _firewall.RemoveAllManagedRules());
         FirewallMessage = result.Message;
         RefreshFirewallRules();
         RefreshCollections();
@@ -1503,7 +1480,7 @@ public partial class MainViewModel : ObservableObject, IDisposable
             SyncAllowlistUi();
             if (IsAdmin)
             {
-                var restored = _firewall.UnblockAllowlistedAddresses();
+                var restored = await Task.Run(() => _firewall.UnblockAllowlistedAddresses());
                 FirewallMessage = restored.Message;
                 RefreshFirewallRules();
                 RefreshCollections();
@@ -1516,7 +1493,7 @@ public partial class MainViewModel : ObservableObject, IDisposable
     }
 
     [RelayCommand]
-    private void AddAllowlistEntry()
+    private async Task AddAllowlistEntry()
     {
         var input = AllowlistInput.Trim();
         if (string.IsNullOrWhiteSpace(input))
@@ -1540,7 +1517,7 @@ public partial class MainViewModel : ObservableObject, IDisposable
             SyncAllowlistUi();
             if (IsAdmin)
             {
-                var restored = _firewall.UnblockAllowlistedAddresses();
+                var restored = await Task.Run(() => _firewall.UnblockAllowlistedAddresses());
                 if (restored.Success)
                     FirewallMessage = message + " · " + restored.Message;
                 RefreshFirewallRules();
@@ -1583,7 +1560,7 @@ public partial class MainViewModel : ObservableObject, IDisposable
     }
 
     [RelayCommand]
-    private void RestoreAllowlisted()
+    private async Task RestoreAllowlisted()
     {
         if (!IsAdmin)
         {
@@ -1591,7 +1568,7 @@ public partial class MainViewModel : ObservableObject, IDisposable
             return;
         }
 
-        var result = _firewall.UnblockAllowlistedAddresses();
+        var result = await Task.Run(() => _firewall.UnblockAllowlistedAddresses());
         FirewallMessage = result.Message;
         MessageBox.Show(result.Message, "Restore allowlisted", MessageBoxButton.OK,
             result.Success ? MessageBoxImage.Information : MessageBoxImage.Warning);
@@ -1618,7 +1595,7 @@ public partial class MainViewModel : ObservableObject, IDisposable
         }
     }
 
-    private bool BlockIpInternal(string ip, string reason)
+    private async Task<bool> BlockIpInternal(string ip, string reason)
     {
         if (!IsAdmin)
         {
@@ -1633,11 +1610,28 @@ public partial class MainViewModel : ObservableObject, IDisposable
             return false;
         }
 
-        if (FirewallService.IsPrivateOrLocal(normalized))
+        if (FirewallService.IsNeverBlockable(normalized))
         {
             FirewallMessage = "Private/local addresses are not blocked by default (would break LAN).";
             MessageBox.Show(FirewallMessage, "Block IP", MessageBoxButton.OK, MessageBoxImage.Information);
             return false;
+        }
+
+        // Auto-block never touches CGNAT, but the operator can — after being told what
+        // it costs, because this is where a VPN client's own tunnel gets cut.
+        if (GeoIpService.IsCarrierGradeNat(normalized))
+        {
+            var proceed = MessageBox.Show(
+                $"{normalized} is in the carrier-NAT range (100.64.0.0/10) used by Tailscale and VPN tunnels.\n\n" +
+                "Blocking it will cut off that tunnel peer. Block it anyway?",
+                "Block IP",
+                MessageBoxButton.YesNo,
+                MessageBoxImage.Warning);
+            if (proceed != MessageBoxResult.Yes)
+            {
+                FirewallMessage = "Block cancelled.";
+                return false;
+            }
         }
 
         // Allowlisted IPs get a confirmed manual override instead of a hard
@@ -1670,7 +1664,7 @@ public partial class MainViewModel : ObservableObject, IDisposable
 
         if (answer != MessageBoxResult.Yes) return false;
 
-        var result = _firewall.BlockIp(normalized, direction, reason, overrideAllowlist);
+        var result = await Task.Run(() => _firewall.BlockIp(normalized, direction, reason, overrideAllowlist));
         FirewallMessage = result.Message;
         if (!result.Success)
             MessageBox.Show(result.Message, "Firewall", MessageBoxButton.OK, MessageBoxImage.Warning);
@@ -1686,7 +1680,7 @@ public partial class MainViewModel : ObservableObject, IDisposable
         return result.Success;
     }
 
-    private void UnblockIpInternal(string ip)
+    private async Task UnblockIpInternal(string ip)
     {
         if (!IsAdmin)
         {
@@ -1694,7 +1688,7 @@ public partial class MainViewModel : ObservableObject, IDisposable
             return;
         }
 
-        var result = _firewall.UnblockIp(ip);
+        var result = await Task.Run(() => _firewall.UnblockIp(ip));
         if (result.Success && FirewallService.TryNormalizeIp(ip, out var normalized, out _))
             _prevention.NoteUnblocked(normalized);
         FirewallMessage = result.Message;
@@ -1749,7 +1743,6 @@ public partial class MainViewModel : ObservableObject, IDisposable
         _monitor.ThreatsDetected -= OnThreatsDetected;
         PersistSettings();
         _duckDns.Dispose();
-        _allowlist.Dispose();
-        _monitor.Dispose();
+        _core.Dispose();
     }
 }

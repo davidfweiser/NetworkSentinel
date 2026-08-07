@@ -88,7 +88,9 @@ public sealed class FirewallService
         if (!TryNormalizeIp(ip, out var normalized, out var error))
             return FirewallOperationResult.Fail(error);
 
-        if (IsPrivateOrLocal(normalized))
+        // Auto-block screens CGNAT out one gate earlier, so anything reaching here in
+        // that range is a deliberate manual block.
+        if (IsNeverBlockable(normalized))
             return FirewallOperationResult.Fail("Refusing to block private/local addresses (LAN, loopback, link-local).");
 
         // overrideAllowlist is only set from an explicit, confirmed user action —
@@ -818,12 +820,35 @@ public sealed class FirewallService
             return false;
         }
 
+        // ::ffff:a.b.c.d is how dual-stack sockets report IPv4 peers — rules and
+        // bookkeeping should use the IPv4 form so both spellings mean one address.
+        if (address.IsIPv4MappedToIPv6)
+            address = address.MapToIPv4();
+
+        // Drop any IPv6 zone id (fe80::1%eth0 parses fine but netsh rejects it in a
+        // rule, and two zone spellings of one address must compare equal).
+        if (address.AddressFamily == System.Net.Sockets.AddressFamily.InterNetworkV6 && address.ScopeId != 0)
+            address = new IPAddress(address.GetAddressBytes());
+
         normalized = address.ToString();
         return true;
     }
 
     public static bool IsPrivateOrLocal(string ip)
         => GeoIpService.IsNonPublic(ip);
+
+    /// <summary>
+    /// Addresses no rule may ever target, because dropping them breaks the machine's
+    /// own connectivity: LAN, loopback, link-local, multicast/broadcast.
+    ///
+    /// Narrower than <see cref="IsPrivateOrLocal"/>, which also covers CGNAT and is
+    /// the right gate for <em>automatic</em> blocking. Blocking a tunnel peer is a
+    /// bad default, not an impossible request — a hostile tailnet peer brute-forcing
+    /// SSH is a real case, and refusing it in the manual path too left the operator
+    /// with no way to stop the attack from inside the app.
+    /// </summary>
+    public static bool IsNeverBlockable(string ip)
+        => GeoIpService.IsNonPublic(ip) && !GeoIpService.IsCarrierGradeNat(ip);
 
     // ── Block expiry ─────────────────────────────────────────────────────
 
@@ -839,8 +864,62 @@ public sealed class FirewallService
     /// </summary>
     public void StartExpirySweep()
     {
+        if (_expiryTimer == null)
+        {
+            // One-time startup pass, off the caller's thread: rules deleted outside the
+            // app leave their expiry entries behind, so prune before the first sweep.
+            _ = Task.Run(() => ReconcileLedgerWithKernel());
+        }
         _expiryTimer ??= new Timer(_ => TrySweepExpired(), null,
             TimeSpan.FromMinutes(1), TimeSpan.FromMinutes(1));
+    }
+
+    /// <summary>
+    /// Drops expiry-ledger entries whose firewall rule no longer exists.
+    ///
+    /// This build keeps no ledger of blocked addresses — <see cref="GetManagedRules"/>
+    /// reads them straight from the Windows Firewall, which persists rules across
+    /// reboots, so the blocked set cannot drift the way a POSIX rule ledger does. What
+    /// does drift is the expiry side-file: a rule removed outside the app (wf.msc,
+    /// Group Policy, "Restore defaults", another administrator) leaves its expiry entry
+    /// behind forever, and <see cref="TrySweepExpired"/> then retries a delete every
+    /// minute for a rule that is already gone.
+    ///
+    /// Listing rules needs no elevation, so this is safe to run at startup — unlike the
+    /// sweep itself, it can never put a UAC prompt in the user's face. Nothing is
+    /// written unless something is actually stale.
+    /// </summary>
+    public FirewallOperationResult ReconcileLedgerWithKernel()
+    {
+        try
+        {
+            var tracked = ExpiryLedger.TrackedNames();
+            if (tracked.Count == 0)
+                return FirewallOperationResult.Ok("Expiry ledger empty — nothing to reconcile.");
+
+            // Listed directly rather than through GetManagedRules(): that returns an
+            // empty list both when there are no managed rules and when netsh failed,
+            // and pruning on a failed listing would discard every live expiry.
+            var listing = RunNetsh("advfirewall firewall show rule name=all");
+            if (!listing.Success || string.IsNullOrWhiteSpace(listing.Message))
+                return FirewallOperationResult.Fail("Could not list firewall rules — reconciliation skipped.");
+
+            // Rule names carry an -In/-Out suffix, so no managed name is a prefix of
+            // another and a plain containment test against the dump is exact enough.
+            var stale = tracked
+                .Where(name => !listing.Message.Contains(name, StringComparison.OrdinalIgnoreCase))
+                .ToList();
+            if (stale.Count == 0)
+                return FirewallOperationResult.Ok("Expiry ledger matches the firewall rules.");
+
+            ExpiryLedger.RemoveMany(stale);
+            return FirewallOperationResult.Ok(
+                $"Dropped {stale.Count} expiry entr{(stale.Count == 1 ? "y" : "ies")} with no matching firewall rule.");
+        }
+        catch (Exception ex)
+        {
+            return FirewallOperationResult.Fail($"Reconcile failed: {ex.Message}");
+        }
     }
 
     private void TrySweepExpired()
@@ -903,6 +982,29 @@ public sealed class FirewallService
 
         public static void Remove(string ruleName) => Set(ruleName, null);
 
+        /// <summary>Every rule name currently carrying an expiry.</summary>
+        public static List<string> TrackedNames()
+        {
+            lock (Gate) return Load().Keys.ToList();
+        }
+
+        /// <summary>
+        /// Drops several entries in one read-modify-write. Re-reads inside the lock and
+        /// removes only the named entries, so a rule blocked while the caller was
+        /// listing the firewall is not erased by writing back a pre-listing snapshot.
+        /// </summary>
+        public static void RemoveMany(IEnumerable<string> ruleNames)
+        {
+            lock (Gate)
+            {
+                var map = Load();
+                var changed = false;
+                foreach (var name in ruleNames)
+                    changed |= map.Remove(name);
+                if (changed) Save(map);
+            }
+        }
+
         public static List<string> ExpiredNames()
         {
             lock (Gate)
@@ -937,7 +1039,7 @@ public sealed class FirewallService
         {
             try
             {
-                File.WriteAllText(LedgerPath, JsonSerializer.Serialize(map));
+                AppPaths.WriteAtomic(LedgerPath, JsonSerializer.Serialize(map));
             }
             catch
             {
