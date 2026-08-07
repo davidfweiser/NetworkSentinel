@@ -271,6 +271,9 @@ public sealed class RemoteHost : INotifyPropertyChanged
 public sealed class ThreatEvent : INotifyPropertyChanged
 {
     private string _origin = "";
+    private string _blockStatus = "";
+    private string _blockStatusDetail = "";
+    private bool _isSourceBlocked;
 
     public DateTime Timestamp { get; init; } = DateTime.Now;
     public ThreatType Type { get; init; }
@@ -285,6 +288,41 @@ public sealed class ThreatEvent : INotifyPropertyChanged
     {
         get => _origin;
         set { if (_origin != value) { _origin = value; OnPropertyChanged(); } }
+    }
+
+    /// <summary>
+    /// Short "is this address being blocked?" verdict for the threat tables ("Blocked",
+    /// "No", "Dry run", "Failed"); empty when the threat names no blockable address.
+    /// Patched in by the frontends from the prevention engine, the same way
+    /// <see cref="Origin"/> is patched in by the geo lookups — a threat event is a record
+    /// of what was seen, and enforcement state moves underneath it.
+    /// </summary>
+    public string BlockStatus
+    {
+        get => _blockStatus;
+        private set { if (_blockStatus != value) { _blockStatus = value; OnPropertyChanged(); } }
+    }
+
+    /// <summary>The full sentence behind <see cref="BlockStatus"/>, shown as a tooltip.</summary>
+    public string BlockStatusDetail
+    {
+        get => _blockStatusDetail;
+        private set { if (_blockStatusDetail != value) { _blockStatusDetail = value; OnPropertyChanged(); } }
+    }
+
+    /// <summary>True when the source address is actually being dropped right now.</summary>
+    public bool IsSourceBlocked
+    {
+        get => _isSourceBlocked;
+        private set { if (_isSourceBlocked != value) { _isSourceBlocked = value; OnPropertyChanged(); } }
+    }
+
+    /// <summary>Applies one enforcement verdict; pass empty/false when there is nothing to say.</summary>
+    public void SetBlockStatus(string status, string detail, bool blocked)
+    {
+        BlockStatus = status;
+        BlockStatusDetail = detail;
+        IsSourceBlocked = blocked;
     }
 
     public event PropertyChangedEventHandler? PropertyChanged;

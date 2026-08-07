@@ -342,10 +342,19 @@ public partial class MainViewModel : ObservableObject, IDisposable
         foreach (var host in _monitor.RemoteHosts)
             host.IsBlocked = _prevention.IsBlocked(host.IpAddress);
 
+        // Only the rows about to be shown: the engine is cheap to ask, but the backlog
+        // behind the filter can be 500 events deep.
+        var visibleThreats = FilterThreats(_monitor.Threats).ToList();
+        foreach (var threat in visibleThreats)
+        {
+            var status = _prevention.DescribeEnforcement(threat);
+            threat.SetBlockStatus(status?.ShortText ?? "", status?.Text ?? "", status?.IsBlocked ?? false);
+        }
+
         Sync(Connections, FilterConnections(_monitor.Connections));
         Sync(ListeningPorts, _monitor.ListeningPorts);
         Sync(RemoteHosts, FilterHosts(_monitor.RemoteHosts));
-        Sync(Threats, FilterThreats(_monitor.Threats));
+        Sync(Threats, visibleThreats);
 
         var activity = _monitor.Activity;
         ActivitySeries.Clear();

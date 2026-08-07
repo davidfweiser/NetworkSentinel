@@ -1525,6 +1525,7 @@ public sealed class WebApp : IDisposable
                     origin = t.Origin,
                     method = t.Method,
                     blockStatus = status?.Text,
+                    blockShort = status?.ShortText,
                     blocked = status?.IsBlocked
                 };
             }),
@@ -2007,6 +2008,8 @@ public sealed class WebApp : IDisposable
   .lvl-high { background: rgba(250,115,64,.18); color: var(--sev-high); }
   .lvl-critical { background: rgba(242,64,89,.35); color: #fff; }
   .blocked { color: var(--danger); font-weight: 600; }
+  /* A block that failed or was only simulated — not stopped, and worth a look. */
+  .warn { color: var(--amber); font-weight: 600; }
   .ok { color: var(--success); }
   .muted { color: var(--muted); }
   .empty { padding: 28px; text-align: center; color: var(--muted); }
@@ -2322,6 +2325,13 @@ public sealed class WebApp : IDisposable
     return `<span class="badge ${lvlClass(level)}">${esc(level)}</span>`;
   }
 
+  // Blocked cell in the threats table: red for a dropped address, amber for a verdict
+  // that wants attention (failed rule, dry run), muted for one deliberately left alone.
+  function blockCellClass(t) {
+    if (t.blocked) return 'blocked';
+    return (t.blockShort === 'Failed' || t.blockShort === 'Dry run') ? 'warn' : 'muted';
+  }
+
   function matchFilter(q, ...parts) {
     if (!q) return true;
     const s = parts.join(' ').toLowerCase();
@@ -2634,7 +2644,7 @@ public sealed class WebApp : IDisposable
 
     const threats = state.threats || [];
     $('dash-threats').innerHTML = table(
-      ['Time', 'Level', 'Type', 'Source', 'Title', 'Origin'],
+      ['Time', 'Level', 'Type', 'Source', 'Title', 'Origin', 'Blocked'],
       threats.slice(0, 12).map(t => `<tr>
         <td class="mono">${esc(t.time)}</td>
         <td>${badge(t.level)}</td>
@@ -2642,6 +2652,7 @@ public sealed class WebApp : IDisposable
         <td class="mono">${esc(t.sourceIp)}</td>
         <td>${esc(t.title)}</td>
         <td class="muted">${esc(t.origin)}</td>
+        <td class="${blockCellClass(t)}" title="${esc(t.blockStatus || '')}">${esc(t.blockShort || '·')}</td>
       </tr>`).join('')
     );
 
@@ -2685,7 +2696,7 @@ public sealed class WebApp : IDisposable
 
     const tq = $('filterThreats').value.trim();
     $('tbl-threats').innerHTML = table(
-      ['Time', 'Level', 'Type', 'Source', 'Title', 'Detail', 'Origin', ''],
+      ['Time', 'Level', 'Type', 'Source', 'Title', 'Detail', 'Origin', 'Blocked', ''],
       (state.threats || []).filter(t => matchFilter(tq, t.level, t.type, t.sourceIp, t.title, t.detail, t.origin))
         .map(t => `<tr>
           <td class="mono">${esc(t.time)}</td>
@@ -2695,6 +2706,7 @@ public sealed class WebApp : IDisposable
           <td>${esc(t.title)}</td>
           <td class="muted">${esc(t.detail)}</td>
           <td class="muted">${esc(t.origin)}</td>
+          <td class="${blockCellClass(t)}" title="${esc(t.blockStatus || '')}">${esc(t.blockShort || '·')}</td>
           <td class="row-actions">${blockable(t.sourceIp)
             ? `<button data-block="${esc(t.sourceIp)}">Block</button>` : ''}</td>
         </tr>`).join('')

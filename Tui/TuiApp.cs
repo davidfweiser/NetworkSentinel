@@ -928,9 +928,11 @@ public sealed class TuiApp : IDisposable
         var hosts = FilterHosts().Take(8).ToList();
 
         var threatTable = new Table().Expand().Border(TableBorder.Simple);
-        threatTable.AddColumns("Time", "Lvl", "IP", "Title");
+        // "Blk" mirrors the remote-hosts panel beside it: a warning on the dashboard
+        // should answer "is anything stopping this?" without a trip to the Threats view.
+        threatTable.AddColumns("Time", "Lvl", "IP", "Title", "Blk");
         if (threats.Count == 0)
-            threatTable.AddRow("-", "-", "-", "[dim]No threats yet[/]");
+            threatTable.AddRow("-", "-", "-", "[dim]No threats yet[/]", "-");
         else
         {
             for (var i = 0; i < threats.Count; i++)
@@ -941,7 +943,8 @@ public sealed class TuiApp : IDisposable
                     mark + t.TimeText,
                     ColorLevel(t.Level),
                     Markup.Escape(t.SourceIp),
-                    Markup.Escape(Truncate(t.Title, 40)));
+                    Markup.Escape(Truncate(t.Title, 40)),
+                    ShortBlockStatus(_prevention.DescribeEnforcement(t)));
             }
         }
 
@@ -1110,7 +1113,8 @@ public sealed class TuiApp : IDisposable
             new TableColumn("Type"),
             new TableColumn("Source IP"),
             new TableColumn("Title"),
-            new TableColumn("Origin"));
+            new TableColumn("Origin"),
+            new TableColumn("Blocked"));
 
         var w = TermWidth;
         var titleW = Math.Clamp(w / 4, 20, 48);
@@ -1119,7 +1123,7 @@ public sealed class TuiApp : IDisposable
 
         var visible = VisibleWindow(rows.Count);
         if (rows.Count == 0)
-            table.AddRow(" ", "[dim]No threat events[/]", "", "", "", "", "");
+            table.AddRow(" ", "[dim]No threat events[/]", "", "", "", "", "", "");
         else
         {
             for (var i = visible.start; i < visible.end; i++)
@@ -1133,7 +1137,9 @@ public sealed class TuiApp : IDisposable
                     Markup.Escape(Truncate(t.TypeText, 18)),
                     Markup.Escape(Truncate(t.SourceIp, ipW)),
                     Markup.Escape(Truncate(t.Title, titleW)),
-                    Markup.Escape(Truncate(t.Origin, originW)));
+                    Markup.Escape(Truncate(t.Origin, originW)),
+                    // Only the rows on screen: the backlog behind them can be 500 deep.
+                    ColorBlockStatus(_prevention.DescribeEnforcement(t)));
             }
         }
 
@@ -1368,6 +1374,29 @@ public sealed class TuiApp : IDisposable
         var end = Math.Min(count, start + height);
         return (start, end);
     }
+
+    /// <summary>
+    /// The blocked/not-blocked verdict for one threat row. Same vocabulary as the GUI
+    /// and web tables (<see cref="EnforcementStatus.ShortText"/>); a dash where the
+    /// threat names no blockable address.
+    /// </summary>
+    private static string ColorBlockStatus(EnforcementStatus? status) => status?.State switch
+    {
+        null => "[dim]·[/]",
+        BlockState.Blocked or BlockState.AlreadyBlocked => "[red]Blocked[/]",
+        BlockState.WouldBlock => "[yellow]Dry run[/]",
+        BlockState.Failed => "[yellow]Failed[/]",
+        _ => "[dim]No[/]"
+    };
+
+    /// <summary>One-letter form for the dashboard's narrow column, matching the hosts panel.</summary>
+    private static string ShortBlockStatus(EnforcementStatus? status) => status?.State switch
+    {
+        null => "[dim]·[/]",
+        BlockState.Blocked or BlockState.AlreadyBlocked => "[red]Y[/]",
+        BlockState.WouldBlock or BlockState.Failed => "[yellow]![/]",
+        _ => "[dim]N[/]"
+    };
 
     private static string ColorLevel(ThreatLevel level) => level switch
     {

@@ -47,6 +47,19 @@ public sealed record EnforcementStatus(BlockState State, string Text)
 {
     /// <summary>True when traffic to and from the address is actually being dropped.</summary>
     public bool IsBlocked => State is BlockState.Blocked or BlockState.AlreadyBlocked;
+
+    /// <summary>
+    /// The verdict as a table cell — <see cref="Text"/> is the tooltip that explains it.
+    /// One vocabulary for all three threat tables, so the GUI, the TUI and the web console
+    /// cannot end up describing the same state three different ways.
+    /// </summary>
+    public string ShortText => State switch
+    {
+        BlockState.Blocked or BlockState.AlreadyBlocked => "Blocked",
+        BlockState.WouldBlock => "Dry run",
+        BlockState.Failed => "Failed",
+        _ => "No"
+    };
 }
 
 /// <summary>Result of one <see cref="PreventionService.Apply"/> pass.</summary>

@@ -82,3 +82,25 @@ public sealed class StringNotEmptyConverter : IValueConverter
     public object? ConvertBack(object? value, Type targetType, object? parameter, CultureInfo culture)
         => throw new NotSupportedException();
 }
+
+/// <summary>
+/// Colours the threat table's Blocked cell, on the theme's signal meanings: red for a
+/// dropped address (trouble, but handled), amber for a verdict that wants attention
+/// (a failed rule, a dry run that wrote nothing), muted for an address deliberately
+/// left alone. Reads <see cref="Models.ThreatEvent.BlockStatus"/>.
+/// </summary>
+public sealed class BlockStatusToBrushConverter : IValueConverter
+{
+    public object? Convert(object? value, Type targetType, object? parameter, CultureInfo culture)
+        => (value as string) switch
+        {
+            "Blocked" => Brush("#FF5D78"),  // Danger
+            "Failed" or "Dry run" => Brush("#F5B93B"),  // AccentAmber
+            _ => Brush("#636B78")           // TextMuted
+        };
+
+    public object? ConvertBack(object? value, Type targetType, object? parameter, CultureInfo culture)
+        => throw new NotSupportedException();
+
+    private static IBrush Brush(string hex) => new SolidColorBrush(Color.Parse(hex));
+}

@@ -229,6 +229,10 @@
                             <TextBlock Text="{Binding SourceIp}" Foreground="{DynamicResource AccentCyanBrush}" FontSize="12"/>
                             <TextBlock Text="{Binding Origin}" Foreground="{DynamicResource TextSecondaryBrush}" FontSize="11" TextWrapping="Wrap"/>
                             <TextBlock Text="{Binding Method}" Foreground="{DynamicResource TextMutedBrush}" FontSize="11"/>
+                            <!-- Same verdict the Threats table and the popup carry. -->
+                            <TextBlock Text="{Binding BlockStatusDetail}" FontSize="11" FontWeight="SemiBold" TextWrapping="Wrap"
+                                       IsVisible="{Binding BlockStatusDetail, Converter={StaticResource NotEmpty}}"
+                                       Foreground="{Binding BlockStatus, Converter={StaticResource BlockStatusBrush}}"/>
                           </StackPanel>
                         </Grid>
                       </Border>
@@ -354,6 +358,16 @@
                 <DataGridTextColumn Header="Coming from" Binding="{Binding Origin}" Width="160"/>
                 <DataGridTextColumn Header="Method" Binding="{Binding Method}" Width="150"/>
                 <DataGridTextColumn Header="Detail" Binding="{Binding Detail}" Width="*"/>
+                <!-- Whether the source address is being blocked; hover for the reason. -->
+                <DataGridTemplateColumn Header="Blocked" Width="90">
+                  <DataGridTemplateColumn.CellTemplate>
+                    <DataTemplate>
+                      <TextBlock Text="{Binding BlockStatus}" FontWeight="SemiBold" VerticalAlignment="Center"
+                                 Foreground="{Binding BlockStatus, Converter={StaticResource BlockStatusBrush}}"
+                                 ToolTip.Tip="{Binding BlockStatusDetail}"/>
+                    </DataTemplate>
+                  </DataGridTemplateColumn.CellTemplate>
+                </DataGridTemplateColumn>
                 <DataGridTemplateColumn Header="Action" Width="100">
                   <DataGridTemplateColumn.CellTemplate>
                     <DataTemplate>
