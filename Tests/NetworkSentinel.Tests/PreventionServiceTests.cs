@@ -1,3 +1,4 @@
+using NetworkSentinel.Models;
 using NetworkSentinel.Services;
 using Xunit;
 
@@ -73,6 +74,124 @@ public class PreventionServiceTests
         // Port suffix and canonical form must land on the same suppression entry.
         prevention.NoteUnblocked("203.0.113.13:443");
         Assert.True(prevention.IsSuppressed("203.0.113.13"));
+    }
+
+    private static ThreatEvent Threat(string ip, ThreatLevel level = ThreatLevel.Critical,
+                                      ThreatType type = ThreatType.PortScan)
+        => new() { SourceIp = ip, Level = level, Type = type, Title = "Port scan" };
+
+    [Fact]
+    public void DescribeEnforcementSaysNothingWithoutAnAddress()
+    {
+        var prevention = Create(out _);
+        // Nothing to block, so the alert must not claim anything either way.
+        Assert.Null(prevention.DescribeEnforcement(Threat("")));
+        Assert.Null(prevention.DescribeEnforcement(Threat("not-an-address")));
+    }
+
+    [Fact]
+    public void DescribeEnforcementReportsAJustWrittenBlock()
+    {
+        var prevention = Create(out _);
+        var threat = Threat("203.0.113.20");
+        var result = new PreventionResult
+        {
+            Decisions = new[]
+            {
+                new PreventionDecision
+                {
+                    Ip = "203.0.113.20",
+                    Action = PreventionAction.Blocked,
+                    Message = "Auto-blocked 203.0.113.20",
+                    Threat = threat
+                }
+            }
+        };
+
+        var status = prevention.DescribeEnforcement(threat, result);
+
+        Assert.NotNull(status);
+        Assert.Equal(BlockState.Blocked, status!.State);
+        Assert.True(status.IsBlocked);
+        Assert.Contains("BLOCKED", status.Text);
+    }
+
+    [Fact]
+    public void DescribeEnforcementReportsAFailedBlockAsNotBlocked()
+    {
+        var prevention = Create(out _);
+        var threat = Threat("203.0.113.21");
+        var result = new PreventionResult
+        {
+            Decisions = new[]
+            {
+                new PreventionDecision
+                {
+                    Ip = "203.0.113.21",
+                    Action = PreventionAction.Failed,
+                    Message = "Auto-block failed for 203.0.113.21: Need admin rights",
+                    FailureReason = "Need admin rights",
+                    Threat = threat
+                }
+            }
+        };
+
+        var status = prevention.DescribeEnforcement(threat, result);
+
+        Assert.NotNull(status);
+        Assert.Equal(BlockState.Failed, status!.State);
+        Assert.False(status.IsBlocked);
+        Assert.Contains("Need admin rights", status.Text);
+    }
+
+    [Fact]
+    public void DescribeEnforcementReportsAnAddressAlreadyUnderARule()
+    {
+        var prevention = Create(out _);
+        prevention.NoteBlocked("203.0.113.22");
+
+        var status = prevention.DescribeEnforcement(Threat("203.0.113.22"));
+
+        Assert.NotNull(status);
+        Assert.Equal(BlockState.AlreadyBlocked, status!.State);
+        Assert.True(status.IsBlocked);
+    }
+
+    [Fact]
+    public void DescribeEnforcementSaysWhyNothingWasBlocked()
+    {
+        var prevention = Create(out _);
+        prevention.Enabled = false;
+
+        var off = prevention.DescribeEnforcement(Threat("203.0.113.23"));
+        Assert.NotNull(off);
+        Assert.False(off!.IsBlocked);
+        Assert.Contains("auto-block is off", off.Text, StringComparison.OrdinalIgnoreCase);
+
+        // A private address is never a candidate, whatever the settings say.
+        var lan = prevention.DescribeEnforcement(Threat("192.168.1.40"));
+        Assert.NotNull(lan);
+        Assert.False(lan!.IsBlocked);
+        Assert.Contains("private", lan.Text, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public void DescribeEnforcementReportsTheGateThatStoppedIt()
+    {
+        var prevention = Create(out _);
+        prevention.Enabled = true;
+        prevention.MinLevel = ThreatLevel.Critical;
+
+        var quiet = prevention.DescribeEnforcement(Threat("203.0.113.24", ThreatLevel.Medium));
+        Assert.NotNull(quiet);
+        Assert.False(quiet!.IsBlocked);
+        Assert.Contains("below the auto-block level", quiet.Text);
+
+        prevention.NoteUnblocked("203.0.113.25");
+        var released = prevention.DescribeEnforcement(Threat("203.0.113.25"));
+        Assert.NotNull(released);
+        Assert.False(released!.IsBlocked);
+        Assert.Contains("released this address manually", released.Text);
     }
 
     [Fact]

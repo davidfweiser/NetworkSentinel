@@ -57,8 +57,26 @@ public sealed class NetworkMonitorService : IDisposable
     private DateTime _threatsTodayDate = DateTime.Now.Date;
 
     public event Action? Updated;
-    /// <summary>Raised on the monitor thread with newly detected threats this poll cycle.</summary>
-    public event Action<IReadOnlyList<ThreatEvent>>? ThreatsDetected;
+
+    /// <summary>
+    /// Raised with the threats detected this poll cycle and what enforcement did about
+    /// them. Not raised on the monitor thread — see <see cref="DispatchAlerts"/>.
+    /// </summary>
+    public event Action<IReadOnlyList<ThreatEvent>, PreventionResult>? ThreatsDetected;
+
+    /// <summary>
+    /// Enforcement for a freshly detected batch, wired to the prevention engine by
+    /// <see cref="SentinelCore"/>. Null leaves detection purely advisory (tests, and any
+    /// host that never arms prevention).
+    /// </summary>
+    public Func<IReadOnlyList<ThreatEvent>, PreventionResult>? Enforce { get; set; }
+
+    /// <summary>
+    /// Turns one threat plus its batch's enforcement result into the "is this address
+    /// being blocked?" line that goes out with the alert. Wired to
+    /// <see cref="PreventionService.DescribeEnforcement"/> by <see cref="SentinelCore"/>.
+    /// </summary>
+    public Func<ThreatEvent, PreventionResult, EnforcementStatus?>? DescribeEnforcement { get; set; }
 
     public DashboardStats Stats { get; } = new();
 
@@ -848,12 +866,42 @@ public sealed class NetworkMonitorService : IDisposable
             QueueGeo(t.SourceIp);
 
         if (newThreats.Count > 0)
-        {
-            ThreatsDetected?.Invoke(newThreats);
-            _webhook.Notify(newThreats, WebhookUrl, WebhookMinLevel);
-        }
+            DispatchAlerts(newThreats);
 
         Updated?.Invoke();
+    }
+
+    /// <summary>
+    /// Enforcement first, alerts second: a warning can only tell the user an address is
+    /// being blocked if the block has been decided by the time the message is composed.
+    /// The batch is enforced once here rather than once per frontend, and every channel —
+    /// the console status line, the desktop popup, the webhook — reports the same verdict.
+    ///
+    /// Off the poll thread, because writing a rule can mean waiting on nft/iptables (or on
+    /// a polkit prompt the user is ignoring), and monitoring must not stall behind it.
+    /// </summary>
+    private void DispatchAlerts(IReadOnlyList<ThreatEvent> threats)
+    {
+        _ = Task.Run(() =>
+        {
+            var prevention = PreventionResult.Empty;
+            if (Enforce is { } enforce)
+            {
+                try
+                {
+                    prevention = enforce(threats);
+                }
+                catch (Exception ex)
+                {
+                    // Surfaced as a status line; the alerts themselves still go out.
+                    prevention = new PreventionResult { StatusMessage = $"Auto-block error: {ex.Message}" };
+                }
+            }
+
+            ThreatsDetected?.Invoke(threats, prevention);
+            _webhook.Notify(threats, WebhookUrl, WebhookMinLevel,
+                t => DescribeEnforcement?.Invoke(t, prevention));
+        });
     }
 
     /// <summary>

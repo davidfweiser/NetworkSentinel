@@ -1611,27 +1611,15 @@ public sealed class WebApp : IDisposable
 
     private void OnMonitorUpdated() => RefreshBlockedIps(force: false);
 
-    private void OnThreatsDetected(IReadOnlyList<ThreatEvent> threats)
+    /// <summary>The monitor enforces the batch before raising this; we only report it.</summary>
+    private void OnThreatsDetected(IReadOnlyList<ThreatEvent> threats, PreventionResult prevention)
     {
-        if (!_prevention.Enabled || threats.Count == 0)
+        if (!prevention.HasMessages)
             return;
 
-        _ = Task.Run(() =>
-        {
-            try
-            {
-                var result = _prevention.Apply(threats);
-                if (!result.HasMessages)
-                    return;
-                _statusMessage = result.Summary;
-                if (result.RulesChanged)
-                    RefreshBlockedIps(force: true);
-            }
-            catch (Exception ex)
-            {
-                _statusMessage = $"Auto-block error: {ex.Message}";
-            }
-        });
+        _statusMessage = prevention.Summary;
+        if (prevention.RulesChanged)
+            RefreshBlockedIps(force: true);
     }
 
     private void RefreshBlockedIps(bool force)

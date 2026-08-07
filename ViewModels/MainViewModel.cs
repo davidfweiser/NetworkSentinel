@@ -293,41 +293,28 @@ public partial class MainViewModel : ObservableObject, IDisposable
         }, DispatcherPriority.Background);
     }
 
-    private void OnThreatsDetected(IReadOnlyList<ThreatEvent> threats)
+    /// <summary>
+    /// The monitor has already run the batch past the prevention engine, so the popup can
+    /// tell the user whether the address it is warning about is being blocked.
+    /// </summary>
+    private void OnThreatsDetected(IReadOnlyList<ThreatEvent> threats, PreventionResult prevention)
     {
         if (threats.Count == 0)
             return;
 
-        if (CriticalAlertsEnabled)
-        {
-            var critical = threats.Where(t => t.Level >= ThreatLevel.Critical).ToList();
-            if (critical.Count > 0)
-                _ = Task.Run(() => _notifier.NotifyCritical(critical));
-        }
+        ShowAutoBlockOutcome(prevention);
 
-        if (!AutoBlockEnabled)
+        if (!CriticalAlertsEnabled)
             return;
 
-        _ = Task.Run(() =>
-        {
-            try
-            {
-                ProcessAutoBlocks(threats);
-            }
-            catch (Exception ex)
-            {
-                Dispatcher.UIThread.Post(() =>
-                {
-                    FirewallMessage = $"Auto-block error: {ex.Message}";
-                    UpdateAutoBlockStatusText();
-                });
-            }
-        });
+        var critical = threats.Where(t => t.Level >= ThreatLevel.Critical).ToList();
+        if (critical.Count > 0)
+            _ = Task.Run(() => _notifier.NotifyCritical(
+                critical, t => _prevention.DescribeEnforcement(t, prevention)));
     }
 
-    private void ProcessAutoBlocks(IReadOnlyList<ThreatEvent> threats)
+    private void ShowAutoBlockOutcome(PreventionResult result)
     {
-        var result = _prevention.Apply(threats);
         if (!result.HasMessages)
             return;
 
@@ -336,7 +323,7 @@ public partial class MainViewModel : ObservableObject, IDisposable
             if (result.StatusMessage != null)
             {
                 AutoBlockStatusText = result.StatusMessage;
-                FirewallMessage = "Auto-block skipped: cannot elevate nft/iptables.";
+                FirewallMessage = result.StatusMessage;
                 return;
             }
 
