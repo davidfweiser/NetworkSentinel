@@ -466,10 +466,8 @@ public sealed class TuiApp : IDisposable
         _prevention.Enabled = !_prevention.Enabled;
         _settings.AutoBlockEnabled = _prevention.Enabled;
         _settings.Save();
-        _statusMessage = _prevention.Enabled
-            ? $"Auto-block ON (≥ {_prevention.MinLevel})" +
-              (_firewall.IsAdministrator ? "" : " — need pkexec for firewall changes")
-            : "Auto-block OFF";
+        _statusMessage = _prevention.Describe() +
+            (_prevention.Enabled && !_firewall.IsAdministrator ? " — need pkexec for firewall changes" : "");
     }
 
     /// <summary>
@@ -556,16 +554,25 @@ public sealed class TuiApp : IDisposable
             return;
         }
 
-        if (!_firewall.IsAdministrator)
-        {
-            _statusMessage = "Cannot block — install pkexec/sudo or run Authorize (u).";
-            return;
-        }
-
         // Same pre-flight the GUI and web console do, so all three frontends agree.
         if (!FirewallService.TryNormalizeIp(ip, out var normalized, out var error))
         {
             _statusMessage = error;
+            return;
+        }
+
+        // Before the elevation check, because re-blocking is a no-op worth naming rather
+        // than a reason to send the user off to install pkexec: the rule is already there.
+        // Rewriting it would also turn an expiring auto-block into a permanent manual one.
+        if (_prevention.IsBlocked(normalized))
+        {
+            _statusMessage = $"{normalized} is already blocked — press x to unblock it.";
+            return;
+        }
+
+        if (!_firewall.IsAdministrator)
+        {
+            _statusMessage = "Cannot block — install pkexec/sudo or run Authorize (u).";
             return;
         }
 
@@ -1199,9 +1206,7 @@ public sealed class TuiApp : IDisposable
 
         var info = new Markup(
             $"[bold]Privilege[/]: {Markup.Escape(_firewall.PrivilegeText)}\n" +
-            $"[bold]Auto-block[/]: {(_prevention.Enabled ? $"[red]ON ≥ {_prevention.MinLevel}[/]" : "[grey]off[/]")}" +
-            $"{(_prevention.DryRun ? " [yellow](dry run)[/]" : "")}  " +
-            $"in={_prevention.BlockInbound} out={_prevention.BlockOutbound}\n" +
+            $"{AutoBlockMarkup()}  in={_prevention.BlockInbound} out={_prevention.BlockOutbound}\n" +
             $"[bold]Allowlist[/]: {Markup.Escape(Truncate(_allowlist.StatusText, 70))}  [dim](view 7 · n add)[/]\n" +
             $"[bold]Blocked IPs (managed)[/]: {_prevention.BlockedCount}");
 
@@ -1388,6 +1393,19 @@ public sealed class TuiApp : IDisposable
         BlockState.Failed => "[yellow]Failed[/]",
         _ => "[dim]No[/]"
     };
+
+    /// <summary>
+    /// The engine's own auto-block line, coloured by how much it is actually doing:
+    /// red when it is writing rules, amber for dry run (deciding but writing nothing),
+    /// grey when it is off.
+    /// </summary>
+    private string AutoBlockMarkup()
+    {
+        var text = Markup.Escape(_prevention.Describe());
+        return !_prevention.Enabled ? $"[grey]{text}[/]"
+             : _prevention.DryRun ? $"[yellow]{text}[/]"
+             : $"[red]{text}[/]";
+    }
 
     /// <summary>One-letter form for the dashboard's narrow column, matching the hosts panel.</summary>
     private static string ShortBlockStatus(EnforcementStatus? status) => status?.State switch

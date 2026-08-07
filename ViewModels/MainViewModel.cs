@@ -368,7 +368,7 @@ public partial class MainViewModel : ObservableObject, IDisposable
 
         var high = Stats.HighThreats;
         var blocked = _prevention.BlockedCount;
-        var auto = AutoBlockEnabled ? $"Auto-block ON (≥{AutoBlockMinLevel})" : "Auto-block OFF";
+        var auto = _prevention.Describe();
         HeroSubtitle = high > 0
             ? $"{high} high/critical · {blocked} blocked · {auto}"
             : $"{blocked} IPs blocked · {auto}";
@@ -423,7 +423,7 @@ public partial class MainViewModel : ObservableObject, IDisposable
         var high = Stats.HighThreats;
         var blocked = _prevention.BlockedCount;
         var mon = Stats.IsMonitoring ? "Live" : "Paused";
-        var auto = AutoBlockEnabled ? $"auto≥{AutoBlockMinLevel}" : "auto off";
+        var auto = _prevention.DescribeShort();
 
         // Compact title for taskbar / window list (GNOME top bar / dock).
         WindowTitle = high > 0
@@ -1215,6 +1215,19 @@ public partial class MainViewModel : ObservableObject, IDisposable
     {
         if (threat == null) return;
         await BlockIpInternal(threat.SourceIp, $"Threat block · {threat.TypeText}: {threat.Title}");
+    }
+
+    /// <summary>
+    /// Releases the address a threat came from. The row offers this instead of "Block IP"
+    /// once the address is already blocked — re-blocking it would prompt for elevation to
+    /// rewrite a rule that is already in force, and would quietly turn an expiring
+    /// auto-block into a permanent manual one.
+    /// </summary>
+    [RelayCommand]
+    private async Task UnblockThreatIp(ThreatEvent? threat)
+    {
+        if (threat == null) return;
+        await UnblockIpInternal(threat.SourceIp);
     }
 
     [RelayCommand]

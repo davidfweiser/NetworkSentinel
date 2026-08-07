@@ -670,7 +670,16 @@ public sealed class PreventionService
             map.Remove(key);
     }
 
-    /// <summary>Status line for the GUI/TUI/web footers.</summary>
+    /// <summary>
+    /// Auto-block state for every status line that reports it: the GUI's hero subtitle and
+    /// tray tooltip, the TUI footer, the web console's pill, and the messages all three
+    /// show when the toggle is flipped.
+    ///
+    /// The frontends each used to build this string themselves, and every one of them
+    /// dropped the same thing — dry run. A console reading "Auto-block ON (≥High)" while
+    /// the engine is deliberately writing no rules is the one state the operator most needs
+    /// named, so the engine that knows it says it.
+    /// </summary>
     public string Describe()
     {
         if (!Enabled)
@@ -678,4 +687,11 @@ public sealed class PreventionService
         var mode = DryRun ? "DRY RUN" : "armed";
         return $"Auto-block {mode} (≥{MinLevel})";
     }
+
+    /// <summary>
+    /// <see cref="Describe"/> for somewhere with no room — a window title, a dock label.
+    /// Still distinguishes dry run: the compact form is where it was lost before.
+    /// </summary>
+    public string DescribeShort()
+        => !Enabled ? "auto off" : DryRun ? $"dry≥{MinLevel}" : $"auto≥{MinLevel}";
 }

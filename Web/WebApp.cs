@@ -838,10 +838,10 @@ public sealed class WebApp : IDisposable
                     _prevention.Enabled = !_prevention.Enabled;
                     _settings.AutoBlockEnabled = _prevention.Enabled;
                     _settings.Save();
-                    _statusMessage = _prevention.Enabled
-                        ? $"Auto-block ON (≥ {_prevention.MinLevel})" +
-                          (_firewall.IsAdministrator ? "" : " — need pkexec/sudo for firewall changes")
-                        : "Auto-block OFF";
+                    _statusMessage = _prevention.Describe() +
+                        (_prevention.Enabled && !_firewall.IsAdministrator
+                            ? " — need pkexec/sudo for firewall changes"
+                            : "");
                     return ActionResultDto.Success(_statusMessage);
 
                 case "cycle_min_level":
@@ -884,7 +884,7 @@ public sealed class WebApp : IDisposable
                         case "autoBlockEnabled":
                             _prevention.Enabled = on;
                             _settings.AutoBlockEnabled = on;
-                            label = on ? $"Auto-block ON (≥ {_prevention.MinLevel})" : "Auto-block OFF";
+                            label = _prevention.Describe();
                             break;
                         case "blockInbound":
                             _prevention.BlockInbound = on;
@@ -1408,6 +1408,9 @@ public sealed class WebApp : IDisposable
             {
                 autoBlockEnabled = _prevention.Enabled,
                 autoBlockMinLevel = _prevention.MinLevel.ToString(),
+                // The engine's own wording for the header pill — the only form that
+                // distinguishes armed from dry run.
+                autoBlockSummary = _prevention.Describe(),
                 blockInbound = _prevention.BlockInbound,
                 blockOutbound = _prevention.BlockOutbound,
                 geoLookupEnabled = _settings.GeoLookupEnabled,
@@ -2621,10 +2624,12 @@ public sealed class WebApp : IDisposable
     $('monLabel').textContent = mon ? 'Monitoring' : 'Asleep';
     $('fwPill').textContent = state.firewall?.isAdmin ? 'Firewall: ready' : 'Firewall: needs elevation';
     const ab = state.settings?.autoBlockEnabled;
-    $('abPill').textContent = ab
-      ? `Auto-block ≥ ${state.settings.autoBlockMinLevel}`
-      : 'Auto-block off';
-    $('btnAuto').textContent = ab ? 'Auto-block ON' : 'Auto-block OFF';
+    // Straight from the engine, so the pill says DRY RUN when nothing is being written.
+    $('abPill').textContent = state.settings?.autoBlockSummary
+      || (ab ? `Auto-block ≥ ${state.settings.autoBlockMinLevel}` : 'Auto-block off');
+    $('btnAuto').textContent = ab
+      ? (state.settings?.preventionDryRun ? 'Auto-block DRY RUN' : 'Auto-block ON')
+      : 'Auto-block OFF';
     $('btnLevel').textContent = 'Min: ' + (state.settings?.autoBlockMinLevel || 'High');
 
     const s = state.stats || {};
@@ -2707,8 +2712,10 @@ public sealed class WebApp : IDisposable
           <td class="muted">${esc(t.detail)}</td>
           <td class="muted">${esc(t.origin)}</td>
           <td class="${blockCellClass(t)}" title="${esc(t.blockStatus || '')}">${esc(t.blockShort || '·')}</td>
-          <td class="row-actions">${blockable(t.sourceIp)
-            ? `<button data-block="${esc(t.sourceIp)}">Block</button>` : ''}</td>
+          <td class="row-actions">${!blockable(t.sourceIp) ? ''
+            : t.blocked
+              ? `<button data-unblock="${esc(t.sourceIp)}">Unblock</button>`
+              : `<button data-block="${esc(t.sourceIp)}">Block</button>`}</td>
         </tr>`).join('')
     );
 

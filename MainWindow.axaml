@@ -368,12 +368,22 @@
                     </DataTemplate>
                   </DataGridTemplateColumn.CellTemplate>
                 </DataGridTemplateColumn>
+                <!-- Block/Unblock swap, as on the Remote Computers grid: offering "Block IP"
+                     for an address already blocked only prompts for elevation to rewrite a
+                     rule that is already in force. -->
                 <DataGridTemplateColumn Header="Action" Width="100">
                   <DataGridTemplateColumn.CellTemplate>
                     <DataTemplate>
-                      <Button Classes="mini-danger" Content="Block IP"
-                              Command="{Binding $parent[Window].DataContext.BlockThreatIpCommand}"
-                              CommandParameter="{Binding}"/>
+                      <StackPanel Orientation="Horizontal" Spacing="6">
+                        <Button Classes="mini-danger" Content="Block IP"
+                                Command="{Binding $parent[Window].DataContext.BlockThreatIpCommand}"
+                                CommandParameter="{Binding}"
+                                IsVisible="{Binding IsSourceBlocked, Converter={StaticResource InvertBool}}"/>
+                        <Button Classes="mini-ghost" Content="Unblock"
+                                Command="{Binding $parent[Window].DataContext.UnblockThreatIpCommand}"
+                                CommandParameter="{Binding}"
+                                IsVisible="{Binding IsSourceBlocked}"/>
+                      </StackPanel>
                     </DataTemplate>
                   </DataGridTemplateColumn.CellTemplate>
                 </DataGridTemplateColumn>
