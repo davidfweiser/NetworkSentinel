@@ -1506,18 +1506,27 @@ public sealed class WebApp : IDisposable
                 blocked = blocked.Contains(h.IpAddress) || h.IsBlocked,
                 lastSeen = h.LastSeenText
             }),
-            threats = _monitor.Threats.Take(200).Select(t => new
+            threats = _monitor.Threats.Take(200).Select(t =>
             {
-                ts = t.Timestamp.ToString("o"),
-                time = t.TimeText,
-                level = t.LevelText,
-                levelNum = (int)t.Level,
-                type = t.TypeText,
-                sourceIp = t.SourceIp,
-                title = t.Title,
-                detail = t.Detail,
-                origin = t.Origin,
-                method = t.Method
+                // Answers "is this address being blocked?" for the browser notification,
+                // exactly as the desktop popup and the webhooks answer it. Null for a
+                // threat that names no blockable address.
+                var status = _prevention.DescribeEnforcement(t);
+                return new
+                {
+                    ts = t.Timestamp.ToString("o"),
+                    time = t.TimeText,
+                    level = t.LevelText,
+                    levelNum = (int)t.Level,
+                    type = t.TypeText,
+                    sourceIp = t.SourceIp,
+                    title = t.Title,
+                    detail = t.Detail,
+                    origin = t.Origin,
+                    method = t.Method,
+                    blockStatus = status?.Text,
+                    blocked = status?.IsBlocked
+                };
             }),
             ports = _monitor.ListeningPorts.Select(p => new
             {
@@ -2556,11 +2565,25 @@ public sealed class WebApp : IDisposable
     if (!criticalPrimed) { criticalPrimed = true; return; }
     if (!fresh.length || !state.settings?.criticalAlertsEnabled) return;
     if (!('Notification' in window) || Notification.permission !== 'granted') return;
-    const head = fresh.length === 1
-      ? 'Critical threat: ' + (fresh[0].type || 'threat detected')
-      : fresh.length + ' critical threats detected';
+    // Same verdict the desktop popup and the webhooks carry: a warning that names an
+    // address should say whether that address is being blocked.
+    const known = fresh.filter(t => t.blockStatus);
+    const nBlocked = fresh.filter(t => t.blocked).length;
+    let head;
+    if (fresh.length === 1) {
+      const label = 'critical threat: ' + (fresh[0].type || 'threat detected');
+      head = !fresh[0].blockStatus ? 'Critical threat: ' + (fresh[0].type || 'threat detected')
+           : fresh[0].blocked ? 'Blocked · ' + label
+           : 'NOT blocked · ' + label;
+    } else {
+      head = fresh.length + ' critical threats'
+           + (!known.length ? ' detected'
+              : nBlocked === known.length ? ' — all blocked'
+              : ' — ' + nBlocked + ' of ' + known.length + ' blocked');
+    }
     const body = fresh.slice(0, 4)
-      .map(t => t.title + (t.sourceIp ? ' — ' + t.sourceIp : '')).join('\n');
+      .map(t => t.title + (t.sourceIp ? ' — ' + t.sourceIp : '')
+                + (t.blockStatus ? '\n  ' + t.blockStatus : '')).join('\n');
     try { new Notification(head, { body, tag: 'ns-critical' }); } catch { /* blocked */ }
   }
 
