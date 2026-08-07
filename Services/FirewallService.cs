@@ -1,6 +1,7 @@
 using System.Diagnostics;
 using System.Net;
 using System.Runtime.InteropServices;
+using System.Text;
 using System.Text.Json;
 using System.Text.RegularExpressions;
 using NetworkSentinel.Models;
@@ -19,6 +20,11 @@ public sealed class FirewallService
     public const string ProbeLogRuleName = "NetworkSentinel-ProbeLog";
     public const string ProbeLogPrefix = "NS-PROBE ";
     private const string NftTable = "inet networksentinel";
+
+    /// <summary>Ledger <see cref="FirewallRuleInfo.Backend"/> values — which tool owns a kernel rule.</summary>
+    private const string NftBackend = "nft";
+    private const string IptablesBackend = "iptables";
+
     private static readonly JsonSerializerOptions JsonOptions = new() { WriteIndented = true };
 
     public AllowlistService? Allowlist { get; set; }
@@ -63,7 +69,9 @@ public sealed class FirewallService
         if (!TryNormalizeIp(ip, out var normalized, out var error))
             return FirewallOperationResult.Fail(error);
 
-        if (IsPrivateOrLocal(normalized))
+        // Auto-block screens CGNAT out one gate earlier, so anything reaching here in
+        // that range is a deliberate manual block.
+        if (IsNeverBlockable(normalized))
             return FirewallOperationResult.Fail("Refusing to block private/local addresses (LAN, loopback, link-local).");
 
         if (!overrideAllowlist && Allowlist != null && Allowlist.IsAllowed(normalized, out var allowReason))
@@ -397,7 +405,8 @@ public sealed class FirewallService
                 RemoteAddresses = "",
                 LocalPorts = "",
                 Protocol = "TCP",
-                Kind = FirewallRuleKind.Other
+                Kind = FirewallRuleKind.Other,
+                Backend = BackendIsNft() ? NftBackend : IptablesBackend
             });
         }
 
@@ -528,6 +537,7 @@ public sealed class FirewallService
                 LocalPorts = "",
                 Protocol = "Any",
                 Kind = FirewallRuleKind.IpBlock,
+                Backend = BackendIsNft() ? NftBackend : IptablesBackend,
                 ExpiresUtc = expiresAfter.HasValue ? DateTime.UtcNow + expiresAfter.Value : null
             });
         }
@@ -576,7 +586,8 @@ public sealed class FirewallService
                 RemoteAddresses = "",
                 LocalPorts = port.ToString(),
                 Protocol = protocol.ToUpperInvariant(),
-                Kind = FirewallRuleKind.PortBlock
+                Kind = FirewallRuleKind.PortBlock,
+                Backend = BackendIsNft() ? NftBackend : IptablesBackend
             });
         }
 
@@ -920,6 +931,13 @@ public sealed class FirewallService
     /// that can happen silently (root, or cached/passwordless sudo) — never a
     /// prompt from startup. When it can't, the ledger is left alone and the next
     /// process start retries.
+    ///
+    /// Every backend an entry could live in is consulted, not just the currently
+    /// active one: installing nftables flips <see cref="BackendIsNft"/> between runs,
+    /// and a missing nft table says nothing about rules iptables wrote. An entry is
+    /// only dropped once the backend that owns it has actually been listed — a
+    /// backend we could not read leaves its entries alone rather than blackholing
+    /// live kernel rules the UI would then have no way to show or remove.
     /// </summary>
     public FirewallOperationResult ReconcileLedgerWithKernel()
     {
@@ -932,44 +950,78 @@ public sealed class FirewallService
             if (!CanElevateSilently())
                 return FirewallOperationResult.Fail("Cannot list kernel rules without prompting — reconciliation skipped.");
 
-            string dump;
+            // Entries written before Backend was recorded could be from either, so they
+            // pin both — and are only judged once both have been read.
+            var needBoth = ledger.Any(r => string.IsNullOrEmpty(r.Backend));
+            var wanted = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            foreach (var r in ledger.Where(r => !string.IsNullOrEmpty(r.Backend)))
+                wanted.Add(r.Backend);
+            if (needBoth || wanted.Count == 0)
+            {
+                wanted.Add(NftBackend);
+                wanted.Add(IptablesBackend);
+            }
+
+            var dump = new StringBuilder();
+            var consulted = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
             _silentElevationOnly = true;
             try
             {
-                if (BackendIsNft())
+                if (wanted.Contains(NftBackend))
                 {
-                    var list = RunPrivileged("nft", $"list table {NftTable}");
-                    if (list.Success)
+                    if (!CommandExists("nft"))
                     {
-                        dump = list.Message;
-                    }
-                    else if (LooksLikeMissingTable(list.Message))
-                    {
-                        // The managed table is gone entirely — the post-reboot case.
-                        // Every ledger entry is stale.
-                        dump = "";
+                        // No nft binary means no nft rules — reading it is vacuously done.
+                        consulted.Add(NftBackend);
                     }
                     else
                     {
-                        return FirewallOperationResult.Fail($"Could not list nft rules: {list.Message}");
+                        var list = RunPrivileged("nft", $"list table {NftTable}");
+                        if (list.Success)
+                        {
+                            dump.Append(list.Message).Append('\n');
+                            consulted.Add(NftBackend);
+                        }
+                        else if (LooksLikeMissingTable(list.Message))
+                        {
+                            // Managed table gone entirely — the post-reboot case. Its
+                            // entries are stale; entries iptables owns are not.
+                            consulted.Add(NftBackend);
+                        }
                     }
                 }
-                else
-                {
-                    var input = RunPrivileged("iptables", "-L INPUT -n");
-                    var output = RunPrivileged("iptables", "-L OUTPUT -n");
-                    if (!input.Success || !output.Success)
-                        return FirewallOperationResult.Fail("Could not list iptables rules — reconciliation skipped.");
-                    dump = input.Message + "\n" + output.Message;
 
-                    if (ledger.Any(r => IptablesToolFor(r.Name) == "ip6tables") && CommandExists("ip6tables"))
+                if (wanted.Contains(IptablesBackend))
+                {
+                    var ok = true;
+                    if (!CommandExists("iptables"))
+                    {
+                        // Same reasoning as nft above.
+                    }
+                    else
+                    {
+                        var input = RunPrivileged("iptables", "-L INPUT -n");
+                        var output = RunPrivileged("iptables", "-L OUTPUT -n");
+                        ok = input.Success && output.Success;
+                        if (ok)
+                            dump.Append(input.Message).Append('\n').Append(output.Message).Append('\n');
+                    }
+
+                    // v6 blocks live in a separate table; miss it and every IPv6 entry
+                    // reads as stale.
+                    var wantsV6 = ledger.Any(r => IptablesToolFor(r.Name) == "ip6tables");
+                    if (ok && wantsV6 && CommandExists("ip6tables"))
                     {
                         var input6 = RunPrivileged("ip6tables", "-L INPUT -n");
                         var output6 = RunPrivileged("ip6tables", "-L OUTPUT -n");
-                        if (!input6.Success || !output6.Success)
-                            return FirewallOperationResult.Fail("Could not list ip6tables rules — reconciliation skipped.");
-                        dump += "\n" + input6.Message + "\n" + output6.Message;
+                        ok = input6.Success && output6.Success;
+                        if (ok)
+                            dump.Append(input6.Message).Append('\n').Append(output6.Message).Append('\n');
                     }
+
+                    if (ok)
+                        consulted.Add(IptablesBackend);
                 }
             }
             finally
@@ -977,14 +1029,36 @@ public sealed class FirewallService
                 _silentElevationOnly = false;
             }
 
+            if (consulted.Count == 0)
+                return FirewallOperationResult.Fail("Could not list kernel rules — reconciliation skipped.");
+
+            var text = dump.ToString();
+
             // Rule names carry an -In/-Out suffix, so no managed name is a prefix of
             // another and a plain containment test against the dump is exact enough.
-            var stale = ledger.Where(r => !dump.Contains(r.Name, StringComparison.Ordinal)).ToList();
+            bool IsStale(FirewallRuleInfo r)
+            {
+                var owner = string.IsNullOrEmpty(r.Backend) ? null : r.Backend;
+                var judged = owner == null
+                    ? consulted.Contains(NftBackend) && consulted.Contains(IptablesBackend)
+                    : consulted.Contains(owner);
+                return judged && !text.Contains(r.Name, StringComparison.Ordinal);
+            }
+
+            var stale = ledger.Where(IsStale).Select(r => r.Name).ToHashSet(StringComparer.OrdinalIgnoreCase);
             if (stale.Count == 0)
                 return FirewallOperationResult.Ok("Ledger matches kernel rules.");
 
-            ledger.RemoveAll(r => stale.Any(s => string.Equals(s.Name, r.Name, StringComparison.OrdinalIgnoreCase)));
-            SaveLedger(ledger);
+            // Re-read under the lock and drop only the names judged stale: the listing
+            // above costs several privileged subprocess calls, and a block written in
+            // that window must not be erased by writing back a pre-fetch snapshot.
+            lock (_ledgerGate)
+            {
+                var current = LoadLedger();
+                current.RemoveAll(r => stale.Contains(r.Name));
+                SaveLedger(current);
+            }
+
             return FirewallOperationResult.Ok(
                 $"Dropped {stale.Count} ledger entr{(stale.Count == 1 ? "y" : "ies")} with no matching kernel rule.");
         }
@@ -1049,6 +1123,15 @@ public sealed class FirewallService
     private static string LedgerPath
         => Path.Combine(AppPaths.DataDirectory, "firewall-rules.json");
 
+    /// <summary>
+    /// Serialises read-modify-write of the ledger. Three threads reach it in a normal
+    /// session — the expiry-sweep timer, the startup reconcile, and auto-block on its
+    /// Task.Run thread — and an unguarded load/save pair silently dropped whichever
+    /// entry lost the race, leaving an orphan kernel rule the UI could not see or
+    /// expire. Static because the ledger is one file, whatever instance touches it.
+    /// </summary>
+    private static readonly object _ledgerGate = new();
+
     private static List<FirewallRuleInfo> LoadLedger()
     {
         try
@@ -1078,17 +1161,23 @@ public sealed class FirewallService
 
     private static void UpsertLedger(FirewallRuleInfo rule)
     {
-        var list = LoadLedger();
-        list.RemoveAll(r => string.Equals(r.Name, rule.Name, StringComparison.OrdinalIgnoreCase));
-        list.Add(rule);
-        SaveLedger(list);
+        lock (_ledgerGate)
+        {
+            var list = LoadLedger();
+            list.RemoveAll(r => string.Equals(r.Name, rule.Name, StringComparison.OrdinalIgnoreCase));
+            list.Add(rule);
+            SaveLedger(list);
+        }
     }
 
     private static void RemoveFromLedger(string name)
     {
-        var list = LoadLedger();
-        list.RemoveAll(r => string.Equals(r.Name, name, StringComparison.OrdinalIgnoreCase));
-        SaveLedger(list);
+        lock (_ledgerGate)
+        {
+            var list = LoadLedger();
+            list.RemoveAll(r => string.Equals(r.Name, name, StringComparison.OrdinalIgnoreCase));
+            SaveLedger(list);
+        }
     }
 
     public static string IpRuleName(string ip, bool inbound)
@@ -1166,6 +1255,19 @@ public sealed class FirewallService
     public static bool IsPrivateOrLocal(string ip)
         => GeoIpService.IsNonPublic(ip);
 
+    /// <summary>
+    /// Addresses no rule may ever target, because dropping them breaks the machine's
+    /// own connectivity: LAN, loopback, link-local, multicast/broadcast.
+    ///
+    /// Narrower than <see cref="IsPrivateOrLocal"/>, which also covers CGNAT and is
+    /// the right gate for <em>automatic</em> blocking. Blocking a tunnel peer is a
+    /// bad default, not an impossible request — a hostile tailnet peer brute-forcing
+    /// SSH is a real case, and refusing it in the manual path too left the operator
+    /// with no way to stop the attack from inside the app.
+    /// </summary>
+    public static bool IsNeverBlockable(string ip)
+        => GeoIpService.IsNonPublic(ip) && !GeoIpService.IsCarrierGradeNat(ip);
+
     [DllImport("libc")]
     private static extern uint geteuid();
 }
@@ -1195,6 +1297,14 @@ public sealed class FirewallRuleInfo
     public string LocalPorts { get; init; } = "";
     public string Protocol { get; init; } = "Any";
     public FirewallRuleKind Kind { get; init; }
+
+    /// <summary>
+    /// Which backend actually wrote the kernel rule: <c>"nft"</c> or <c>"iptables"</c>.
+    /// Empty on entries written before this was recorded. Reconciliation needs it —
+    /// the live backend can change between runs (installing nftables flips it), and
+    /// "the nft table is missing" is not evidence about a rule iptables created.
+    /// </summary>
+    public string Backend { get; init; } = "";
 
     /// <summary>UTC time this rule stops applying (null = permanent). Set by auto-block expiry.</summary>
     public DateTime? ExpiresUtc { get; init; }

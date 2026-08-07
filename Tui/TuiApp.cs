@@ -544,8 +544,12 @@ public sealed class TuiApp : IDisposable
         }
 
         var result = _firewall.AuthorizeElevation();
-        if (result.Success && _settings.ProbeLogEnabled)
-            _firewall.EnableProbeLogging();
+        if (result.Success)
+        {
+            _prevention.NoteElevationAuthorized();
+            if (_settings.ProbeLogEnabled)
+                _firewall.EnableProbeLogging();
+        }
         _statusMessage = result.Message;
     }
 
@@ -577,9 +581,17 @@ public sealed class TuiApp : IDisposable
             return;
         }
 
-        if (FirewallService.IsPrivateOrLocal(normalized))
+        if (FirewallService.IsNeverBlockable(normalized))
         {
             _statusMessage = "Private/local addresses are not blocked (would break LAN).";
+            return;
+        }
+
+        // Auto-block never touches CGNAT; a manual block may, once confirmed.
+        if (GeoIpService.IsCarrierGradeNat(normalized) &&
+            !Confirm($"{normalized} is carrier-NAT (100.64.0.0/10) — blocking it cuts off that tunnel peer. Block it anyway?"))
+        {
+            _statusMessage = "Block cancelled.";
             return;
         }
 

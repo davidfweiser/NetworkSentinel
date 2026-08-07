@@ -1234,8 +1234,12 @@ public sealed class WebApp : IDisposable
                 case "authorize":
                 {
                     var r = _firewall.AuthorizeElevation();
-                    if (r.Success && _settings.ProbeLogEnabled)
-                        _firewall.EnableProbeLogging();
+                    if (r.Success)
+                    {
+                        _prevention.NoteElevationAuthorized();
+                        if (_settings.ProbeLogEnabled)
+                            _firewall.EnableProbeLogging();
+                    }
                     _statusMessage = r.Message;
                     return r.Success ? ActionResultDto.Success(r.Message) : ActionResultDto.Fail(r.Message);
                 }

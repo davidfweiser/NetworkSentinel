@@ -1178,8 +1178,12 @@ public partial class MainViewModel : ObservableObject, IDisposable
         try
         {
             var result = await Task.Run(() => _firewall.AuthorizeElevation());
-            if (result.Success && _settings.ProbeLogEnabled)
-                await Task.Run(() => _firewall.EnableProbeLogging());
+            if (result.Success)
+            {
+                _prevention.NoteElevationAuthorized();
+                if (_settings.ProbeLogEnabled)
+                    await Task.Run(() => _firewall.EnableProbeLogging());
+            }
             FirewallMessage = result.Message;
             IsAdmin = _firewall.IsAdministrator;
             FirewallStatusText = _firewall.PrivilegeText;
@@ -1496,11 +1500,26 @@ public partial class MainViewModel : ObservableObject, IDisposable
             return false;
         }
 
-        if (FirewallService.IsPrivateOrLocal(normalized))
+        if (FirewallService.IsNeverBlockable(normalized))
         {
             FirewallMessage = "Private/local addresses are not blocked by default (would break LAN).";
             await DialogService.ShowInfoAsync(FirewallMessage, "Block IP");
             return false;
+        }
+
+        // Auto-block never touches CGNAT, but the operator can — after being told what
+        // it costs, because this is where a VPN client's own tunnel gets cut.
+        if (GeoIpService.IsCarrierGradeNat(normalized))
+        {
+            var proceed = await DialogService.ConfirmAsync(
+                $"{normalized} is in the carrier-NAT range (100.64.0.0/10) used by Tailscale and VPN tunnels.\n\n" +
+                "Blocking it will cut off that tunnel peer. Block it anyway?",
+                "Block IP");
+            if (!proceed)
+            {
+                FirewallMessage = "Block cancelled.";
+                return false;
+            }
         }
 
         bool overrideAllowlist = false;

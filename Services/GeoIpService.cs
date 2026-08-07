@@ -253,6 +253,22 @@ public sealed class GeoIpService : IDisposable
         return false;
     }
 
+    /// <summary>
+    /// 100.64.0.0/10 (RFC 6598). Kept out of <em>auto</em>-block by
+    /// <see cref="IsNonPublic"/>, but a real host lives at the other end — a tailnet
+    /// peer or a subscriber behind carrier NAT — so a manual block must still be
+    /// possible. Unlike a LAN address, firewalling one cannot cut the machine off
+    /// from its own network.
+    /// </summary>
+    public static bool IsCarrierGradeNat(string ip)
+    {
+        if (!IPAddress.TryParse(ip, out var address)) return false;
+        if (address.IsIPv4MappedToIPv6) address = address.MapToIPv4();
+        if (address.AddressFamily != AddressFamily.InterNetwork) return false;
+        var bytes = address.GetAddressBytes();
+        return bytes[0] == 100 && bytes[1] >= 64 && bytes[1] <= 127;
+    }
+
     /// <summary>Multicast / broadcast destinations (mDNS, SSDP, …) — noise, not peers.</summary>
     public static bool IsMulticastOrBroadcast(string ip)
     {
