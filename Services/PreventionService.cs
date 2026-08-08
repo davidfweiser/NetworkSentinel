@@ -20,7 +20,11 @@ public enum PreventionAction
     Skipped
 }
 
-/// <summary>One acted-on threat. Threats filtered out by the gates never produce a decision.</summary>
+/// <summary>
+/// One threat the engine acted on — or, for <see cref="PreventionAction.Skipped"/>, deliberately
+/// did not. The other gates filter silently; only a refusal the operator would otherwise have to
+/// explain to themselves produces a decision without a rule.
+/// </summary>
 public sealed class PreventionDecision
 {
     public required string Ip { get; init; }
@@ -242,7 +246,10 @@ public sealed class PreventionService
         if (!Enabled || threats.Count == 0)
             return PreventionResult.Empty;
 
-        if (!_firewall.IsAdministrator)
+        // Dry run writes no rule, so it has nothing to elevate for. Demanding privilege to
+        // *simulate* blocked the one workflow the mode exists for: checking what a new
+        // detection source would drop before giving it the right to drop anything.
+        if (!DryRun && !_firewall.IsAdministrator)
         {
             return new PreventionResult
             {
