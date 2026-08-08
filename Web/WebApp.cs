@@ -1572,11 +1572,18 @@ public sealed class WebApp : IDisposable
         return $"{_monitor.DnsHygieneStatus} ({enc} encrypted / {plain} plaintext)";
     }
 
-    /// <summary>WireGuard monitor state for the settings panel.</summary>
+    /// <summary>
+    /// WireGuard monitor state for the settings panel, plus the tunnel-endpoint shield —
+    /// which runs whether or not peer monitoring is on, and is what a VPN operator needs
+    /// to see before arming auto-block.
+    /// </summary>
     private string WireGuardStatusText()
-        => _settings.WireGuardMonitorEnabled
+    {
+        var monitor = _settings.WireGuardMonitorEnabled
             ? _monitor.WireGuardStatus
             : "Off — WireGuard peers are invisible to the connection heuristics until this is on.";
+        return $"{monitor} · {_monitor.WireGuardProtectionStatus}";
+    }
 
     /// <summary>
     /// Peer rows for the console. Only public keys are exposed: the private and preshared

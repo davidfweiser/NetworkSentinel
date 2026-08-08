@@ -10,7 +10,14 @@ public enum PreventionAction
     /// <summary>Dry-run mode: the block was decided but deliberately not written.</summary>
     Simulated,
     /// <summary>The firewall rejected the rule.</summary>
-    Failed
+    Failed,
+    /// <summary>
+    /// A gate held the block back for a reason worth saying out loud. Only the tunnel-endpoint
+    /// gate reports: every other gate refuses something ordinary (a LAN address, an allowlisted
+    /// host), while this one refuses a *threat* against a live VPN peer. Silence there sends the
+    /// operator hunting through firewall rules for a block that was never made.
+    /// </summary>
+    Skipped
 }
 
 /// <summary>One acted-on threat. Threats filtered out by the gates never produce a decision.</summary>
@@ -82,6 +89,9 @@ public sealed class PreventionService
     /// <summary>A manual unblock suppresses auto-block for this address for this long.</summary>
     public static readonly TimeSpan ManualUnblockSuppressFor = TimeSpan.FromHours(24);
 
+    /// <summary>How often the same address may repeat a "not blocking, it is a tunnel endpoint" note.</summary>
+    public static readonly TimeSpan ProtectedNoteCooldown = TimeSpan.FromMinutes(10);
+
     /// <summary>
     /// How long auto-block stands down after elevation itself fails. Elevation failure
     /// is never per-address — a dismissed pkexec dialog or missing sudo rule fails for
@@ -108,6 +118,9 @@ public sealed class PreventionService
     private readonly Dictionary<string, DateTime> _skipUntil = new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<string, DateTime> _suppressedUntil = new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<string, DateTime> _protectedUntil = new(StringComparer.OrdinalIgnoreCase);
+
+    /// <summary>Address → when a "not blocking a tunnel endpoint" note may be repeated.</summary>
+    private readonly Dictionary<string, DateTime> _noteCooldown = new(StringComparer.OrdinalIgnoreCase);
 
     private HashSet<string> _blockedIps = new(StringComparer.OrdinalIgnoreCase);
     private DateTime _blockedIpsRefreshedAt = DateTime.MinValue;
@@ -256,8 +269,12 @@ public sealed class PreventionService
 
         foreach (var threat in threats)
         {
-            if (!ShouldConsider(threat, claimSlot: !DryRun, out var ip))
+            if (!ShouldConsider(threat, claimSlot: !DryRun, out var ip, out var heldBack))
+            {
+                if (heldBack != null)
+                    decisions.Add(heldBack);
                 continue;
+            }
 
             if (DryRun)
             {
@@ -339,10 +356,15 @@ public sealed class PreventionService
     /// The gate stack. When <paramref name="claimSlot"/> is set, a passing threat claims the
     /// address as a side effect, so two concurrent batches naming the same IP can't both try
     /// to block it. Dry run passes false — it decides but never acts.
+    ///
+    /// <paramref name="heldBack"/> is set when a gate refused something the operator needs to
+    /// know about (currently only the tunnel-endpoint shield), so the refusal surfaces instead
+    /// of looking like a block that silently never happened.
     /// </summary>
-    private bool ShouldConsider(ThreatEvent threat, bool claimSlot, out string ip)
+    private bool ShouldConsider(ThreatEvent threat, bool claimSlot, out string ip, out PreventionDecision? heldBack)
     {
         ip = "";
+        heldBack = null;
 
         if (threat.Level < MinLevel)
             return false;
@@ -367,7 +389,22 @@ public sealed class PreventionService
             return false;
 
         if (IsProtectedAddress is { } externallyProtected && externallyProtected(normalized))
+        {
+            // Worth reporting: a threat really was raised against a live VPN peer, and the
+            // only reason no rule exists is that dropping it would take the tunnel with it.
+            if (ShouldNote(normalized))
+            {
+                heldBack = new PreventionDecision
+                {
+                    Ip = normalized,
+                    Action = PreventionAction.Skipped,
+                    Message = $"Not blocking {normalized} ({threat.LevelText}: {threat.Title}) — " +
+                              "it is a WireGuard tunnel endpoint; blocking it would cut that VPN. Block it manually if you mean to.",
+                    Threat = threat
+                };
+            }
             return false;
+        }
 
         lock (_gate)
         {
@@ -389,6 +426,24 @@ public sealed class PreventionService
 
         ip = normalized;
         return true;
+    }
+
+    /// <summary>
+    /// Rate-limits the held-back notes. A peer whose traffic keeps tripping a heuristic
+    /// would otherwise repeat the same line on every poll and bury everything else.
+    /// </summary>
+    private bool ShouldNote(string ip)
+    {
+        lock (_gate)
+        {
+            var now = DateTime.UtcNow;
+            if (_noteCooldown.TryGetValue(ip, out var until) && now < until)
+                return false;
+            _noteCooldown[ip] = now.Add(ProtectedNoteCooldown);
+            if (_noteCooldown.Count > 64)
+                PruneExpired(_noteCooldown);
+            return true;
+        }
     }
 
     public FirewallDirection ResolveDirection()

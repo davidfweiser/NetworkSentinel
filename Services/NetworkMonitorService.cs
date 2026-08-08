@@ -19,6 +19,7 @@ public sealed class NetworkMonitorService : IDisposable
     private readonly ExfiltrationMonitor _exfil = new();
     private readonly SuricataService _suricata = new();
     private readonly WireGuardMonitor _wireGuard = new();
+    private readonly WireGuardEndpointGuard _wireGuardEndpoints = new();
     private readonly DnsHygieneMonitor _dns = new();
     private readonly ConntrackEventSource _conntrack = new();
     private readonly WebhookNotifier _webhook = new();
@@ -470,6 +471,8 @@ public sealed class NetworkMonitorService : IDisposable
         if (_honeypotEnabled) _honeypot.Start(_honeypotPorts);
         if (_suricataEnabled) _suricata.Start();
         if (_wireGuardEnabled) _wireGuard.Start();
+        // Unconditional: the tunnel shield must not depend on a monitoring toggle.
+        _wireGuardEndpoints.Start();
         if (_dnsHygieneEnabled) _dns.Start();
         if (_conntrackEventsEnabled) _conntrack.Start();
         _loop = Task.Run(() => RunAsync(_cts.Token));
@@ -492,6 +495,7 @@ public sealed class NetworkMonitorService : IDisposable
         _honeypot.Stop();
         _suricata.Stop();
         _wireGuard.Stop();
+        _wireGuardEndpoints.Stop();
         _dns.Stop();
         _conntrack.Stop();
         _history.Save();
@@ -518,28 +522,46 @@ public sealed class NetworkMonitorService : IDisposable
     /// client traffic keeps the normal cadence, so a busy machine doesn't poll flat out.
     /// </summary>
     /// <summary>
-    /// True when the address is a current WireGuard peer's public endpoint — the address
-    /// its encrypted tunnel packets arrive from. Blocking an endpoint kills that client's
-    /// VPN, so the prevention engine consults this before auto-blocking: WireGuard's own
-    /// alerts carry the endpoint as the threat source (for geo enrichment), and any other
-    /// detector can flag the same address when a peer's traffic trips a heuristic.
-    /// Only meaningful while WireGuard monitoring is enabled; with no peer data it simply
-    /// never matches.
+    /// True when the address is a WireGuard peer's public endpoint — the address its
+    /// encrypted tunnel packets arrive from. Blocking an endpoint kills that client's VPN
+    /// and every service reached through it, so the prevention engine consults this before
+    /// auto-blocking: WireGuard's own alerts carry the endpoint as the threat source (for
+    /// geo enrichment), and any other detector can flag the same address when a peer's
+    /// traffic trips a heuristic.
+    ///
+    /// Answered from two sources, because the live peer list alone was not enough: it is
+    /// empty unless WireGuard *monitoring* is enabled (off by default), which left the
+    /// shield inert on exactly the VPN gateways it was written for. <see cref="WireGuardEndpointGuard"/>
+    /// tracks endpoints regardless of that setting and remembers them for a day, so a peer
+    /// that has just roamed — or a tunnel that is already down — is still not blockable.
     /// </summary>
     public bool IsWireGuardPeerEndpoint(string ip)
     {
         if (string.IsNullOrEmpty(ip) || !FirewallService.TryNormalizeIp(ip, out var normalized, out _))
             return false;
 
+        if (_wireGuardEndpoints.IsProtected(normalized))
+            return true;
+
         foreach (var peer in _wireGuard.Peers)
         {
             if (string.IsNullOrEmpty(peer.EndpointIp)) continue;
             if (FirewallService.TryNormalizeIp(peer.EndpointIp, out var endpoint, out _) &&
                 string.Equals(endpoint, normalized, StringComparison.OrdinalIgnoreCase))
+            {
+                // Seen live before the guard's own sample caught up — keep it either way.
+                _wireGuardEndpoints.Remember(endpoint);
                 return true;
+            }
         }
         return false;
     }
+
+    /// <summary>State of the tunnel-endpoint shield, independent of peer monitoring.</summary>
+    public string WireGuardProtectionStatus => _wireGuardEndpoints.Status;
+
+    /// <summary>Endpoint addresses currently shielded from auto-block.</summary>
+    public IReadOnlyCollection<string> WireGuardProtectedEndpoints => _wireGuardEndpoints.Endpoints;
 
     /// <summary>
     /// True when the address falls inside some WireGuard peer's AllowedIPs — i.e. the
@@ -1154,6 +1176,7 @@ public sealed class NetworkMonitorService : IDisposable
         _honeypot.Dispose();
         _suricata.Dispose();
         _wireGuard.Dispose();
+        _wireGuardEndpoints.Dispose();
         _dns.Dispose();
         _conntrack.Dispose();
         _intel.Dispose();

@@ -24,6 +24,11 @@
   </ItemGroup>
 
   <ItemGroup>
+    <!-- Parsers and samplers stay internal to the app; the suite still needs to reach them. -->
+    <InternalsVisibleTo Include="NetworkSentinel.Tests" />
+  </ItemGroup>
+
+  <ItemGroup>
     <PackageReference Include="Avalonia" Version="11.2.5" />
     <PackageReference Include="Avalonia.Desktop" Version="11.2.5" />
     <PackageReference Include="Avalonia.Themes.Fluent" Version="11.2.5" />

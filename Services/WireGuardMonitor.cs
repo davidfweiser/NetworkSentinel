@@ -338,7 +338,11 @@ public sealed class WireGuardMonitor : IDisposable
         return true;
     }
 
-    private bool TryRunWgDump(out string output, out string error)
+    /// <summary>
+    /// Runs `wg show all dump`. Static and internal because <see cref="WireGuardEndpointGuard"/>
+    /// needs the same peer state whether or not peer *monitoring* is switched on.
+    /// </summary>
+    internal static bool TryRunWgDump(out string output, out string error)
     {
         output = "";
         error = "";
