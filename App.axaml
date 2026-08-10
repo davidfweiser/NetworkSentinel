@@ -19,6 +19,7 @@
       <conv:IssuingToTextConverter x:Key="IssueCertText"/>
       <conv:InvertBoolConverter x:Key="InvertBool"/>
       <conv:StringNotEmptyConverter x:Key="NotEmpty"/>
+      <conv:BlockStatusToBrushConverter x:Key="BlockStatusBrush"/>
       <FontFamily x:Key="AppFont">Inter, Ubuntu, Cantarell, sans-serif</FontFamily>
     </ResourceDictionary>
   </Application.Resources>

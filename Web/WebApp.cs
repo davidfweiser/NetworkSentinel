@@ -838,10 +838,10 @@ public sealed class WebApp : IDisposable
                     _prevention.Enabled = !_prevention.Enabled;
                     _settings.AutoBlockEnabled = _prevention.Enabled;
                     _settings.Save();
-                    _statusMessage = _prevention.Enabled
-                        ? $"Auto-block ON (≥ {_prevention.MinLevel})" +
-                          (_firewall.IsAdministrator ? "" : " — need pkexec/sudo for firewall changes")
-                        : "Auto-block OFF";
+                    _statusMessage = _prevention.Describe() +
+                        (_prevention.Enabled && !_firewall.IsAdministrator
+                            ? " — need pkexec/sudo for firewall changes"
+                            : "");
                     return ActionResultDto.Success(_statusMessage);
 
                 case "cycle_min_level":
@@ -884,7 +884,7 @@ public sealed class WebApp : IDisposable
                         case "autoBlockEnabled":
                             _prevention.Enabled = on;
                             _settings.AutoBlockEnabled = on;
-                            label = on ? $"Auto-block ON (≥ {_prevention.MinLevel})" : "Auto-block OFF";
+                            label = _prevention.Describe();
                             break;
                         case "blockInbound":
                             _prevention.BlockInbound = on;
@@ -1408,6 +1408,9 @@ public sealed class WebApp : IDisposable
             {
                 autoBlockEnabled = _prevention.Enabled,
                 autoBlockMinLevel = _prevention.MinLevel.ToString(),
+                // The engine's own wording for the header pill — the only form that
+                // distinguishes armed from dry run.
+                autoBlockSummary = _prevention.Describe(),
                 blockInbound = _prevention.BlockInbound,
                 blockOutbound = _prevention.BlockOutbound,
                 geoLookupEnabled = _settings.GeoLookupEnabled,
@@ -1506,18 +1509,28 @@ public sealed class WebApp : IDisposable
                 blocked = blocked.Contains(h.IpAddress) || h.IsBlocked,
                 lastSeen = h.LastSeenText
             }),
-            threats = _monitor.Threats.Take(200).Select(t => new
+            threats = _monitor.Threats.Take(200).Select(t =>
             {
-                ts = t.Timestamp.ToString("o"),
-                time = t.TimeText,
-                level = t.LevelText,
-                levelNum = (int)t.Level,
-                type = t.TypeText,
-                sourceIp = t.SourceIp,
-                title = t.Title,
-                detail = t.Detail,
-                origin = t.Origin,
-                method = t.Method
+                // Answers "is this address being blocked?" for the browser notification,
+                // exactly as the desktop popup and the webhooks answer it. Null for a
+                // threat that names no blockable address.
+                var status = _prevention.DescribeEnforcement(t);
+                return new
+                {
+                    ts = t.Timestamp.ToString("o"),
+                    time = t.TimeText,
+                    level = t.LevelText,
+                    levelNum = (int)t.Level,
+                    type = t.TypeText,
+                    sourceIp = t.SourceIp,
+                    title = t.Title,
+                    detail = t.Detail,
+                    origin = t.Origin,
+                    method = t.Method,
+                    blockStatus = status?.Text,
+                    blockShort = status?.ShortText,
+                    blocked = status?.IsBlocked
+                };
             }),
             ports = _monitor.ListeningPorts.Select(p => new
             {
@@ -1618,27 +1631,15 @@ public sealed class WebApp : IDisposable
 
     private void OnMonitorUpdated() => RefreshBlockedIps(force: false);
 
-    private void OnThreatsDetected(IReadOnlyList<ThreatEvent> threats)
+    /// <summary>The monitor enforces the batch before raising this; we only report it.</summary>
+    private void OnThreatsDetected(IReadOnlyList<ThreatEvent> threats, PreventionResult prevention)
     {
-        if (!_prevention.Enabled || threats.Count == 0)
+        if (!prevention.HasMessages)
             return;
 
-        _ = Task.Run(() =>
-        {
-            try
-            {
-                var result = _prevention.Apply(threats);
-                if (!result.HasMessages)
-                    return;
-                _statusMessage = result.Summary;
-                if (result.RulesChanged)
-                    RefreshBlockedIps(force: true);
-            }
-            catch (Exception ex)
-            {
-                _statusMessage = $"Auto-block error: {ex.Message}";
-            }
-        });
+        _statusMessage = prevention.Summary;
+        if (prevention.RulesChanged)
+            RefreshBlockedIps(force: true);
     }
 
     private void RefreshBlockedIps(bool force)
@@ -2017,6 +2018,8 @@ public sealed class WebApp : IDisposable
   .lvl-high { background: rgba(250,115,64,.18); color: var(--sev-high); }
   .lvl-critical { background: rgba(242,64,89,.35); color: #fff; }
   .blocked { color: var(--danger); font-weight: 600; }
+  /* A block that failed or was only simulated — not stopped, and worth a look. */
+  .warn { color: var(--amber); font-weight: 600; }
   .ok { color: var(--success); }
   .muted { color: var(--muted); }
   .empty { padding: 28px; text-align: center; color: var(--muted); }
@@ -2332,6 +2335,13 @@ public sealed class WebApp : IDisposable
     return `<span class="badge ${lvlClass(level)}">${esc(level)}</span>`;
   }
 
+  // Blocked cell in the threats table: red for a dropped address, amber for a verdict
+  // that wants attention (failed rule, dry run), muted for one deliberately left alone.
+  function blockCellClass(t) {
+    if (t.blocked) return 'blocked';
+    return (t.blockShort === 'Failed' || t.blockShort === 'Dry run') ? 'warn' : 'muted';
+  }
+
   function matchFilter(q, ...parts) {
     if (!q) return true;
     const s = parts.join(' ').toLowerCase();
@@ -2575,11 +2585,25 @@ public sealed class WebApp : IDisposable
     if (!criticalPrimed) { criticalPrimed = true; return; }
     if (!fresh.length || !state.settings?.criticalAlertsEnabled) return;
     if (!('Notification' in window) || Notification.permission !== 'granted') return;
-    const head = fresh.length === 1
-      ? 'Critical threat: ' + (fresh[0].type || 'threat detected')
-      : fresh.length + ' critical threats detected';
+    // Same verdict the desktop popup and the webhooks carry: a warning that names an
+    // address should say whether that address is being blocked.
+    const known = fresh.filter(t => t.blockStatus);
+    const nBlocked = fresh.filter(t => t.blocked).length;
+    let head;
+    if (fresh.length === 1) {
+      const label = 'critical threat: ' + (fresh[0].type || 'threat detected');
+      head = !fresh[0].blockStatus ? 'Critical threat: ' + (fresh[0].type || 'threat detected')
+           : fresh[0].blocked ? 'Blocked · ' + label
+           : 'NOT blocked · ' + label;
+    } else {
+      head = fresh.length + ' critical threats'
+           + (!known.length ? ' detected'
+              : nBlocked === known.length ? ' — all blocked'
+              : ' — ' + nBlocked + ' of ' + known.length + ' blocked');
+    }
     const body = fresh.slice(0, 4)
-      .map(t => t.title + (t.sourceIp ? ' — ' + t.sourceIp : '')).join('\n');
+      .map(t => t.title + (t.sourceIp ? ' — ' + t.sourceIp : '')
+                + (t.blockStatus ? '\n  ' + t.blockStatus : '')).join('\n');
     try { new Notification(head, { body, tag: 'ns-critical' }); } catch { /* blocked */ }
   }
 
@@ -2607,10 +2631,12 @@ public sealed class WebApp : IDisposable
     $('monLabel').textContent = mon ? 'Monitoring' : 'Asleep';
     $('fwPill').textContent = state.firewall?.isAdmin ? 'Firewall: ready' : 'Firewall: needs elevation';
     const ab = state.settings?.autoBlockEnabled;
-    $('abPill').textContent = ab
-      ? `Auto-block ≥ ${state.settings.autoBlockMinLevel}`
-      : 'Auto-block off';
-    $('btnAuto').textContent = ab ? 'Auto-block ON' : 'Auto-block OFF';
+    // Straight from the engine, so the pill says DRY RUN when nothing is being written.
+    $('abPill').textContent = state.settings?.autoBlockSummary
+      || (ab ? `Auto-block ≥ ${state.settings.autoBlockMinLevel}` : 'Auto-block off');
+    $('btnAuto').textContent = ab
+      ? (state.settings?.preventionDryRun ? 'Auto-block DRY RUN' : 'Auto-block ON')
+      : 'Auto-block OFF';
     $('btnLevel').textContent = 'Min: ' + (state.settings?.autoBlockMinLevel || 'High');
 
     const s = state.stats || {};
@@ -2630,7 +2656,7 @@ public sealed class WebApp : IDisposable
 
     const threats = state.threats || [];
     $('dash-threats').innerHTML = table(
-      ['Time', 'Level', 'Type', 'Source', 'Title', 'Origin'],
+      ['Time', 'Level', 'Type', 'Source', 'Title', 'Origin', 'Blocked'],
       threats.slice(0, 12).map(t => `<tr>
         <td class="mono">${esc(t.time)}</td>
         <td>${badge(t.level)}</td>
@@ -2638,6 +2664,7 @@ public sealed class WebApp : IDisposable
         <td class="mono">${esc(t.sourceIp)}</td>
         <td>${esc(t.title)}</td>
         <td class="muted">${esc(t.origin)}</td>
+        <td class="${blockCellClass(t)}" title="${esc(t.blockStatus || '')}">${esc(t.blockShort || '·')}</td>
       </tr>`).join('')
     );
 
@@ -2681,7 +2708,7 @@ public sealed class WebApp : IDisposable
 
     const tq = $('filterThreats').value.trim();
     $('tbl-threats').innerHTML = table(
-      ['Time', 'Level', 'Type', 'Source', 'Title', 'Detail', 'Origin', ''],
+      ['Time', 'Level', 'Type', 'Source', 'Title', 'Detail', 'Origin', 'Blocked', ''],
       (state.threats || []).filter(t => matchFilter(tq, t.level, t.type, t.sourceIp, t.title, t.detail, t.origin))
         .map(t => `<tr>
           <td class="mono">${esc(t.time)}</td>
@@ -2691,8 +2718,11 @@ public sealed class WebApp : IDisposable
           <td>${esc(t.title)}</td>
           <td class="muted">${esc(t.detail)}</td>
           <td class="muted">${esc(t.origin)}</td>
-          <td class="row-actions">${blockable(t.sourceIp)
-            ? `<button data-block="${esc(t.sourceIp)}">Block</button>` : ''}</td>
+          <td class="${blockCellClass(t)}" title="${esc(t.blockStatus || '')}">${esc(t.blockShort || '·')}</td>
+          <td class="row-actions">${!blockable(t.sourceIp) ? ''
+            : t.blocked
+              ? `<button data-unblock="${esc(t.sourceIp)}">Unblock</button>`
+              : `<button data-block="${esc(t.sourceIp)}">Block</button>`}</td>
         </tr>`).join('')
     );
 

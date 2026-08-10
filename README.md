@@ -12,7 +12,7 @@ Three ways to run it:
 
 > **Host-based** intrusion detection and prevention. It detects on its own heuristics and, with Suricata attached (0.6.0), on signature/payload inspection — then enforces in the kernel via `nftables`. It is not an inline network appliance: it protects the machine it runs on, not a segment, and it does not sit in the forwarding path.
 
-Linux port of the original Windows WPF Network Sentinel. Platform layers use `/proc/net`, `ss`, conntrack netlink, `nftables`/`iptables` (elevated via **pkexec**), and XDG data paths. Version **0.6.4**.
+Linux port of the original Windows WPF Network Sentinel. Platform layers use `/proc/net`, `ss`, conntrack netlink, `nftables`/`iptables` (elevated via **pkexec**), and XDG data paths. Version **0.6.5**.
 
 ---
 
@@ -50,6 +50,24 @@ Heuristics flag patterns such as:
 | **Exfiltration monitor** | `ss -tinp` per-socket byte counters; alerts when outbound traffic to a single non-allowlisted public host exceeds a threshold (default **250 MB / 10 min**). LAN destinations (NAS backups) and allowlisted hosts stay quiet. TCP only — UDP/QUIC carries no equivalent kernel counter. |
 
 Each alert includes **source IP**, **method**, and **where it’s coming from** (DNS + best-effort geo). Threat events and the host/listener baseline **persist across restarts** (`threat-log.jsonl`, `host-history.json`).
+
+### Every warning says whether the address is blocked (0.6.5)
+
+A warning that names an address and stops there sends you to the console to find out whether anything was actually done about it. So each batch of threats is run past the prevention engine **before** any alert about it leaves the machine, and the alert carries the verdict:
+
+| Verdict | When |
+| --- | --- |
+| `BLOCKED — auto-block rule added` | A rule was just written for the address |
+| `BLOCKED — a rule for this address is already in place` | It was already blocked |
+| `NOT blocked — the firewall refused the rule: …` | A block was attempted and failed |
+| `NOT blocked — dry run (it would have been blocked)` | Prevention is in dry-run mode |
+| `NOT blocked — auto-block is off` / `no firewall privileges` / `you released this address manually` / `allowlisted` / `below the auto-block level (≥High)` / … | The gate that stopped it — see [Prevention engine](#prevention-engine-060) |
+
+Desktop notifications lead with it in the title (`Blocked · critical threat: Port Scan`, or `3 critical threats — 2 of 3 blocked`), the web console's browser notifications say the same, webhooks carry it in the message body, and generic JSON payloads add `blocked`, `block_state` and `block_status` fields. Threats that name no blockable address (a startup-item change, a new local listener) say nothing about blocking rather than guessing.
+
+The threat tables answer it too, so the screen you land on after a warning agrees with the warning: a **Blocked** column in the GUI (hover for the full reason) and the web console, and a `Blk` column in the TUI — red when the address is being dropped, amber for a block that failed or was only simulated, muted when it was deliberately left alone. A row whose address is already blocked offers **Unblock** in place of **Block**, as the Remote Computers views do; re-blocking would only rewrite a rule that is already in force.
+
+Every status line that reports auto-block state — the GUI hero subtitle and tray tooltip, the TUI footer, the web console's header pill, and the message each shows when you flip the toggle — comes from the engine itself, so **DRY RUN** is never mistaken for armed.
 
 ### Remote alerting (webhook)
 Set **Settings → Webhook URL** to push Critical threats off the machine — the payload adapts automatically: **ntfy** (plain text + `Title`/`Priority` headers), **Slack** (`{"text": …}`), **Discord** (`{"content": …}`), anything else gets a generic JSON document. Per-source/type cooldown stops a burst from flooding the channel.
@@ -204,7 +222,7 @@ Domains are DNS-resolved to current IPs. Auto-block never touches allowlisted IP
 | **Allowlist** | Add/remove trusted domains and IPs; refresh the feed |
 | **Settings** | Monitoring on/off, poll interval, geo lookups, auth-log and closed-port scan detection, the 0.4.0 detectors (threat intel, new-listener alerts, process reputation, ARP/gateway watch, startup-item watch, exfiltration threshold, honeypot ports), **kernel flow events**, **DNS hygiene** (with approved resolvers), **WireGuard peer monitoring** (with a live peer table), **Suricata signature ingestion** (EVE path, maximum severity, muted sids), **auto-block dry run**, **HTTPS + DuckDNS remote access** (including **Issue certificate**), webhook URL, auto-block + minimum severity + expiry, block direction (in/out), allowlist feed, **change master password**, **Remove all rules** |
 
-The page header shows the running version (e.g. `v0.6.4`) — check it after an upgrade to confirm the new build is live.
+The page header shows the running version (e.g. `v0.6.5`) — check it after an upgrade to confirm the new build is live.
 
 ### Sleep / Wake
 
@@ -758,7 +776,8 @@ All three UIs write the same `~/.local/share/NetworkSentinel/settings.json`, so 
 | `Services/PersistenceWatcher.cs` | systemd / cron / autostart folder watch |
 | `Services/ExfiltrationMonitor.cs` | `ss` per-socket byte sampling |
 | `Services/HostHistoryStore.cs` | Persistent host + listener baseline, threat log |
-| `Services/WebhookNotifier.cs` | ntfy / Slack / Discord / generic JSON alerts |
+| `Services/WebhookNotifier.cs` | ntfy / Slack / Discord / generic JSON alerts, each carrying the block verdict |
+| `Services/DesktopNotifier.cs` | Critical desktop popups (notify-send / gdbus), blocked-or-not in the title |
 | `Services/GeoIpService.cs` | Reverse DNS + public geo lookup |
 | `Services/FirewallService.cs` | nftables / iptables via pkexec; rule ledger; auto-block expiry sweep |
 | `Services/AppSettings.cs` / `AppPaths.cs` | XDG data dir + JSON settings |

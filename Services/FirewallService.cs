@@ -691,7 +691,34 @@ public sealed class FirewallService
         return _backendNft.Value;
     }
 
+    /// <summary>
+    /// Cached <c>which</c> results. <see cref="IsAdministrator"/> probes for pkexec and
+    /// sudo, and it is now read per alert (see <see cref="PreventionService.DescribeEnforcement"/>)
+    /// as well as per block — a subprocess each time, for an answer that changes only when
+    /// someone installs an elevation helper. Short TTL rather than permanent, so installing
+    /// one mid-session is still picked up.
+    /// </summary>
+    private static readonly TimeSpan CommandProbeTtl = TimeSpan.FromSeconds(60);
+    private static readonly Dictionary<string, (bool Exists, DateTime CheckedUtc)> CommandProbes = new();
+
     private static bool CommandExists(string name)
+    {
+        lock (CommandProbes)
+        {
+            if (CommandProbes.TryGetValue(name, out var cached) &&
+                DateTime.UtcNow - cached.CheckedUtc < CommandProbeTtl)
+                return cached.Exists;
+        }
+
+        var exists = ProbeCommand(name);
+
+        lock (CommandProbes)
+            CommandProbes[name] = (exists, DateTime.UtcNow);
+
+        return exists;
+    }
+
+    private static bool ProbeCommand(string name)
     {
         try
         {
