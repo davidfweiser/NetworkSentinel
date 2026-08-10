@@ -308,58 +308,47 @@ public partial class MainViewModel : ObservableObject, IDisposable
         }, DispatcherPriority.Background);
     }
 
-    private void OnThreatsDetected(IReadOnlyList<ThreatEvent> threats)
+    /// <summary>
+    /// The monitor has already run the batch past the prevention engine, so the toast can
+    /// tell the user whether the address it is warning about is being blocked.
+    /// </summary>
+    private void OnThreatsDetected(IReadOnlyList<ThreatEvent> threats, PreventionResult prevention)
     {
         if (threats.Count == 0)
             return;
 
-        if (CriticalAlertsEnabled)
-        {
-            var critical = threats.Where(t => t.Level >= ThreatLevel.Critical).ToList();
-            if (critical.Count > 0)
-                _ = Task.Run(() => _notifier.NotifyCritical(critical));
-        }
+        ShowAutoBlockOutcome(prevention);
 
-        if (!_prevention.Enabled)
+        if (!CriticalAlertsEnabled)
             return;
 
-        // Run auto-block on the thread pool — firewall COM/netsh calls must
-        // not stall the monitor's polling loop.
-        _ = Task.Run(() =>
+        var critical = threats.Where(t => t.Level >= ThreatLevel.Critical).ToList();
+        if (critical.Count > 0)
+            _ = Task.Run(() => _notifier.NotifyCritical(
+                critical, t => _prevention.DescribeEnforcement(t, prevention)));
+    }
+
+    private void ShowAutoBlockOutcome(PreventionResult result)
+    {
+        if (!result.HasMessages)
+            return;
+
+        var dispatcher = Application.Current?.Dispatcher;
+        dispatcher?.BeginInvoke(() =>
         {
-            try
+            if (result.StatusMessage is { } status)
             {
-                var result = _prevention.Apply(threats);
-                if (!result.HasMessages)
-                    return;
-
-                var dispatcher = Application.Current?.Dispatcher;
-                dispatcher?.BeginInvoke(() =>
-                {
-                    if (result.StatusMessage is { } status)
-                    {
-                        AutoBlockStatusText = status;
-                        FirewallMessage = "Auto-block skipped: not running as Administrator.";
-                        return;
-                    }
-
-                    FirewallMessage = result.Summary;
-                    UpdateAutoBlockStatusText();
-                    if (result.RulesChanged)
-                    {
-                        RefreshFirewallRules();
-                        RefreshCollections();
-                    }
-                });
+                AutoBlockStatusText = status;
+                FirewallMessage = status;
+                return;
             }
-            catch (Exception ex)
+
+            FirewallMessage = result.Summary;
+            UpdateAutoBlockStatusText();
+            if (result.RulesChanged)
             {
-                var dispatcher = Application.Current?.Dispatcher;
-                dispatcher?.BeginInvoke(() =>
-                {
-                    FirewallMessage = $"Auto-block error: {ex.Message}";
-                    UpdateAutoBlockStatusText();
-                });
+                RefreshFirewallRules();
+                RefreshCollections();
             }
         });
     }
@@ -373,10 +362,19 @@ public partial class MainViewModel : ObservableObject, IDisposable
         foreach (var host in _monitor.RemoteHosts)
             host.IsBlocked = _prevention.IsBlocked(host.IpAddress);
 
+        // Only the rows about to be shown: the engine is cheap to ask, but the backlog
+        // behind the filter can be 500 events deep.
+        var visibleThreats = FilterThreats(_monitor.Threats).ToList();
+        foreach (var threat in visibleThreats)
+        {
+            var status = _prevention.DescribeEnforcement(threat);
+            threat.SetBlockStatus(status?.ShortText ?? "", status?.Text ?? "", status?.IsBlocked ?? false);
+        }
+
         Sync(Connections, FilterConnections(_monitor.Connections));
         Sync(ListeningPorts, _monitor.ListeningPorts);
         Sync(RemoteHosts, FilterHosts(_monitor.RemoteHosts));
-        Sync(Threats, FilterThreats(_monitor.Threats));
+        Sync(Threats, visibleThreats);
 
         var activity = _monitor.Activity;
         ActivitySeries.Clear();
@@ -390,7 +388,7 @@ public partial class MainViewModel : ObservableObject, IDisposable
 
         var high = Stats.HighThreats;
         var blocked = _prevention.BlockedCount;
-        var auto = AutoBlockEnabled ? $"Auto-block ON (≥{AutoBlockMinLevel})" : "Auto-block OFF";
+        var auto = _prevention.Describe();
         HeroSubtitle = high > 0
             ? $"{high} high/critical · {blocked} blocked · {auto}"
             : $"{blocked} IPs blocked · {auto}";
@@ -1308,6 +1306,19 @@ public partial class MainViewModel : ObservableObject, IDisposable
     {
         if (threat == null) return;
         await BlockIpInternal(threat.SourceIp, $"Threat block · {threat.TypeText}: {threat.Title}");
+    }
+
+    /// <summary>
+    /// Releases the address a threat came from. The row offers this instead of "Block IP"
+    /// once the address is already blocked — re-blocking it would prompt for elevation to
+    /// rewrite a rule that is already in force, and would quietly turn an expiring
+    /// auto-block into a permanent manual one.
+    /// </summary>
+    [RelayCommand]
+    private async Task UnblockThreatIp(ThreatEvent? threat)
+    {
+        if (threat == null) return;
+        await UnblockIpInternal(threat.SourceIp);
     }
 
     [RelayCommand]

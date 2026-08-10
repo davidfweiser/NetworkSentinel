@@ -66,6 +66,10 @@ public sealed class SentinelCore : IDisposable
         Monitor.IsIpAllowlisted = ip => Allowlist.IsAllowed(ip, out _);
         // A WireGuard peer's public endpoint must never be auto-blocked — that kills the tunnel.
         Prevention.IsProtectedAddress = Monitor.IsWireGuardPeerEndpoint;
+        // Every batch is enforced before any warning about it goes out, so an alert that
+        // names an address can also say whether that address is being blocked.
+        Monitor.Enforce = Prevention.Apply;
+        Monitor.DescribeEnforcement = Prevention.DescribeEnforcement;
 
         // An elevated process can re-install the probe-log rule silently; unelevated
         // runs wait for the user to authorize elevation instead of failing at startup.

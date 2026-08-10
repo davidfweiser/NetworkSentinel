@@ -10,16 +10,67 @@ public enum PreventionAction
     /// <summary>Dry-run mode: the block was decided but deliberately not written.</summary>
     Simulated,
     /// <summary>The firewall rejected the rule.</summary>
-    Failed
+    Failed,
+    /// <summary>
+    /// A gate held the block back for a reason worth saying out loud. Only the tunnel-endpoint
+    /// gate reports: every other gate refuses something ordinary (a LAN address, an allowlisted
+    /// host), while this one refuses a *threat* against a live VPN peer. Silence there sends the
+    /// operator hunting through firewall rules for a block that was never made.
+    /// </summary>
+    Skipped
 }
 
-/// <summary>One acted-on threat. Threats filtered out by the gates never produce a decision.</summary>
+/// <summary>
+/// One threat the engine acted on — or, for <see cref="PreventionAction.Skipped"/>, deliberately
+/// did not. The other gates filter silently; only a refusal the operator would otherwise have to
+/// explain to themselves produces a decision without a rule.
+/// </summary>
 public sealed class PreventionDecision
 {
     public required string Ip { get; init; }
     public required PreventionAction Action { get; init; }
     public required string Message { get; init; }
     public required ThreatEvent Threat { get; init; }
+
+    /// <summary>Why the firewall refused, on a <see cref="PreventionAction.Failed"/> decision.</summary>
+    public string? FailureReason { get; init; }
+}
+
+/// <summary>Where an alert's address stands with the enforcement engine.</summary>
+public enum BlockState
+{
+    /// <summary>A rule was just written for it.</summary>
+    Blocked,
+    /// <summary>A rule this app owns was already in place.</summary>
+    AlreadyBlocked,
+    /// <summary>Dry run: it cleared every gate, but no rule was written.</summary>
+    WouldBlock,
+    /// <summary>A block was attempted and the firewall refused it.</summary>
+    Failed,
+    /// <summary>Left alone — see the text for which gate stopped it.</summary>
+    NotBlocked
+}
+
+/// <summary>
+/// The answer to "is this address being blocked?", phrased for an alert.
+/// </summary>
+public sealed record EnforcementStatus(BlockState State, string Text)
+{
+    /// <summary>True when traffic to and from the address is actually being dropped.</summary>
+    public bool IsBlocked => State is BlockState.Blocked or BlockState.AlreadyBlocked;
+
+    /// <summary>
+    /// The verdict as a table cell — <see cref="Text"/> is the tooltip that explains it.
+    /// One vocabulary for all three threat tables, so the GUI, the TUI and the web console
+    /// cannot end up describing the same state three different ways.
+    /// </summary>
+    public string ShortText => State switch
+    {
+        BlockState.Blocked or BlockState.AlreadyBlocked => "Blocked",
+        BlockState.WouldBlock => "Dry run",
+        BlockState.Failed => "Failed",
+        _ => "No"
+    };
 }
 
 /// <summary>Result of one <see cref="PreventionService.Apply"/> pass.</summary>
@@ -41,6 +92,10 @@ public sealed class PreventionResult
     public string Summary => Decisions.Count > 0
         ? string.Join(" · ", Decisions.Select(d => d.Message))
         : StatusMessage ?? "";
+
+    /// <summary>What this pass decided about <paramref name="ip"/>, if it reached a decision at all.</summary>
+    public PreventionDecision? DecisionFor(string ip)
+        => Decisions.FirstOrDefault(d => string.Equals(d.Ip, ip, StringComparison.OrdinalIgnoreCase));
 }
 
 /// <summary>
@@ -58,6 +113,11 @@ public sealed class PreventionResult
 ///   not allowlisted → not this machine's own address → not a protected
 ///   endpoint (WireGuard peers) → not operator-protected → not already blocked →
 ///   not suppressed by a manual unblock → not attempted in the last RetryAfter.
+///
+/// The engine also answers for the alert channels: <see cref="DescribeEnforcement"/>
+/// turns a threat plus the pass that ran over its batch into the "is this address being
+/// blocked?" line that desktop toasts and webhooks carry, so a warning and the console
+/// can never disagree about what was done.
 ///
 /// In <see cref="DryRun"/> mode every gate still runs and decisions are still
 /// reported, but no rule is written. That is the safe way to promote a noisy new
@@ -82,6 +142,9 @@ public sealed class PreventionService
 
     /// <summary>A manual unblock suppresses auto-block for this address for this long.</summary>
     public static readonly TimeSpan ManualUnblockSuppressFor = TimeSpan.FromHours(24);
+
+    /// <summary>How often the same address may repeat a "not blocking, it is a tunnel endpoint" note.</summary>
+    public static readonly TimeSpan ProtectedNoteCooldown = TimeSpan.FromMinutes(10);
 
     /// <summary>
     /// How long auto-block stands down after elevation itself fails. Elevation failure
@@ -109,6 +172,9 @@ public sealed class PreventionService
     private readonly Dictionary<string, DateTime> _skipUntil = new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<string, DateTime> _suppressedUntil = new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<string, DateTime> _protectedUntil = new(StringComparer.OrdinalIgnoreCase);
+
+    /// <summary>Address → when a "not blocking a tunnel endpoint" note may be repeated.</summary>
+    private readonly Dictionary<string, DateTime> _noteCooldown = new(StringComparer.OrdinalIgnoreCase);
 
     private HashSet<string> _blockedIps = new(StringComparer.OrdinalIgnoreCase);
     private DateTime _blockedIpsRefreshedAt = DateTime.MinValue;
@@ -230,7 +296,10 @@ public sealed class PreventionService
         if (!Enabled || threats.Count == 0)
             return PreventionResult.Empty;
 
-        if (!_firewall.IsAdministrator)
+        // Dry run writes no rule, so it has nothing to elevate for. Demanding privilege to
+        // *simulate* blocked the one workflow the mode exists for: checking what a new
+        // detection source would drop before giving it the right to drop anything.
+        if (!DryRun && !_firewall.IsAdministrator)
         {
             return new PreventionResult
             {
@@ -257,8 +326,12 @@ public sealed class PreventionService
 
         foreach (var threat in threats)
         {
-            if (!ShouldConsider(threat, claimSlot: !DryRun, out var ip))
+            if (!ShouldConsider(threat, claimSlot: !DryRun, out var ip, out var heldBack))
+            {
+                if (heldBack != null)
+                    decisions.Add(heldBack);
                 continue;
+            }
 
             if (DryRun)
             {
@@ -298,6 +371,7 @@ public sealed class PreventionService
                     Ip = ip,
                     Action = PreventionAction.Failed,
                     Message = $"Auto-block failed for {ip}: {result.Message}",
+                    FailureReason = result.Message,
                     Threat = threat
                 });
 
@@ -322,6 +396,87 @@ public sealed class PreventionService
     }
 
     /// <summary>
+    /// Says whether the address an alert names is being blocked, in words that can go
+    /// straight into the warning. Pass the <paramref name="result"/> of the pass that ran
+    /// over the same batch: a decision it reached is the authoritative answer, and every
+    /// other case is read back off the gates.
+    ///
+    /// A warning that names an address but says nothing about enforcement leaves the
+    /// reader to go and work out whether anything stopped it — at the one moment they can
+    /// least afford to. Null means the threat names no blockable address (a persistence
+    /// change, a new local listener), so there is nothing to claim either way.
+    /// </summary>
+    public EnforcementStatus? DescribeEnforcement(ThreatEvent threat, PreventionResult? result = null)
+    {
+        if (!FirewallService.TryNormalizeIp(threat.SourceIp, out var ip, out _))
+            return null;
+
+        if (result?.DecisionFor(ip) is { } decision)
+        {
+            return decision.Action switch
+            {
+                PreventionAction.Blocked => new EnforcementStatus(
+                    BlockState.Blocked, "BLOCKED — auto-block rule added"),
+                PreventionAction.Simulated => new EnforcementStatus(
+                    BlockState.WouldBlock, "NOT blocked — dry run (it would have been blocked)"),
+                _ => new EnforcementStatus(
+                    BlockState.Failed, $"NOT blocked — the firewall refused the rule: {decision.FailureReason}")
+            };
+        }
+
+        if (FirewallService.IsPrivateOrLocal(ip))
+            return new EnforcementStatus(BlockState.NotBlocked, "Not blocked — private address, never auto-blocked");
+
+        // Most useful answer first: a rule already covers it, whatever the gates would say.
+        if (IsBlocked(ip))
+            return new EnforcementStatus(BlockState.AlreadyBlocked, "BLOCKED — a rule for this address is already in place");
+
+        if (!Enabled)
+            return new EnforcementStatus(BlockState.NotBlocked, "NOT blocked — auto-block is off");
+
+        if (threat.Level < MinLevel)
+            return new EnforcementStatus(BlockState.NotBlocked,
+                $"Not blocked — below the auto-block level (≥{MinLevel})");
+
+        if (threat.Type == ThreatType.NewRemoteHost)
+            return new EnforcementStatus(BlockState.NotBlocked, "Not blocked — first contact is informational only");
+
+        if (_allowlist.IsAllowed(ip, out var reason))
+            return new EnforcementStatus(BlockState.NotBlocked,
+                $"Not blocked — allowlisted{(string.IsNullOrWhiteSpace(reason) ? "" : $" ({reason})")}");
+
+        if (LocalAddresses.IsOwnAddress(ip))
+            return new EnforcementStatus(BlockState.NotBlocked, "Not blocked — this machine's own address");
+
+        if (IsProtectedAddress is { } externallyProtected && externallyProtected(ip))
+            return new EnforcementStatus(BlockState.NotBlocked, "Not blocked — protected endpoint (blocking it would cut a VPN tunnel)");
+
+        lock (_gate)
+        {
+            var now = DateTime.UtcNow;
+            if (_protectedUntil.TryGetValue(ip, out var protectedUntil) && now < protectedUntil)
+                return new EnforcementStatus(BlockState.NotBlocked, "Not blocked — protected while you are administering from it");
+            if (_suppressedUntil.TryGetValue(ip, out var suppressedUntil) && now < suppressedUntil)
+                return new EnforcementStatus(BlockState.NotBlocked, "NOT blocked — you released this address manually");
+            if (now < _elevationBackoffUntil)
+                return new EnforcementStatus(BlockState.NotBlocked, "NOT blocked — auto-block paused after a failed elevation");
+            if (_skipUntil.TryGetValue(ip, out var eligibleAt) && now < eligibleAt)
+                return new EnforcementStatus(BlockState.NotBlocked, "Not blocked yet — already claimed by an earlier attempt");
+        }
+
+        if (DryRun)
+            return new EnforcementStatus(BlockState.WouldBlock, "NOT blocked — prevention is in dry-run mode");
+
+        // Last, because it is the answer least likely to be the interesting one: only an
+        // address that cleared every other gate has a privilege problem worth reporting.
+        if (!_firewall.IsAdministrator)
+            return new EnforcementStatus(BlockState.NotBlocked,
+                "NOT blocked — Administrator rights are required (restart elevated)");
+
+        return new EnforcementStatus(BlockState.NotBlocked, "NOT blocked");
+    }
+
+    /// <summary>
     /// Matches the failure text of every no-privilege path out of
     /// <see cref="FirewallService"/>: this process not being elevated, and netsh or the
     /// firewall service itself refusing the operation for want of Administrator rights.
@@ -337,10 +492,15 @@ public sealed class PreventionService
     /// The gate stack. When <paramref name="claimSlot"/> is set, a passing threat claims the
     /// address as a side effect, so two concurrent batches naming the same IP can't both try
     /// to block it. Dry run passes false — it decides but never acts.
+    ///
+    /// <paramref name="heldBack"/> is set when a gate refused something the operator needs to
+    /// know about (currently only the tunnel-endpoint shield), so the refusal surfaces instead
+    /// of looking like a block that silently never happened.
     /// </summary>
-    private bool ShouldConsider(ThreatEvent threat, bool claimSlot, out string ip)
+    private bool ShouldConsider(ThreatEvent threat, bool claimSlot, out string ip, out PreventionDecision? heldBack)
     {
         ip = "";
+        heldBack = null;
 
         if (threat.Level < MinLevel)
             return false;
@@ -365,7 +525,22 @@ public sealed class PreventionService
             return false;
 
         if (IsProtectedAddress is { } externallyProtected && externallyProtected(normalized))
+        {
+            // Worth reporting: a threat really was raised against a live VPN peer, and the
+            // only reason no rule exists is that dropping it would take the tunnel with it.
+            if (ShouldNote(normalized))
+            {
+                heldBack = new PreventionDecision
+                {
+                    Ip = normalized,
+                    Action = PreventionAction.Skipped,
+                    Message = $"Not blocking {normalized} ({threat.LevelText}: {threat.Title}) — " +
+                              "it is a WireGuard tunnel endpoint; blocking it would cut that VPN. Block it manually if you mean to.",
+                    Threat = threat
+                };
+            }
             return false;
+        }
 
         lock (_gate)
         {
@@ -387,6 +562,24 @@ public sealed class PreventionService
 
         ip = normalized;
         return true;
+    }
+
+    /// <summary>
+    /// Rate-limits the held-back notes. A peer whose traffic keeps tripping a heuristic
+    /// would otherwise repeat the same line on every poll and bury everything else.
+    /// </summary>
+    private bool ShouldNote(string ip)
+    {
+        lock (_gate)
+        {
+            var now = DateTime.UtcNow;
+            if (_noteCooldown.TryGetValue(ip, out var until) && now < until)
+                return false;
+            _noteCooldown[ip] = now.Add(ProtectedNoteCooldown);
+            if (_noteCooldown.Count > 64)
+                PruneExpired(_noteCooldown);
+            return true;
+        }
     }
 
     public FirewallDirection ResolveDirection()
@@ -537,7 +730,16 @@ public sealed class PreventionService
             map.Remove(key);
     }
 
-    /// <summary>Status line for the GUI/TUI/web footers.</summary>
+    /// <summary>
+    /// Auto-block state for every status line that reports it: the GUI's hero subtitle and
+    /// tray tooltip, the TUI footer, the web console's pill, and the messages all three
+    /// show when the toggle is flipped.
+    ///
+    /// The frontends each used to build this string themselves, and every one of them
+    /// dropped the same thing — dry run. A console reading "Auto-block ON (≥High)" while
+    /// the engine is deliberately writing no rules is the one state the operator most needs
+    /// named, so the engine that knows it says it.
+    /// </summary>
     public string Describe()
     {
         if (!Enabled)
@@ -545,4 +747,11 @@ public sealed class PreventionService
         var mode = DryRun ? "DRY RUN" : "armed";
         return $"Auto-block {mode} (≥{MinLevel})";
     }
+
+    /// <summary>
+    /// <see cref="Describe"/> for somewhere with no room — a window title, a taskbar label.
+    /// Still distinguishes dry run: the compact form is where it was lost before.
+    /// </summary>
+    public string DescribeShort()
+        => !Enabled ? "auto off" : DryRun ? $"dry≥{MinLevel}" : $"auto≥{MinLevel}";
 }

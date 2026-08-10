@@ -19,6 +19,7 @@ public sealed class NetworkMonitorService : IDisposable
     private readonly ExfiltrationMonitor _exfil = new();
     private readonly SuricataService _suricata = new();
     private readonly WireGuardMonitor _wireGuard = new();
+    private readonly WireGuardEndpointGuard _wireGuardEndpoints = new();
     private readonly DnsHygieneMonitor _dns = new();
     private readonly FlowEventSource _flowEvents = new();
     private readonly WebhookNotifier _webhook = new();
@@ -57,8 +58,26 @@ public sealed class NetworkMonitorService : IDisposable
     private DateTime _threatsTodayDate = DateTime.Now.Date;
 
     public event Action? Updated;
-    /// <summary>Raised on the monitor thread with newly detected threats this poll cycle.</summary>
-    public event Action<IReadOnlyList<ThreatEvent>>? ThreatsDetected;
+
+    /// <summary>
+    /// Raised with the threats detected this poll cycle and what enforcement did about
+    /// them. Not raised on the monitor thread — see <see cref="DispatchAlerts"/>.
+    /// </summary>
+    public event Action<IReadOnlyList<ThreatEvent>, PreventionResult>? ThreatsDetected;
+
+    /// <summary>
+    /// Enforcement for a freshly detected batch, wired to the prevention engine by
+    /// <see cref="SentinelCore"/>. Null leaves detection purely advisory (tests, and any
+    /// host that never arms prevention).
+    /// </summary>
+    public Func<IReadOnlyList<ThreatEvent>, PreventionResult>? Enforce { get; set; }
+
+    /// <summary>
+    /// Turns one threat plus its batch's enforcement result into the "is this address
+    /// being blocked?" line that goes out with the alert. Wired to
+    /// <see cref="PreventionService.DescribeEnforcement"/> by <see cref="SentinelCore"/>.
+    /// </summary>
+    public Func<ThreatEvent, PreventionResult, EnforcementStatus?>? DescribeEnforcement { get; set; }
 
     public DashboardStats Stats { get; } = new();
 
@@ -469,6 +488,8 @@ public sealed class NetworkMonitorService : IDisposable
         if (_honeypotEnabled) _honeypot.Start(_honeypotPorts);
         if (_suricataEnabled) _suricata.Start();
         if (_wireGuardEnabled) _wireGuard.Start();
+        // Unconditional: the tunnel shield must not depend on a monitoring toggle.
+        _wireGuardEndpoints.Start();
         if (_dnsHygieneEnabled) _dns.Start();
         if (_flowEventsEnabled) _flowEvents.Start();
         _loop = Task.Run(() => RunAsync(_cts.Token));
@@ -491,6 +512,7 @@ public sealed class NetworkMonitorService : IDisposable
         _honeypot.Stop();
         _suricata.Stop();
         _wireGuard.Stop();
+        _wireGuardEndpoints.Stop();
         _dns.Stop();
         _flowEvents.Stop();
         _history.Save();
@@ -512,28 +534,46 @@ public sealed class NetworkMonitorService : IDisposable
     private volatile HashSet<int> _liveListeningPorts = new();
 
     /// <summary>
-    /// True when the address is a current WireGuard peer's public endpoint — the address
-    /// its encrypted tunnel packets arrive from. Blocking an endpoint kills that client's
-    /// VPN, so the prevention engine consults this before auto-blocking: WireGuard's own
-    /// alerts carry the endpoint as the threat source (for geo enrichment), and any other
-    /// detector can flag the same address when a peer's traffic trips a heuristic.
-    /// Only meaningful while WireGuard monitoring is enabled; with no peer data it simply
-    /// never matches.
+    /// True when the address is a WireGuard peer's public endpoint — the address its
+    /// encrypted tunnel packets arrive from. Blocking an endpoint kills that client's VPN
+    /// and every service reached through it, so the prevention engine consults this before
+    /// auto-blocking: WireGuard's own alerts carry the endpoint as the threat source (for
+    /// geo enrichment), and any other detector can flag the same address when a peer's
+    /// traffic trips a heuristic.
+    ///
+    /// Answered from two sources, because the live peer list alone was not enough: it is
+    /// empty unless WireGuard *monitoring* is enabled (off by default), which left the
+    /// shield inert on exactly the VPN gateways it was written for. <see cref="WireGuardEndpointGuard"/>
+    /// tracks endpoints regardless of that setting and remembers them for a day, so a peer
+    /// that has just roamed — or a tunnel that is already down — is still not blockable.
     /// </summary>
     public bool IsWireGuardPeerEndpoint(string ip)
     {
         if (string.IsNullOrEmpty(ip) || !FirewallService.TryNormalizeIp(ip, out var normalized, out _))
             return false;
 
+        if (_wireGuardEndpoints.IsProtected(normalized))
+            return true;
+
         foreach (var peer in _wireGuard.Peers)
         {
             if (string.IsNullOrEmpty(peer.EndpointIp)) continue;
             if (FirewallService.TryNormalizeIp(peer.EndpointIp, out var endpoint, out _) &&
                 string.Equals(endpoint, normalized, StringComparison.OrdinalIgnoreCase))
+            {
+                // Seen live before the guard's own sample caught up — keep it either way.
+                _wireGuardEndpoints.Remember(endpoint);
                 return true;
+            }
         }
         return false;
     }
+
+    /// <summary>State of the tunnel-endpoint shield, independent of peer monitoring.</summary>
+    public string WireGuardProtectionStatus => _wireGuardEndpoints.Status;
+
+    /// <summary>Endpoint addresses currently shielded from auto-block.</summary>
+    public IReadOnlyCollection<string> WireGuardProtectedEndpoints => _wireGuardEndpoints.Endpoints;
 
     /// <summary>
     /// True when the address falls inside some WireGuard peer's AllowedIPs — i.e. the
@@ -859,12 +899,42 @@ public sealed class NetworkMonitorService : IDisposable
             QueueGeo(t.SourceIp);
 
         if (newThreats.Count > 0)
-        {
-            ThreatsDetected?.Invoke(newThreats);
-            _webhook.Notify(newThreats, WebhookUrl, WebhookMinLevel);
-        }
+            DispatchAlerts(newThreats);
 
         Updated?.Invoke();
+    }
+
+    /// <summary>
+    /// Enforcement first, alerts second: a warning can only tell the user an address is
+    /// being blocked if the block has been decided by the time the message is composed.
+    /// The batch is enforced once here rather than once per frontend, and every channel —
+    /// the console status line, the desktop toast, the webhook — reports the same verdict.
+    ///
+    /// Off the poll thread, because writing a rule means waiting on the Windows Firewall
+    /// COM object model (or on netsh), and monitoring must not stall behind it.
+    /// </summary>
+    private void DispatchAlerts(IReadOnlyList<ThreatEvent> threats)
+    {
+        _ = Task.Run(() =>
+        {
+            var prevention = PreventionResult.Empty;
+            if (Enforce is { } enforce)
+            {
+                try
+                {
+                    prevention = enforce(threats);
+                }
+                catch (Exception ex)
+                {
+                    // Surfaced as a status line; the alerts themselves still go out.
+                    prevention = new PreventionResult { StatusMessage = $"Auto-block error: {ex.Message}" };
+                }
+            }
+
+            ThreatsDetected?.Invoke(threats, prevention);
+            _webhook.Notify(threats, WebhookUrl, WebhookMinLevel,
+                t => DescribeEnforcement?.Invoke(t, prevention));
+        });
     }
 
     /// <summary>
@@ -1186,6 +1256,7 @@ public sealed class NetworkMonitorService : IDisposable
         _honeypot.Dispose();
         _suricata.Dispose();
         _wireGuard.Dispose();
+        _wireGuardEndpoints.Dispose();
         _dns.Dispose();
         _flowEvents.Dispose();
         _intel.Dispose();

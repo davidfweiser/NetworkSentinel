@@ -17,6 +17,7 @@
             <conv:NavSelectedConverter x:Key="NavSelected"/>
             <conv:InvertBoolConverter x:Key="InvertBool"/>
             <conv:StringNotEmptyToVisibilityConverter x:Key="NotEmptyVis"/>
+            <conv:BlockStatusToBrushConverter x:Key="BlockStatusBrush"/>
 
             <FontFamily x:Key="AppFont">Segoe UI Variable, Segoe UI</FontFamily>
         </ResourceDictionary>
