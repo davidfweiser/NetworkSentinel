@@ -10,7 +10,26 @@ Three ways to run it (same idea as the Linux build):
 | **Terminal UI (`--tui`)** | Server Core, RDP console, SSH-style workflows |
 | **Headless web UI (`-w`)** | Browser dashboard on a server (master-password protected) |
 
-> Awareness / monitoring tooling — not a full IDS/IPS replacement. Version **0.6.2**.
+> Awareness / monitoring tooling — not a full IDS/IPS replacement. Version **0.6.5**.
+
+---
+
+## What's new in 0.6.5
+
+Brings the Windows build level with the Linux 0.6.5 release. Two independent pieces: a tunnel-endpoint shield that stops auto-block severing your own VPN, and a block verdict carried into every warning.
+
+| Area | What changed |
+|------|--------------|
+| **Tunnel endpoints are never auto-blocked** | The never-block gate for WireGuard peer endpoints read the *live* peer list, so it was inert unless **WireGuard peer monitoring** was switched on — off by default, and therefore off on exactly the VPN gateways that needed it. It also went blind whenever the tunnel was already down: `wg` reports no endpoint then, so the one address that would restore the tunnel looked like any other stranger. Blocking an endpoint does not drop an attacker; it drops the tunnel and every service behind it, while the console keeps answering on the LAN. The new shield runs regardless of that setting, samples every 60 s, and **remembers every endpoint for 24 h** across restarts. Hostnames in a config are deliberately not resolved — whoever answers DNS could otherwise write their own address into a never-block list. |
+| **The gate stops being silent** | A threat against a protected endpoint now reports `Not blocking <ip> … it is a WireGuard tunnel endpoint` instead of leaving you to hunt for a rule that was never made. Rate-limited per address. |
+| **Every warning says whether the address is blocked** | A toast or webhook named an address and stopped there, and the alert went out *before* the prevention engine had looked at the batch — so at alert time there was no answer to give. Enforcement now runs before any alert leaves the machine, and the verdict rides along: toast titles (`Blocked · critical threat: Port Scan`), webhook bodies, ntfy first lines, generic JSON (`blocked` / `block_state` / `block_status`), and the web console's browser notifications. |
+| **Blocked column on every threat table** | The screen you land on after a warning now agrees with the warning — GUI (hover for the full reason), TUI and web console, red for a dropped address, amber for a block that failed or was only simulated, muted for one deliberately left alone. |
+| **Unblock in place of Block** | A threat row whose address is already blocked offers **Unblock**, as the Remote Computers grid already did. Re-blocking only rewrites a rule already in force — and because the manual path passes no expiry, a stray click turned an expiring auto-block into a permanent manual one. |
+| **Dry run means dry run** | Every frontend built its own auto-block status line and every one dropped the same thing: dry run. A console could read `Auto-block ON (≥High)` while the engine was deliberately writing nothing. All of them now come from the engine. Dry run also no longer demands elevation — it writes no rule, and refusing to *simulate* blocked the one workflow the mode exists for. |
+
+Twenty more tests arrive with it (88 total), including the tunnel-endpoint gate end to end and a `wg show all dump` parse asserting neither the interface private key nor a peer's preshared key survives.
+
+**Upgrading** is in place and non-destructive, as in 0.5.x. Re-run the installer and confirm the web header reads `v0.6.5`.
 
 ---
 
@@ -359,11 +378,11 @@ Self-contained by default — the server does **not** need the .NET SDK or a com
 
 ```powershell
 # Copy the .install.cmd to the server, then run it (UAC prompt if not elevated):
-.\NetworkSentinel-windows-server-x64-0.6.2.install.cmd
+.\NetworkSentinel-windows-server-x64-0.6.5.install.cmd
 # optional port:
-.\NetworkSentinel-windows-server-x64-0.6.2.install.cmd -Port 18765
+.\NetworkSentinel-windows-server-x64-0.6.5.install.cmd -Port 18765
 # unpack without installing:
-.\NetworkSentinel-windows-server-x64-0.6.2.install.cmd --extract-only
+.\NetworkSentinel-windows-server-x64-0.6.5.install.cmd --extract-only
 ```
 
 The one-file installer is a `.cmd`, not a `.ps1`: `cmd.exe` stops reading the script at `exit /b`, so the ZIP appended to it is never parsed. PowerShell tokenizes an entire `-File` script before running any of it, and the cost on appended binary is quadratic (16 MB ≈ 5½ minutes) before it fails to parse at all — so the shell-style "payload after exit" trick only works with a `cmd` entry point.
@@ -425,7 +444,7 @@ No URL ACL is reserved. That was an `HttpListener` requirement; Kestrel binds th
 
 #### Upgrades and uninstall
 
-Re-running the installer **upgrades in place**: it stops the running task, replaces the binaries, and restarts. `%ProgramData%\NetworkSentinel` is both the install folder and the data directory, so the installer removes **only the files the package ships** — the master password hash, settings, allowlist, logs, host history, threat log, `duckdns.json`, `tls\`, and `acme\` all survive. The web page header shows the running version (e.g. `v0.6.2`) — check it after an upgrade to confirm the new build is live.
+Re-running the installer **upgrades in place**: it stops the running task, replaces the binaries, and restarts. `%ProgramData%\NetworkSentinel` is both the install folder and the data directory, so the installer removes **only the files the package ships** — the master password hash, settings, allowlist, logs, host history, threat log, `duckdns.json`, `tls\`, and `acme\` all survive. The web page header shows the running version (e.g. `v0.6.5`) — check it after an upgrade to confirm the new build is live.
 
 Uninstall keeps that same data by default so a reinstall picks up where you left off:
 
