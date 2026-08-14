@@ -12,7 +12,7 @@ Three ways to run it:
 
 > **Host-based** intrusion detection and prevention. It detects on its own heuristics and, with Suricata attached (0.6.0), on signature/payload inspection — then enforces in the kernel via `nftables`. It is not an inline network appliance: it protects the machine it runs on, not a segment, and it does not sit in the forwarding path.
 
-Linux port of the original Windows WPF Network Sentinel. Platform layers use `/proc/net`, `ss`, conntrack netlink, `nftables`/`iptables` (elevated via **pkexec**), and XDG data paths. Version **0.6.5**.
+Linux port of the original Windows WPF Network Sentinel. Platform layers use `/proc/net`, `ss`, conntrack netlink, `nftables`/`iptables` (elevated via **pkexec**), and XDG data paths. Version **0.6.6**.
 
 ---
 
@@ -154,8 +154,31 @@ Endpoints are collected from three places, so there is no window where one is bl
 
 - **Hostnames in a config are deliberately not resolved.** `Endpoint = vpn.example.org:51820` contributes nothing, because anyone able to answer DNS could otherwise write their own address into a never-block list — the same reasoning as the allowlist drift detector above. The live dump reports the resolved address anyway.
 - WireGuard interfaces are detected from sysfs (`DEVTYPE=wireguard`) — no root, no subprocess — so a host with no tunnel spends nothing. A host that *has* one but cannot read its peers says so in **Settings → VPN (WireGuard)** rather than staying quiet: an unprivileged run can still write rules through pkexec, so silence there would be the dangerous case.
-- When a detector does flag a peer endpoint, the console now says so — `Not blocking 203.0.113.9 (Critical: …) — it is a WireGuard tunnel endpoint` — instead of leaving you to wonder why no rule appeared. Rate-limited per address.
+- When a detector does flag a peer endpoint, the console now says so — `Not blocking 203.0.113.9 (Critical: …) — it is a VPN tunnel endpoint` — instead of leaving you to wonder why no rule appeared. Rate-limited per address.
 - **Manual blocking is unaffected**, here as with the operator shield: a hostile tunnel peer is a real case. Cutting off a peer for good belongs in WireGuard's own configuration (`wg set <iface> peer <key> remove`).
+
+#### The same shield for IPSec, including site-to-site (0.6.6)
+
+The argument above is not WireGuard's; it is any tunnel's, and until 0.6.6 only WireGuard got it. **IPSec peers are now shielded from auto-block on the same terms**, which matters most for a **site-to-site** tunnel — the case where the peer cannot phone you to say it went down:
+
+- the far end is another site's router at a **fixed public address**, indistinguishable from any stranger's to every heuristic here;
+- its traffic is the exact shape the heuristics look for — one remote address holding long-lived flows to whatever the tunnel carries, re-keying on a timer, and **retrying hard whenever the link flaps**, which reads like a brute-force or scan pattern;
+- so a single auto-block drops the tunnel for **both** sites at once, and nothing at this end looks wrong afterwards: the rule applied, the console still answers, and the other office simply loses the VPN.
+
+Peers are collected the same belt-and-braces way, on the same 60 s cadence, and remembered for the same 24 h:
+
+| Source | Covers |
+|--------|--------|
+| `ip xfrm state` | Live kernel SAs. This is the source that matters most because it is **implementation-independent** — strongSwan, libreswan and Openswan all install the same XFRM state |
+| `swanctl --list-sas`, else `ipsec status` | The window where IKE is up but no child SA is installed yet — where a flapping tunnel spends most of its time, and where `ip xfrm state` shows nothing |
+| `left=` / `right=` in `/etc/ipsec.conf` and `/etc/ipsec.d/*.conf`; `local_addrs` / `remote_addrs` in `/etc/swanctl/swanctl.conf` and `/etc/swanctl/conf.d/*.conf` | The peer named in configuration — still there with the tunnel **down**, which is the state a site is in after the very block this prevents |
+| A persisted 24 h memory (`ipsec-endpoints.json`) | Restarts, re-keying windows, a momentary command failure, and a tunnel that has **already** dropped |
+
+- **Traffic selectors are never read.** `leftsubnet`, `rightsubnet`, `local_ts` and `remote_ts` routinely hold `0.0.0.0/0`, and a shield that swallowed a default route would silently disable auto-block for the whole internet. Only `left`, `right`, `local_addrs` and `remote_addrs` are read, only when the value is a bare address — the match is on the whole key, so `rightsourceip` and friends cannot slip through.
+- `%any` and hostnames contribute nothing, for the same reason as WireGuard's `Endpoint =`.
+- Both ends of an SA are kept rather than guessing which is remote: `left` being the local end is a convention configs are routinely written against, and this host's own addresses are refused by an earlier gate anyway.
+- Reading live SAs needs **root** (CAP_NET_ADMIN). A host that clearly runs IPSec but cannot read its peers says so in the console's VPN status rather than staying quiet — an unprivileged run can still write rules through pkexec, so silence would be the dangerous case.
+- Detection is unchanged: this gate only stops the machine deciding on its own. **Manual blocking still works**, and a peer that really is hostile belongs in the IPSec configuration, not in a firewall rule that also takes the tunnel down.
 
 ### Signature detection — Suricata (0.6.0)
 
@@ -222,7 +245,7 @@ Domains are DNS-resolved to current IPs. Auto-block never touches allowlisted IP
 | **Allowlist** | Add/remove trusted domains and IPs; refresh the feed |
 | **Settings** | Monitoring on/off, poll interval, geo lookups, auth-log and closed-port scan detection, the 0.4.0 detectors (threat intel, new-listener alerts, process reputation, ARP/gateway watch, startup-item watch, exfiltration threshold, honeypot ports), **kernel flow events**, **DNS hygiene** (with approved resolvers), **WireGuard peer monitoring** (with a live peer table), **Suricata signature ingestion** (EVE path, maximum severity, muted sids), **auto-block dry run**, **HTTPS + DuckDNS remote access** (including **Issue certificate**), webhook URL, auto-block + minimum severity + expiry, block direction (in/out), allowlist feed, **change master password**, **Remove all rules** |
 
-The page header shows the running version (e.g. `v0.6.5`) — check it after an upgrade to confirm the new build is live.
+The page header shows the running version (e.g. `v0.6.6`) — check it after an upgrade to confirm the new build is live.
 
 ### Sleep / Wake
 

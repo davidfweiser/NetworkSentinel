@@ -20,6 +20,7 @@ public sealed class NetworkMonitorService : IDisposable
     private readonly SuricataService _suricata = new();
     private readonly WireGuardMonitor _wireGuard = new();
     private readonly WireGuardEndpointGuard _wireGuardEndpoints = new();
+    private readonly IpsecEndpointGuard _ipsecEndpoints = new();
     private readonly DnsHygieneMonitor _dns = new();
     private readonly ConntrackEventSource _conntrack = new();
     private readonly WebhookNotifier _webhook = new();
@@ -491,6 +492,8 @@ public sealed class NetworkMonitorService : IDisposable
         if (_wireGuardEnabled) _wireGuard.Start();
         // Unconditional: the tunnel shield must not depend on a monitoring toggle.
         _wireGuardEndpoints.Start();
+        // Same for IPSec, which has no monitoring toggle to hide behind in the first place.
+        _ipsecEndpoints.Start();
         if (_dnsHygieneEnabled) _dns.Start();
         if (_conntrackEventsEnabled) _conntrack.Start();
         _loop = Task.Run(() => RunAsync(_cts.Token));
@@ -514,6 +517,7 @@ public sealed class NetworkMonitorService : IDisposable
         _suricata.Stop();
         _wireGuard.Stop();
         _wireGuardEndpoints.Stop();
+        _ipsecEndpoints.Stop();
         _dns.Stop();
         _conntrack.Stop();
         _history.Save();
@@ -580,6 +584,30 @@ public sealed class NetworkMonitorService : IDisposable
 
     /// <summary>Endpoint addresses currently shielded from auto-block.</summary>
     public IReadOnlyCollection<string> WireGuardProtectedEndpoints => _wireGuardEndpoints.Endpoints;
+
+    /// <summary>
+    /// True when the address is an IPSec tunnel endpoint — the public address an IKE/ESP
+    /// peer talks to this host from. The site-to-site case is why this exists: the peer is
+    /// another site's router at a fixed public address, holding long-lived flows and
+    /// retrying hard whenever the link flaps, which is indistinguishable from the traffic
+    /// the heuristics are built to catch. Blocking it drops the tunnel for both sites, and
+    /// nothing at this end looks wrong afterwards.
+    /// </summary>
+    public bool IsIpsecPeerEndpoint(string ip) => _ipsecEndpoints.IsProtected(ip);
+
+    /// <summary>State of the IPSec tunnel-endpoint shield.</summary>
+    public string IpsecProtectionStatus => _ipsecEndpoints.Status;
+
+    /// <summary>IPSec peer addresses currently shielded from auto-block.</summary>
+    public IReadOnlyCollection<string> IpsecProtectedEndpoints => _ipsecEndpoints.Endpoints;
+
+    /// <summary>
+    /// True when the address carries a VPN tunnel of any supported kind. This is what the
+    /// prevention engine consults: a gateway may run WireGuard and IPSec side by side, and
+    /// the question at the point of blocking is only ever "would this rule cut a tunnel".
+    /// </summary>
+    public bool IsVpnTunnelEndpoint(string ip)
+        => IsWireGuardPeerEndpoint(ip) || IsIpsecPeerEndpoint(ip);
 
     /// <summary>
     /// True when the address falls inside some WireGuard peer's AllowedIPs — i.e. the
@@ -1225,6 +1253,7 @@ public sealed class NetworkMonitorService : IDisposable
         _suricata.Dispose();
         _wireGuard.Dispose();
         _wireGuardEndpoints.Dispose();
+        _ipsecEndpoints.Dispose();
         _dns.Dispose();
         _conntrack.Dispose();
         _intel.Dispose();

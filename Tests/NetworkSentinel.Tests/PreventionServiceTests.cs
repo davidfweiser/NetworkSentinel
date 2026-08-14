@@ -93,7 +93,7 @@ public class PreventionServiceTests
 
         var held = Assert.Single(result.Decisions, d => d.Action == PreventionAction.Skipped);
         Assert.Equal("203.0.113.30", held.Ip);
-        Assert.Contains("WireGuard tunnel endpoint", held.Message);
+        Assert.Contains("VPN tunnel endpoint", held.Message);
         // The unprotected address in the same batch is unaffected.
         Assert.Contains(result.Decisions, d => d.Ip == "203.0.113.31" && d.Action == PreventionAction.Simulated);
         // Holding a block back is not a rule change; frontends must not refresh on it.
