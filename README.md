@@ -813,7 +813,9 @@ All three UIs write the same `~/.local/share/NetworkSentinel/settings.json`, so 
 | `Services/DuckDnsUpdater.cs` | DuckDNS dynamic-DNS refresh; token stored `0600` |
 | `Services/CertIssuanceService.cs` | Runs the issuance script for the Settings **Issue certificate** button |
 | `Services/LoginThrottle.cs` | Per-IP lockout for the console's password endpoints |
+| `Services/WireGuardEndpointGuard.cs` / `IpsecEndpointGuard.cs` | Tunnel endpoints that must never be auto-blocked |
 | `scripts/issue-duckdns-cert.sh` | Let's Encrypt DNS-01 issuance for a duckdns.org name |
+| `scripts/diagnose-ipsec.sh` | Read-only triage for a site-to-site tunnel that won't come up |
 | `Web/WebAuthStore.cs` | Master password hash + session tokens |
 | `scripts/package.sh` | Build self-contained tarball + `.install.sh` |
 | `scripts/install-from-package.sh` | Server/desktop installer (shipped as `install.sh`) |
@@ -886,6 +888,29 @@ On GNOME / Pop!_OS the indicator appears in the top bar (StatusNotifier / AppInd
 | Port already in use | Change `WEB_PORT` or run `networksentinel -w` to auto-pick a free high port. |
 | Port shows `LISTEN` locally but unreachable from outside | On a cloud VPS (Linode, AWS, DigitalOcean, …), the process listening (`sudo ss -ltnp \| grep 18765`) only proves the app is up — the provider's network firewall/security group can still drop inbound traffic before it reaches the box. Open the port in the provider's dashboard. |
 | Service dies after logout (user unit) | `sudo loginctl enable-linger "$USER"` |
+| Site-to-site VPN tunnel dropped and won't come back | Run `sudo bash scripts/diagnose-ipsec.sh <peer-ip>` — see [below](#a-site-to-site-tunnel-that-wont-come-up). |
+
+### A site-to-site tunnel that won't come up
+
+```bash
+sudo bash scripts/diagnose-ipsec.sh 203.0.113.7    # the peer's public address
+```
+
+Read-only, takes about 25 s, changes nothing. It answers three questions in order: **is this host blocking the peer or the IKE ports**, **is the peer's traffic arriving at all and from which address**, and **what does the IKE daemon say**. Where that lands tells you which of these it is:
+
+| What the script shows | What it means |
+|---|---|
+| A firewall rule naming the peer | This host blocked it. Allowlist the address (TUI `n`, or the web console's Allowlist tab) — that also removes the rule. A plain unblock only suppresses re-blocking for 24 h, so the tunnel would drop again tomorrow |
+| No local rule, and **no packets captured** | Nothing is reaching the box, so the drop is upstream. On a cloud VPS this is nearly always the **provider's** firewall, which is invisible from inside the machine — see the note below |
+| Packets arriving from a **different address** than the config names | The far end's WAN address changed. Classic on a dynamic residential line, and it looks exactly like a failure with no cause: worked for months, then stopped, nobody touched either end |
+| Packets from the right address, IKE still failing | A negotiation problem — the log section names it (auth failure, proposal mismatch, no matching peer config) |
+
+**On a cloud VPS, check the provider firewall first.** IPSec needs **UDP 500** (IKE) and **UDP 4500** (NAT-T) inbound, and these are not open by default. Two traps here:
+
+- **Some providers cannot express ESP at all.** Linode's Cloud Firewall offers TCP, UDP, ICMP and IPENCAP — there is no protocol-50 option, so raw ESP can never be allowed. If IKE completes but no traffic crosses the tunnel, force UDP encapsulation (`forceencaps=yes` in `ipsec.conf`, or `encap = yes` for swanctl) so ESP travels inside UDP 4500, then `sudo ipsec restart`.
+- **A peer on a dynamic address outgrows a pinned rule.** Scoping the source to the peer's `/32` is the right instinct, but every ISP rotation then breaks the tunnel until someone edits both the provider firewall *and* `right=`. Identify the peer by identity instead — `right=%any` with `rightid=`, authenticated by a strong PSK or certificate — and the address stops mattering. The provider firewall rule still has to widen to all sources, so the authentication is doing the work the address filter used to.
+
+**This app never auto-blocks a tunnel endpoint** — see [Tunnel endpoints are never auto-blocked](#tunnel-endpoints-are-never-auto-blocked). If the script does find a rule naming your peer, it was a manual block or predates 0.6.6.
 
 ---
 
