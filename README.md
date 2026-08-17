@@ -215,7 +215,9 @@ Polling `/proc/net` can only ever describe the moment the file was read — on t
 - Dedicated **nftables** table `inet networksentinel` when `nft` is available; otherwise **iptables** with `NetworkSentinel-*` comments
 - Only manages rules owned by this app; other firewall rules are left alone
 - The rule ledger is **reconciled with the kernel at startup**: nft/iptables rules don't survive a reboot while the ledger file does, so entries with no live kernel rule are dropped instead of masquerading as active blocks (runs only when elevation is silent — root or passwordless/cached sudo — never a startup password prompt)
-- Block rules are created as an `-In`/`-Out` pair and **removed together** in one click
+- Block rules are created as an `-In`/`-Out` pair and **removed together** in one click (config rules are never paired, so their names are exempt from that)
+- Your own rules, written on the **Firewall Config** page (0.7.0) — see below
+- **App-minted blocks always win** (0.7.0): auto-block and manual blocks are *inserted at the head* of their chain while config rules are *appended*, so a config `Allow` can never reopen an address auto-block just shut
 - **Auto-block** on/off with minimum severity (`Medium` / `High` / `Critical`)
 - Removing/unblocking a rule **suppresses auto-block for that IP for 24 h** (persisted), so removed rules stay gone across restarts
 - **Auto-block expiry** (1 h … 7 days, off by default) — an expired address stops counting as blocked immediately; the `nft`/`iptables` rule itself is dropped by a background sweep as soon as it can elevate without a prompt (running as root, or cached/passwordless sudo). Manual blocks are always permanent
@@ -239,13 +241,17 @@ Daily totals and the last raw counters persist to `traffic-history.json`, so the
 
 Turn it off with `TrafficMeterEnabled` (Settings → Traffic metering); the history is kept but stops growing.
 
+The charts are on the **GUI dashboard**. The meter itself runs wherever the app runs, so a headless server still records the daily history into `traffic-history.json` — the web console and TUI just have no chart for it yet.
+
 > **Difference from the macOS build:** that one meters `ppp*` too. Here it does not — a PPPoE link is carried by an Ethernet interface that is already metered, so counting both would double every byte on a DSL connection.
 
 ### Firewall Config — write your own rules (0.7.0)
 
 A **Firewall Config** page under *Firewall & Block* that adds, edits and deletes inbound and outbound rules, shaped like the Linode Cloud Manager firewall page (and [FireWallConfig](https://github.com/davidfweiser/FireWallConfig) on Ubuntu): one list per direction, Label / Action / Protocol / Port range / Sources, one form for both add and edit, and labels minted from the port's service (`block-inbound-ssh`) when you leave the field blank.
 
-Rules land in the same `inet networksentinel` table (or the same `NetworkSentinel-*` iptables comments) and the same ledger as the app's own blocks, so the TUI and web console see them too.
+Rules land in the same `inet networksentinel` table (or the same `NetworkSentinel-*` iptables comments) and the same ledger as the app's own blocks.
+
+The **editor is GUI-only** for now. The rules it writes are ordinary kernel rules and ordinary ledger entries, so they apply system-wide and show up in the TUI's and web console's existing Firewall rule lists, where they read as kind **Config rule** — those two just cannot add or edit them yet.
 
 **Precedence is fixed rather than incidental.** The chains are first-match-wins and rules are added one at a time, so ledger order decides nothing — a config *Allow* written today would otherwise sit ahead of a block auto-block appends tomorrow, and the accept would win. So app-minted blocks are **inserted at the head** of their chain (`nft insert`, `iptables -I … 1`) while config rules are **appended**. Every auto-block and manual block therefore precedes every config rule, whichever was created first.
 
