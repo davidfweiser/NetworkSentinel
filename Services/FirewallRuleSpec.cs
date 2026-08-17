@@ -1,0 +1,547 @@
+using System.Globalization;
+using System.Net;
+using System.Net.Sockets;
+using System.Text;
+using System.Text.RegularExpressions;
+using NetworkSentinel.Native;
+
+namespace NetworkSentinel.Services;
+
+/// <summary>
+/// One firewall rule as the operator writes it: an action, a direction, a
+/// protocol, a port range and a set of addresses — the same six fields the
+/// Linode Cloud Manager firewall page asks for, and the shape
+/// <see href="https://github.com/davidfweiser/FireWallConfig">FireWallConfig</see>
+/// uses on Ubuntu.
+///
+/// The fields are strings because they come straight from text boxes and combo
+/// boxes; <see cref="FirewallRuleSpecs.Normalize"/> canonicalises them and
+/// <see cref="FirewallRuleSpecs.Validate"/> refuses the ones the backend would
+/// reject or that would quietly do something enormous.
+/// </summary>
+public sealed class FirewallRuleSpec
+{
+    public string Label { get; set; } = "";
+
+    /// <summary>Allow or Block. FireWallConfig's Accept/Drop, in the backend's vocabulary.</summary>
+    public string Action { get; set; } = FirewallRuleSpecs.ActionBlock;
+
+    public string Direction { get; set; } = FirewallRuleSpecs.DirectionInbound;
+
+    /// <summary>TCP, UDP, ICMP or Any.</summary>
+    public string Protocol { get; set; } = "TCP";
+
+    /// <summary>"22", "8000-8001", "80, 443", or empty for every port.</summary>
+    public string PortRange { get; set; } = "";
+
+    /// <summary>
+    /// Comma-separated addresses or CIDR blocks. Empty (or "any") means every
+    /// address — the source for an inbound rule, the destination for an outbound
+    /// one.
+    /// </summary>
+    public string Addresses { get; set; } = "";
+
+    public FirewallRuleSpec Clone() => new()
+    {
+        Label = Label,
+        Action = Action,
+        Direction = Direction,
+        Protocol = Protocol,
+        PortRange = PortRange,
+        Addresses = Addresses
+    };
+}
+
+/// <summary>One nftables rule body, ready to follow <c>add rule &lt;table&gt; &lt;chain&gt;</c>.</summary>
+public sealed record NftRuleMatch(string Match);
+
+/// <summary>
+/// One iptables rule body, ready to sit between <c>-A &lt;CHAIN&gt;</c> and the
+/// <c>-j</c> target. <paramref name="IsV6"/> selects ip6tables over iptables:
+/// the two binaries keep separate tables, and feeding a v6 address to iptables
+/// is rejected outright rather than silently ignored.
+/// </summary>
+public sealed record IptablesRuleMatch(bool IsV6, string Match);
+
+/// <summary>
+/// Parsing, validation and backend rendering for <see cref="FirewallRuleSpec"/>.
+/// Kept apart from <see cref="FirewallService"/> because it is pure text work
+/// with no privilege and no I/O, which is what makes it testable.
+/// </summary>
+public static class FirewallRuleSpecs
+{
+    public const string ActionAllow = "Allow";
+    public const string ActionBlock = "Block";
+    public const string DirectionInbound = "Inbound";
+    public const string DirectionOutbound = "Outbound";
+    public const string ProtocolAny = "Any";
+
+    /// <summary>What the grid and the editor show for "no address filter".</summary>
+    public const string AnyAddressText = "All IPv4, All IPv6";
+
+    public static readonly string[] Actions = { ActionAllow, ActionBlock };
+    public static readonly string[] Directions = { DirectionInbound, DirectionOutbound };
+    public static readonly string[] Protocols = { "TCP", "UDP", "ICMP", ProtocolAny };
+
+    private static readonly Regex PortToken = new(@"^(\d{1,5})(?:\s*[-:]\s*(\d{1,5}))?$", RegexOptions.Compiled);
+
+    private static readonly HashSet<string> AnyAddressWords = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "", "any", "anywhere", "all", "all ipv4", "all ipv6", "all ipv4, all ipv6",
+        "0.0.0.0/0", "::/0"
+    };
+
+    /// <summary>
+    /// Splits a port field into canonical tokens: "22" stays, "8000-8001" becomes
+    /// "8000:8001". An empty field means every port. The colon form is the
+    /// internal canonical shape; each backend renderer converts it to its own
+    /// syntax (nft wants <c>8000-8001</c>, iptables multiport wants
+    /// <c>8000:8001</c>).
+    /// </summary>
+    public static bool TryParsePorts(string? text, out List<string> ports, out string error)
+    {
+        ports = new List<string>();
+        error = "";
+
+        var raw = (text ?? "").Trim();
+        if (raw.Length == 0) return true;
+
+        foreach (var token in raw.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+        {
+            var match = PortToken.Match(token);
+            if (!match.Success)
+            {
+                error = $"Invalid port: {token}";
+                ports.Clear();
+                return false;
+            }
+
+            var start = int.Parse(match.Groups[1].Value, CultureInfo.InvariantCulture);
+            int? end = match.Groups[2].Success
+                ? int.Parse(match.Groups[2].Value, CultureInfo.InvariantCulture)
+                : null;
+
+            if (start is < 1 or > 65535 || end is < 1 or > 65535)
+            {
+                error = $"Port out of range: {token}";
+                ports.Clear();
+                return false;
+            }
+            if (end.HasValue && start > end.Value)
+            {
+                error = $"Port range starts after it ends: {token}";
+                ports.Clear();
+                return false;
+            }
+
+            ports.Add(end.HasValue ? $"{start}:{end.Value}" : start.ToString(CultureInfo.InvariantCulture));
+        }
+
+        return true;
+    }
+
+    /// <summary>
+    /// Splits an address field into IPs and CIDR blocks. An empty list means
+    /// "any" — the caller renders that by omitting the address match entirely.
+    /// </summary>
+    public static bool TryParseAddresses(string? text, out List<string> addresses, out string error)
+    {
+        addresses = new List<string>();
+        error = "";
+
+        var raw = (text ?? "").Trim();
+        if (AnyAddressWords.Contains(raw)) return true;
+
+        foreach (var token in raw.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+        {
+            if (AnyAddressWords.Contains(token))
+            {
+                // One "any" in the list makes the whole list "any".
+                addresses.Clear();
+                return true;
+            }
+
+            if (token.Contains('/'))
+            {
+                if (!TryNormalizeCidr(token, out var cidr))
+                {
+                    error = $"Invalid network: {token}";
+                    addresses.Clear();
+                    return false;
+                }
+                addresses.Add(cidr);
+                continue;
+            }
+
+            if (!FirewallService.TryNormalizeIp(token, out var ip, out _))
+            {
+                error = $"Invalid address: {token}";
+                addresses.Clear();
+                return false;
+            }
+            addresses.Add(ip);
+        }
+
+        return true;
+    }
+
+    private static bool TryNormalizeCidr(string token, out string cidr)
+    {
+        cidr = "";
+        var parts = token.Split('/', 2);
+        if (parts.Length != 2) return false;
+        if (!IPAddress.TryParse(parts[0].Trim(), out var address)) return false;
+        if (!int.TryParse(parts[1].Trim(), NumberStyles.Integer, CultureInfo.InvariantCulture, out var prefix))
+            return false;
+
+        var max = address.AddressFamily == AddressFamily.InterNetworkV6 ? 128 : 32;
+        if (prefix < 0 || prefix > max) return false;
+
+        cidr = $"{address}/{prefix}";
+        return true;
+    }
+
+    /// <summary>True when an address or CIDR token belongs to the IPv6 family.</summary>
+    public static bool IsV6Address(string token)
+    {
+        var bare = token.Split('/', 2)[0].Trim();
+        return IPAddress.TryParse(bare, out var address) &&
+               address.AddressFamily == AddressFamily.InterNetworkV6;
+    }
+
+    /// <summary>
+    /// Canonical form: trimmed, cased the way the combo boxes offer, ports and
+    /// addresses re-rendered from what parsed, and a minted label when the
+    /// operator left it blank.
+    /// </summary>
+    public static FirewallRuleSpec Normalize(FirewallRuleSpec spec)
+    {
+        var action = Match(spec.Action, Actions, ActionBlock);
+        var direction = Match(spec.Direction, Directions, DirectionInbound);
+        var protocol = Match(spec.Protocol, Protocols, "TCP");
+
+        TryParsePorts(spec.PortRange, out var ports, out _);
+        TryParseAddresses(spec.Addresses, out var addresses, out _);
+
+        var portText = string.Join(", ", ports.Select(p => p.Replace(':', '-')));
+        var addressText = addresses.Count == 0 ? AnyAddressText : string.Join(", ", addresses);
+
+        return new FirewallRuleSpec
+        {
+            Label = CleanLabel(spec.Label) is { Length: > 0 } clean
+                ? clean
+                : AutoLabel(action, direction, protocol, ports),
+            Action = action,
+            Direction = direction,
+            Protocol = protocol,
+            PortRange = portText,
+            Addresses = addressText
+        };
+    }
+
+    /// <summary>Empty string when the spec is usable; the reason when it is not.</summary>
+    public static string Validate(FirewallRuleSpec spec)
+    {
+        if (!Actions.Contains(spec.Action, StringComparer.OrdinalIgnoreCase))
+            return $"Unknown action: {Blank(spec.Action)}";
+        if (!Directions.Contains(spec.Direction, StringComparer.OrdinalIgnoreCase))
+            return $"Unknown direction: {Blank(spec.Direction)}";
+        if (!Protocols.Contains(spec.Protocol, StringComparer.OrdinalIgnoreCase))
+            return $"Unknown protocol: {Blank(spec.Protocol)}";
+
+        if (!TryParsePorts(spec.PortRange, out var ports, out var portError))
+            return portError;
+        if (!TryParseAddresses(spec.Addresses, out var addresses, out var addressError))
+            return addressError;
+
+        if (ports.Count > 0 && spec.Protocol.Equals("ICMP", StringComparison.OrdinalIgnoreCase))
+            return "ICMP has no ports — clear the port range or pick TCP/UDP.";
+
+        // The one shape that is always a mistake: a pass rule with no protocol,
+        // no port and no address punches a hole for everything.
+        if (spec.Action.Equals(ActionAllow, StringComparison.OrdinalIgnoreCase) &&
+            spec.Protocol.Equals(ProtocolAny, StringComparison.OrdinalIgnoreCase) &&
+            ports.Count == 0 && addresses.Count == 0)
+        {
+            return "An Allow rule with protocol Any, no port and no address would allow all traffic. " +
+                   "Set a port, a protocol, or an address.";
+        }
+
+        return "";
+    }
+
+    /// <summary>
+    /// True when the rule matches every address and every port in its direction —
+    /// a block like that cuts the machine off, so the console confirms first.
+    /// </summary>
+    public static bool IsCatchAll(FirewallRuleSpec spec)
+    {
+        TryParsePorts(spec.PortRange, out var ports, out _);
+        TryParseAddresses(spec.Addresses, out var addresses, out _);
+        return ports.Count == 0 && addresses.Count == 0;
+    }
+
+    /// <summary>True when the rule's port range covers <paramref name="port"/>.</summary>
+    public static bool CoversPort(FirewallRuleSpec spec, int port)
+    {
+        if (!TryParsePorts(spec.PortRange, out var ports, out _))
+            return false;
+        if (ports.Count == 0)
+            return true; // every port
+
+        foreach (var token in ports)
+        {
+            var range = token.Split(':', 2);
+            if (!int.TryParse(range[0], out var start)) continue;
+            var end = range.Length == 2 && int.TryParse(range[1], out var parsed) ? parsed : start;
+            if (port >= start && port <= end) return true;
+        }
+        return false;
+    }
+
+    /// <summary>
+    /// Mints a Linode-style label — <c>block-inbound-ssh</c> — when the operator
+    /// leaves the field blank, so every rule has a name to refer to.
+    /// </summary>
+    public static string AutoLabel(string action, string direction, string protocol, IReadOnlyList<string> ports)
+    {
+        var verb = action.Equals(ActionAllow, StringComparison.OrdinalIgnoreCase) ? "allow" : "block";
+        var side = direction.Equals(DirectionOutbound, StringComparison.OrdinalIgnoreCase) ? "outbound" : "inbound";
+
+        var slugs = new List<string>();
+        foreach (var token in ports.Take(3))
+        {
+            var first = token.Split(':', 2)[0];
+            if (!int.TryParse(first, NumberStyles.Integer, CultureInfo.InvariantCulture, out var port)) continue;
+            var slug = ServiceSlug(port);
+            if (!slugs.Contains(slug)) slugs.Add(slug);
+        }
+
+        if (slugs.Count > 0)
+            return $"{verb}-{side}-{string.Join("-", slugs)}";
+
+        if (!protocol.Equals(ProtocolAny, StringComparison.OrdinalIgnoreCase))
+            return $"{verb}-{side}-{protocol.ToLowerInvariant()}";
+
+        return $"{verb}-{side}-all";
+    }
+
+    /// <summary>
+    /// Well-known service name for a port, lower-cased for use in a label. Falls
+    /// back to the port number, which is exactly what an unknown port deserves.
+    /// </summary>
+    private static string ServiceSlug(int port)
+    {
+        var hint = PortCatalog.GetHint(port, "TCP");
+        if (hint is "Custom / unknown" or "UDP service")
+            return port.ToString(CultureInfo.InvariantCulture);
+
+        var slug = Regex.Replace(hint.ToLowerInvariant(), @"[^a-z0-9]+", "-").Trim('-');
+        return slug.Length > 0 ? slug : port.ToString(CultureInfo.InvariantCulture);
+    }
+
+    /// <summary>Strips whitespace and anything a rule comment or a rule name cannot carry.</summary>
+    public static string CleanLabel(string? label)
+    {
+        var text = (label ?? "").Trim();
+        if (text.Length == 0) return "";
+        text = Regex.Replace(text, @"\s+", "-");
+        text = Regex.Replace(text, @"[^A-Za-z0-9_.:\-]+", "");
+        return text.Length > 48 ? text[..48] : text;
+    }
+
+    /// <summary>
+    /// Ledger form of a validated spec. The caller supplies the unique name and,
+    /// once the rule is written, which binary took it.
+    /// </summary>
+    public static FirewallRuleInfo ToRule(FirewallRuleSpec spec, string name, bool enabled = true, string backend = "")
+    {
+        var normalized = Normalize(spec);
+        TryParseAddresses(normalized.Addresses, out var addresses, out _);
+
+        return new FirewallRuleInfo
+        {
+            Name = name,
+            Label = normalized.Label,
+            Description = $"{normalized.Action} {normalized.Protocol} " +
+                          $"{(normalized.PortRange.Length > 0 ? normalized.PortRange : "all ports")} " +
+                          $"{(normalized.Direction == DirectionInbound ? "from" : "to")} {normalized.Addresses}",
+            Enabled = enabled,
+            IsBlock = normalized.Action.Equals(ActionBlock, StringComparison.OrdinalIgnoreCase),
+            Direction = normalized.Direction.Equals(DirectionOutbound, StringComparison.OrdinalIgnoreCase)
+                ? FirewallDirection.Outbound
+                : FirewallDirection.Inbound,
+            RemoteAddresses = string.Join(", ", addresses),
+            LocalPorts = normalized.PortRange,
+            Protocol = normalized.Protocol,
+            Kind = FirewallRuleKind.Custom,
+            Backend = backend
+        };
+    }
+
+    /// <summary>Editor form of a stored rule, for the Edit button.</summary>
+    public static FirewallRuleSpec FromRule(FirewallRuleInfo rule) => new()
+    {
+        Label = rule.Label.Length > 0 ? rule.Label : rule.Name,
+        Action = rule.IsBlock ? ActionBlock : ActionAllow,
+        Direction = rule.Direction == FirewallDirection.Outbound ? DirectionOutbound : DirectionInbound,
+        Protocol = string.IsNullOrWhiteSpace(rule.Protocol) ? ProtocolAny : rule.Protocol,
+        PortRange = rule.LocalPorts,
+        Addresses = rule.RemoteAddresses
+    };
+
+    // ── Backend rendering ────────────────────────────────────────────────
+    //
+    // Inbound rules filter on the source address and the local (destination)
+    // port; outbound rules filter on the destination address and the destination
+    // port — "outbound to port 443" means the service being reached, which is
+    // what an operator means and what UFW's `allow out … port 443` does. That
+    // differs from the legacy port-block rules, which match the local source
+    // port on the way out.
+    //
+    // One spec can need more than one kernel rule. Both backends match a single
+    // address family per rule, so a mixed v4/v6 address list splits in two; and
+    // a port range under protocol "Any" splits into TCP and UDP, because neither
+    // iptables nor a readable nft rule matches a port without naming a protocol.
+
+    /// <summary>
+    /// Renders a config rule as nftables rule bodies — everything that follows
+    /// <c>add rule &lt;table&gt; &lt;chain&gt;</c> and precedes the verdict.
+    /// </summary>
+    public static IReadOnlyList<NftRuleMatch> BuildNftMatches(FirewallRuleInfo rule)
+    {
+        var inbound = rule.Direction != FirewallDirection.Outbound;
+        TryParseAddresses(rule.RemoteAddresses, out var addresses, out _);
+        TryParsePorts(rule.LocalPorts, out var ports, out _);
+
+        var v4 = addresses.Where(a => !IsV6Address(a)).ToList();
+        var v6 = addresses.Where(IsV6Address).ToList();
+
+        // No address filter at all is one family-agnostic rule; otherwise one per
+        // family that the operator actually listed.
+        var groups = addresses.Count == 0
+            ? new List<(string? Family, List<string> Items)> { (null, new List<string>()) }
+            : new List<(string? Family, List<string> Items)>();
+        if (v4.Count > 0) groups.Add(("ip", v4));
+        if (v6.Count > 0) groups.Add(("ip6", v6));
+
+        var matches = new List<NftRuleMatch>();
+        foreach (var (family, items) in groups)
+        {
+            foreach (var protocol in ProtocolsToEmit(rule.Protocol, ports.Count > 0))
+            {
+                var sb = new StringBuilder();
+
+                if (family != null)
+                    sb.Append(family).Append(inbound ? " saddr " : " daddr ").Append(NftList(items)).Append(' ');
+
+                if (protocol == "ICMP")
+                {
+                    // In an inet table the two ICMPs are distinct protocols. With no
+                    // address to pin the family, match both.
+                    sb.Append(family switch
+                    {
+                        "ip" => "meta l4proto icmp ",
+                        "ip6" => "meta l4proto icmpv6 ",
+                        _ => "meta l4proto { icmp, icmpv6 } "
+                    });
+                }
+                else if (protocol != null)
+                {
+                    sb.Append(protocol.ToLowerInvariant()).Append(' ');
+                    if (ports.Count > 0)
+                        sb.Append("dport ").Append(NftList(ports.Select(NftPort).ToList())).Append(' ');
+                }
+
+                matches.Add(new NftRuleMatch(sb.ToString().TrimEnd()));
+            }
+        }
+
+        return matches;
+    }
+
+    /// <summary>
+    /// Renders a config rule as iptables rule bodies — everything between
+    /// <c>-A &lt;CHAIN&gt;</c> and the <c>-j</c> target.
+    /// </summary>
+    public static IReadOnlyList<IptablesRuleMatch> BuildIptablesMatches(FirewallRuleInfo rule)
+    {
+        var inbound = rule.Direction != FirewallDirection.Outbound;
+        TryParseAddresses(rule.RemoteAddresses, out var addresses, out _);
+        TryParsePorts(rule.LocalPorts, out var ports, out _);
+
+        // iptables takes one address per rule; a list becomes a rule each. With no
+        // address the rule is family-agnostic and goes to iptables (v4), which is
+        // where the rest of this backend's unqualified rules live.
+        var targets = addresses.Count == 0
+            ? new List<string?> { null }
+            : addresses.Cast<string?>().ToList();
+
+        var matches = new List<IptablesRuleMatch>();
+        foreach (var address in targets)
+        {
+            var isV6 = address != null && IsV6Address(address);
+
+            foreach (var protocol in ProtocolsToEmit(rule.Protocol, ports.Count > 0))
+            {
+                var sb = new StringBuilder();
+
+                if (protocol == "ICMP")
+                    sb.Append("-p ").Append(isV6 ? "icmpv6" : "icmp").Append(' ');
+                else if (protocol != null)
+                    sb.Append("-p ").Append(protocol.ToLowerInvariant()).Append(' ');
+
+                if (address != null)
+                    sb.Append(inbound ? "-s " : "-d ").Append(address).Append(' ');
+
+                if (ports.Count > 0 && protocol is not (null or "ICMP"))
+                {
+                    // A single port is a plain --dport; anything else needs the
+                    // multiport match, which is the only way iptables takes a list.
+                    if (ports.Count == 1 && !ports[0].Contains(':'))
+                        sb.Append("--dport ").Append(ports[0]).Append(' ');
+                    else
+                        sb.Append("-m multiport --dports ").Append(string.Join(",", ports)).Append(' ');
+                }
+
+                matches.Add(new IptablesRuleMatch(isV6, sb.ToString().TrimEnd()));
+            }
+        }
+
+        return matches;
+    }
+
+    /// <summary>
+    /// Which protocols a rule expands into. "Any" with no ports needs no protocol
+    /// match at all; "Any" with ports becomes one TCP rule and one UDP rule,
+    /// because a port match without a protocol is not expressible in iptables and
+    /// is not worth expressing obscurely in nft.
+    /// </summary>
+    private static IReadOnlyList<string?> ProtocolsToEmit(string? protocol, bool hasPorts)
+    {
+        var value = (protocol ?? ProtocolAny).Trim();
+        if (value.Length == 0 || value.Equals(ProtocolAny, StringComparison.OrdinalIgnoreCase))
+            return hasPorts ? new string?[] { "TCP", "UDP" } : new string?[] { null };
+
+        return new string?[] { value.ToUpperInvariant() };
+    }
+
+    /// <summary>nft's port ranges use a dash; the canonical token uses a colon.</summary>
+    private static string NftPort(string token) => token.Replace(':', '-');
+
+    /// <summary>nft takes a bare token or a braced set.</summary>
+    private static string NftList(IReadOnlyList<string> items)
+        => items.Count == 1 ? items[0] : "{ " + string.Join(", ", items) + " }";
+
+    private static string Match(string? value, IReadOnlyList<string> options, string fallback)
+    {
+        foreach (var option in options)
+        {
+            if (string.Equals(value?.Trim(), option, StringComparison.OrdinalIgnoreCase))
+                return option;
+        }
+        return fallback;
+    }
+
+    private static string Blank(string? value) => string.IsNullOrWhiteSpace(value) ? "(empty)" : value.Trim();
+}

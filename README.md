@@ -12,7 +12,7 @@ Three ways to run it:
 
 > **Host-based** intrusion detection and prevention. It detects on its own heuristics and, with Suricata attached (0.6.0), on signature/payload inspection — then enforces in the kernel via `nftables`. It is not an inline network appliance: it protects the machine it runs on, not a segment, and it does not sit in the forwarding path.
 
-Linux port of the original Windows WPF Network Sentinel. Platform layers use `/proc/net`, `ss`, conntrack netlink, `nftables`/`iptables` (elevated via **pkexec**), and XDG data paths. Version **0.6.5**.
+Linux port of the original Windows WPF Network Sentinel. Platform layers use `/proc/net`, `ss`, conntrack netlink, `nftables`/`iptables` (elevated via **pkexec**), and XDG data paths. Version **0.7.0**.
 
 ---
 
@@ -25,6 +25,7 @@ Linux port of the original Windows WPF Network Sentinel. Platform layers use `/p
 | **Live connections** | Process name (via `/proc/*/fd` inode map), local/remote endpoints, TCP state, origin summary |
 | **Remote computers** | Peers observed talking to this PC, reverse DNS, geo/ISP when public |
 | **Activity chart** | Live sparkline of connection samples (GUI) |
+| **Data-flow charts** (0.7.0) | Bytes in/out sampled from `/proc/net/dev`: live throughput, this month's totals, and paired bars per day or per month (GUI) |
 
 ### Threat awareness
 Heuristics flag patterns such as:
@@ -154,8 +155,31 @@ Endpoints are collected from three places, so there is no window where one is bl
 
 - **Hostnames in a config are deliberately not resolved.** `Endpoint = vpn.example.org:51820` contributes nothing, because anyone able to answer DNS could otherwise write their own address into a never-block list — the same reasoning as the allowlist drift detector above. The live dump reports the resolved address anyway.
 - WireGuard interfaces are detected from sysfs (`DEVTYPE=wireguard`) — no root, no subprocess — so a host with no tunnel spends nothing. A host that *has* one but cannot read its peers says so in **Settings → VPN (WireGuard)** rather than staying quiet: an unprivileged run can still write rules through pkexec, so silence there would be the dangerous case.
-- When a detector does flag a peer endpoint, the console now says so — `Not blocking 203.0.113.9 (Critical: …) — it is a WireGuard tunnel endpoint` — instead of leaving you to wonder why no rule appeared. Rate-limited per address.
+- When a detector does flag a peer endpoint, the console now says so — `Not blocking 203.0.113.9 (Critical: …) — it is a VPN tunnel endpoint` — instead of leaving you to wonder why no rule appeared. Rate-limited per address.
 - **Manual blocking is unaffected**, here as with the operator shield: a hostile tunnel peer is a real case. Cutting off a peer for good belongs in WireGuard's own configuration (`wg set <iface> peer <key> remove`).
+
+#### The same shield for IPSec, including site-to-site (0.6.6)
+
+The argument above is not WireGuard's; it is any tunnel's, and until 0.6.6 only WireGuard got it. **IPSec peers are now shielded from auto-block on the same terms**, which matters most for a **site-to-site** tunnel — the case where the peer cannot phone you to say it went down:
+
+- the far end is another site's router at a **fixed public address**, indistinguishable from any stranger's to every heuristic here;
+- its traffic is the exact shape the heuristics look for — one remote address holding long-lived flows to whatever the tunnel carries, re-keying on a timer, and **retrying hard whenever the link flaps**, which reads like a brute-force or scan pattern;
+- so a single auto-block drops the tunnel for **both** sites at once, and nothing at this end looks wrong afterwards: the rule applied, the console still answers, and the other office simply loses the VPN.
+
+Peers are collected the same belt-and-braces way, on the same 60 s cadence, and remembered for the same 24 h:
+
+| Source | Covers |
+|--------|--------|
+| `ip xfrm state` | Live kernel SAs. This is the source that matters most because it is **implementation-independent** — strongSwan, libreswan and Openswan all install the same XFRM state |
+| `swanctl --list-sas`, else `ipsec status` | The window where IKE is up but no child SA is installed yet — where a flapping tunnel spends most of its time, and where `ip xfrm state` shows nothing |
+| `left=` / `right=` in `/etc/ipsec.conf` and `/etc/ipsec.d/*.conf`; `local_addrs` / `remote_addrs` in `/etc/swanctl/swanctl.conf` and `/etc/swanctl/conf.d/*.conf` | The peer named in configuration — still there with the tunnel **down**, which is the state a site is in after the very block this prevents |
+| A persisted 24 h memory (`ipsec-endpoints.json`) | Restarts, re-keying windows, a momentary command failure, and a tunnel that has **already** dropped |
+
+- **Traffic selectors are never read.** `leftsubnet`, `rightsubnet`, `local_ts` and `remote_ts` routinely hold `0.0.0.0/0`, and a shield that swallowed a default route would silently disable auto-block for the whole internet. Only `left`, `right`, `local_addrs` and `remote_addrs` are read, only when the value is a bare address — the match is on the whole key, so `rightsourceip` and friends cannot slip through.
+- `%any` and hostnames contribute nothing, for the same reason as WireGuard's `Endpoint =`.
+- Both ends of an SA are kept rather than guessing which is remote: `left` being the local end is a convention configs are routinely written against, and this host's own addresses are refused by an earlier gate anyway.
+- Reading live SAs needs **root** (CAP_NET_ADMIN). A host that clearly runs IPSec but cannot read its peers says so in the console's VPN status rather than staying quiet — an unprivileged run can still write rules through pkexec, so silence would be the dangerous case.
+- Detection is unchanged: this gate only stops the machine deciding on its own. **Manual blocking still works**, and a peer that really is hostile belongs in the IPSec configuration, not in a firewall rule that also takes the tunnel down.
 
 ### Signature detection — Suricata (0.6.0)
 
@@ -191,13 +215,54 @@ Polling `/proc/net` can only ever describe the moment the file was read — on t
 - Dedicated **nftables** table `inet networksentinel` when `nft` is available; otherwise **iptables** with `NetworkSentinel-*` comments
 - Only manages rules owned by this app; other firewall rules are left alone
 - The rule ledger is **reconciled with the kernel at startup**: nft/iptables rules don't survive a reboot while the ledger file does, so entries with no live kernel rule are dropped instead of masquerading as active blocks (runs only when elevation is silent — root or passwordless/cached sudo — never a startup password prompt)
-- Block rules are created as an `-In`/`-Out` pair and **removed together** in one click
+- Block rules are created as an `-In`/`-Out` pair and **removed together** in one click (config rules are never paired, so their names are exempt from that)
+- Your own rules, written on the **Firewall Config** page (0.7.0) — see below
+- **App-minted blocks always win** (0.7.0): auto-block and manual blocks are *inserted at the head* of their chain while config rules are *appended*, so a config `Allow` can never reopen an address auto-block just shut
 - **Auto-block** on/off with minimum severity (`Medium` / `High` / `Critical`)
 - Removing/unblocking a rule **suppresses auto-block for that IP for 24 h** (persisted), so removed rules stay gone across restarts
 - **Auto-block expiry** (1 h … 7 days, off by default) — an expired address stops counting as blocked immediately; the `nft`/`iptables` rule itself is dropped by a background sweep as soon as it can elevate without a prompt (running as root, or cached/passwordless sudo). Manual blocks are always permanent
 - The web console **refuses to block its own port** — that would cut off your browser mid-request and look like a crash
 - Settings in `~/.local/share/NetworkSentinel/settings.json` (or `$XDG_DATA_HOME/NetworkSentinel`)
 - **Authorize firewall** — elevates only `nft`/`iptables` via **pkexec** (password dialog). The GUI always runs as your user
+
+### Data flow — how much, not just who (0.7.0)
+
+The dashboard has always answered *who is talking to this machine*. It now also answers *how much went in and out*.
+
+`TrafficMeterService` reads the kernel's cumulative per-interface byte counters from `/proc/net/dev` every 5 s and diffs them — no packet capture, no root, no subprocess. Three cards on the dashboard: live in/out throughput on one shared zero-based scale (two independent scales would make a trickle of uploads look like a saturated download), this month's totals, and paired bars per day of the month or per month of the year.
+
+Three details decide whether the numbers are right, and each has a test:
+
+- **Physical links only.** `en*`, `eth*`, `wl*`, `ww*`. A tunnel (`wg0`, `tun0`, `ipsec0`), a VLAN sub-interface (`eth0.100`), a bridge, a bond master and a container `veth` all carry bytes that already crossed a physical link — counting both would double every tunnelled byte. `lo` never leaves the machine. Bond *slaves* are metered and the master is not, which gives the total exactly once.
+- **The name/counter boundary.** The kernel pads the interface name to six characters, so a long name with a wide counter leaves no space after the colon (`enp0s31f6:7590338536`). Splitting the row on whitespace alone would shift every column.
+- **Counters reset.** A reboot or an interface bounce restarts them at zero; a counter that moved backwards is treated as a fresh start and its current value is the delta.
+
+Daily totals and the last raw counters persist to `traffic-history.json`, so the diff continues across a restart — but that first catch-up delta spans however long the app was shut, so it counts toward the day and is deliberately **not** charted as a rate.
+
+Turn it off with `TrafficMeterEnabled` (Settings → Traffic metering); the history is kept but stops growing.
+
+The charts are on the **GUI dashboard**. The meter itself runs wherever the app runs, so a headless server still records the daily history into `traffic-history.json` — the web console and TUI just have no chart for it yet.
+
+> **Difference from the macOS build:** that one meters `ppp*` too. Here it does not — a PPPoE link is carried by an Ethernet interface that is already metered, so counting both would double every byte on a DSL connection.
+
+### Firewall Config — write your own rules (0.7.0)
+
+A **Firewall Config** page under *Firewall & Block* that adds, edits and deletes inbound and outbound rules, shaped like the Linode Cloud Manager firewall page (and [FireWallConfig](https://github.com/davidfweiser/FireWallConfig) on Ubuntu): one list per direction, Label / Action / Protocol / Port range / Sources, one form for both add and edit, and labels minted from the port's service (`block-inbound-ssh`) when you leave the field blank.
+
+Rules land in the same `inet networksentinel` table (or the same `NetworkSentinel-*` iptables comments) and the same ledger as the app's own blocks.
+
+The **editor is GUI-only** for now. The rules it writes are ordinary kernel rules and ordinary ledger entries, so they apply system-wide and show up in the TUI's and web console's existing Firewall rule lists, where they read as kind **Config rule** — those two just cannot add or edit them yet.
+
+**Precedence is fixed rather than incidental.** The chains are first-match-wins and rules are added one at a time, so ledger order decides nothing — a config *Allow* written today would otherwise sit ahead of a block auto-block appends tomorrow, and the accept would win. So app-minted blocks are **inserted at the head** of their chain (`nft insert`, `iptables -I … 1`) while config rules are **appended**. Every auto-block and manual block therefore precedes every config rule, whichever was created first.
+
+One consequence, accepted deliberately: the probe-log rule is appended too, so a SYN from an address that is already blocked is now dropped before it reaches the log. Probe logging exists to catch scans from hosts that are *not* blocked yet.
+
+Other details:
+
+- The page states plainly that the managed chains **accept** anything no rule matches, so an Allow rule opens a path through the rules above it rather than granting access on its own.
+- Blocking everything, or blocking inbound SSH, is **confirmed before it loads**.
+- A rule the kernel rejects is rolled back out of the ledger instead of being left there claiming to be in force.
+- One rule can need more than one kernel rule: a mixed IPv4/IPv6 address list splits by family (v6 goes to `ip6tables` when nft is unavailable), and a port range under protocol *Any* splits into TCP and UDP, because a port match without a protocol is not expressible in iptables.
 
 ### Known-good allowlist (never block)
 Trusted sites are protected so auto-block (and manual block) will not cut off everyday tools:
@@ -222,7 +287,7 @@ Domains are DNS-resolved to current IPs. Auto-block never touches allowlisted IP
 | **Allowlist** | Add/remove trusted domains and IPs; refresh the feed |
 | **Settings** | Monitoring on/off, poll interval, geo lookups, auth-log and closed-port scan detection, the 0.4.0 detectors (threat intel, new-listener alerts, process reputation, ARP/gateway watch, startup-item watch, exfiltration threshold, honeypot ports), **kernel flow events**, **DNS hygiene** (with approved resolvers), **WireGuard peer monitoring** (with a live peer table), **Suricata signature ingestion** (EVE path, maximum severity, muted sids), **auto-block dry run**, **HTTPS + DuckDNS remote access** (including **Issue certificate**), webhook URL, auto-block + minimum severity + expiry, block direction (in/out), allowlist feed, **change master password**, **Remove all rules** |
 
-The page header shows the running version (e.g. `v0.6.5`) — check it after an upgrade to confirm the new build is live.
+The page header shows the running version (e.g. `v0.7.0`) — check it after an upgrade to confirm the new build is live.
 
 ### Sleep / Wake
 
@@ -711,6 +776,7 @@ All three UIs write the same `~/.local/share/NetworkSentinel/settings.json`, so 
 | `PersistenceWatchEnabled` | `true` | systemd / cron / autostart folder watch |
 | `ExfilMonitorEnabled` | `true` | Per-socket outbound byte monitoring via `ss` |
 | `ExfilMbPer10Min` | `250` | Exfiltration alert threshold, MB per 10 minutes |
+| `TrafficMeterEnabled` | `true` | Sample `/proc/net/dev` for the dashboard's data-flow charts and the monthly history |
 | `HoneypotEnabled` | `false` | Bind decoy TCP ports |
 | `HoneypotPorts` | `"2323,3389,5900"` | Which ports to decoy (busy ones are skipped) |
 | `WebHttpsEnabled` | `false` | Serve the console over TLS as well as HTTP (needs `WebTlsCertPath`) |
@@ -780,9 +846,12 @@ All three UIs write the same `~/.local/share/NetworkSentinel/settings.json`, so 
 | `Services/DesktopNotifier.cs` | Critical desktop popups (notify-send / gdbus), blocked-or-not in the title |
 | `Services/GeoIpService.cs` | Reverse DNS + public geo lookup |
 | `Services/FirewallService.cs` | nftables / iptables via pkexec; rule ledger; auto-block expiry sweep |
+| `Services/FirewallRuleSpec.cs` | Firewall Config rule parsing, validation and nft/iptables rendering (no privilege, no I/O) |
+| `Services/TrafficMeterService.cs` | `/proc/net/dev` byte-counter sampling + daily history behind the data-flow charts |
 | `Services/AppSettings.cs` / `AppPaths.cs` | XDG data dir + JSON settings |
 | `Services/DialogService.cs` | Avalonia confirm/info dialogs |
 | `ViewModels/MainViewModel.cs` | UI state, commands, auto-block wiring, Settings view (incl. Remote access) |
+| `ViewModels/MainViewModel.FirewallConfig.cs` / `.Traffic.cs` | Firewall Config page; data-flow chart series and legends |
 | `MainWindow.axaml` | Avalonia dashboard UI |
 | `Tui/TuiApp.cs` | Spectre.Console terminal UI (`--tui`) |
 | `Web/WebApp.cs` | Headless browser UI (`-w` / `--web`, Kestrel) |
@@ -790,13 +859,16 @@ All three UIs write the same `~/.local/share/NetworkSentinel/settings.json`, so 
 | `Services/DuckDnsUpdater.cs` | DuckDNS dynamic-DNS refresh; token stored `0600` |
 | `Services/CertIssuanceService.cs` | Runs the issuance script for the Settings **Issue certificate** button |
 | `Services/LoginThrottle.cs` | Per-IP lockout for the console's password endpoints |
+| `Services/WireGuardEndpointGuard.cs` / `IpsecEndpointGuard.cs` | Tunnel endpoints that must never be auto-blocked |
 | `scripts/issue-duckdns-cert.sh` | Let's Encrypt DNS-01 issuance for a duckdns.org name |
+| `scripts/diagnose-ipsec.sh` | Read-only triage for a site-to-site tunnel that won't come up |
 | `Web/WebAuthStore.cs` | Master password hash + session tokens |
 | `scripts/package.sh` | Build self-contained tarball + `.install.sh` |
 | `scripts/install-from-package.sh` | Server/desktop installer (shipped as `install.sh`) |
 | `scripts/systemd/` | `networksentinel-web` unit + `web.env` example |
 | `Themes/` | Colors and control styles |
 | `Controls/Sparkline.cs` | Live activity chart |
+| `Controls/TrafficChart.cs` | Dual sparkline + paired bar chart for the data-flow cards |
 | `Program.cs` | Entry point; GUI / TUI / web routing; refuses GUI-as-root on Wayland |
 
 ---
@@ -863,6 +935,29 @@ On GNOME / Pop!_OS the indicator appears in the top bar (StatusNotifier / AppInd
 | Port already in use | Change `WEB_PORT` or run `networksentinel -w` to auto-pick a free high port. |
 | Port shows `LISTEN` locally but unreachable from outside | On a cloud VPS (Linode, AWS, DigitalOcean, …), the process listening (`sudo ss -ltnp \| grep 18765`) only proves the app is up — the provider's network firewall/security group can still drop inbound traffic before it reaches the box. Open the port in the provider's dashboard. |
 | Service dies after logout (user unit) | `sudo loginctl enable-linger "$USER"` |
+| Site-to-site VPN tunnel dropped and won't come back | Run `sudo bash scripts/diagnose-ipsec.sh <peer-ip>` — see [below](#a-site-to-site-tunnel-that-wont-come-up). |
+
+### A site-to-site tunnel that won't come up
+
+```bash
+sudo bash scripts/diagnose-ipsec.sh 203.0.113.7    # the peer's public address
+```
+
+Read-only, takes about 25 s, changes nothing. It answers three questions in order: **is this host blocking the peer or the IKE ports**, **is the peer's traffic arriving at all and from which address**, and **what does the IKE daemon say**. Where that lands tells you which of these it is:
+
+| What the script shows | What it means |
+|---|---|
+| A firewall rule naming the peer | This host blocked it. Allowlist the address (TUI `n`, or the web console's Allowlist tab) — that also removes the rule. A plain unblock only suppresses re-blocking for 24 h, so the tunnel would drop again tomorrow |
+| No local rule, and **no packets captured** | Nothing is reaching the box, so the drop is upstream. On a cloud VPS this is nearly always the **provider's** firewall, which is invisible from inside the machine — see the note below |
+| Packets arriving from a **different address** than the config names | The far end's WAN address changed. Classic on a dynamic residential line, and it looks exactly like a failure with no cause: worked for months, then stopped, nobody touched either end |
+| Packets from the right address, IKE still failing | A negotiation problem — the log section names it (auth failure, proposal mismatch, no matching peer config) |
+
+**On a cloud VPS, check the provider firewall first.** IPSec needs **UDP 500** (IKE) and **UDP 4500** (NAT-T) inbound, and these are not open by default. Two traps here:
+
+- **Some providers cannot express ESP at all.** Linode's Cloud Firewall offers TCP, UDP, ICMP and IPENCAP — there is no protocol-50 option, so raw ESP can never be allowed. If IKE completes but no traffic crosses the tunnel, force UDP encapsulation (`forceencaps=yes` in `ipsec.conf`, or `encap = yes` for swanctl) so ESP travels inside UDP 4500, then `sudo ipsec restart`.
+- **A peer on a dynamic address outgrows a pinned rule.** Scoping the source to the peer's `/32` is the right instinct, but every ISP rotation then breaks the tunnel until someone edits both the provider firewall *and* `right=`. Identify the peer by identity instead — `right=%any` with `rightid=`, authenticated by a strong PSK or certificate — and the address stops mattering. The provider firewall rule still has to widen to all sources, so the authentication is doing the work the address filter used to.
+
+**This app never auto-blocks a tunnel endpoint** — see [Tunnel endpoints are never auto-blocked](#tunnel-endpoints-are-never-auto-blocked). If the script does find a rule naming your peer, it was a manual block or predates 0.6.6.
 
 ---
 

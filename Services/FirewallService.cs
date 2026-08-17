@@ -185,10 +185,15 @@ public sealed class FirewallService
 
             // Blocks are created as an -In/-Out pair. Removing only the clicked row left
             // the sibling active, so the IP stayed blocked and remove "didn't work".
+            //
+            // Config rules are never paired, and their names end in an operator's
+            // label — "block-inbound-In" would otherwise drag an unrelated
+            // "block-inbound-Out" rule out of the ledger with it.
+            var isPaired = !name.StartsWith($"{RulePrefix}-Rule-", StringComparison.OrdinalIgnoreCase);
             var siblings = new List<string> { name };
-            if (name.EndsWith("-In", StringComparison.OrdinalIgnoreCase))
+            if (isPaired && name.EndsWith("-In", StringComparison.OrdinalIgnoreCase))
                 siblings.Add(name[..^"-In".Length] + "-Out");
-            else if (name.EndsWith("-Out", StringComparison.OrdinalIgnoreCase))
+            else if (isPaired && name.EndsWith("-Out", StringComparison.OrdinalIgnoreCase))
                 siblings.Add(name[..^"-Out".Length] + "-In");
 
             var removed = new List<string>();
@@ -304,6 +309,174 @@ public sealed class FirewallService
         return FirewallOperationResult.Ok(
             $"Restored {removed} allowlisted address(es): {string.Join("; ", notes.Take(12))}" +
             (notes.Count > 12 ? "…" : ""));
+    }
+
+    // ── Firewall Config rules (operator-authored) ────────────────────────
+
+    /// <summary>
+    /// Why an operator's Allow rule can never reopen an address auto-block just
+    /// shut, on either backend.
+    ///
+    /// The macOS build regenerates one PF anchor from the ledger on every change,
+    /// so it fixes precedence by emitting app-minted blocks before config rules.
+    /// Here rules are added to live nft/iptables chains one at a time and are
+    /// evaluated in chain order, so ledger order decides nothing: a config Allow
+    /// written today would sit ahead of a block auto-block appends tomorrow, and
+    /// the accept would win.
+    ///
+    /// So the ordering is enforced where the rules are written instead —
+    /// app-minted blocks are <b>inserted at the head</b> of their chain
+    /// (<c>nft insert</c>, <c>iptables -I … 1</c>) while config rules are
+    /// <b>appended</b>. Every app block therefore precedes every config rule, no
+    /// matter which was created first, and the first terminal verdict wins.
+    ///
+    /// One consequence, accepted deliberately: the probe-log rule is appended too,
+    /// so a SYN from an address that is already blocked is now dropped before it
+    /// reaches the log. Probe logging exists to catch scans of closed ports from
+    /// hosts that are not blocked yet, and dropping the duplicate noise is an
+    /// improvement rather than a loss.
+    /// </summary>
+    internal const string PrecedenceNote = "app blocks insert at the chain head; config rules append";
+
+    /// <summary>
+    /// nft verb that puts a rule where <see cref="PrecedenceNote"/> says it goes:
+    /// <c>insert</c> prepends, <c>add</c> appends.
+    /// </summary>
+    internal static string NftAddVerb(FirewallRuleKind kind)
+        => kind == FirewallRuleKind.Custom ? "add" : "insert";
+
+    /// <summary>
+    /// iptables chain clause with the same meaning: <c>-I CHAIN 1</c> prepends,
+    /// <c>-A CHAIN</c> appends.
+    /// </summary>
+    internal static string IptablesChainClause(FirewallRuleKind kind, string chain)
+        => kind == FirewallRuleKind.Custom ? $"-A {chain}" : $"-I {chain} 1";
+
+    /// <summary>
+    /// Every managed rule in evaluation order — app-minted blocks first, then the
+    /// operator's config rules. <see cref="GetManagedRules"/> sorts for the flat
+    /// rule list; the Firewall Config view needs the real order instead, because
+    /// the chains are first-match-wins.
+    /// </summary>
+    public IReadOnlyList<FirewallRuleInfo> GetConfigRules()
+    {
+        var ledger = LoadLedger();
+        return ledger
+            .OrderBy(r => r.Kind == FirewallRuleKind.Custom ? 1 : 0)
+            .ToList();
+    }
+
+    /// <summary>
+    /// Creates or replaces one operator-authored rule. Passing
+    /// <paramref name="replaceName"/> edits in place: the old kernel rule and
+    /// ledger entry are dropped and the new one is appended, so the edited rule
+    /// moves to the end of the config section.
+    /// </summary>
+    public FirewallOperationResult SaveCustomRule(FirewallRuleSpec spec, string? replaceName = null)
+    {
+        var normalized = FirewallRuleSpecs.Normalize(spec);
+        var error = FirewallRuleSpecs.Validate(normalized);
+        if (error.Length > 0)
+            return FirewallOperationResult.Fail(error);
+
+        if (!IsAdministrator)
+            return FirewallOperationResult.Fail("No way to elevate (need pkexec or sudo) to modify the host firewall.");
+
+        if (!string.IsNullOrWhiteSpace(replaceName))
+        {
+            var existing = LoadLedger().FirstOrDefault(r =>
+                string.Equals(r.Name, replaceName, StringComparison.OrdinalIgnoreCase));
+            if (existing == null)
+                return FirewallOperationResult.Fail($"No rule named “{replaceName}” to edit — it may have been removed.");
+            if (existing.Kind != FirewallRuleKind.Custom)
+                return FirewallOperationResult.Fail("Only Firewall Config rules can be edited here.");
+
+            RemoveRuleByName(replaceName!);
+        }
+
+        EnsureBackendReady();
+
+        var name = UniqueCustomRuleName(normalized.Label, LoadLedger());
+        var rule = FirewallRuleSpecs.ToRule(normalized, name,
+            backend: BackendIsNft() ? NftBackend : IptablesBackend);
+        var applied = ApplyCustomRule(rule);
+
+        if (!applied.Success)
+        {
+            // A rule the kernel would not take must not stay in the ledger claiming
+            // to be in force. Any fragment that did load is torn back out, so a
+            // half-applied rule cannot survive as a silent partial block.
+            RemoveRuleByName(name);
+            return FirewallOperationResult.Fail($"The rule was rejected, so it was not kept: {applied.Message}");
+        }
+
+        UpsertLedger(rule);
+
+        return FirewallOperationResult.Ok(string.IsNullOrWhiteSpace(replaceName)
+            ? $"Added rule “{normalized.Label}”."
+            : $"Saved rule “{normalized.Label}”.");
+    }
+
+    /// <summary>
+    /// Writes one config rule's kernel fragments. A spec can need more than one:
+    /// a mixed v4/v6 address list splits by family, and a port range under
+    /// protocol Any splits into TCP and UDP.
+    /// </summary>
+    private FirewallOperationResult ApplyCustomRule(FirewallRuleInfo rule)
+    {
+        var verdictNft = rule.IsBlock ? "drop" : "accept";
+        var verdictIpt = rule.IsBlock ? "DROP" : "ACCEPT";
+        var chain = rule.IsInbound ? "input" : "output";
+        var table = rule.IsInbound ? "INPUT" : "OUTPUT";
+
+        if (BackendIsNft())
+        {
+            var matches = FirewallRuleSpecs.BuildNftMatches(rule);
+            if (matches.Count == 0)
+                return FirewallOperationResult.Fail("The rule matched nothing to write.");
+
+            foreach (var fragment in matches)
+            {
+                // Appended, not inserted — app-minted blocks own the head of the chain.
+                var r = RunPrivileged("nft",
+                    $"{NftAddVerb(rule.Kind)} rule {NftTable} {chain} {fragment.Match} counter {verdictNft} comment \"{Escape(rule.Name)}\"");
+                if (!r.Success)
+                    return FirewallOperationResult.Fail($"Failed nft add {rule.Name}: {r.Message}");
+            }
+
+            return FirewallOperationResult.Ok($"Rule “{rule.Name}” applied (nftables).");
+        }
+
+        var iptMatches = FirewallRuleSpecs.BuildIptablesMatches(rule);
+        if (iptMatches.Count == 0)
+            return FirewallOperationResult.Fail("The rule matched nothing to write.");
+
+        foreach (var fragment in iptMatches)
+        {
+            var tool = fragment.IsV6 ? "ip6tables" : "iptables";
+            if (fragment.IsV6 && !CommandExists("ip6tables"))
+                return FirewallOperationResult.Fail(
+                    "Cannot write the IPv6 part of this rule: ip6tables is not installed (and nft is unavailable).");
+
+            var body = fragment.Match.Length > 0 ? fragment.Match + " " : "";
+            var r = RunPrivileged(tool,
+                $"{IptablesChainClause(rule.Kind, table)} {body}-j {verdictIpt} -m comment --comment \"{Escape(rule.Name)}\"");
+            if (!r.Success)
+                return FirewallOperationResult.Fail($"Failed {tool} add {rule.Name}: {r.Message}");
+        }
+
+        return FirewallOperationResult.Ok($"Rule “{rule.Name}” applied (iptables).");
+    }
+
+    /// <summary>Rule names are the ledger key, so a repeated label gets a suffix.</summary>
+    private static string UniqueCustomRuleName(string label, List<FirewallRuleInfo> ledger)
+    {
+        var baseName = $"{RulePrefix}-Rule-{Sanitize(label)}";
+        var name = baseName;
+        var suffix = 2;
+        while (ledger.Any(r => string.Equals(r.Name, name, StringComparison.OrdinalIgnoreCase)))
+            name = $"{baseName}-{suffix++}";
+        return name;
     }
 
     public IReadOnlyList<FirewallRuleInfo> GetManagedRules()
@@ -499,8 +672,9 @@ public sealed class FirewallService
             if (IPAddress.TryParse(ip, out var addr) && addr.AddressFamily == System.Net.Sockets.AddressFamily.InterNetworkV6)
                 match = isInbound ? $"ip6 saddr {ip}" : $"ip6 daddr {ip}";
 
+            // Inserted at the head of the chain, not appended: see PrecedenceNote.
             var r = RunPrivileged("nft",
-                $"add rule {NftTable} {chain} {match} counter drop comment \"{Escape(name)}\"");
+                $"{NftAddVerb(FirewallRuleKind.IpBlock)} rule {NftTable} {chain} {match} counter drop comment \"{Escape(name)}\"");
             applied = r.Success
                 ? FirewallOperationResult.Ok($"Rule “{name}” applied (nftables).")
                 : FirewallOperationResult.Fail($"Failed nft add {name}: {r.Message}");
@@ -518,7 +692,7 @@ public sealed class FirewallService
             var table = isInbound ? "INPUT" : "OUTPUT";
             var flag = isInbound ? "-s" : "-d";
             var r = RunPrivileged(tool,
-                $"-A {table} {flag} {ip} -j DROP -m comment --comment \"{Escape(name)}\"");
+                $"{IptablesChainClause(FirewallRuleKind.IpBlock, table)} {flag} {ip} -j DROP -m comment --comment \"{Escape(name)}\"");
             applied = r.Success
                 ? FirewallOperationResult.Ok($"Rule “{name}” applied ({tool}).")
                 : FirewallOperationResult.Fail($"Failed {tool} add {name}: {r.Message}");
@@ -558,7 +732,7 @@ public sealed class FirewallService
             var chain = isInbound ? "input" : "output";
             var portMatch = isInbound ? $"dport {port}" : $"sport {port}";
             var r = RunPrivileged("nft",
-                $"add rule {NftTable} {chain} {proto} {portMatch} counter drop comment \"{Escape(name)}\"");
+                $"{NftAddVerb(FirewallRuleKind.PortBlock)} rule {NftTable} {chain} {proto} {portMatch} counter drop comment \"{Escape(name)}\"");
             applied = r.Success
                 ? FirewallOperationResult.Ok($"Rule “{name}” applied (nftables).")
                 : FirewallOperationResult.Fail($"Failed nft add {name}: {r.Message}");
@@ -568,7 +742,7 @@ public sealed class FirewallService
             var table = isInbound ? "INPUT" : "OUTPUT";
             var portFlag = isInbound ? "--dport" : "--sport";
             var r = RunPrivileged("iptables",
-                $"-A {table} -p {proto} {portFlag} {port} -j DROP -m comment --comment \"{Escape(name)}\"");
+                $"{IptablesChainClause(FirewallRuleKind.PortBlock, table)} -p {proto} {portFlag} {port} -j DROP -m comment --comment \"{Escape(name)}\"");
             applied = r.Success
                 ? FirewallOperationResult.Ok($"Rule “{name}” applied (iptables).")
                 : FirewallOperationResult.Fail($"Failed iptables add {name}: {r.Message}");
@@ -614,9 +788,19 @@ public sealed class FirewallService
         }
         else
         {
-            var tool = IptablesToolFor(name);
-            removed |= DeleteIptablesByComment(tool, "INPUT", name);
-            removed |= DeleteIptablesByComment(tool, "OUTPUT", name);
+            // A config rule's name carries no address, so which binary holds it
+            // cannot be read off the name the way an IP block's can: one rule can
+            // have written fragments into both tables from a mixed v4/v6 address
+            // list. Sweeping both is the only way to leave nothing behind.
+            var tools = name.StartsWith($"{RulePrefix}-Rule-", StringComparison.OrdinalIgnoreCase)
+                ? new[] { "iptables", "ip6tables" }.Where(t => t == "iptables" || CommandExists(t)).ToArray()
+                : new[] { IptablesToolFor(name) };
+
+            foreach (var tool in tools)
+            {
+                removed |= DeleteIptablesByComment(tool, "INPUT", name);
+                removed |= DeleteIptablesByComment(tool, "OUTPUT", name);
+            }
         }
 
         // Ledger is always updated so UI stays consistent even if kernel rule was already gone.
@@ -1310,12 +1494,27 @@ public enum FirewallRuleKind
 {
     IpBlock,
     PortBlock,
-    Other
+    Other,
+
+    /// <summary>
+    /// A rule the operator wrote in the Firewall Config view: any action, any
+    /// direction, a protocol, a port range and an address list. The other kinds
+    /// are minted by the app (auto-block, manual block, probe logging).
+    /// </summary>
+    Custom
 }
 
 public sealed class FirewallRuleInfo
 {
     public string Name { get; init; } = "";
+
+    /// <summary>
+    /// Operator-facing name for a Firewall Config rule (<c>block-inbound-ssh</c>).
+    /// Empty on rules the app minted itself, which fall back to a description
+    /// derived from what they match.
+    /// </summary>
+    public string Label { get; init; } = "";
+
     public string Description { get; init; } = "";
     public bool Enabled { get; init; }
     public bool IsBlock { get; init; }
@@ -1347,8 +1546,57 @@ public sealed class FirewallRuleInfo
     {
         FirewallRuleKind.IpBlock => "IP block",
         FirewallRuleKind.PortBlock => "Port block",
+        FirewallRuleKind.Custom => "Config rule",
         _ => "Rule"
     };
+
+    /// <summary>Only Firewall Config rules can be edited; the rest are app-minted.</summary>
+    public bool IsCustom => Kind == FirewallRuleKind.Custom;
+
+    public bool IsInbound => Direction != FirewallDirection.Outbound;
+
+    /// <summary>Label column: the operator's name, or a description of what the rule matches.</summary>
+    public string LabelText
+    {
+        get
+        {
+            if (!string.IsNullOrWhiteSpace(Label)) return Label;
+            return Kind switch
+            {
+                FirewallRuleKind.IpBlock => $"auto-block-{(IsInbound ? "inbound" : "outbound")}-{AddressText}",
+                FirewallRuleKind.PortBlock => $"block-{(IsInbound ? "inbound" : "outbound")}-port-{LocalPorts}",
+                _ => Name
+            };
+        }
+    }
+
+    /// <summary>Where the rule came from, so app-minted rules are not mistaken for config.</summary>
+    public string OriginText
+    {
+        get
+        {
+            if (string.Equals(Name, FirewallService.ProbeLogRuleName, StringComparison.OrdinalIgnoreCase))
+                return "Probe logging";
+
+            return Kind switch
+            {
+                FirewallRuleKind.IpBlock => "Auto/manual block",
+                FirewallRuleKind.PortBlock => "Port block",
+                FirewallRuleKind.Custom => "Firewall config",
+                _ => "Managed"
+            };
+        }
+    }
+
+    public string ProtocolText => string.IsNullOrWhiteSpace(Protocol) ? "Any" : Protocol;
+
+    public string PortRangeText => string.IsNullOrWhiteSpace(LocalPorts) ? "All ports" : LocalPorts;
+
+    /// <summary>Sources on an inbound rule, destinations on an outbound one.</summary>
+    public string AddressListText => string.IsNullOrWhiteSpace(RemoteAddresses)
+        ? FirewallRuleSpecs.AnyAddressText
+        : RemoteAddresses;
+
     /// <summary>Best-effort IP target for display (falls back to parsing the rule name).</summary>
     public string AddressText
     {
