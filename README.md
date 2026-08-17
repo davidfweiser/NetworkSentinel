@@ -12,7 +12,7 @@ Three ways to run it:
 
 > **Host-based** intrusion detection and prevention. It detects on its own heuristics and, with Suricata attached (0.6.0), on signature/payload inspection — then enforces in the kernel via `nftables`. It is not an inline network appliance: it protects the machine it runs on, not a segment, and it does not sit in the forwarding path.
 
-Linux port of the original Windows WPF Network Sentinel. Platform layers use `/proc/net`, `ss`, conntrack netlink, `nftables`/`iptables` (elevated via **pkexec**), and XDG data paths. Version **0.6.6**.
+Linux port of the original Windows WPF Network Sentinel. Platform layers use `/proc/net`, `ss`, conntrack netlink, `nftables`/`iptables` (elevated via **pkexec**), and XDG data paths. Version **0.7.0**.
 
 ---
 
@@ -25,6 +25,7 @@ Linux port of the original Windows WPF Network Sentinel. Platform layers use `/p
 | **Live connections** | Process name (via `/proc/*/fd` inode map), local/remote endpoints, TCP state, origin summary |
 | **Remote computers** | Peers observed talking to this PC, reverse DNS, geo/ISP when public |
 | **Activity chart** | Live sparkline of connection samples (GUI) |
+| **Data-flow charts** (0.7.0) | Bytes in/out sampled from `/proc/net/dev`: live throughput, this month's totals, and paired bars per day or per month (GUI) |
 
 ### Threat awareness
 Heuristics flag patterns such as:
@@ -222,6 +223,41 @@ Polling `/proc/net` can only ever describe the moment the file was read — on t
 - Settings in `~/.local/share/NetworkSentinel/settings.json` (or `$XDG_DATA_HOME/NetworkSentinel`)
 - **Authorize firewall** — elevates only `nft`/`iptables` via **pkexec** (password dialog). The GUI always runs as your user
 
+### Data flow — how much, not just who (0.7.0)
+
+The dashboard has always answered *who is talking to this machine*. It now also answers *how much went in and out*.
+
+`TrafficMeterService` reads the kernel's cumulative per-interface byte counters from `/proc/net/dev` every 5 s and diffs them — no packet capture, no root, no subprocess. Three cards on the dashboard: live in/out throughput on one shared zero-based scale (two independent scales would make a trickle of uploads look like a saturated download), this month's totals, and paired bars per day of the month or per month of the year.
+
+Three details decide whether the numbers are right, and each has a test:
+
+- **Physical links only.** `en*`, `eth*`, `wl*`, `ww*`. A tunnel (`wg0`, `tun0`, `ipsec0`), a VLAN sub-interface (`eth0.100`), a bridge, a bond master and a container `veth` all carry bytes that already crossed a physical link — counting both would double every tunnelled byte. `lo` never leaves the machine. Bond *slaves* are metered and the master is not, which gives the total exactly once.
+- **The name/counter boundary.** The kernel pads the interface name to six characters, so a long name with a wide counter leaves no space after the colon (`enp0s31f6:7590338536`). Splitting the row on whitespace alone would shift every column.
+- **Counters reset.** A reboot or an interface bounce restarts them at zero; a counter that moved backwards is treated as a fresh start and its current value is the delta.
+
+Daily totals and the last raw counters persist to `traffic-history.json`, so the diff continues across a restart — but that first catch-up delta spans however long the app was shut, so it counts toward the day and is deliberately **not** charted as a rate.
+
+Turn it off with `TrafficMeterEnabled` (Settings → Traffic metering); the history is kept but stops growing.
+
+> **Difference from the macOS build:** that one meters `ppp*` too. Here it does not — a PPPoE link is carried by an Ethernet interface that is already metered, so counting both would double every byte on a DSL connection.
+
+### Firewall Config — write your own rules (0.7.0)
+
+A **Firewall Config** page under *Firewall & Block* that adds, edits and deletes inbound and outbound rules, shaped like the Linode Cloud Manager firewall page (and [FireWallConfig](https://github.com/davidfweiser/FireWallConfig) on Ubuntu): one list per direction, Label / Action / Protocol / Port range / Sources, one form for both add and edit, and labels minted from the port's service (`block-inbound-ssh`) when you leave the field blank.
+
+Rules land in the same `inet networksentinel` table (or the same `NetworkSentinel-*` iptables comments) and the same ledger as the app's own blocks, so the TUI and web console see them too.
+
+**Precedence is fixed rather than incidental.** The chains are first-match-wins and rules are added one at a time, so ledger order decides nothing — a config *Allow* written today would otherwise sit ahead of a block auto-block appends tomorrow, and the accept would win. So app-minted blocks are **inserted at the head** of their chain (`nft insert`, `iptables -I … 1`) while config rules are **appended**. Every auto-block and manual block therefore precedes every config rule, whichever was created first.
+
+One consequence, accepted deliberately: the probe-log rule is appended too, so a SYN from an address that is already blocked is now dropped before it reaches the log. Probe logging exists to catch scans from hosts that are *not* blocked yet.
+
+Other details:
+
+- The page states plainly that the managed chains **accept** anything no rule matches, so an Allow rule opens a path through the rules above it rather than granting access on its own.
+- Blocking everything, or blocking inbound SSH, is **confirmed before it loads**.
+- A rule the kernel rejects is rolled back out of the ledger instead of being left there claiming to be in force.
+- One rule can need more than one kernel rule: a mixed IPv4/IPv6 address list splits by family (v6 goes to `ip6tables` when nft is unavailable), and a port range under protocol *Any* splits into TCP and UDP, because a port match without a protocol is not expressible in iptables.
+
 ### Known-good allowlist (never block)
 Trusted sites are protected so auto-block (and manual block) will not cut off everyday tools:
 
@@ -245,7 +281,7 @@ Domains are DNS-resolved to current IPs. Auto-block never touches allowlisted IP
 | **Allowlist** | Add/remove trusted domains and IPs; refresh the feed |
 | **Settings** | Monitoring on/off, poll interval, geo lookups, auth-log and closed-port scan detection, the 0.4.0 detectors (threat intel, new-listener alerts, process reputation, ARP/gateway watch, startup-item watch, exfiltration threshold, honeypot ports), **kernel flow events**, **DNS hygiene** (with approved resolvers), **WireGuard peer monitoring** (with a live peer table), **Suricata signature ingestion** (EVE path, maximum severity, muted sids), **auto-block dry run**, **HTTPS + DuckDNS remote access** (including **Issue certificate**), webhook URL, auto-block + minimum severity + expiry, block direction (in/out), allowlist feed, **change master password**, **Remove all rules** |
 
-The page header shows the running version (e.g. `v0.6.6`) — check it after an upgrade to confirm the new build is live.
+The page header shows the running version (e.g. `v0.7.0`) — check it after an upgrade to confirm the new build is live.
 
 ### Sleep / Wake
 
@@ -734,6 +770,7 @@ All three UIs write the same `~/.local/share/NetworkSentinel/settings.json`, so 
 | `PersistenceWatchEnabled` | `true` | systemd / cron / autostart folder watch |
 | `ExfilMonitorEnabled` | `true` | Per-socket outbound byte monitoring via `ss` |
 | `ExfilMbPer10Min` | `250` | Exfiltration alert threshold, MB per 10 minutes |
+| `TrafficMeterEnabled` | `true` | Sample `/proc/net/dev` for the dashboard's data-flow charts and the monthly history |
 | `HoneypotEnabled` | `false` | Bind decoy TCP ports |
 | `HoneypotPorts` | `"2323,3389,5900"` | Which ports to decoy (busy ones are skipped) |
 | `WebHttpsEnabled` | `false` | Serve the console over TLS as well as HTTP (needs `WebTlsCertPath`) |
@@ -803,9 +840,12 @@ All three UIs write the same `~/.local/share/NetworkSentinel/settings.json`, so 
 | `Services/DesktopNotifier.cs` | Critical desktop popups (notify-send / gdbus), blocked-or-not in the title |
 | `Services/GeoIpService.cs` | Reverse DNS + public geo lookup |
 | `Services/FirewallService.cs` | nftables / iptables via pkexec; rule ledger; auto-block expiry sweep |
+| `Services/FirewallRuleSpec.cs` | Firewall Config rule parsing, validation and nft/iptables rendering (no privilege, no I/O) |
+| `Services/TrafficMeterService.cs` | `/proc/net/dev` byte-counter sampling + daily history behind the data-flow charts |
 | `Services/AppSettings.cs` / `AppPaths.cs` | XDG data dir + JSON settings |
 | `Services/DialogService.cs` | Avalonia confirm/info dialogs |
 | `ViewModels/MainViewModel.cs` | UI state, commands, auto-block wiring, Settings view (incl. Remote access) |
+| `ViewModels/MainViewModel.FirewallConfig.cs` / `.Traffic.cs` | Firewall Config page; data-flow chart series and legends |
 | `MainWindow.axaml` | Avalonia dashboard UI |
 | `Tui/TuiApp.cs` | Spectre.Console terminal UI (`--tui`) |
 | `Web/WebApp.cs` | Headless browser UI (`-w` / `--web`, Kestrel) |
@@ -822,6 +862,7 @@ All three UIs write the same `~/.local/share/NetworkSentinel/settings.json`, so 
 | `scripts/systemd/` | `networksentinel-web` unit + `web.env` example |
 | `Themes/` | Colors and control styles |
 | `Controls/Sparkline.cs` | Live activity chart |
+| `Controls/TrafficChart.cs` | Dual sparkline + paired bar chart for the data-flow cards |
 | `Program.cs` | Entry point; GUI / TUI / web routing; refuses GUI-as-root on Wayland |
 
 ---
