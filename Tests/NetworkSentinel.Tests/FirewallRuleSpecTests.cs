@@ -324,6 +324,47 @@ public class FirewallRuleSpecTests
         Assert.Equal("-A INPUT", FirewallService.IptablesChainClause(FirewallRuleKind.Custom, "INPUT"));
     }
 
+    // ── Validate-before-normalise ────────────────────────────────────────
+
+    [Fact]
+    public void AnUnparseablePortRangeIsRejectedRatherThanTurnedIntoEveryPort()
+    {
+        // Normalize re-renders the port field from what parsed and drops what did
+        // not, and an empty port field means EVERY port. Validating the normalized
+        // spec therefore accepted "block 443-80" and armed a catch-all block.
+        var typed = Spec(ports: "443-80");
+
+        Assert.False(FirewallRuleSpecs.TryPrepare(typed, out _, out var error));
+        Assert.Contains("starts after it ends", error);
+
+        // The shape of the bug, pinned so it cannot come back: normalising first
+        // really does produce a catch-all that passes validation.
+        var normalizedFirst = FirewallRuleSpecs.Normalize(typed);
+        Assert.Equal("", normalizedFirst.PortRange);
+        Assert.True(FirewallRuleSpecs.IsCatchAll(normalizedFirst));
+        Assert.Equal("", FirewallRuleSpecs.Validate(normalizedFirst));
+    }
+
+    [Fact]
+    public void AnUnparseableAddressIsRejectedRatherThanWidenedToEveryAddress()
+    {
+        Assert.False(FirewallRuleSpecs.TryPrepare(Spec(addresses: "not-an-ip"), out _, out var error));
+        Assert.Contains("Invalid address", error);
+    }
+
+    [Fact]
+    public void TryPrepareReturnsTheCanonicalFormWhenTheInputIsGood()
+    {
+        Assert.True(FirewallRuleSpecs.TryPrepare(
+            Spec(action: "block", protocol: "tcp", ports: "8000-8001"), out var spec, out var error));
+
+        Assert.Equal("", error);
+        Assert.Equal(FirewallRuleSpecs.ActionBlock, spec.Action);
+        Assert.Equal("TCP", spec.Protocol);
+        Assert.Equal("8000-8001", spec.PortRange);
+        Assert.False(FirewallRuleSpecs.IsCatchAll(spec));
+    }
+
     [Fact]
     public void ConfigRulesCarryTheirOwnKindAndOrigin()
     {

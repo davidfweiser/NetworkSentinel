@@ -374,9 +374,9 @@ public sealed class FirewallService
     /// </summary>
     public FirewallOperationResult SaveCustomRule(FirewallRuleSpec spec, string? replaceName = null)
     {
-        var normalized = FirewallRuleSpecs.Normalize(spec);
-        var error = FirewallRuleSpecs.Validate(normalized);
-        if (error.Length > 0)
+        // Validate before normalising — see FirewallRuleSpecs.TryPrepare for why the
+        // other order turns an unparseable port range into "every port".
+        if (!FirewallRuleSpecs.TryPrepare(spec, out var normalized, out var error))
             return FirewallOperationResult.Fail(error);
 
         if (!IsAdministrator)

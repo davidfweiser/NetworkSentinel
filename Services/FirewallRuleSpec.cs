@@ -239,6 +239,29 @@ public static class FirewallRuleSpecs
         };
     }
 
+    /// <summary>
+    /// Validate what the operator typed, then canonicalise it. Order matters, and
+    /// getting it backwards is dangerous rather than merely wrong:
+    /// <see cref="Normalize"/> re-renders the port and address fields from what
+    /// parsed and drops what did not, so a typo'd range like <c>443-80</c> comes
+    /// out as an empty port field — and an empty port field means *every port*.
+    /// Validating the normalized spec would therefore accept "block 443-80" and
+    /// quietly write "block everything".
+    /// </summary>
+    /// <returns>True when the rule is usable, with <paramref name="normalized"/> set.</returns>
+    public static bool TryPrepare(FirewallRuleSpec input, out FirewallRuleSpec normalized, out string error)
+    {
+        error = Validate(input);
+        if (error.Length > 0)
+        {
+            normalized = input;
+            return false;
+        }
+
+        normalized = Normalize(input);
+        return true;
+    }
+
     /// <summary>Empty string when the spec is usable; the reason when it is not.</summary>
     public static string Validate(FirewallRuleSpec spec)
     {
