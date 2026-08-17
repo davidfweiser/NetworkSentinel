@@ -202,7 +202,10 @@ public partial class MainViewModel
     [RelayCommand]
     private async Task SaveConfigRule()
     {
-        var spec = FirewallRuleSpecs.Normalize(new FirewallRuleSpec
+        // Validate before normalising — see FirewallRuleSpecs.TryPrepare. The other
+        // order silently drops a port range the parser rejected, and an empty port
+        // field means every port, so "443-80" would arm a catch-all block.
+        var typed = new FirewallRuleSpec
         {
             Label = RuleLabel,
             Action = RuleAction,
@@ -210,10 +213,9 @@ public partial class MainViewModel
             Protocol = RuleProtocol,
             PortRange = RulePortRange,
             Addresses = RuleAddresses
-        });
+        };
 
-        var error = FirewallRuleSpecs.Validate(spec);
-        if (error.Length > 0)
+        if (!FirewallRuleSpecs.TryPrepare(typed, out var spec, out var error))
         {
             RuleEditorError = error;
             return;

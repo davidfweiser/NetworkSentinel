@@ -68,9 +68,22 @@ fi
 
 # Normalize line endings — a Windows checkout ships CRLF, which breaks
 # shebangs ("/usr/bin/env: bash\r") and systemd unit parsing on the server.
+#
+# Not `sed -i`: that spelling is GNU-only (BSD sed wants an argument after -i
+# and reads the next word as the backup suffix), and BSD sed does not read \r
+# in a pattern as a carriage return either — it matches a literal 'r'. So a
+# release built on a Mac used to die here, or silently mangle the scripts.
+# `tr -d '\r'` is POSIX and means the same thing for these text files, and
+# truncating in place with `cat` keeps the executable bit that `mv` would drop.
 find "$STAGE" -maxdepth 2 -type f \
   \( -name '*.sh' -o -name '*.service' -o -name '*.desktop' -o -name '*.env.example' -o -name 'README-INSTALL.txt' \) \
-  -exec sed -i 's/\r$//' {} +
+  -print0 |
+while IFS= read -r -d '' file; do
+  tmp="${file}.crlf.$$"
+  tr -d '\r' < "$file" > "$tmp"
+  cat "$tmp" > "$file"
+  rm -f "$tmp"
+done
 
 # Short README for operators
 cat > "$STAGE/README-INSTALL.txt" <<EOF
@@ -167,7 +180,23 @@ echo "==> Creating tarball…"
 mkdir -p "$DIST_DIR"
 # --mode: force sane exec bits into the archive — chmod is a no-op when this
 # script runs on a Windows checkout (Git Bash/NTFS), which shipped a 644 binary.
-tar -C "$DIST_DIR" --mode='u+rwx,go+rx' -czf "$OUT_TGZ" "$NAME"
+#
+# That flag is GNU tar's; the bsdtar macOS ships as `tar` rejects it outright,
+# so prefer a real GNU tar (Homebrew installs one as `gtar`) and fall back to
+# whatever `tar` is without the flag. The fallback is safe on a Unix checkout —
+# the chmod +x above already set the bits — and only the Windows case, which
+# cannot run bsdtar anyway, actually depends on --mode.
+TAR="tar"
+if ! tar --version 2>/dev/null | grep -qi 'gnu tar'; then
+  command -v gtar >/dev/null 2>&1 && TAR="gtar"
+fi
+
+if "$TAR" --version 2>/dev/null | grep -qi 'gnu tar'; then
+  "$TAR" -C "$DIST_DIR" --mode='u+rwx,go+rx' -czf "$OUT_TGZ" "$NAME"
+else
+  echo "    (no GNU tar — archiving with $(basename "$TAR") and the on-disk modes)"
+  "$TAR" -C "$DIST_DIR" -czf "$OUT_TGZ" "$NAME"
+fi
 
 # Convenience checksum for the archive
 (
