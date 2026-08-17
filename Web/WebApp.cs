@@ -372,7 +372,7 @@ public sealed class WebApp : IDisposable
 
         if (req.Method == "GET" && (path is "/" or "/index.html"))
         {
-            WriteHtml(res, IndexHtml);
+            WriteHtml(res, PageHtml());
             return;
         }
 
@@ -1888,6 +1888,14 @@ public sealed class WebApp : IDisposable
         }
     }
 
+    /// <summary>
+    /// The console page with this build's version stamped into it, so the script
+    /// can tell that the server it is talking to has since been upgraded. Rebuilt
+    /// per request rather than cached: a page load is rare next to the state poll,
+    /// and one string replace is cheaper than reasoning about when to invalidate.
+    /// </summary>
+    private string PageHtml() => IndexHtml.Replace("__NS_VERSION__", _appVersion);
+
     private static void WriteHtml(HttpResponse res, string html)
     {
         var bytes = Encoding.UTF8.GetBytes(html);
@@ -2057,6 +2065,13 @@ public sealed class WebApp : IDisposable
     color: #f6d089; font-size: .88rem;
   }
   .sleep-banner strong { color: var(--amber); letter-spacing: .04em; text-transform: uppercase; font-size: .78rem; }
+  /* An upgrade is news, not a warning — same shape as the sleep banner, cyan
+     rather than amber, so it does not read as something being wrong. */
+  .sleep-banner.upgrade {
+    background: rgba(59,200,180,.08); border-color: rgba(59,200,180,.45); color: #a9e7dd;
+  }
+  .sleep-banner.upgrade strong { color: var(--cyan); }
+  .sleep-banner.upgrade button { background: linear-gradient(135deg, var(--cyan), var(--blue)); }
   .sleep-banner .spacer { flex: 1; }
   .sleep-banner button {
     appearance: none; border: none; border-radius: 8px; padding: 7px 14px; cursor: pointer;
@@ -2377,6 +2392,15 @@ public sealed class WebApp : IDisposable
     <span class="spacer"></span>
     <button type="button" id="btnWakeBanner">Wake up</button>
   </div>
+  <!-- Shown when the server has been upgraded under an open tab. The page only
+       ever re-fetches /api/state, never its own HTML, so no cache header can get
+       the new markup in here — only a reload can. -->
+  <div class="sleep-banner upgrade hidden" id="upgradeBanner">
+    <strong>Updated</strong>
+    <span id="upgradeText">The server is running a newer version than this page.</span>
+    <span class="spacer"></span>
+    <button type="button" id="btnReloadPage">Reload</button>
+  </div>
 
   <section id="tab-dashboard">
     <div class="cards" id="cards"></div>
@@ -2541,6 +2565,11 @@ public sealed class WebApp : IDisposable
 
 <script>
 (() => {
+  // Stamped into the page when it is served, so it records the build this markup
+  // came from. state.version is whatever the server is running now; the two
+  // diverge exactly when the service has been upgraded under an open tab.
+  const BUILD_VERSION = '__NS_VERSION__';
+
   let state = null;
   let tab = 'dashboard';
   let lastError = '';
@@ -2829,6 +2858,29 @@ public sealed class WebApp : IDisposable
       </div>`;
   }
 
+  // ── Upgrade detection ─────────────────────────────────────────────────────
+  // A tab left open across an upgrade keeps its old markup: the page polls
+  // /api/state but never re-requests its own HTML, so no cache header can
+  // deliver the new UI. The features simply appear to be missing, which is
+  // exactly how it looked the first time. Offer the reload instead.
+  //
+  // Never reload automatically — an operator may be mid-rule in the Firewall
+  // Config form, and throwing that away to pick up a cosmetic change would be a
+  // worse bug than the one this fixes.
+
+  function checkForUpgrade() {
+    const running = state && state.version;
+    // The placeholder survives only if the page was served by a build that does
+    // not stamp it; treat that as "cannot tell" rather than "upgraded".
+    if (!running || BUILD_VERSION.startsWith('__')) return;
+    if (running === BUILD_VERSION) return;
+
+    $('upgradeText').textContent =
+      `This page was loaded from v${BUILD_VERSION}; the server is now running v${running}. ` +
+      'Reload to pick up the new console.';
+    $('upgradeBanner').classList.remove('hidden');
+  }
+
   // ── Data flow ─────────────────────────────────────────────────────────────
   // Both directions share one zero-based scale. Two independent scales would draw
   // a trickle of uploads at the same height as a saturated download, which is the
@@ -3079,6 +3131,7 @@ public sealed class WebApp : IDisposable
     const forceLists = !!opts.forceLists;
     $('ver').textContent = 'v' + (state.version || '?');
     $('clock').textContent = state.clock || '';
+    checkForUpgrade();
     // Don't overwrite a recent action result (add/remove/block) with the generic status.
     if (state.statusMessage && Date.now() > statusHoldUntil)
       setStatus(state.statusMessage, false);
@@ -3420,6 +3473,9 @@ public sealed class WebApp : IDisposable
 
   $('btnSleep').onclick = () => toggleSleep();
   $('btnWakeBanner').onclick = () => toggleSleep(false);
+  // true: bypass the bfcache, which would otherwise hand back the very markup
+  // this banner exists to replace.
+  $('btnReloadPage').onclick = () => location.reload(true);
   $('btnAuto').onclick = () => apiAction('toggle_autoblock');
   $('btnLevel').onclick = () => apiAction('cycle_min_level');
   $('btnAuth').onclick = () => apiAction('authorize');
