@@ -12,7 +12,7 @@ Three ways to run it:
 
 > **Host-based** intrusion detection and prevention. It detects on its own heuristics and, with Suricata attached (0.6.0), on signature/payload inspection — then enforces in the kernel via `nftables`. It is not an inline network appliance: it protects the machine it runs on, not a segment, and it does not sit in the forwarding path.
 
-Linux port of the original Windows WPF Network Sentinel. Platform layers use `/proc/net`, `ss`, conntrack netlink, `nftables`/`iptables` (elevated via **pkexec**), and XDG data paths. Version **0.7.0**.
+Linux port of the original Windows WPF Network Sentinel. Platform layers use `/proc/net`, `ss`, conntrack netlink, `nftables`/`iptables` (elevated via **pkexec**), and XDG data paths. Version **0.7.1**.
 
 ---
 
@@ -25,7 +25,7 @@ Linux port of the original Windows WPF Network Sentinel. Platform layers use `/p
 | **Live connections** | Process name (via `/proc/*/fd` inode map), local/remote endpoints, TCP state, origin summary |
 | **Remote computers** | Peers observed talking to this PC, reverse DNS, geo/ISP when public |
 | **Activity chart** | Live sparkline of connection samples (GUI) |
-| **Data-flow charts** (0.7.0) | Bytes in/out sampled from `/proc/net/dev`: live throughput, this month's totals, and paired bars per day or per month (GUI) |
+| **Data-flow charts** (0.7.0) | Bytes in/out sampled from `/proc/net/dev`: live throughput, this month's totals, and paired bars per day or per month (GUI + web console since 0.7.1) |
 
 ### Threat awareness
 Heuristics flag patterns such as:
@@ -241,7 +241,7 @@ Daily totals and the last raw counters persist to `traffic-history.json`, so the
 
 Turn it off with `TrafficMeterEnabled` (Settings → Traffic metering); the history is kept but stops growing.
 
-The charts are on the **GUI dashboard**. The meter itself runs wherever the app runs, so a headless server still records the daily history into `traffic-history.json` — the web console and TUI just have no chart for it yet.
+The charts are on the **GUI dashboard and the web console** (0.7.1). The meter itself runs wherever the app runs, so a headless server records the daily history into `traffic-history.json` either way; the TUI is the one front-end with no chart for it.
 
 > **Difference from the macOS build:** that one meters `ppp*` too. Here it does not — a PPPoE link is carried by an Ethernet interface that is already metered, so counting both would double every byte on a DSL connection.
 
@@ -251,7 +251,9 @@ A **Firewall Config** page under *Firewall & Block* that adds, edits and deletes
 
 Rules land in the same `inet networksentinel` table (or the same `NetworkSentinel-*` iptables comments) and the same ledger as the app's own blocks.
 
-The **editor is GUI-only** for now. The rules it writes are ordinary kernel rules and ordinary ledger entries, so they apply system-wide and show up in the TUI's and web console's existing Firewall rule lists, where they read as kind **Config rule** — those two just cannot add or edit them yet.
+The editor is in the **GUI and the web console** (0.7.1). The rules it writes are ordinary kernel rules and ordinary ledger entries, so they apply system-wide and also show up in the TUI's Firewall list, where they read as kind **Config rule** — the TUI just cannot add or edit them.
+
+The web console additionally refuses an inbound Block that matches every source and covers its own port. The GUI can ask you to confirm taking the machine off the network; over the web that confirmation would travel down the connection the rule is about to cut, so there would be no one left to answer. A rule scoped to named addresses goes through — the Firewall tab's **Block IP** already blocks a chosen address on every port.
 
 **Precedence is fixed rather than incidental.** The chains are first-match-wins and rules are added one at a time, so ledger order decides nothing — a config *Allow* written today would otherwise sit ahead of a block auto-block appends tomorrow, and the accept would win. So app-minted blocks are **inserted at the head** of their chain (`nft insert`, `iptables -I … 1`) while config rules are **appended**. Every auto-block and manual block therefore precedes every config rule, whichever was created first.
 
@@ -284,10 +286,11 @@ Domains are DNS-resolved to current IPs. Auto-block never touches allowlisted IP
 | **Hosts** | Remote peers; block / unblock by row or by typed IP |
 | **Ports** | Local listeners; one-click **Block port** |
 | **Firewall** | Managed rules grouped as In/Out pairs; manual IP and port blocking; **Restore allowlisted** |
+| **Firewall Config** (0.7.1) | Add / edit / delete your own inbound and outbound rules; shows app-minted blocks alongside them in evaluation order |
 | **Allowlist** | Add/remove trusted domains and IPs; refresh the feed |
 | **Settings** | Monitoring on/off, poll interval, geo lookups, auth-log and closed-port scan detection, the 0.4.0 detectors (threat intel, new-listener alerts, process reputation, ARP/gateway watch, startup-item watch, exfiltration threshold, honeypot ports), **kernel flow events**, **DNS hygiene** (with approved resolvers), **WireGuard peer monitoring** (with a live peer table), **Suricata signature ingestion** (EVE path, maximum severity, muted sids), **auto-block dry run**, **HTTPS + DuckDNS remote access** (including **Issue certificate**), webhook URL, auto-block + minimum severity + expiry, block direction (in/out), allowlist feed, **change master password**, **Remove all rules** |
 
-The page header shows the running version (e.g. `v0.7.0`) — check it after an upgrade to confirm the new build is live.
+The page header shows the running version (e.g. `v0.7.1`) — check it after an upgrade to confirm the new build is live.
 
 ### Sleep / Wake
 
