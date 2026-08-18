@@ -480,8 +480,9 @@ public partial class MainViewModel
         // something to discover afterwards.
         if (rule.Copies > 1)
         {
-            warning += $"\n\nWindows holds {rule.Copies} identical copies of this rule. " +
-                       "Deleting it removes every one of them.";
+            warning += $"\n\nWindows holds {rule.Copies} copies of this rule" +
+                       (string.IsNullOrEmpty(rule.Profiles) ? "" : $" across {rule.Profiles}") +
+                       ". Deleting it removes every one of them.";
         }
 
         var confirmed = MessageBox.Show(

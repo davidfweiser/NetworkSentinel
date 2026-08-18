@@ -264,6 +264,56 @@ Firewall Policy                       BlockInbound,AllowOutbound
     }
 
     [Fact]
+    public void OneRuleStoredPerProfileIsOneRowCoveringBothProfiles()
+    {
+        // How Windows ships its built-in groups: File and Printer Sharing is stored once
+        // for Domain and once for Private,Public. Nothing a front-end displays separates
+        // them, so they arrived as two rows nothing could tell apart and a delete aimed
+        // at either was refused as ambiguous.
+        var rules = HostFirewallScanner.Dedupe(HostFirewallScanner.ParseHostRules(Dump(
+            Block("File and Printer Sharing (SMB-In)", localPort: "445", profiles: "Domain"),
+            Block("File and Printer Sharing (SMB-In)", localPort: "445", profiles: "Private,Public")), out _));
+
+        var rule = Assert.Single(rules);
+        Assert.Equal(2, rule.Copies);
+        Assert.Equal("Domain,Private,Public", rule.Profiles);
+        // Every profile is the same as no scope worth printing.
+        Assert.Equal("", rule.ProfileScopeText);
+    }
+
+    [Fact]
+    public void ARuleLiveOnOneProfileSaysWhichOne()
+    {
+        var rules = HostFirewallScanner.Dedupe(HostFirewallScanner.ParseHostRules(Dump(
+            Block("Remote Desktop", localPort: "3389", profiles: "Domain")), out _));
+
+        var rule = Assert.Single(rules);
+        Assert.Equal(1, rule.Copies);
+        Assert.Equal("Domain", rule.ProfileScopeText);
+    }
+
+    [Fact]
+    public void RulesScopedToDifferentProgramsStayApart()
+    {
+        // The fold drops the profile, not the program: one rule admitting svchost and one
+        // admitting System are two rules, and folding them would hide half a firewall.
+        var rules = HostFirewallScanner.Dedupe(HostFirewallScanner.ParseHostRules(Dump(
+            Block("Core Networking", localPort: "5353", program: @"C:\Windows\System32\svchost.exe"),
+            Block("Core Networking", localPort: "5353", program: "System")), out _));
+
+        Assert.Equal(2, rules.Count);
+        Assert.All(rules, r => Assert.Equal(1, r.Copies));
+    }
+
+    [Theory]
+    [InlineData("Domain", "Private,Public", "Domain,Private,Public")]
+    [InlineData("Private,Public", "Domain", "Domain,Private,Public")]
+    [InlineData("Domain", "Domain", "Domain")]
+    [InlineData("", "Public", "Public")]
+    public void MergedProfilesKeepWindowsOwnOrder(string left, string right, string expected)
+        => Assert.Equal(expected, HostFirewallScanner.MergeProfiles(left, right));
+
+    [Fact]
     public void TwoRulesThatShareANameButNotAShapeAreTwoRules()
     {
         var rules = HostFirewallScanner.Dedupe(HostFirewallScanner.ParseHostRules(Dump(

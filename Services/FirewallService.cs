@@ -1595,8 +1595,12 @@ public sealed class FirewallRuleInfo
     /// <summary>Windows service the rule is scoped to, empty when it applies to any.</summary>
     public string Service { get; init; } = "";
 
-    /// <summary>Profiles the rule applies to, as netsh spells them: "Domain,Private,Public".</summary>
-    public string Profiles { get; init; } = "";
+    /// <summary>
+    /// Profiles the rule applies to, as netsh spells them: "Domain,Private,Public".
+    /// Settable because the scan folds a rule stored once per profile into one row and
+    /// carries the union here — see <see cref="HostFirewallScanner.Dedupe"/>.
+    /// </summary>
+    public string Profiles { get; set; } = "";
 
     /// <summary>
     /// Local-port constraint as netsh reported it. <see cref="LocalPorts"/> is the
@@ -1625,6 +1629,25 @@ public sealed class FirewallRuleInfo
 
     /// <summary>"×685" for a folded duplicate set, empty for a rule that is one rule.</summary>
     public string CopiesText => Copies > 1 ? $"×{Copies}" : "";
+
+    /// <summary>
+    /// Which profiles this rule is live on, but only when that is not all of them.
+    /// "Domain,Private,Public" is netsh's way of saying "always", and a column repeating
+    /// it down every row would bury the handful of rules that really are scoped.
+    /// </summary>
+    public string ProfileScopeText
+    {
+        get
+        {
+            var parts = Profiles.Split(',', StringSplitOptions.RemoveEmptyEntries)
+                                .Select(p => p.Trim())
+                                .Where(p => p.Length > 0)
+                                .ToList();
+            if (parts.Count == 0 || parts.Count >= 3) return "";
+            if (parts.Count == 1 && parts[0].Equals("Any", StringComparison.OrdinalIgnoreCase)) return "";
+            return string.Join(", ", parts);
+        }
+    }
 
     public bool IsExpired => ExpiresUtc.HasValue && ExpiresUtc.Value <= DateTime.UtcNow;
 
