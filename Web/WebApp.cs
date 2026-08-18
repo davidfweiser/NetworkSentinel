@@ -1697,13 +1697,24 @@ public sealed class WebApp : IDisposable
     /// WireGuard monitor state for the settings panel, plus the tunnel-endpoint shield —
     /// which runs whether or not peer monitoring is on, and is what a VPN operator needs
     /// to see before arming auto-block.
+    ///
+    /// The IPSec half of the shield has no toggle of its own to hang a row on, so it is
+    /// reported here — but only once it has something to say. A host with no IPSec would
+    /// otherwise carry a permanent line about a protocol it does not run.
     /// </summary>
     private string WireGuardStatusText()
     {
         var monitor = _settings.WireGuardMonitorEnabled
             ? _monitor.WireGuardStatus
             : "Off — WireGuard peers are invisible to the connection heuristics until this is on.";
-        return $"{monitor} · {_monitor.WireGuardProtectionStatus}";
+        var text = $"{monitor} · {_monitor.WireGuardProtectionStatus}";
+
+        var ipsec = _monitor.IpsecProtectionStatus;
+        if (_monitor.IpsecProtectedEndpoints.Count > 0 ||
+            ipsec.Contains("cannot be read", StringComparison.Ordinal))
+            text += $" · {ipsec}";
+
+        return text;
     }
 
     /// <summary>
