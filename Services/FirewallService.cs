@@ -1,8 +1,10 @@
 using System.Diagnostics;
+using System.Globalization;
 using System.Net;
 using System.Runtime.InteropServices;
 using System.Text;
 using System.Text.Json;
+using System.Text.Json.Serialization;
 using System.Text.RegularExpressions;
 using NetworkSentinel.Models;
 
@@ -25,18 +27,21 @@ public sealed class FirewallService
     private const string NftBackend = "nft";
     private const string IptablesBackend = "iptables";
 
+    /// <summary>Marks a ledger rule that UFW wrote, so removal goes back out through UFW.</summary>
+    private const string UfwBackend = "ufw";
+
     private static readonly JsonSerializerOptions JsonOptions = new() { WriteIndented = true };
 
     public AllowlistService? Allowlist { get; set; }
 
     /// <summary>True when euid is root (rare; GUI should not run as root on Wayland).</summary>
-    public bool IsRoot
+    public bool IsRoot => IsRootProcess();
+
+    /// <summary>Static form, for the read path which has no instance to hand.</summary>
+    internal static bool IsRootProcess()
     {
-        get
-        {
-            try { return geteuid() == 0; }
-            catch { return false; }
-        }
+        try { return geteuid() == 0; }
+        catch { return false; }
     }
 
     /// <summary>True when firewall changes can be attempted (root or elevatable via pkexec/sudo).</summary>
@@ -394,11 +399,14 @@ public sealed class FirewallService
             RemoveRuleByName(replaceName!);
         }
 
-        EnsureBackendReady();
+        var viaUfw = BackendIsUfw();
+        // Only our own nft table needs bootstrapping; under UFW we write into its
+        // chains and must not add a competing table beside them.
+        if (!viaUfw) EnsureBackendReady();
 
         var name = UniqueCustomRuleName(normalized.Label, LoadLedger());
         var rule = FirewallRuleSpecs.ToRule(normalized, name,
-            backend: BackendIsNft() ? NftBackend : IptablesBackend);
+            backend: viaUfw ? UfwBackend : BackendIsNft() ? NftBackend : IptablesBackend);
         var applied = ApplyCustomRule(rule);
 
         if (!applied.Success)
@@ -424,6 +432,11 @@ public sealed class FirewallService
     /// </summary>
     private FirewallOperationResult ApplyCustomRule(FirewallRuleInfo rule)
     {
+        // UFW first where it is running: it owns the chains, and a rule written
+        // under it would be invisible in `ufw status` and lost on `ufw reload`.
+        if (BackendIsUfw())
+            return ApplyViaUfw(rule);
+
         var verdictNft = rule.IsBlock ? "drop" : "accept";
         var verdictIpt = rule.IsBlock ? "DROP" : "ACCEPT";
         var chain = rule.IsInbound ? "input" : "output";
@@ -466,6 +479,111 @@ public sealed class FirewallService
         }
 
         return FirewallOperationResult.Ok($"Rule “{rule.Name}” applied (iptables).");
+    }
+
+    // ── UFW write path ───────────────────────────────────────────────────
+
+    /// <summary>
+    /// Writes one config rule through UFW. Every command goes into a single
+    /// batched shell script: one spec can need several `ufw` invocations (one per
+    /// address × port), and polkit does not cache, so running them separately
+    /// raises one password dialog each.
+    /// </summary>
+    private FirewallOperationResult ApplyViaUfw(FirewallRuleInfo rule)
+    {
+        var spec = FirewallRuleSpecs.FromRule(rule);
+        // The kernel comment is the ledger key, not the operator's label — that is
+        // how a rescan tells our rules apart from everyone else's.
+        spec.Label = rule.Name;
+
+        var commands = UfwWriter.BuildAddCommands(spec);
+        if (commands.Count == 0)
+            return FirewallOperationResult.Fail("The rule matched nothing to write.");
+
+        var result = RunUfwBatch(commands);
+        InvalidateUfwProbe();
+        return result.Success
+            ? FirewallOperationResult.Ok($"Rule “{rule.Name}” applied (UFW).")
+            : FirewallOperationResult.Fail($"Failed ufw add {rule.Name}: {result.Message}");
+    }
+
+    /// <summary>
+    /// Deletes a UFW rule by its number in `ufw status numbered`. Numbers shift as
+    /// rows are removed, so they are deleted highest-first; an "anywhere" rule has
+    /// an IPv4 and an IPv6 twin and both numbers come back, because leaving one
+    /// behind still admits the traffic the delete was supposed to stop.
+    /// </summary>
+    private FirewallOperationResult RemoveViaUfw(FirewallRuleInfo rule)
+    {
+        var listing = RunPrivileged("ufw", "status numbered");
+        var numbers = listing.Success
+            ? UfwWriter.MatchNumbers(rule, UfwWriter.ParseNumbered(listing.Message))
+            : Array.Empty<int>();
+
+        IReadOnlyList<string[]> commands = numbers.Count > 0
+            ? numbers.OrderByDescending(n => n).Select(n => new[] { "--force", "delete", n.ToString(CultureInfo.InvariantCulture) }).ToList()
+            : UfwWriter.BuildDeleteCommands(FirewallRuleSpecs.FromRule(rule));
+
+        var result = RunUfwBatch(commands);
+        InvalidateUfwProbe();
+        return result;
+    }
+
+    private static FirewallOperationResult RunUfwBatch(IReadOnlyList<string[]> commands)
+    {
+        var ufw = ResolveExecutable("ufw") ?? "ufw";
+        var script = string.Join(" && ", commands.Select(argv =>
+            Sh(ufw) + " " + string.Join(" ", argv.Select(Sh))));
+        return RunPrivilegedBatch(script);
+    }
+
+    /// <summary>
+    /// Deletes a rule that came from a host scan rather than this app's ledger —
+    /// a UFW rule, or a bare nftables rule identified by its handle. The Firewall
+    /// Config view lists the whole host firewall, so Delete has to work on rows
+    /// Network Sentinel did not write; refusing them would make the list a
+    /// read-only report with buttons that lie.
+    /// </summary>
+    public FirewallOperationResult DeleteHostRule(FirewallRuleInfo rule)
+    {
+        if (!IsAdministrator)
+            return FirewallOperationResult.Fail("No way to elevate (need pkexec or sudo) to modify the host firewall.");
+
+        // One of ours: go through the ledger so its bookkeeping stays truthful.
+        if (!rule.IsForeign || rule.Kind != FirewallRuleKind.Other)
+            return RemoveRule(rule.Name);
+
+        var origin = rule.Origin ?? "";
+        if (origin.Equals("UFW", StringComparison.OrdinalIgnoreCase) || BackendIsUfw())
+        {
+            var viaUfw = RemoveViaUfw(rule);
+            return viaUfw.Success
+                ? FirewallOperationResult.Ok($"Removed “{rule.LabelText}” from UFW.")
+                : FirewallOperationResult.Fail($"UFW refused the delete: {viaUfw.Message}");
+        }
+
+        if (rule.Handle.Length > 0 && BackendIsNft())
+        {
+            var family = rule.Family.ToLowerInvariant() switch
+            {
+                "ipv4" or "ip" => "ip",
+                "ipv6" or "ip6" => "ip6",
+                "" => "inet",
+                var other when other is "inet" or "netdev" or "bridge" or "arp" => other,
+                _ => "inet"
+            };
+            var table = rule.Table.Length > 0 ? rule.Table : "filter";
+            var chain = rule.Chain.Length > 0 ? rule.Chain : (rule.IsInbound ? "input" : "output");
+
+            var r = RunPrivileged("nft", $"delete rule {family} {Sh(table)} {Sh(chain)} handle {Sh(rule.Handle)}");
+            return r.Success
+                ? FirewallOperationResult.Ok($"Removed “{rule.LabelText}” from nftables.")
+                : FirewallOperationResult.Fail($"nftables refused the delete: {r.Message}");
+        }
+
+        return FirewallOperationResult.Fail(
+            $"“{rule.LabelText}” came from {(origin.Length > 0 ? origin : "the kernel")} and carries no handle to " +
+            "delete it by. Remove it where it was created.");
     }
 
     /// <summary>Rule names are the ledger key, so a repeated label gets a suffix.</summary>
@@ -772,6 +890,19 @@ public sealed class FirewallService
     {
         bool removed = false;
 
+        // A rule UFW wrote is not in our nft table and has no comment nft can find;
+        // it has to come out the way it went in.
+        var ledgerEntry = LoadLedger().FirstOrDefault(r =>
+            string.Equals(r.Name, name, StringComparison.OrdinalIgnoreCase));
+        if (ledgerEntry != null && ledgerEntry.Backend.Equals("ufw", StringComparison.OrdinalIgnoreCase))
+        {
+            removed = RemoveViaUfw(ledgerEntry).Success;
+            RemoveFromLedger(name);
+            return removed
+                ? FirewallOperationResult.Ok($"Removed “{name}”.")
+                : FirewallOperationResult.Fail($"UFW would not remove “{name}”.");
+        }
+
         if (BackendIsNft())
         {
             var list = RunPrivileged("nft", $"-a list table {NftTable}");
@@ -874,6 +1005,38 @@ public sealed class FirewallService
         _backendNft = CommandExists("nft");
         return _backendNft.Value;
     }
+
+    private static (bool Active, DateTime CheckedUtc) _ufwState;
+    private static readonly TimeSpan UfwProbeTtl = TimeSpan.FromSeconds(30);
+
+    /// <summary>
+    /// True when UFW is installed and active, which makes it the owner of the
+    /// host firewall: it holds the nftables chains and re-applies its rule set on
+    /// reload and at boot. A rule written straight into nftables underneath it is
+    /// invisible in `ufw status` and does not survive `ufw reload` — so where UFW
+    /// is running, every rule this app writes goes through UFW instead.
+    ///
+    /// Installed-but-inactive does not count. Enabling UFW can lock an operator
+    /// out of SSH, and that decision is never ours to make; with UFW off, the
+    /// nftables path below is still the live firewall.
+    /// </summary>
+    internal static bool BackendIsUfw()
+    {
+        if (DateTime.UtcNow - _ufwState.CheckedUtc < UfwProbeTtl) return _ufwState.Active;
+
+        var active = false;
+        if (CommandExists("ufw"))
+        {
+            var status = ReadCommand("ufw", "status");
+            active = status.Ok && status.StdOut.Contains("Status: active", StringComparison.OrdinalIgnoreCase);
+        }
+
+        _ufwState = (active, DateTime.UtcNow);
+        return active;
+    }
+
+    /// <summary>Forgets the cached UFW probe — called after a write, which can flip it.</summary>
+    private static void InvalidateUfwProbe() => _ufwState = (false, DateTime.MinValue);
 
     /// <summary>
     /// Cached <c>which</c> results. <see cref="IsAdministrator"/> probes for pkexec and
@@ -1035,6 +1198,85 @@ public sealed class FirewallService
         catch
         {
             return null;
+        }
+    }
+
+    // ── Read-only command execution ──────────────────────────────────────
+    //
+    // HostFirewallScanner reads the live ruleset (`ufw status`, `nft -j list
+    // ruleset`, `iptables -S`, `ss -tulpnH`). Those are inspections, not
+    // changes, so they must never raise a pkexec password dialog — a firewall
+    // view that prompts for a password every refresh is a view nobody opens.
+    // The order is: try it as we are, then retry under `sudo -n`, which either
+    // works from cached/NOPASSWD credentials or fails immediately.
+
+    private const int ReadProcessTimeoutMs = 8_000;
+
+    /// <summary>Whether a read-only tool is on PATH. Shares the probe cache with the write path.</summary>
+    internal static bool ReadCommandExists(string name) => CommandExists(name);
+
+    /// <summary>
+    /// Runs a read-only command and returns its streams separately — unlike
+    /// <see cref="RunProcess"/>, which merges them, and would feed stderr into a
+    /// JSON parser. Never elevates interactively.
+    /// </summary>
+    internal static (bool Ok, string StdOut, string StdErr) ReadCommand(string file, params string[] args)
+    {
+        var resolved = ResolveExecutable(file);
+        if (resolved == null) return (false, "", $"{file} not found");
+
+        var direct = ReadProcess(resolved, args);
+        if (direct.Ok && direct.StdOut.Trim().Length > 0) return direct;
+
+        // Empty or refused as a normal user is the usual case for `ufw status`
+        // and `nft list ruleset`; passwordless sudo is the one retry worth making.
+        if (!IsRootProcess() && CommandExists("sudo"))
+        {
+            var sudo = ResolveExecutable("sudo");
+            if (sudo != null)
+            {
+                var elevated = ReadProcess(sudo, new[] { "-n", resolved }.Concat(args).ToArray());
+                if (elevated.Ok && elevated.StdOut.Trim().Length > 0) return elevated;
+            }
+        }
+
+        return direct;
+    }
+
+    private static (bool Ok, string StdOut, string StdErr) ReadProcess(string file, IReadOnlyList<string> args)
+    {
+        try
+        {
+            var psi = new ProcessStartInfo(file)
+            {
+                UseShellExecute = false,
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+                CreateNoWindow = true
+            };
+            foreach (var arg in args) psi.ArgumentList.Add(arg);
+
+            using var p = Process.Start(psi);
+            if (p == null) return (false, "", $"Could not start {file}.");
+
+            // Both pipes drained concurrently — see RunProcess for why reading one
+            // to EOF first deadlocks.
+            var stdoutTask = p.StandardOutput.ReadToEndAsync();
+            var stderrTask = p.StandardError.ReadToEndAsync();
+
+            if (!p.WaitForExit(ReadProcessTimeoutMs))
+            {
+                try { p.Kill(entireProcessTree: true); } catch { /* already gone */ }
+                return (false, "", $"{file} did not finish within {ReadProcessTimeoutMs / 1000}s.");
+            }
+
+            return (p.ExitCode == 0,
+                    stdoutTask.GetAwaiter().GetResult(),
+                    stderrTask.GetAwaiter().GetResult());
+        }
+        catch (Exception ex)
+        {
+            return (false, "", ex.Message);
         }
     }
 
@@ -1535,6 +1777,45 @@ public sealed class FirewallRuleInfo
     /// <summary>UTC time this rule stops applying (null = permanent). Set by auto-block expiry.</summary>
     public DateTime? ExpiresUtc { get; init; }
 
+    // ── Host-scan fields ─────────────────────────────────────────────────
+    //
+    // Set by HostFirewallScanner on rules read back out of the kernel, which is
+    // most of what the Firewall Config view lists: UFW's rules, WireGuard's,
+    // Docker's, and this app's own. They are never persisted — the ledger holds
+    // only rules Network Sentinel wrote, and it already knows their shape.
+
+    /// <summary>
+    /// Which subsystem put the rule in the kernel — "UFW", "Network Sentinel",
+    /// "WireGuard", "Docker", "nftables". Drives the Created by column, so a
+    /// foreign rule is never mistaken for one this app is responsible for.
+    /// </summary>
+    [JsonIgnore] public string Origin { get; init; } = "";
+
+    /// <summary>nftables rule handle: what <c>nft delete rule … handle N</c> needs.</summary>
+    [JsonIgnore] public string Handle { get; init; } = "";
+
+    [JsonIgnore] public string Table { get; init; } = "";
+    [JsonIgnore] public string Chain { get; init; } = "";
+
+    /// <summary>nft address family — <c>inet</c>, <c>ip</c>, <c>ip6</c>.</summary>
+    [JsonIgnore] public string Family { get; init; } = "";
+
+    /// <summary>
+    /// True for a rule read out of the kernel that this app did not write. The
+    /// editor still opens it, but deletes route to whichever backend owns it.
+    /// </summary>
+    [JsonIgnore] public bool IsForeign { get; init; }
+
+    /// <summary>Verdict as the backend words it: Accept, Drop, Reject, Return, Jump.</summary>
+    [JsonIgnore] public string Verdict { get; init; } = "";
+
+    /// <summary>
+    /// The rule's own kernel comment, empty when it carries none. Distinct from
+    /// <see cref="Label"/>, which falls back to a minted name — an unnamed bare
+    /// accept in a base chain is plumbing, and only the comment tells them apart.
+    /// </summary>
+    [JsonIgnore] public string Comment { get; init; } = "";
+
     public bool IsExpired => ExpiresUtc.HasValue && ExpiresUtc.Value <= DateTime.UtcNow;
 
     public string ExpiryText => ExpiresUtc.HasValue
@@ -1575,6 +1856,10 @@ public sealed class FirewallRuleInfo
     {
         get
         {
+            // A scanned rule already knows who wrote it; the ledger kinds below
+            // only describe rules this app minted.
+            if (!string.IsNullOrWhiteSpace(Origin)) return Origin;
+
             if (string.Equals(Name, FirewallService.ProbeLogRuleName, StringComparison.OrdinalIgnoreCase))
                 return "Probe logging";
 
