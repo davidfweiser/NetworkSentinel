@@ -245,11 +245,11 @@ The charts are on the **GUI dashboard and the web console** (0.7.1). The meter i
 
 > **Difference from the macOS build:** that one meters `ppp*` too. Here it does not — a PPPoE link is carried by an Ethernet interface that is already metered, so counting both would double every byte on a DSL connection.
 
-### Firewall Config — the whole host firewall (0.7.0, rebuilt in 0.7.3)
+### Firewall Config — the whole host firewall (0.7.0, rebuilt in 0.7.4)
 
 A **Firewall Config** page under *Firewall & Block* that adds, edits and deletes inbound and outbound rules, shaped like the Linode Cloud Manager firewall page: one list per direction, Label / Action / Protocol / Port range / Sources, one form for both add and edit, and labels minted from the port's service (`block-inbound-ssh`) when you leave the field blank.
 
-**Since 0.7.3 the page reads the host firewall rather than this app's ledger**, the way [FireWallConfig](https://github.com/davidfweiser/FireWallConfig) does on Ubuntu — and for the same reason. Until then it listed only rules Network Sentinel had written itself, out of `firewall-rules.json`. On a box running UFW that is a near-empty page sitting next to a firewall full of rules, and the rules this app added were invisible in `ufw status` in turn. One machine has one firewall; the page now shows all of it, named after the host:
+**Since 0.7.4 the page reads the host firewall rather than this app's ledger**, the way [FireWallConfig](https://github.com/davidfweiser/FireWallConfig) does on Ubuntu — and for the same reason. Until then it listed only rules Network Sentinel had written itself, out of `firewall-rules.json`. On a box running UFW that is a near-empty page sitting next to a firewall full of rules, and the rules this app added were invisible in `ufw status` in turn. One machine has one firewall; the page now shows all of it, named after the host:
 
 | Source | Read with |
 |---|---|
@@ -262,6 +262,10 @@ A **Firewall Config** page under *Firewall & Block* that adds, edits and deletes
 UFW's own helper chains (`ufw-before-*`, `ufw-track-*`, the logging chains) and the established/loopback boilerplate every ruleset opens with are folded out, so the list is rules somebody chose. Everything else stays: UFW's rules, WireGuard's, Docker's, and Network Sentinel's own, each named in a **Created by** column so a foreign rule is never mistaken for one this app is responsible for. These are read-only inspections and never raise a password dialog — they run as you, retry once under `sudo -n`, and say in the policy line when a short list is a privilege problem rather than an empty firewall.
 
 **Listening services.** Under the two rule lists, what is actually listening (`ss -tulpnH`) with the verdict the rules above pass on it: **Open** (reachable from anywhere), **Restricted** (admitted, but only from named addresses), **Local only** (bound to loopback), **Not allowed** (listening into a closed door), **No firewall**. A rule list on its own does not answer "is this port reachable"; the two together do.
+
+Every socket is listed with its **bind address**, so a service like NetBIOS shows its separate rows on `0.0.0.0`, the LAN address and the broadcast address rather than one collapsed entry — the same set `ss -tuln` prints. **New rule** on a row opens the editor with that socket's protocol and port already filled in (0.7.4), which is the point of listing them next to the rules: a rule here is written against a socket, and retyping the port out of a terminal is how one goes missing.
+
+The listeners come from `ss`, which needs no privilege, so they are listed even when no firewall backend could be read at all — an unprivileged run, or a host with no firewall configured, still gets the inventory with a **No firewall** verdict against each row.
 
 **Writes follow the host.** Where UFW is active it owns the chains — it re-applies its rule set at boot and on `ufw reload`, so a rule written into nftables underneath it was invisible in `ufw status` and did not survive a reload, which looks exactly like a block quietly failing. So rules now go through `ufw allow` / `deny` where UFW is running, and into nftables (or iptables) where it is not. Installed-but-inactive does not count: enabling UFW can lock you out of SSH and that is never this app's decision to make.
 
@@ -278,8 +282,6 @@ The web console additionally refuses an inbound Block that matches every source 
 **Precedence is fixed rather than incidental.** The chains are first-match-wins and rules are added one at a time, so ledger order decides nothing — a config *Allow* written today would otherwise sit ahead of a block auto-block appends tomorrow, and the accept would win. So app-minted blocks are **inserted at the head** of their chain (`nft insert`, `iptables -I … 1`) while config rules are **appended**. Every auto-block and manual block therefore precedes every config rule, whichever was created first.
 
 One consequence, accepted deliberately: the probe-log rule is appended too, so a SYN from an address that is already blocked is now dropped before it reaches the log. Probe logging exists to catch scans from hosts that are *not* blocked yet.
-
-**Listening ports are on the page (0.7.3).** A rule here is written against a socket, so the page lists the sockets: protocol, **bind address**, port, service, process and PID for every TCP LISTEN and bound UDP socket — the same set `ss -tuln` prints, including the several rows a service like NetBIOS puts on one port across `0.0.0.0`, the LAN address and the broadcast address. **New rule** on a row opens the editor with that socket's protocol and port already filled in.
 
 The bind address deliberately does *not* carry into Sources. That field matches the far end of a connection, so seeding it with `0.0.0.0`, `::` or this host's own LAN address would write a rule that matches nothing an attacker sends. The editor note says so on the spot.
 
@@ -304,7 +306,7 @@ Domains are DNS-resolved to current IPs. Auto-block never touches allowlisted IP
 
 ### Web console layout
 
-The console is laid out like the desktop window (0.7.3), because they are the same
+The console is laid out like the desktop window (0.7.4), because they are the same
 product and the menus should not be a different shape in each: a **230px navigation
 rail** on the left carrying the desktop's menu names and hierarchy — Firewall Config
 and Allowlist indented under **Firewall & Block**, Help under **Settings** — with a
@@ -323,7 +325,7 @@ action row. Below ~900px the rail folds into a wrapping row above the content.
 | **Remote Computers** | Remote peers; block / unblock by row or by typed IP |
 | **Open Ports** | Local listeners; one-click **Block port** |
 | **Firewall & Block** | Managed rules grouped as In/Out pairs; manual IP and port blocking; **Restore allowlisted** |
-| **Firewall Config** (0.7.1, rebuilt 0.7.3) | The whole host firewall — UFW's rules, Network Sentinel's, and everyone else's — plus listening services and their firewall verdict; add / edit / delete any of them |
+| **Firewall Config** (0.7.1, rebuilt 0.7.4) | The whole host firewall — UFW's rules, Network Sentinel's, and everyone else's — plus listening services and their firewall verdict; add / edit / delete any of them |
 | **Allowlist** | Add/remove trusted domains and IPs; refresh the feed |
 | **Settings** | Monitoring on/off, poll interval, geo lookups, auth-log and closed-port scan detection, the 0.4.0 detectors (threat intel, new-listener alerts, process reputation, ARP/gateway watch, startup-item watch, exfiltration threshold, honeypot ports), **kernel flow events**, **DNS hygiene** (with approved resolvers), **WireGuard peer monitoring** (with a live peer table), **Suricata signature ingestion** (EVE path, maximum severity, muted sids), **auto-block dry run**, **HTTPS + DuckDNS remote access** (including **Issue certificate**), webhook URL, auto-block + minimum severity + expiry, block direction (in/out), allowlist feed, **change master password**, **Remove all rules** |
 
@@ -727,7 +729,7 @@ sudo systemctl restart networksentinel-web  # retry block/unblock afterwards
 
 This keeps the service itself running as your unprivileged user for everything else, and only elevates the firewall binaries — the headless equivalent of the pkexec prompt the desktop GUI uses.
 
-Include `ufw` where the host uses it (0.7.3). The same grant does double duty: Firewall Config's *reads* (`ufw status verbose`, `nft -j list ruleset`, `iptables -S`) go through `sudo -n`, so without this rule the page lists only what is world-readable, and the writes go through `ufw` rather than `nft`. Drop `ufw` from the line on a host that does not run it — sudoers should not name binaries that are not there.
+Include `ufw` where the host uses it (0.7.4). The same grant does double duty: Firewall Config's *reads* (`ufw status verbose`, `nft -j list ruleset`, `iptables -S`) go through `sudo -n`, so without this rule the page lists only what is world-readable, and the writes go through `ufw` rather than `nft`. Drop `ufw` from the line on a host that does not run it — sudoers should not name binaries that are not there.
 
 ---
 
