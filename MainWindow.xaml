@@ -1074,6 +1074,8 @@
                                     <TextBlock Text="Firewall configuration" FontWeight="Bold" FontSize="15"/>
                                     <TextBlock Text="{Binding FirewallConfigSummary}" Margin="0,4,0,0" FontSize="12"
                                                Foreground="{StaticResource AccentCyanBrush}" TextWrapping="Wrap"/>
+                                    <TextBlock Text="{Binding FirewallConfigListenerText}" Margin="0,4,0,0" FontSize="12"
+                                               Foreground="{StaticResource TextSecondaryBrush}" TextWrapping="Wrap"/>
                                     <TextBlock Text="{Binding FirewallConfigPolicyText}" Margin="0,6,16,0" FontSize="11.5"
                                                Foreground="{StaticResource TextSecondaryBrush}" TextWrapping="Wrap"/>
                                     <TextBlock Text="{Binding FirewallConfigMessage}" Margin="0,6,0,0" FontSize="12"
@@ -1086,9 +1088,14 @@
                                     <Button Content="Add an Outbound Rule" Style="{StaticResource GhostButton}"
                                             MinWidth="180" Margin="0,0,0,8"
                                             Command="{Binding AddOutboundRuleCommand}"/>
-                                    <Button Content="Refresh" Style="{StaticResource GhostButton}"
+                                    <Button Content="Rescan the host firewall" Style="{StaticResource GhostButton}"
                                             MinWidth="180"
+                                            ToolTip="Re-reads Windows Defender Firewall and the listening sockets"
                                             Command="{Binding RefreshFirewallConfigCommand}"/>
+                                    <TextBlock Text="Scanning…" FontSize="11" Margin="0,6,0,0"
+                                               HorizontalAlignment="Right"
+                                               Foreground="{StaticResource AccentCyanBrush}"
+                                               Visibility="{Binding IsFirewallConfigScanning, Converter={StaticResource BoolToVis}}"/>
                                 </StackPanel>
                             </Grid>
                         </Border>
@@ -1096,7 +1103,7 @@
                         <!-- Add/edit form. Inline rather than a modal: the rule lists stay
                              visible while a rule is written, which is how you check you are not
                              duplicating one. -->
-                        <Border Style="{StaticResource Card}" Grid.Row="1" Margin="0,0,0,12"
+                        <Border x:Name="RuleEditorCard" Style="{StaticResource Card}" Grid.Row="1" Margin="0,0,0,12"
                                 Visibility="{Binding IsRuleEditorOpen, Converter={StaticResource BoolToVis}}">
                             <StackPanel>
                                 <TextBlock Text="{Binding RuleEditorTitle}" FontWeight="Bold" FontSize="15"/>
@@ -1178,12 +1185,13 @@
                             </StackPanel>
                         </Border>
 
-                        <!-- MinHeight, not a fixed height: the two lists share whatever the window
+                        <!-- MinHeight, not a fixed height: the lists share whatever the window
                              leaves them, but never shrink to a single row when the editor is open. -->
                         <Grid Grid.Row="2">
                             <Grid.RowDefinitions>
                                 <RowDefinition Height="*"/>
                                 <RowDefinition Height="*"/>
+                                <RowDefinition Height="Auto"/>
                             </Grid.RowDefinitions>
 
                             <Border Style="{StaticResource Card}" Margin="0,0,0,12" MinHeight="230">
@@ -1211,6 +1219,7 @@
                                             <DataGridTextColumn Header="Port range" Binding="{Binding PortRangeText}" Width="120"/>
                                             <DataGridTextColumn Header="Sources" Binding="{Binding AddressListText}" Width="180"/>
                                             <DataGridTextColumn Header="Created by" Binding="{Binding OriginText}" Width="140"/>
+                                            <DataGridTextColumn Header="Copies" Binding="{Binding CopiesText}" Width="60"/>
                                             <DataGridTemplateColumn Header="" Width="150">
                                                 <DataGridTemplateColumn.CellTemplate>
                                                     <DataTemplate>
@@ -1231,7 +1240,7 @@
                                 </DockPanel>
                             </Border>
 
-                            <Border Style="{StaticResource Card}" Grid.Row="1" MinHeight="230">
+                            <Border Style="{StaticResource Card}" Grid.Row="1" MinHeight="230" Margin="0,0,0,12">
                                 <DockPanel>
                                     <Grid DockPanel.Dock="Top" Margin="0,0,0,10">
                                         <Grid.ColumnDefinitions>
@@ -1256,6 +1265,7 @@
                                             <DataGridTextColumn Header="Port range" Binding="{Binding PortRangeText}" Width="120"/>
                                             <DataGridTextColumn Header="Destinations" Binding="{Binding AddressListText}" Width="180"/>
                                             <DataGridTextColumn Header="Created by" Binding="{Binding OriginText}" Width="140"/>
+                                            <DataGridTextColumn Header="Copies" Binding="{Binding CopiesText}" Width="60"/>
                                             <DataGridTemplateColumn Header="" Width="150">
                                                 <DataGridTemplateColumn.CellTemplate>
                                                     <DataTemplate>
@@ -1268,6 +1278,40 @@
                                                                     Command="{Binding DataContext.DeleteConfigRuleCommand, RelativeSource={RelativeSource AncestorType=Window}}"
                                                                     CommandParameter="{Binding}"/>
                                                         </StackPanel>
+                                                    </DataTemplate>
+                                                </DataGridTemplateColumn.CellTemplate>
+                                            </DataGridTemplateColumn>
+                                        </DataGrid.Columns>
+                                    </DataGrid>
+                                </DockPanel>
+                            </Border>
+
+                            <!-- What is listening, and what the rules above do to it. A rule list on
+                                 its own does not answer "is this port actually reachable" — the two
+                                 together do, which is the pairing FireWallConfig shows. -->
+                            <Border Style="{StaticResource Card}" Grid.Row="2" MinHeight="200">
+                                <DockPanel>
+                                    <StackPanel DockPanel.Dock="Top" Margin="0,0,0,10">
+                                        <TextBlock Text="Listening services" FontWeight="Bold" FontSize="15"/>
+                                        <TextBlock Text="{Binding FirewallConfigListenerText}" FontSize="11.5" Margin="0,2,0,0"
+                                                   Foreground="{StaticResource TextSecondaryBrush}"/>
+                                    </StackPanel>
+                                    <DataGrid ItemsSource="{Binding ListeningServices}"
+                                              Style="{StaticResource ModernDataGrid}" AutoGenerateColumns="False"
+                                              MaxHeight="420">
+                                        <DataGrid.Columns>
+                                            <DataGridTextColumn Header="Process" Binding="{Binding Process}" Width="*"/>
+                                            <DataGridTextColumn Header="Protocol" Binding="{Binding Protocol}" Width="90"/>
+                                            <DataGridTextColumn Header="Port" Binding="{Binding Port}" Width="80"/>
+                                            <DataGridTextColumn Header="Service" Binding="{Binding ServiceName}" Width="150"/>
+                                            <DataGridTextColumn Header="Bind address" Binding="{Binding Address}" Width="170"/>
+                                            <DataGridTextColumn Header="Firewall" Binding="{Binding Covered}" Width="120"/>
+                                            <DataGridTemplateColumn Header="" Width="130">
+                                                <DataGridTemplateColumn.CellTemplate>
+                                                    <DataTemplate>
+                                                        <Button Content="New rule" Style="{StaticResource MiniGhostButton}"
+                                                                Command="{Binding DataContext.NewRuleForListenerCommand, RelativeSource={RelativeSource AncestorType=Window}}"
+                                                                CommandParameter="{Binding}"/>
                                                     </DataTemplate>
                                                 </DataGridTemplateColumn.CellTemplate>
                                             </DataGridTemplateColumn>

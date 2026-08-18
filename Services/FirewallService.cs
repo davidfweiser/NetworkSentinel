@@ -247,6 +247,71 @@ public sealed class FirewallService
         }
     }
 
+    /// <summary>
+    /// Deletes a rule that came from a host scan rather than from this app's own
+    /// rules — one Windows shipped, or one an installer wrote. The Firewall Config
+    /// view lists the whole host firewall, so Delete has to work on rows Network
+    /// Sentinel did not write; refusing them would make the list a read-only report
+    /// with buttons that lie.
+    /// </summary>
+    public FirewallOperationResult DeleteHostRule(FirewallRuleInfo? rule)
+    {
+        if (rule == null)
+            return FirewallOperationResult.Fail("No rule to remove.");
+
+        // One of ours: through the managed path, which clears the expiry ledger and
+        // takes the rule's -In/-Out sibling with it.
+        if (!rule.IsForeign)
+            return RemoveRule(rule.Name);
+
+        if (!IsAdministrator)
+            return FirewallOperationResult.Fail("Administrator rights are required to modify the Windows Firewall.");
+        if (string.IsNullOrWhiteSpace(rule.Name))
+            return FirewallOperationResult.Fail(
+                "That rule has no name to delete it by — remove it in Windows Defender Firewall (wf.msc).");
+
+        // netsh deletes by match, not by identity, and Windows rule names are not
+        // unique: 685 rules on this host can share one name. Every field the row
+        // displays goes in as a filter so the delete takes the rules the row stands
+        // for and nothing beside them. "Any" values are left out — netsh reads them
+        // as filters too, and no rule matches a filter of "any".
+        var args = new StringBuilder($"advfirewall firewall delete rule name=\"{Escape(rule.Name)}\"");
+        args.Append(rule.IsInbound ? " dir=in" : " dir=out");
+
+        if (!rule.ProtocolText.Equals(FirewallRuleSpecs.ProtocolAny, StringComparison.OrdinalIgnoreCase))
+            args.Append($" protocol={Escape(rule.ProtocolText)}");
+        if (!string.IsNullOrWhiteSpace(rule.LocalPortsRaw))
+            args.Append($" localport=\"{Escape(NetshList(rule.LocalPortsRaw))}\"");
+        if (!string.IsNullOrWhiteSpace(rule.RemotePortsRaw))
+            args.Append($" remoteport=\"{Escape(NetshList(rule.RemotePortsRaw))}\"");
+        if (!string.IsNullOrWhiteSpace(rule.RemoteAddresses))
+            args.Append($" remoteip=\"{Escape(NetshList(rule.RemoteAddresses))}\"");
+        if (!string.IsNullOrWhiteSpace(rule.Program))
+            args.Append($" program=\"{Escape(rule.Program)}\"");
+
+        FirewallOperationResult result;
+        try { result = RunNetsh(args.ToString()); }
+        catch (Exception ex) { return FirewallOperationResult.Fail($"Remove failed: {ex.Message}"); }
+
+        InvalidateRuleCache();
+
+        if (!result.Success)
+            return FirewallOperationResult.Fail(
+                $"Windows Defender Firewall refused the delete: {result.Message}");
+
+        // netsh answers "Deleted N rule(s)." — worth repeating, because one row can
+        // stand for a set of identical rules and N is how many really went.
+        var count = Regex.Match(result.Message, @"Deleted\s+(\d+)\s+rule", RegexOptions.IgnoreCase);
+        var howMany = count.Success && count.Groups[1].Value != "1"
+            ? $" ({count.Groups[1].Value} identical rules)"
+            : "";
+        return FirewallOperationResult.Ok($"Removed “{rule.LabelText}” from Windows Defender Firewall{howMany}.");
+    }
+
+    /// <summary>A display list ("80, 443") as netsh wants it, with no spaces.</summary>
+    private static string NetshList(string value)
+        => string.Join(",", SplitList(value));
+
     /// <param name="skip">Rules to leave in place (e.g. the web console's own allow rule).</param>
     public FirewallOperationResult RemoveAllManagedRules(Func<FirewallRuleInfo, bool>? skip = null)
     {
@@ -775,80 +840,65 @@ public sealed class FirewallService
     }
 
     /// <summary>
-    /// Parses a <c>netsh advfirewall firewall show rule</c> dump into one entry per
-    /// firewall rule. Split out from the netsh call so the parsing is testable.
+    /// One rule as netsh printed it, before anything is made of the values. Two
+    /// readers walk the same dump — the managed-rule list below, and the whole-host
+    /// scan in <see cref="HostFirewallScanner"/> — so the line handling and netsh's
+    /// wrapped-list continuations live in one place rather than being written twice.
     /// </summary>
-    internal static List<FirewallRuleInfo> ParseNetshRules(string dump)
+    internal sealed class NetshRuleBlock
     {
-        var list = new List<FirewallRuleInfo>();
+        public string Name { get; set; } = "";
+        public string Enabled { get; set; } = "";
+        public string Direction { get; set; } = "";
+        public string Description { get; set; } = "";
+        public string RemoteIp { get; set; } = "";
+        public string LocalPort { get; set; } = "";
+        public string RemotePort { get; set; } = "";
+        public string Protocol { get; set; } = "";
+        public string Action { get; set; } = "";
 
-        string? currentName = null;
-        string enabled = "";
-        string direction = "";
-        string description = "";
-        string remoteIp = "";
-        string localPort = "";
-        string remotePort = "";
-        string protocol = "";
-        string action = "";
+        public string Grouping { get; set; } = "";
+        public string Profiles { get; set; } = "";
+
+        // Verbose-only: `show rule name=all` without verbose prints no Program or
+        // Service line at all. Empty reads the same way as "not constrained", which
+        // is what a rule without one means, so the managed reader below is
+        // unaffected by which form of the dump it was handed.
+        public string Program { get; set; } = "";
+        public string Service { get; set; } = "";
+
+        public bool IsOutbound => Direction.Contains("Out", StringComparison.OrdinalIgnoreCase);
+        public bool IsEnabled => Enabled.Contains("Yes", StringComparison.OrdinalIgnoreCase);
+        public bool IsBlock => Action.Contains("Block", StringComparison.OrdinalIgnoreCase);
+    }
+
+    /// <summary>
+    /// Splits a <c>netsh advfirewall firewall show rule</c> dump into one block per
+    /// rule. Split out from the netsh call so the parsing is testable.
+    /// </summary>
+    internal static IEnumerable<NetshRuleBlock> ScanNetshBlocks(string dump)
+    {
+        NetshRuleBlock? current = null;
 
         // netsh wraps a long address or port list onto following indented lines, so
         // the field it belongs to has to stay selected across them.
         string? continuing = null;
 
-        void Flush()
-        {
-            if (string.IsNullOrWhiteSpace(currentName) || !IsManagedRuleName(currentName))
-                return;
-
-            var isOutbound = direction.Contains("Out", StringComparison.OrdinalIgnoreCase);
-            var isConfig = IsConfigRuleName(currentName);
-
-            // A config rule owns its whole address list, CIDR and all. Everything
-            // else targets one address, and the display has always shown just that.
-            var remoteNorm = isConfig ? NormalizeRemoteList(remoteIp) : NormalizeRemote(remoteIp);
-
-            // Config rules write the port the operator meant: the local port on the
-            // way in, the port being reached on the way out. App-minted port blocks
-            // use the local port in both directions.
-            var portField = isConfig && isOutbound ? remotePort : localPort;
-            var portsNorm = NormalizePorts(portField);
-
-            var protoNorm = string.IsNullOrWhiteSpace(protocol) ? "Any" : protocol.Trim();
-            if (isConfig && protoNorm.StartsWith("ICMP", StringComparison.OrdinalIgnoreCase))
-                protoNorm = "ICMP"; // netsh spells the two families apart; the spec does not
-
-            list.Add(new FirewallRuleInfo
-            {
-                Name = currentName,
-                Label = isConfig ? currentName[ConfigRulePrefix.Length..] : "",
-                Enabled = enabled.Contains("Yes", StringComparison.OrdinalIgnoreCase),
-                IsBlock = action.Contains("Block", StringComparison.OrdinalIgnoreCase),
-                Direction = isOutbound ? FirewallDirection.Outbound : FirewallDirection.Inbound,
-                RemoteAddresses = remoteNorm,
-                LocalPorts = portsNorm,
-                Protocol = protoNorm,
-                Kind = ClassifyRuleKind(currentName, remoteNorm, portsNorm),
-                Description = description,
-                ExpiresUtc = ExpiryLedger.Get(currentName)
-            });
-        }
-
-        foreach (var raw in dump.Split('\n'))
+        foreach (var raw in (dump ?? "").Split('\n'))
         {
             var line = raw.TrimEnd('\r');
 
             // Indented and not a key of its own: the tail of the list above it.
-            if (continuing != null && line.Length > 0 && char.IsWhiteSpace(line[0]))
+            if (current != null && continuing != null && line.Length > 0 && char.IsWhiteSpace(line[0]))
             {
                 var tail = line.Trim();
                 if (tail.Length > 0)
                 {
                     switch (continuing)
                     {
-                        case "remoteip": remoteIp = Append(remoteIp, tail); break;
-                        case "localport": localPort = Append(localPort, tail); break;
-                        case "remoteport": remotePort = Append(remotePort, tail); break;
+                        case "remoteip": current.RemoteIp = Append(current.RemoteIp, tail); break;
+                        case "localport": current.LocalPort = Append(current.LocalPort, tail); break;
+                        case "remoteport": current.RemotePort = Append(current.RemotePort, tail); break;
                     }
                     continue;
                 }
@@ -858,39 +908,105 @@ public sealed class FirewallService
 
             if (line.StartsWith("Rule Name:", StringComparison.OrdinalIgnoreCase))
             {
-                Flush();
-                currentName = line["Rule Name:".Length..].Trim();
-                enabled = direction = remoteIp = localPort = remotePort = protocol = action = description = "";
+                if (current != null) yield return current;
+                current = new NetshRuleBlock { Name = NetshField(line, "Rule Name:") };
+            }
+            else if (current == null)
+            {
+                // netsh prints a banner before the first rule; nothing to attach it to.
             }
             else if (line.StartsWith("Enabled:", StringComparison.OrdinalIgnoreCase))
-                enabled = line["Enabled:".Length..].Trim();
+                current.Enabled = NetshField(line, "Enabled:");
             else if (line.StartsWith("Direction:", StringComparison.OrdinalIgnoreCase))
-                direction = line["Direction:".Length..].Trim();
+                current.Direction = NetshField(line, "Direction:");
             else if (line.StartsWith("Description:", StringComparison.OrdinalIgnoreCase))
-                description = line["Description:".Length..].Trim();
+                current.Description = NetshField(line, "Description:");
+            else if (line.StartsWith("Grouping:", StringComparison.OrdinalIgnoreCase))
+                current.Grouping = NetshField(line, "Grouping:");
+            else if (line.StartsWith("Profiles:", StringComparison.OrdinalIgnoreCase))
+                current.Profiles = NetshField(line, "Profiles:");
+            else if (line.StartsWith("Program:", StringComparison.OrdinalIgnoreCase))
+                current.Program = NetshField(line, "Program:");
+            else if (line.StartsWith("Service:", StringComparison.OrdinalIgnoreCase))
+                current.Service = NetshField(line, "Service:");
             else if (line.StartsWith("RemoteIP:", StringComparison.OrdinalIgnoreCase))
             {
-                remoteIp = line["RemoteIP:".Length..].Trim();
+                current.RemoteIp = NetshField(line, "RemoteIP:");
                 continuing = "remoteip";
             }
             else if (line.StartsWith("LocalPort:", StringComparison.OrdinalIgnoreCase))
             {
-                localPort = line["LocalPort:".Length..].Trim();
+                current.LocalPort = NetshField(line, "LocalPort:");
                 continuing = "localport";
             }
             else if (line.StartsWith("RemotePort:", StringComparison.OrdinalIgnoreCase))
             {
-                remotePort = line["RemotePort:".Length..].Trim();
+                current.RemotePort = NetshField(line, "RemotePort:");
                 continuing = "remoteport";
             }
             else if (line.StartsWith("Protocol:", StringComparison.OrdinalIgnoreCase))
-                protocol = line["Protocol:".Length..].Trim();
+                current.Protocol = NetshField(line, "Protocol:");
             else if (line.StartsWith("Action:", StringComparison.OrdinalIgnoreCase))
-                action = line["Action:".Length..].Trim();
+                current.Action = NetshField(line, "Action:");
         }
 
-        Flush();
+        if (current != null) yield return current;
+    }
+
+    private static string NetshField(string line, string key) => line[key.Length..].Trim();
+
+    /// <summary>
+    /// Parses a <c>netsh advfirewall firewall show rule</c> dump into one entry per
+    /// rule Network Sentinel owns. Everything else on the host is skipped here and
+    /// read by <see cref="HostFirewallScanner"/> instead.
+    /// </summary>
+    internal static List<FirewallRuleInfo> ParseNetshRules(string dump)
+    {
+        var list = new List<FirewallRuleInfo>();
+        foreach (var block in ScanNetshBlocks(dump))
+        {
+            if (string.IsNullOrWhiteSpace(block.Name) || !IsManagedRuleName(block.Name)) continue;
+            list.Add(FromManagedBlock(block));
+        }
         return list;
+    }
+
+    /// <summary>One rule of ours, read the way the app's own views expect it.</summary>
+    private static FirewallRuleInfo FromManagedBlock(NetshRuleBlock block)
+    {
+        var isConfig = IsConfigRuleName(block.Name);
+
+        // A config rule owns its whole address list, CIDR and all. Everything
+        // else targets one address, and the display has always shown just that.
+        var remoteNorm = isConfig ? NormalizeRemoteList(block.RemoteIp) : NormalizeRemote(block.RemoteIp);
+
+        // Config rules write the port the operator meant: the local port on the
+        // way in, the port being reached on the way out. App-minted port blocks
+        // use the local port in both directions.
+        var portField = isConfig && block.IsOutbound ? block.RemotePort : block.LocalPort;
+        var portsNorm = NormalizePorts(portField);
+
+        var protoNorm = string.IsNullOrWhiteSpace(block.Protocol) ? "Any" : block.Protocol.Trim();
+        if (isConfig && protoNorm.StartsWith("ICMP", StringComparison.OrdinalIgnoreCase))
+            protoNorm = "ICMP"; // netsh spells the two families apart; the spec does not
+
+        return new FirewallRuleInfo
+        {
+            Name = block.Name,
+            Label = isConfig ? block.Name[ConfigRulePrefix.Length..] : "",
+            Enabled = block.IsEnabled,
+            IsBlock = block.IsBlock,
+            Direction = block.IsOutbound ? FirewallDirection.Outbound : FirewallDirection.Inbound,
+            RemoteAddresses = remoteNorm,
+            LocalPorts = portsNorm,
+            Protocol = protoNorm,
+            Kind = ClassifyRuleKind(block.Name, remoteNorm, portsNorm),
+            Description = block.Description,
+            Profiles = block.Profiles,
+            Program = block.Program,
+            Service = block.Service,
+            ExpiresUtc = ExpiryLedger.Get(block.Name)
+        };
     }
 
     private static string Append(string list, string tail)
@@ -970,7 +1086,7 @@ public sealed class FirewallService
     private static IEnumerable<string> SplitList(string value)
         => value.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
 
-    private static string NormalizePorts(string port)
+    internal static string NormalizePorts(string port)
     {
         var value = (port ?? "").Trim();
         if (value.Length == 0 || value is "*" || value.Equals("Any", StringComparison.OrdinalIgnoreCase))
@@ -984,7 +1100,7 @@ public sealed class FirewallService
     /// writes a full-length mask on a single host, so both are converted back or
     /// the Edit button would hand the form something it cannot parse.
     /// </summary>
-    private static string NormalizeRemoteList(string remote)
+    internal static string NormalizeRemoteList(string remote)
     {
         if (string.IsNullOrWhiteSpace(remote)) return "";
         if (remote.Trim() is "Any" or "*") return "";
@@ -1071,7 +1187,7 @@ public sealed class FirewallService
         return TryNormalizeIp(raw, out ip, out _);
     }
 
-    private static FirewallOperationResult RunNetsh(string args)
+    internal static FirewallOperationResult RunNetsh(string args)
     {
         try
         {
@@ -1455,6 +1571,61 @@ public sealed class FirewallRuleInfo
     /// <summary>UTC time this rule stops applying (null = permanent). Set by auto-block expiry.</summary>
     public DateTime? ExpiresUtc { get; init; }
 
+    // ── Host-scan fields ─────────────────────────────────────────────────
+    //
+    // Set by HostFirewallScanner on rules read back out of Windows Defender
+    // Firewall, which is most of what the Firewall Config view lists: Windows'
+    // own rules, the ones installers wrote, and this app's. Nothing here is
+    // persisted — the app's ledger holds only rule names and expiry times.
+
+    /// <summary>
+    /// Who put the rule in the firewall — "Core Networking", "Microsoft Teams",
+    /// "chrome.exe", "Local rule". Drives the Created by column, so a rule this
+    /// app is not responsible for is never shown as one of its own. Empty on
+    /// managed rules, where <see cref="OriginText"/> derives it from the kind.
+    /// </summary>
+    public string Origin { get; init; } = "";
+
+    /// <summary>netsh's Grouping field: the display group a rule belongs to.</summary>
+    public string Grouping { get; init; } = "";
+
+    /// <summary>Program the rule is scoped to, empty when it applies to any program.</summary>
+    public string Program { get; init; } = "";
+
+    /// <summary>Windows service the rule is scoped to, empty when it applies to any.</summary>
+    public string Service { get; init; } = "";
+
+    /// <summary>Profiles the rule applies to, as netsh spells them: "Domain,Private,Public".</summary>
+    public string Profiles { get; init; } = "";
+
+    /// <summary>
+    /// Local-port constraint as netsh reported it. <see cref="LocalPorts"/> is the
+    /// display value — the local port on an inbound rule, the remote port on an
+    /// outbound one — so both raw halves are kept for the delete filter, which has
+    /// to name the rule's whole shape to avoid taking its neighbours with it.
+    /// </summary>
+    public string LocalPortsRaw { get; init; } = "";
+
+    /// <summary>Remote-port constraint as netsh reported it. See <see cref="LocalPortsRaw"/>.</summary>
+    public string RemotePortsRaw { get; init; } = "";
+
+    /// <summary>
+    /// How many identical rules this row stands for. Windows lets the same rule be
+    /// added over and over — a setup script run twice leaves two — so the scan folds
+    /// exact duplicates into one row and counts them rather than printing 685 of them.
+    /// </summary>
+    public int Copies { get; set; } = 1;
+
+    /// <summary>
+    /// True for a rule read out of the firewall that this app did not write. The
+    /// editor still opens it, but saving replaces it and deleting removes it from
+    /// Windows Defender Firewall rather than from the app's ledger.
+    /// </summary>
+    public bool IsForeign { get; init; }
+
+    /// <summary>"×685" for a folded duplicate set, empty for a rule that is one rule.</summary>
+    public string CopiesText => Copies > 1 ? $"×{Copies}" : "";
+
     public bool IsExpired => ExpiresUtc.HasValue && ExpiresUtc.Value <= DateTime.UtcNow;
 
     public string ExpiryText => ExpiresUtc.HasValue
@@ -1496,6 +1667,10 @@ public sealed class FirewallRuleInfo
     {
         get
         {
+            // A scanned rule already knows who wrote it; the kinds below only
+            // describe rules this app minted.
+            if (!string.IsNullOrWhiteSpace(Origin)) return Origin;
+
             if (Name.Contains("-Web-", StringComparison.OrdinalIgnoreCase))
                 return "Web console";
 

@@ -44,6 +44,79 @@ public sealed class WebApp : IDisposable
     private readonly NetworkMonitorService _monitor;
     private readonly FirewallService _firewall;
     private readonly AllowlistService _allowlist;
+
+    // ── Host firewall scan ───────────────────────────────────────────────
+    //
+    // The Firewall Config tab lists the whole host firewall, which means two netsh
+    // dumps and a megabyte of text. /api/state is polled every 2.5s, so the scan is
+    // cached and only re-run on demand — when the tab asks for it, and after any
+    // write — with a TTL as a backstop so a stale page self-heals.
+    //
+    // It also rides on its own endpoint rather than in /api/state: a Windows host
+    // carries hundreds of rules where a Linux one carries a dozen, and putting that
+    // in the 2.5s poll would mean re-sending the machine's whole firewall every few
+    // seconds to a page that shows it on one tab.
+
+    private HostFirewallScanner? _hostScanner;
+    private HostFirewallSnapshot? _hostScan;
+    private DateTime _hostScanAtUtc = DateTime.MinValue;
+    private readonly object _hostScanGate = new();
+    private static readonly TimeSpan HostScanTtl = TimeSpan.FromSeconds(60);
+
+    private HostFirewallSnapshot HostScan(bool force = false)
+    {
+        lock (_hostScanGate)
+        {
+            if (!force && _hostScan != null && DateTime.UtcNow - _hostScanAtUtc < HostScanTtl)
+                return _hostScan;
+
+            _hostScanner ??= new HostFirewallScanner(_firewall);
+            try
+            {
+                _hostScan = _hostScanner.Scan();
+            }
+            catch (Exception ex)
+            {
+                _hostScan = HostFirewallSnapshot.Unreadable(
+                    "The host firewall scan failed.", new[] { ex.Message });
+            }
+            _hostScanAtUtc = DateTime.UtcNow;
+            return _hostScan;
+        }
+    }
+
+    /// <summary>Drops the cached scan so the next request re-reads the firewall.</summary>
+    private void InvalidateHostScan()
+    {
+        lock (_hostScanGate) _hostScanAtUtc = DateTime.MinValue;
+    }
+
+    /// <summary>
+    /// Stable identity for a scanned rule, so a Delete pressed in the browser acts on
+    /// the row that was displayed. Rule names are not unique on Windows — this host
+    /// holds 685 rules called "allow 9009" — so the key is the rule's whole shape,
+    /// and an ambiguous match is refused rather than guessed at.
+    /// </summary>
+    private static string ScannedRuleKey(FirewallRuleInfo r) => string.Join("|",
+        r.IsInbound ? "in" : "out", r.ActionText, r.ProtocolText,
+        r.PortRangeText, r.AddressListText, r.LabelText, r.OriginText);
+
+    private FirewallRuleInfo? FindScannedRule(string key, out string problem)
+    {
+        problem = "";
+        var scan = HostScan();
+        var matches = scan.Inbound.Concat(scan.Outbound)
+            .Where(r => string.Equals(ScannedRuleKey(r), key, StringComparison.Ordinal))
+            .ToList();
+
+        if (matches.Count == 1) return matches[0];
+        problem = matches.Count == 0
+            ? "That rule is no longer in the host firewall — the list has moved on. Rescan and try again."
+            : "Several rules on this host have exactly that shape, so it is not clear which one to remove. " +
+              "Give them distinct names, or remove it where it was created.";
+        return null;
+    }
+
     private readonly WebAuthStore _auth = new();
     private readonly AppSettings _settings;
 
@@ -538,6 +611,16 @@ public sealed class WebApp : IDisposable
         if (req.Method == "GET" && path == "/api/state")
         {
             WriteJson(res, 200, BuildState());
+            return;
+        }
+
+        // The Firewall Config tab's own data, fetched when that tab is opened rather
+        // than ridden along with the 2.5s poll — see the HostScan notes above.
+        // ?rescan=1 is the tab's Rescan button: a read, but a slow one.
+        if (req.Method == "GET" && path == "/api/hostfirewall")
+        {
+            var force = req.Query["rescan"].ToString() is "1" or "true";
+            WriteJson(res, 200, BuildHostFirewall(force));
             return;
         }
 
@@ -1372,11 +1455,72 @@ public sealed class WebApp : IDisposable
                         ? null
                         : System.Net.WebUtility.HtmlDecode(req.Replace.Trim());
 
+                    // Editing a rule the host owns rather than one of ours: remove the
+                    // original where it lives first. Windows has no edit-in-place for
+                    // somebody else's rule, and writing the replacement on top would
+                    // leave both in force — with the block of the two winning.
+                    if (!string.IsNullOrWhiteSpace(req.Key))
+                    {
+                        var original = FindScannedRule(req.Key!.Trim(), out var lookupProblem);
+                        if (original == null) return ActionResultDto.Fail(lookupProblem);
+                        if (IsOwnWebRule(original.Name))
+                            return ActionResultDto.Fail(SelfRuleRefusal(original.Name));
+
+                        var dropped = _firewall.DeleteHostRule(original);
+                        if (!dropped.Success)
+                        {
+                            _statusMessage = $"The original rule could not be removed, so it was not replaced: {dropped.Message}";
+                            return ActionResultDto.Fail(_statusMessage);
+                        }
+                        InvalidateHostScan();
+                    }
+
                     var saved = _firewall.SaveCustomRule(spec, replace);
                     _statusMessage = saved.Message;
+                    if (saved.Success) InvalidateHostScan();
                     return saved.Success
                         ? ActionResultDto.Success(saved.Message)
                         : ActionResultDto.Fail(saved.Message);
+                }
+
+                case "rescan_firewall":
+                {
+                    var scan = HostScan(force: true);
+                    _statusMessage = $"{scan.HostLabel}: {scan.Backend} · {scan.Status} · {scan.RulesSummary}.";
+                    return ActionResultDto.Success(_statusMessage);
+                }
+
+                case "delete_host_rule":
+                {
+                    var key = (req.Key ?? "").Trim();
+                    if (key.Length == 0) return ActionResultDto.Fail("Rule identity required.");
+                    if (!_firewall.IsAdministrator)
+                        return ActionResultDto.Fail("Cannot remove rules — run Network Sentinel elevated (Admin / service as SYSTEM).");
+
+                    var target = FindScannedRule(key, out var problem);
+                    if (target == null) return ActionResultDto.Fail(problem);
+                    if (IsOwnWebRule(target.Name))
+                        return ActionResultDto.Fail(SelfRuleRefusal(target.Name));
+
+                    FirewallOperationResult dropped;
+                    try { dropped = _firewall.DeleteHostRule(target); }
+                    catch (Exception ex)
+                    {
+                        _statusMessage = $"Remove failed: {ex.Message}";
+                        return ActionResultDto.Fail(_statusMessage);
+                    }
+
+                    _statusMessage = dropped.Message;
+                    if (dropped.Success)
+                    {
+                        InvalidateHostScan();
+                        if (FirewallService.TryExtractIpFromManagedRule(target.Name, target.RemoteAddresses, out var freedIp))
+                            _prevention.NoteUnblocked(freedIp);
+                        try { RefreshBlockedIps(force: true); } catch { /* ignore */ }
+                    }
+                    return dropped.Success
+                        ? ActionResultDto.Success(dropped.Message)
+                        : ActionResultDto.Fail(dropped.Message);
                 }
 
                 case "remove_rule":
@@ -1386,10 +1530,7 @@ public sealed class WebApp : IDisposable
                     if (string.IsNullOrEmpty(name))
                         return ActionResultDto.Fail("Rule name required.");
                     if (IsOwnWebRule(name))
-                        return ActionResultDto.Fail(
-                            $"\"{name}\" is the allow rule that lets your browser reach this console — " +
-                            "removing it from here would instantly cut off this page (it looks like a crash). " +
-                            "To remove web access, use the desktop app or run uninstall-web-service.ps1 on the server.");
+                        return ActionResultDto.Fail(SelfRuleRefusal(name));
                     if (!_firewall.IsAdministrator)
                         return ActionResultDto.Fail("Cannot remove rules — run Network Sentinel elevated (Admin / service as SYSTEM).");
 
@@ -1412,6 +1553,7 @@ public sealed class WebApp : IDisposable
                         if (FirewallService.TryExtractIpFromManagedRule(name, null, out var removedIp))
                             _prevention.NoteUnblocked(removedIp);
 
+                        InvalidateHostScan();
                         try { RefreshBlockedIps(force: true); }
                         catch { /* ignore */ }
                     }
@@ -1441,6 +1583,8 @@ public sealed class WebApp : IDisposable
             version = _appVersion,
             clock = DateTime.Now.ToString("dddd, MMM d  ·  HH:mm:ss"),
             statusMessage = _statusMessage,
+            // Hero subtitle on both front-ends counts the same thing.
+            blockedCount = blocked.Count,
             firewall = new
             {
                 isAdmin = _firewall.IsAdministrator,
@@ -1612,17 +1756,48 @@ public sealed class WebApp : IDisposable
                 threats = a.ThreatCount,
                 hosts = a.RemoteHostCount
             }),
-            traffic = TrafficSnapshot(),
-            // App-minted blocks first, then the operator's config rules. The Firewall
-            // Config tab shows both so it is clear which rules the page owns — and
-            // Windows Firewall evaluates every block ahead of every allow regardless
-            // of this order, which is what makes the listing safe to read as-is.
-            configRules = _firewall.GetConfigRules().Select(r => new
+            traffic = TrafficSnapshot()
+        };
+    }
+
+    /// <summary>
+    /// The whole host firewall as Windows Defender Firewall holds it — Windows' own
+    /// rules, the ones installers wrote, and this app's — with what is listening
+    /// behind them. Network Sentinel's rules come first in each direction, then
+    /// blocks ahead of allows, which is the order Windows evaluates them in.
+    /// </summary>
+    private object BuildHostFirewall(bool rescan)
+    {
+        var scan = HostScan(force: rescan);
+
+        return new
+        {
+            ok = true,
+            hostFirewall = new
+            {
+                host = scan.HostLabel,
+                backend = scan.Backend,
+                status = scan.Status,
+                enabled = scan.Enabled,
+                defaultInbound = scan.DefaultInbound,
+                defaultOutbound = scan.DefaultOutbound,
+                description = scan.Description,
+                privilegeNote = scan.PrivilegeNote,
+                rulesSummary = scan.RulesSummary,
+                profiles = scan.ProfilesSeen,
+                disabledRules = scan.DisabledRules,
+                errors = scan.Errors,
+                scannedAt = scan.ScannedUtc.ToLocalTime().ToString("HH:mm:ss")
+            },
+            configRules = scan.Inbound.Concat(scan.Outbound).Select(r => new
             {
                 name = r.Name,
+                key = ScannedRuleKey(r),
                 label = r.LabelText,
                 isProtected = IsOwnWebRule(r.Name),
                 isCustom = r.IsCustom,
+                isForeign = r.IsForeign,
+                copies = r.Copies,
                 inbound = r.IsInbound,
                 action = r.ActionText,
                 direction = r.DirectionText,
@@ -1631,6 +1806,15 @@ public sealed class WebApp : IDisposable
                 addresses = r.AddressListText,
                 origin = r.OriginText,
                 expiry = r.ExpiryText
+            }),
+            listeners = scan.Listeners.Select(l => new
+            {
+                protocol = l.Protocol,
+                address = l.Address,
+                port = l.Port,
+                service = l.ServiceName,
+                process = l.Process,
+                covered = l.Covered
             })
         };
     }
@@ -1741,6 +1925,12 @@ public sealed class WebApp : IDisposable
     /// </summary>
     private bool IsOwnWebRule(string name)
         => string.Equals(name, $"{FirewallService.RulePrefix}-Web-{_port}", StringComparison.OrdinalIgnoreCase);
+
+    /// <summary>Why the console will not remove the rule that carries this page.</summary>
+    private static string SelfRuleRefusal(string name)
+        => $"\"{name}\" is the allow rule that lets your browser reach this console — " +
+           "removing it from here would instantly cut off this page (it looks like a crash). " +
+           "To remove web access, use the desktop app or run uninstall-web-service.ps1 on the server.";
 
     /// <summary>
     /// Why a Firewall Config rule cannot be written from this console, or null when
@@ -1926,6 +2116,12 @@ public sealed class WebApp : IDisposable
 
         /// <summary>Name of the rule being replaced, when the form is editing rather than adding.</summary>
         public string? Replace { get; set; }
+
+        /// <summary>
+        /// Whole-shape identity of a scanned host rule (see ScannedRuleKey). Windows
+        /// rule names repeat, so a delete names the shape, not the label.
+        /// </summary>
+        public string? Key { get; set; }
     }
 
     private sealed class AuthBody
@@ -1986,34 +2182,90 @@ public sealed class WebApp : IDisposable
       radial-gradient(900px 500px at 90% 0%, rgba(74,158,255,.1), transparent 45%),
       var(--bg-deep);
   }
-  header {
-    display: flex; flex-wrap: wrap; align-items: center; gap: 12px 20px;
-    padding: 16px 22px; border-bottom: 1px solid var(--stroke);
-    background: linear-gradient(180deg, #11282a, #0f151f);
-    position: sticky; top: 0; z-index: 10;
+  /* Shell — a 230px navigation rail and a scrolling main column, laid out like
+     the desktop window. The web console and the desktop app are the same
+     product; the menus should not be a different shape in each. */
+  #appShell { display: flex; align-items: flex-start; gap: 14px; padding: 18px; min-height: 100vh; }
+  .sidebar {
+    flex: 0 0 230px; width: 230px;
+    /* Full window height, not content height: the status block belongs at the
+       foot of the rail the way it does on the desktop, not floating mid-page. */
+    position: sticky; top: 18px; height: calc(100vh - 36px);
+    display: flex; flex-direction: column;
+    background: var(--bg-card); border: 1px solid var(--stroke);
+    border-radius: 18px; padding: 16px;
   }
-  .brand { display: flex; flex-direction: column; gap: 2px; min-width: 180px; }
-  .brand h1 {
-    margin: 0; font-size: 1.15rem; letter-spacing: .02em;
-    background: linear-gradient(90deg, var(--cyan), var(--blue));
-    -webkit-background-clip: text; background-clip: text; color: transparent;
+  .shell-main { flex: 1 1 auto; min-width: 0; }
+
+  .brand { display: flex; align-items: center; gap: 12px; margin: 4px 4px 18px; }
+  .brand .mark {
+    width: 42px; height: 42px; border-radius: 10px; flex-shrink: 0;
+    display: flex; align-items: center; justify-content: center;
+    background: linear-gradient(135deg, var(--cyan), var(--blue));
   }
-  .brand .sub { color: var(--text2); font-size: .78rem; }
-  .clock { color: var(--muted); font-size: .85rem; font-family: var(--mono); }
-  nav { display: flex; flex-wrap: wrap; gap: 6px; flex: 1; }
-  nav button, .actions button, .row-actions button, .toolbar button {
+  .brand .mark svg { width: 23px; height: 23px; display: block; }
+  .brand h1 { margin: 0; font-size: 1rem; font-weight: 700; letter-spacing: .01em; }
+  .brand .sub { color: var(--muted); font-size: .69rem; line-height: 1.55; }
+  .brand .sub.tint { color: var(--cyan); }
+
+  nav { display: flex; flex-direction: column; overflow-y: auto; min-height: 0; }
+  .nav-cap { font-size: .62rem; font-weight: 700; letter-spacing: .09em; color: var(--muted); margin: 0 0 8px 8px; }
+  nav button {
+    appearance: none; display: block; width: 100%; text-align: left;
+    background: transparent; border: 1px solid transparent; border-radius: 10px;
+    color: var(--text2); font: inherit; font-size: .84rem; font-weight: 600;
+    padding: 11px 14px; margin: 3px 0; cursor: pointer; transition: .15s ease;
+  }
+  nav button:hover { background: rgba(255,255,255,.05); color: var(--text); }
+  nav button.active { background: rgba(74,158,255,.15); color: var(--text); }
+  /* Submenu entry: indented under its parent and a shade quieter, so the rail
+     reads as a hierarchy rather than a longer flat list — the same shape the
+     desktop's SubNavButton gives Firewall Config and Allowlist. */
+  nav button.sub { padding: 8px 14px 8px 30px; font-size: .79rem; font-weight: 400; margin: 0 0 3px; }
+
+  /* Status block pinned to the foot of the rail, as on the desktop: what the
+     monitor is doing, whether the firewall can be written, and the one toggle
+     that decides whether detections turn into firewall rules. */
+  .side-status { margin-top: auto; padding-top: 16px; }
+  .side-status .box {
+    background: rgba(255,255,255,.05); border: 1px solid var(--stroke);
+    border-radius: 14px; padding: 12px;
+  }
+  .side-cap { font-size: .62rem; font-weight: 700; letter-spacing: .09em; color: var(--muted); }
+  .side-status .txt { color: var(--text2); font-size: .77rem; line-height: 1.45; margin-top: 6px; }
+  .side-status .line { display: flex; align-items: center; gap: 8px; margin-top: 10px; color: var(--text2); font-size: .77rem; }
+  .side-status .ab {
+    margin-top: 12px; padding: 10px; border-radius: 10px;
+    border: 1px solid var(--stroke); background: rgba(255,255,255,.05);
+  }
+  .side-status .ab label {
+    display: flex; align-items: center; gap: 8px; margin-top: 8px;
+    color: var(--text2); font-size: .8rem; cursor: pointer;
+  }
+  .side-status .ab input { accent-color: var(--blue); width: 15px; height: 15px; cursor: pointer; flex-shrink: 0; }
+  .side-status .ab .txt { margin-top: 8px; font-size: .72rem; }
+
+  /* Sticky, as the old top header was: Sleep, Clear alerts and Authorize have to
+     stay reachable from the bottom of a long table. Padded out to the right edge
+     so rows scrolling underneath do not show through beside it. */
+  .hero {
+    position: sticky; top: 0; z-index: 5;
+    margin: -18px -18px 14px 0; padding: 18px 18px 12px 0;
+    background: linear-gradient(180deg, rgba(10,14,20,.97) 65%, rgba(10,14,20,.85));
+    backdrop-filter: blur(6px);
+  }
+  .hero .clock { color: var(--muted); font-size: .78rem; font-family: var(--mono); }
+  .hero h1 { margin: 2px 0 0; font-size: 1.4rem; font-weight: 700; }
+  .hero .lead { color: var(--text2); font-size: .8rem; margin: 4px 0 10px; }
+  .actions { display: flex; flex-wrap: wrap; gap: 8px; }
+  .actions button, .row-actions button, .toolbar button {
     appearance: none; border: 1px solid var(--stroke); background: var(--bg-card);
     color: var(--text2); border-radius: 8px; padding: 7px 12px; cursor: pointer;
     font: inherit; font-size: .82rem; transition: .15s ease;
   }
-  nav button:hover, .actions button:hover, .row-actions button:hover, .toolbar button:hover {
+  .actions button:hover, .row-actions button:hover, .toolbar button:hover {
     background: var(--bg-hover); color: var(--text); border-color: var(--stroke-strong);
   }
-  nav button.active {
-    color: var(--text); border-color: transparent;
-    background: linear-gradient(135deg, rgba(61,231,200,.25), rgba(74,158,255,.3));
-  }
-  .actions { display: flex; flex-wrap: wrap; gap: 6px; }
   .actions button.primary {
     color: var(--bg-deep); font-weight: 600;
     background: linear-gradient(135deg, var(--cyan), var(--blue));
@@ -2056,7 +2308,7 @@ public sealed class WebApp : IDisposable
   /* Dim the live data while asleep so stale rows can't be read as current traffic.
      Settings stays at full strength — it holds the other way to wake the console. */
   body.asleep main > section:not(#tab-settings) { opacity: .42; filter: grayscale(.55); }
-  main { padding: 18px 22px 40px; max-width: 1720px; margin: 0 auto; }
+  main { padding: 0 0 40px; }
   .status {
     margin-bottom: 14px; padding: 10px 14px; border-radius: 10px;
     background: var(--bg-panel); border: 1px solid var(--stroke);
@@ -2227,11 +2479,6 @@ public sealed class WebApp : IDisposable
   .ok { color: var(--success); }
   .muted { color: var(--muted); }
   .empty { padding: 28px; text-align: center; color: var(--muted); }
-  .pill {
-    display: inline-flex; align-items: center; gap: 6px;
-    padding: 4px 10px; border-radius: 999px; font-size: .78rem;
-    background: var(--bg-card); border: 1px solid var(--stroke); color: var(--text2);
-  }
   .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--muted); }
   .dot.on { background: var(--success); box-shadow: 0 0 8px rgba(77,209,140,.6); }
   .dot.off { background: var(--amber); }
@@ -2300,9 +2547,19 @@ public sealed class WebApp : IDisposable
   .auth-card button.submit:disabled { opacity: .55; cursor: wait; }
   .auth-card .hint { color: var(--muted); font-size: .78rem; margin: 14px 0 0; line-height: 1.4; }
   #appShell.hidden { display: none !important; }
+  /* Under ~900px the rail cannot hold its width and the content column at the
+     same time, so it folds into a wrapping row above the content. */
+  @media (max-width: 900px) {
+    #appShell { flex-direction: column; gap: 12px; padding: 12px; }
+    .sidebar { flex: none; width: auto; position: static; height: auto; }
+    nav { flex-direction: row; flex-wrap: wrap; gap: 4px; overflow: visible; }
+    .nav-cap { width: 100%; margin-bottom: 2px; }
+    nav button { width: auto; margin: 0; }
+    nav button.sub { padding-left: 14px; }
+    .side-status { margin-top: 14px; padding-top: 0; }
+    .hero { position: static; margin: 0 0 14px; padding: 0; background: none; backdrop-filter: none; }
+  }
   @media (max-width: 720px) {
-    header { padding: 12px 14px; }
-    main { padding: 12px 14px 32px; }
     th, td { padding: 8px; }
   }
 </style>
@@ -2332,33 +2589,66 @@ public sealed class WebApp : IDisposable
 </div>
 
 <div id="appShell" class="hidden">
-<header>
+<aside class="sidebar">
   <div class="brand">
-    <h1>Network Sentinel</h1>
-    <div class="sub">Web console · <span id="ver">—</span></div>
+    <div class="mark">
+      <svg viewBox="0 0 24 24" fill="none" stroke="#0a0e14" stroke-width="2"
+           stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <path d="M12 2 4 5.5V11c0 5 3.4 9.1 8 10.5 4.6-1.4 8-5.5 8-10.5V5.5L12 2Z"/>
+        <path d="m9 12 2 2 4-4"/>
+      </svg>
+    </div>
+    <div>
+      <h1>Network Sentinel</h1>
+      <div class="sub">Port &amp; intrusion watch</div>
+      <div class="sub" id="ver">—</div>
+      <div class="sub tint">Web console</div>
+    </div>
   </div>
-  <div class="clock" id="clock">—</div>
+
   <nav id="nav">
+    <div class="nav-cap">NAVIGATION</div>
     <button data-tab="dashboard" class="active">Dashboard</button>
-    <button data-tab="connections">Connections</button>
-    <button data-tab="hosts">Hosts</button>
-    <button data-tab="threats">Threats</button>
-    <button data-tab="ports">Ports</button>
-    <button data-tab="firewall">Firewall</button>
-    <button data-tab="fwconfig">Firewall Config</button>
-    <button data-tab="allowlist">Allowlist</button>
+    <button data-tab="connections">Live Connections</button>
+    <button data-tab="hosts">Remote Computers</button>
+    <button data-tab="threats">Break-in Attempts</button>
+    <button data-tab="ports">Open Ports</button>
+    <button data-tab="firewall">Firewall &amp; Block</button>
+    <button data-tab="fwconfig" class="sub" title="Add, edit and delete inbound and outbound rules">Firewall Config</button>
+    <button data-tab="allowlist" class="sub" title="Domains and IPs that are never blocked">Allowlist</button>
     <button data-tab="settings">Settings</button>
-    <button data-tab="help">Help</button>
+    <button data-tab="help" class="sub">Help</button>
   </nav>
+
+  <div class="side-status">
+    <div class="box">
+      <div class="side-cap">STATUS</div>
+      <div class="txt" id="sideStatus">Connecting…</div>
+      <div class="line"><span class="dot" id="monDot"></span> <span id="monLabel">—</span></div>
+      <div class="line" id="fwPill">—</div>
+      <div class="ab">
+        <div class="side-cap">AUTO-BLOCK</div>
+        <label><input type="checkbox" id="chkAuto"/> <span>Enable auto-block</span></label>
+        <div class="txt" id="abPill">—</div>
+      </div>
+    </div>
+  </div>
+</aside>
+
+<div class="shell-main">
+<div class="hero">
+  <div class="clock" id="clock">—</div>
+  <h1>Network Defense Console</h1>
+  <div class="lead" id="heroLead">—</div>
   <div class="actions">
     <button id="btnSleep" class="primary" title="Stop monitoring and put Network Sentinel to sleep">Sleep</button>
     <button id="btnAuto">Auto-block</button>
     <button id="btnLevel">Min: High</button>
-    <button id="btnAuth">Authorize</button>
+    <button id="btnAuth">Authorize firewall</button>
     <button id="btnClear" class="danger">Clear alerts</button>
     <button id="btnLogout">Sign out</button>
   </div>
-</header>
+</div>
 <main>
   <div class="status" id="status">Connecting…</div>
   <div class="sleep-banner hidden" id="sleepBanner">
@@ -2379,11 +2669,6 @@ public sealed class WebApp : IDisposable
 
   <section id="tab-dashboard">
     <div class="cards" id="cards"></div>
-    <div class="toolbar">
-      <span class="pill"><span class="dot" id="monDot"></span> <span id="monLabel">—</span></span>
-      <span class="pill" id="fwPill">—</span>
-      <span class="pill" id="abPill">—</span>
-    </div>
     <h3 style="margin:18px 0 8px;font-size:.95rem;color:var(--text2)">Activity — last 5 minutes</h3>
     <div class="chart-card" id="dash-chart"></div>
     <h3 style="margin:18px 0 8px;font-size:.95rem;color:var(--text2)">
@@ -2449,7 +2734,7 @@ public sealed class WebApp : IDisposable
     <div class="toolbar">
       <button id="btnAddInbound">Add an Inbound Rule</button>
       <button id="btnAddOutbound">Add an Outbound Rule</button>
-      <button id="btnRefreshFwCfg">Refresh list</button>
+      <button id="btnRefreshFwCfg">Rescan the host firewall</button>
     </div>
     <p class="muted" id="fwCfgPolicy" style="margin:0 0 10px;font-size:.85rem"></p>
     <p class="muted" id="fwCfgSummary" style="margin:0 0 10px;font-size:.85rem"></p>
@@ -2484,6 +2769,11 @@ public sealed class WebApp : IDisposable
     <div id="tbl-fwconfig-in"></div>
     <h3 style="margin:18px 0 8px;font-size:.95rem;color:var(--text2)">Outbound rules <span class="muted" id="outboundCount"></span></h3>
     <div id="tbl-fwconfig-out"></div>
+    <!-- A rule list alone does not answer "is this port actually reachable" —
+         the listeners and the rules above them together do. -->
+    <h3 style="margin:18px 0 8px;font-size:.95rem;color:var(--text2)">Listening services <span class="muted" id="listenerCount"></span></h3>
+    <p class="muted" id="listenHint" style="margin:0 0 10px;font-size:.85rem"></p>
+    <div id="tbl-fwconfig-listeners"></div>
   </section>
 
   <section id="tab-allowlist" class="hidden">
@@ -2522,20 +2812,22 @@ public sealed class WebApp : IDisposable
       <p><strong>Network Sentinel</strong> headless web UI — same monitoring and firewall stack as the desktop and TUI apps.</p>
       <p>Start with <code>NetworkSentinel -w</code> (optional port: <code>-w 18765</code>). The process picks a free high port when you omit one.</p>
       <ul>
-        <li><strong>Dashboard</strong> — live counters and recent threats</li>
-        <li><strong>Connections / Threats</strong> — live traffic with per-row Block buttons</li>
-        <li><strong>Hosts</strong> — remote peers; block/unblock IPs</li>
-        <li><strong>Ports</strong> — local listeners; block a port with one click</li>
-        <li><strong>Firewall</strong> — managed rules, manual IP/port blocking, remove rules</li>
+        <li><strong>Dashboard</strong> — live counters, activity and data-flow charts, recent threats</li>
+        <li><strong>Live Connections / Break-in Attempts</strong> — live traffic with per-row Block buttons</li>
+        <li><strong>Remote Computers</strong> — remote peers; block/unblock IPs</li>
+        <li><strong>Open Ports</strong> — local listeners; block a port with one click</li>
+        <li><strong>Firewall &amp; Block</strong> — managed rules, manual IP/port blocking, remove rules</li>
+        <li><strong>Firewall Config</strong> — the whole host firewall: every rule Windows Defender Firewall holds, what is listening behind them, and add/edit/delete</li>
         <li><strong>Allowlist</strong> — domains/IPs that are never blocked</li>
         <li><strong>Settings</strong> — auto-block behavior, block direction, geo lookups, refresh speed, and master password</li>
       </ul>
-      <p><strong>Sleep / Wake</strong> — the first button in the header stops every watcher (connections, listening ports, failed logons, port-scan probes, ARP, startup items, exfiltration, honeypot) and parks the console. Press it again to wake up and start monitoring from live data. Firewall blocks stay in force while asleep — sleeping stops watching, it does not unblock anything. Sleep applies to this web service; a desktop or TUI instance is a separate process and keeps running.</p>
+      <p><strong>Sleep / Wake</strong> — the first button above stops every watcher (connections, listening ports, failed logons, port-scan probes, ARP, startup items, exfiltration, honeypot) and parks the console. Press it again to wake up and start monitoring from live data. Firewall blocks stay in force while asleep — sleeping stops watching, it does not unblock anything. Sleep applies to this web service; a desktop or TUI instance is a separate process and keeps running.</p>
       <p class="muted">Firewall actions need Administrator. Prefer running the service elevated once rather than elevating per action.</p>
       <p class="muted">Web access is gated by a master password (set on first visit; change it anytime under Settings). The password is stored only as a salted one-way hash. Sign out or close the browser to require it again.</p>
     </div>
   </section>
 </main>
+</div>
 </div>
 
 <script>
@@ -2699,8 +2991,17 @@ public sealed class WebApp : IDisposable
     try {
       if (await fetchState()) render({ forceLists: true });
     } catch { /* ignore */ }
+    // A rule write invalidates the server's cached scan, so the Firewall Config
+    // tab is not left showing the firewall as it was before the write.
+    if (hostScan && RULE_ACTIONS.has(action)) await loadHostFirewall(false);
     return data;
   }
+
+  // Actions that change what is in the host firewall.
+  const RULE_ACTIONS = new Set([
+    'save_config_rule', 'delete_host_rule', 'remove_rule', 'remove_all_rules',
+    'block', 'unblock', 'block_port', 'unblock_port', 'restore_allowlisted'
+  ]);
 
   async function refresh() {
     // Frozen tabs: do not auto-redraw (scroll position + readability).
@@ -2975,27 +3276,76 @@ public sealed class WebApp : IDisposable
   };
 
   let editingRuleName = '';
+  // Identity of a scanned host rule being edited. Windows rule names repeat, so
+  // the server matches on the rule's whole shape, not on its label.
+  let editingRuleKey = '';
+
+  // The host firewall scan, on its own endpoint: hundreds of rules are not
+  // something to re-send with every 2.5s poll, and this tab does not live-refresh
+  // anyway. Fetched when the tab is opened, after any write, and on Rescan.
+  let hostScan = null;
+
+  async function fetchHostFirewall(rescan) {
+    const res = await fetch('/api/hostfirewall' + (rescan ? '?rescan=1' : ''),
+                            { cache: 'no-store', credentials: 'same-origin' });
+    if (res.status === 401) {
+      stopAllTimers();
+      showAuth('login', 'Session expired. Sign in again.');
+      return false;
+    }
+    if (!res.ok) throw new Error('HTTP ' + res.status);
+    hostScan = await res.json();
+    return true;
+  }
+
+  async function loadHostFirewall(rescan) {
+    try {
+      if (await fetchHostFirewall(rescan)) renderFirewallConfig();
+    } catch (e) {
+      setStatus('Could not read the host firewall: ' + (e.message || e), true);
+    }
+  }
+
+  const COVERED_CLASS = {
+    'Open': 'warn',
+    'Restricted': 'ok',
+    'Blocked': 'blocked',
+    'Not allowed': 'muted',
+    'Local only': 'muted',
+    'No firewall': 'blocked'
+  };
 
   function renderFirewallConfig() {
-    const rules = state.configRules || [];
+    const rules = (hostScan && hostScan.configRules) || [];
+    const fw = (hostScan && hostScan.hostFirewall) || {};
+    const listeners = (hostScan && hostScan.listeners) || [];
     const inbound = rules.filter(r => r.inbound);
     const outbound = rules.filter(r => !r.inbound);
-    const custom = rules.filter(r => r.isCustom).length;
+    const mine = rules.filter(r => !r.isForeign).length;
+    const folded = rules.reduce((n, r) => n + ((r.copies || 1) - 1), 0);
 
+    const allowsByDefault = (fw.defaultInbound || '').toLowerCase() === 'allow';
     $('fwCfgPolicy').textContent =
-      'Windows Defender Firewall evaluates block rules before allow rules, so an Allow rule here can ' +
-      'never reopen an address auto-block just closed — whichever was written first. What no rule can ' +
-      'change is a profile\'s default action for traffic nothing matches; that is a per-profile setting ' +
-      'in Windows Firewall (inbound blocked, outbound allowed on a stock install).';
+      `Default policy: ${fw.defaultInbound || '?'} inbound, ${fw.defaultOutbound || '?'} outbound. ` +
+      (allowsByDefault
+        ? 'Inbound traffic no rule matches is allowed, so an Allow rule opens a path through the rules ' +
+          'above it rather than granting access on its own. '
+        : 'Inbound traffic no rule matches is blocked, so a service is only reachable if a rule admits it. ') +
+      'Windows evaluates block rules before allow rules, so an Allow rule here can never reopen an ' +
+      'address auto-block just closed. ' + (fw.privilegeNote || '');
     $('fwCfgSummary').textContent =
-      `${rules.length} rule${rules.length === 1 ? '' : 's'} loaded ` +
-      `(${custom} from this page, ${rules.length - custom} from auto-block and manual blocks). ` +
-      'Live refresh is off on this tab; click Refresh list to update.';
+      `${fw.host || ''} · ${fw.backend || '?'} · ${fw.status || '?'} · ${fw.rulesSummary || 'No rules'} ` +
+      `(${mine} from Network Sentinel, ${rules.length - mine} from the rest of the host)` +
+      (folded ? ` · ${folded} duplicate rules folded into the rows they repeat` : '') +
+      (fw.disabledRules ? ` · ${fw.disabledRules} disabled rules not listed` : '') +
+      `. Scanned ${fw.scannedAt || '—'}. Live refresh is off on this tab; click Rescan to re-read the firewall.` +
+      ((fw.errors && fw.errors.length) ? '  ' + fw.errors.join('  ') : '');
     $('inboundCount').textContent = `(${inbound.length})`;
     $('outboundCount').textContent = `(${outbound.length})`;
+    $('listenerCount').textContent = `(${listeners.length})`;
 
     const rows = (list, addrHeader) => table(
-      ['Label', 'Action', 'Protocol', 'Port range', addrHeader, 'Created by', ''],
+      ['Label', 'Action', 'Protocol', 'Port range', addrHeader, 'Created by', 'Copies', ''],
       list.map(r => `<tr>
         <td class="mono">${esc(r.label)}</td>
         <td class="${r.action === 'Block' ? 'blocked' : ''}">${esc(r.action)}</td>
@@ -3003,19 +3353,70 @@ public sealed class WebApp : IDisposable
         <td class="mono">${esc(r.ports)}</td>
         <td class="mono">${esc(r.addresses)}</td>
         <td class="muted">${esc(r.origin)}</td>
+        <td class="muted">${r.copies > 1 ? '×' + esc(r.copies) : ''}</td>
         <td class="row-actions">${r.isProtected
           ? '<span class="muted" title="The allow rule that lets your browser reach this console">console</span>'
-          : (r.isCustom ? `<button data-editrule="${esc(r.name)}">Edit</button> ` : '') +
-            `<button data-delrule="${esc(r.name)}">Delete</button>`}</td>
+          : `<button data-editrule="${esc(r.key)}">Edit</button> ` +
+            `<button data-delrule="${esc(r.key)}">Delete</button>`}</td>
       </tr>`).join('')
     );
 
     $('tbl-fwconfig-in').innerHTML = rows(inbound, 'Sources');
     $('tbl-fwconfig-out').innerHTML = rows(outbound, 'Destinations');
+
+    // The sockets a rule here is written against, and what the rules above do to
+    // them. Without this you read `netstat -ano` in a terminal and retype the port,
+    // which is how ports and bind addresses go missing from the rule set.
+    $('listenHint').textContent =
+      `${listeners.length} listening socket${listeners.length === 1 ? '' : 's'} — the same set ` +
+      '"netstat -ano" prints, with what the inbound rules above do to each one. ' +
+      '"New rule" fills the form above in with that socket\'s protocol and port.';
+    $('tbl-fwconfig-listeners').innerHTML = table(
+      ['Process', 'Protocol', 'Port', 'Service', 'Bind address', 'Firewall', ''],
+      listeners.map(l => `<tr>
+        <td>${esc(l.process)}</td>
+        <td>${esc(l.protocol)}</td>
+        <td class="mono">${esc(l.port)}</td>
+        <td class="muted">${esc(l.service)}</td>
+        <td class="mono">${esc(l.address)}</td>
+        <td class="${COVERED_CLASS[l.covered] || ''}">${esc(l.covered)}</td>
+        <td class="row-actions"><button data-portrule="${esc(l.port)}" data-proto="${esc(l.protocol)}"
+            data-endpoint="${esc(l.address ? l.address + ':' + l.port : 'port ' + l.port)}"
+            data-process="${esc(l.process)}">New rule</button></td>
+      </tr>`).join('') || '<tr><td colspan="7" class="muted">No listening sockets reported.</td></tr>'
+    );
+  }
+
+  // Protocol and port carry over from the socket; the bind address deliberately
+  // does not. Sources matches the far end of a connection, so seeding it with
+  // 0.0.0.0, :: or this host's own LAN address would match nothing an attacker sends.
+  function openRuleEditorForPort(port, proto, endpoint, process) {
+    if (!/^\d+$/.test(String(port))) {
+      setStatus(`"${port}" is not a single port number, so there is nothing to prefill — ` +
+                'write the rule by hand with Add an Inbound Rule.', true);
+      return;
+    }
+    openRuleEditor(null, 'Inbound');
+    $('ruleProtocol').value = String(proto).toUpperCase() === 'UDP' ? 'UDP' : 'TCP';
+    $('rulePorts').value = String(port);
+    // Same sentence the GUI's MainViewModel.DescribeListener builds, so an operator
+    // moving between the two front-ends reads the same note about the same socket.
+    const who = !process || process.trim() === '' || process.trim() === '—'
+      ? 'an unidentified process'
+      : process;
+    $('ruleEditorNote').textContent =
+      `Writes a rule for ${$('ruleProtocol').value} port ${port}, which ${who} on ${endpoint} is listening on. ` +
+      'Sources is left empty (every address) — it matches the remote end, not the address the service is ' +
+      'bound to. The web service needs Administrator rights.';
+    $('ruleEditor').scrollIntoView({ block: 'nearest' });
   }
 
   function openRuleEditor(rule, direction) {
-    editingRuleName = rule ? rule.name : '';
+    // A rule the host owns is replaced, not edited in place: the server deletes it
+    // where it lives and writes the new values. Only our own rules can be edited
+    // by name.
+    editingRuleName = rule && !rule.isForeign ? rule.name : '';
+    editingRuleKey = rule && rule.isForeign ? (rule.key || '') : '';
     $('ruleLabel').value = rule ? rule.label : '';
     $('ruleAction').value = rule ? rule.action : 'Block';
     $('ruleDirection').value = rule ? (rule.inbound ? 'Inbound' : 'Outbound') : direction;
@@ -3029,7 +3430,11 @@ public sealed class WebApp : IDisposable
     $('ruleEditorTitle').textContent =
       (rule ? 'Edit an ' : 'Add an ') + $('ruleDirection').value + ' Rule';
     $('ruleEditorNote').textContent = rule
-      ? 'Replaces the loaded rule with these values.'
+      ? (rule.isForeign
+          ? `“${rule.label}” was created by ${rule.origin}. Saving removes it from Windows Defender ` +
+            'Firewall and writes these values as a rule of Network Sentinel\'s — there is no way to ' +
+            'edit somebody else\'s rule in place.'
+          : 'Replaces the loaded rule with these values.')
       : 'Writes a rule into Windows Defender Firewall. The web service needs Administrator rights.';
     $('btnSaveRule').textContent = rule ? 'Save Rule' : 'Add Rule';
     updateRuleAddrHint();
@@ -3038,6 +3443,7 @@ public sealed class WebApp : IDisposable
 
   function closeRuleEditor() {
     editingRuleName = '';
+    editingRuleKey = '';
     $('ruleEditor').classList.add('hidden');
     $('ruleEditorError').textContent = '';
   }
@@ -3048,7 +3454,7 @@ public sealed class WebApp : IDisposable
       ? 'Destinations — leave empty for every address.'
       : 'Sources — leave empty for every address.';
     $('ruleEditorTitle').textContent =
-      (editingRuleName ? 'Edit an ' : 'Add an ') + $('ruleDirection').value + ' Rule';
+      (editingRuleName || editingRuleKey ? 'Edit an ' : 'Add an ') + $('ruleDirection').value + ' Rule';
   }
 
   // ── Critical-threat warnings: tab-title badge + browser notification ───────
@@ -3124,16 +3530,25 @@ public sealed class WebApp : IDisposable
     $('monDot').className = 'dot ' + (mon ? 'on' : 'off');
     $('monLabel').textContent = mon ? 'Monitoring' : 'Asleep';
     $('fwPill').textContent = state.firewall?.isAdmin ? 'Firewall: ready' : 'Firewall: needs elevation';
+    $('fwPill').title = state.firewall?.privilegeText || '';
+    $('sideStatus').textContent = state.stats?.statusText || '';
     const ab = state.settings?.autoBlockEnabled;
-    // Straight from the engine, so the pill says DRY RUN when nothing is being written.
-    $('abPill').textContent = state.settings?.autoBlockSummary
+    // Straight from the engine, so it says DRY RUN when nothing is being written.
+    const abSummary = state.settings?.autoBlockSummary
       || (ab ? `Auto-block ≥ ${state.settings.autoBlockMinLevel}` : 'Auto-block off');
+    $('abPill').textContent = abSummary;
+    $('chkAuto').checked = !!ab;
     $('btnAuto').textContent = ab
       ? (state.settings?.preventionDryRun ? 'Auto-block DRY RUN' : 'Auto-block ON')
       : 'Auto-block OFF';
     $('btnLevel').textContent = 'Min: ' + (state.settings?.autoBlockMinLevel || 'High');
 
     const s = state.stats || {};
+    // Same sentence the desktop hero carries, from the same three numbers.
+    const highNow = s.highThreats || 0, blockedNow = state.blockedCount || 0;
+    $('heroLead').textContent = highNow > 0
+      ? `${highNow} high/critical · ${blockedNow} blocked · ${abSummary}`
+      : `${blockedNow} IPs blocked · ${abSummary}`;
     $('cards').innerHTML = [
       ['Listening', s.listeningPorts, 'cyan'],
       ['Connections', s.activeConnections, 'cyan'],
@@ -3296,8 +3711,10 @@ public sealed class WebApp : IDisposable
       renderSettings();
 
       // Never while the editor is open: redrawing the tables is harmless, but the
-      // operator is mid-rule and a refresh that reset the form would lose it.
-      if ($('ruleEditor').classList.contains('hidden')) {
+      // operator is mid-rule and a refresh that reset the form would lose it. And
+      // never before the scan has arrived — the tables would flash empty and read
+      // as a firewall with no rules in it.
+      if (hostScan && $('ruleEditor').classList.contains('hidden')) {
         const cfgIn = saveScroll('tbl-fwconfig-in');
         const cfgOut = saveScroll('tbl-fwconfig-out');
         renderFirewallConfig();
@@ -3440,6 +3857,9 @@ public sealed class WebApp : IDisposable
     } else {
       syncSleepMode();
     }
+    // The host firewall rides on its own endpoint, so opening the tab is what
+    // fetches it — the first time, and whenever a write has invalidated it.
+    if (tab === 'fwconfig' && !hostScan) loadHostFirewall(false);
   });
 
   $('btnSleep').onclick = () => toggleSleep();
@@ -3448,6 +3868,9 @@ public sealed class WebApp : IDisposable
   // this banner exists to replace.
   $('btnReloadPage').onclick = () => location.reload(true);
   $('btnAuto').onclick = () => apiAction('toggle_autoblock');
+  // Same action as the hero button — render() writes .checked back from the
+  // engine, so a refused toggle snaps the box back rather than lying about it.
+  $('chkAuto').onchange = () => apiAction('toggle_autoblock');
   $('btnLevel').onclick = () => apiAction('cycle_min_level');
   $('btnAuth').onclick = () => apiAction('authorize');
   $('btnClear').onclick = () => apiAction('clear_threats');
@@ -3490,7 +3913,13 @@ public sealed class WebApp : IDisposable
 
   $('btnAddInbound').onclick = () => openRuleEditor(null, 'Inbound');
   $('btnAddOutbound').onclick = () => openRuleEditor(null, 'Outbound');
-  $('btnRefreshFwCfg').onclick = () => refreshFrozenTab();
+  // Forces a fresh read of Windows Defender Firewall and the listening sockets —
+  // the cached scan behind /api/hostfirewall is what keeps a tab switch from
+  // shelling out to netsh twice every time.
+  $('btnRefreshFwCfg').onclick = async () => {
+    await loadHostFirewall(true);
+    refreshFrozenTab();
+  };
   $('btnCancelRule').onclick = () => closeRuleEditor();
   $('ruleDirection').onchange = () => updateRuleAddrHint();
   $('trafficRange').onchange = () => { if (state) renderTraffic(); };
@@ -3504,7 +3933,8 @@ public sealed class WebApp : IDisposable
       protocol: $('ruleProtocol').value,
       ports: $('rulePorts').value.trim(),
       addresses: $('ruleAddresses').value.trim(),
-      replace: editingRuleName || ''
+      replace: editingRuleName || '',
+      key: editingRuleKey || ''
     };
 
     // The blunt ones get a confirm here too. The server refuses anything that would
@@ -3694,26 +4124,46 @@ public sealed class WebApp : IDisposable
         apiAction('block_port', { value: port, kind: proto, direction: 'Inbound' });
       return;
     }
+    const pr = e.target.closest('[data-portrule]');
+    if (pr) {
+      openRuleEditorForPort(pr.dataset.portrule, pr.dataset.proto || 'TCP',
+                            pr.dataset.endpoint || '', pr.dataset.process || '');
+      return;
+    }
+    const scanned = () => (hostScan && hostScan.configRules) || [];
     const er = e.target.closest('[data-editrule]');
     if (er) {
-      const name = (er.dataset.editrule || '').trim();
-      const rule = (state.configRules || []).find(x => x.name === name);
+      const key = (er.dataset.editrule || '').trim();
+      const rule = scanned().find(x => x.key === key);
       if (rule) openRuleEditor(rule, rule.inbound ? 'Inbound' : 'Outbound');
       return;
     }
     const dr = e.target.closest('[data-delrule]');
     if (dr) {
-      const name = (dr.dataset.delrule || '').trim();
-      const rule = (state.configRules || []).find(x => x.name === name);
-      if (!rule) { setStatus('Could not read rule name from the row.', true); return; }
-      const warn = rule.isCustom ? ''
-        : `\n\nThis rule came from ${rule.origin.toLowerCase()}. Deleting it unblocks that traffic ` +
-          'until something detects it again.';
+      const key = (dr.dataset.delrule || '').trim();
+      const rule = scanned().find(x => x.key === key);
+      if (!rule) { setStatus('Could not read the rule from the row.', true); return; }
+      let warn = '';
+      if (rule.isForeign) {
+        warn = `\n\nThis rule belongs to ${rule.origin}, not to Network Sentinel. ` +
+               'Deleting it removes it from Windows Defender Firewall for good.';
+      } else if (!rule.isCustom) {
+        warn = `\n\nThis rule came from ${rule.origin.toLowerCase()}. Deleting it unblocks that traffic ` +
+               'until something detects it again.';
+      }
+      if (rule.action === 'Allow' && /\b3389\b/.test(rule.ports || '')) {
+        warn += '\n\nThis is the rule that allows Remote Desktop — deleting it can end the session you ' +
+                'administer this host with.';
+      }
+      if (rule.copies > 1) {
+        warn += `\n\nWindows holds ${rule.copies} identical copies of this rule. Deleting it removes ` +
+                'every one of them.';
+      }
       const detail = `${rule.action} · ${rule.direction} · ${rule.protocol} · ${rule.ports} · ${rule.addresses}`;
       if (confirm(`Delete "${rule.label}"?\n\n${detail}${warn}\n\n(Requires Administrator)`)) {
         dr.disabled = true;
         dr.textContent = 'Deleting…';
-        apiAction('remove_rule', { value: name, name: name }).finally(() => {
+        apiAction('delete_host_rule', { key }).finally(() => {
           if (dr.isConnected) { dr.disabled = false; dr.textContent = 'Delete'; }
         });
       }

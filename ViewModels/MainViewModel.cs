@@ -236,7 +236,9 @@ public partial class MainViewModel : ObservableObject, IDisposable
         FirewallStatusText = _firewall.PrivilegeText;
         UpdateAutoBlockStatusText();
         RefreshFirewallRules();
-        InitializeFirewallConfig();
+        // No firewall-config scan here: it reads the machine's whole firewall, and
+        // navigating to that page runs it anyway. Doing it at startup would spend
+        // two netsh dumps on every launch for a page most sessions never open.
         InitializeTraffic();
         _ = InitializeAllowlistAsync();
 
@@ -593,8 +595,11 @@ public partial class MainViewModel : ObservableObject, IDisposable
 
         if (ShowFirewall)
             RefreshFirewallRules();
+        // Fire and forget: the host firewall scan runs off the UI thread and the tab
+        // has to open now, not when netsh finishes. It reports into the view's own
+        // "Scanning…" indicator, so nothing here has to wait for it.
         if (ShowFirewallConfig)
-            RefreshFirewallConfig();
+            _ = RefreshFirewallConfigAsync();
         if (ShowSettings)
             RefreshMonitorStatusText();
     }

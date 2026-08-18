@@ -10,7 +10,43 @@ Three ways to run it (same idea as the Linux build):
 | **Terminal UI (`--tui`)** | Server Core, RDP console, SSH-style workflows |
 | **Headless web UI (`-w`)** | Browser dashboard on a server (master-password protected) |
 
-> Awareness / monitoring tooling — not a full IDS/IPS replacement. Version **0.6.5**.
+> Awareness / monitoring tooling — not a full IDS/IPS replacement. Version **0.7.4**.
+
+---
+
+## What's new in 0.7.4
+
+The Firewall Config page stops being a list of this app's own rules and becomes the machine's firewall, and the web console is laid out like the desktop window.
+
+| Area | What changed |
+|------|--------------|
+| **The whole host firewall** | Firewall Config used to list the `NetworkSentinel-*` rules and nothing else — a handful of rows sitting beside the *fifteen hundred* rules Windows, your installers and your games have written into the same firewall. One machine has one firewall; the page now reads all of it (`netsh advfirewall firewall show rule name=all verbose`), with a **Created by** column naming who wrote each rule, so a foreign rule is never mistaken for one this app is responsible for. Edit and Delete work on any of them. |
+| **Listening services** | Under the rule lists: every TCP LISTEN and bound UDP socket with its bind address, owning process and service name, and the verdict the inbound rules pass on it — **Open**, **Restricted**, **Blocked**, **Not allowed**, **Local only**. A rule list on its own cannot answer *is this port reachable*; the two together do. **New rule** on a row opens the editor with that socket's protocol and port filled in. |
+| **Duplicate rules are counted, not repeated** | Windows does not stop a setup script adding its rule on every run. The development machine this was written on holds **685 identical copies** of one rule; the page folds them into a single row marked `×685`, and deleting it removes all of them. |
+| **Profiles, read rather than assumed** | The default policy shown is the one the *active* profile actually holds, and rules scoped to a profile that is not in force do not count towards a listener's verdict. "Block all inbound connections, including those in the list of allowed apps" is called out where it applies, because under it no allow rule below is doing anything. |
+| **The console has the desktop's menus** | The web console is laid out like the desktop window: a navigation rail with the same menu names and hierarchy (Firewall Config and Allowlist indented under **Firewall & Block**), a **STATUS** block pinned to its foot with the auto-block toggle, and the desktop's hero header — clock, title, and the `high/critical · blocked · auto-block` subtitle from the same three numbers. |
+
+Reading the firewall needs no elevation on Windows, so the whole list is there whether or not the app is running as Administrator — only writing needs **Run as Admin**.
+
+## What's new in 0.7.2
+
+Brings the Windows build level with the Linux 0.7.2 release, plus the IPSec half of the tunnel shield. Two new features, one new guard, and a fix to a write path that was losing data quietly.
+
+| Area | What changed |
+|------|--------------|
+| **Data-flow charts** | The dashboard has always answered *who* is talking to this machine; it now also answers *how much went in and out*. Live in/out throughput on one shared zero-based scale (two independent scales draw a trickle of uploads at the same height as a saturated download), this month's totals, and paired bars per day of the month or per month of the year — in the desktop app **and** the web console. Sampled from the per-adapter octet counters every 5 s: no capture, no elevation, no subprocess. |
+| **Physical adapters only** | A tunnel, a Hyper-V or VMware switch port, a teaming multiplexor and an OpenVPN TAP adapter all carry bytes that already crossed a real adapter, so counting both would double every tunnelled byte. The adapter *type* does not settle it — Wintun, Hyper-V switch ports and the KM-TEST loopback adapter all claim to be Ethernet — so the driver description is read too. Team **members** are metered and the multiplexor is not, which gives the total exactly once. |
+| **Firewall Config** | A page in the desktop app and a tab in the web console for writing your own rules: Label / Action / Protocol / Port range / Sources, one form for both add and edit, service presets, and labels minted from the port (`block-inbound-rdp`) when you leave the field blank. Rules are ordinary `NetworkSentinel-Rule-*` Windows Firewall rules, so they apply system-wide and show up in `wf.msc`. |
+| **Precedence needs no work here** | Windows Firewall groups rules by type and evaluates **blocks before allows**, so a config *Allow* can never reopen an address auto-block just shut, whichever was written first. (The Linux build has to insert app blocks at the head of a first-match-wins chain to get the same guarantee.) What no rule can change is a profile's default action — the page says so rather than implying an Allow rule is what grants access. |
+| **Rules that would cut you off** | Blocking everything, or blocking inbound RDP, is confirmed before it is written. The **web console refuses outright** an inbound block that matches every source and covers its own port: the desktop app can ask you to confirm, but over the web the confirmation would travel down the connection being cut. A rule the firewall rejects is rolled back rather than left behind claiming to be in force. |
+| **A typo'd port range no longer means "every port"** | Validation now runs *before* canonicalisation. The other order silently dropped a range the parser rejected — and an empty port field means every port, so `443-80` armed a catch-all block. |
+| **IPSec tunnel endpoints are never auto-blocked** | The shield that already covered WireGuard now covers IPSec, which matters most for **site-to-site**: the peer is another site's router at a fixed public address, holding long-lived flows and retrying hard whenever the link flaps — the exact shape the heuristics look for. One auto-block drops the tunnel for both sites, and nothing at this end looks wrong afterwards. Peers are learned from live SAs, connection-security rules and the RAS phonebooks, and remembered for 24 h across restarts. Subnets, ranges and hostnames are never taken: a shield that swallowed `0.0.0.0/0` would disable auto-block for the whole internet. |
+| **The upgrade banner** | A tab left open across an upgrade keeps its old markup — the page polls `/api/state` but never re-requests its own HTML, so no cache header can deliver the new UI and the new features simply look absent. The page now carries the build it was served from, and when the server reports a different one a banner offers a reload. It never reloads on its own: you may be mid-rule in the editor. |
+| **Atomic writes stop losing bursts** | `WriteAtomic` retried a lost publish on a flat 15 ms sleep for 12 attempts — it gave up after ~165 ms, and every loser of a race woke at the same instant and collided again in lockstep. Since the callers swallow exceptions, that meant a **silently dropped write**; the firewall ledger has three concurrent writers and every frontend saves settings. Now randomised backoff to a 2 s deadline. |
+
+A hundred more tests arrive with it (**188 total**), including the netsh rule round-trip, the adapter filter, the IPSec parsers, the console's self-block guard, and a concurrency test rebuilt so it actually fails on the bug it guards (32 writers released together: 8 failures in 8 runs before the fix, 0 in 15 after).
+
+**Upgrading** is in place and non-destructive, as in 0.5.x. Re-run the installer and confirm the web header reads `v0.7.2` — and if a console tab was already open, it will now tell you itself.
 
 ---
 
@@ -155,7 +191,7 @@ Windows toasts lead with it in the title (`Blocked · critical threat: Port Scan
 
 The threat tables answer it too, so the screen you land on after a warning agrees with the warning: a **Blocked** column in the GUI (hover for the full reason) and the web console, and a `Blk` column in the TUI — red when the address is being dropped, amber for a block that failed or was only simulated, muted when it was deliberately left alone. A row whose address is already blocked offers **Unblock** in place of **Block IP**, as the Remote Computers grid does; re-blocking would only rewrite a rule that is already in force, and would quietly turn an expiring auto-block into a permanent manual one.
 
-Every status line that reports auto-block state — the GUI hero subtitle, the TUI footer, the web console's header pill, and the message each shows when you flip the toggle — comes from the engine itself, so **DRY RUN** is never mistaken for armed.
+Every status line that reports auto-block state — the GUI hero subtitle, the TUI footer, the web console's sidebar status block, and the message each shows when you flip the toggle — comes from the engine itself, so **DRY RUN** is never mistaken for armed.
 
 ### Prevention engine
 
@@ -319,7 +355,7 @@ Set **Settings → Webhook URL** to push Critical threats off the machine — th
 - **Block / unblock** remote IPs (inbound, outbound, or both) — rules are created as an `-In`/`-Out` pair and removed together (config rules are never paired, so their names are exempt from that)
 - Your own rules, written on the **Firewall Config** page — see below
 - **Block local ports** (TCP/UDP)
-- Only manages rules named `NetworkSentinel-*` so other firewall rules are left alone
+- Only *manages* rules named `NetworkSentinel-*` — auto-block, manual blocks and expiry never touch anything else. Since 0.7.4 the Firewall Config page can also **show and edit the rest of the host firewall** on request, but nothing automatic acts on a rule this app did not write
 - All firewall changes go through **`netsh` in a separate process** (never firewall COM — COM from web/thread-pool threads can crash the host)
 - **Auto-block** on/off with minimum severity (`Medium` / `High` / `Critical`)
 - Removing/unblocking a rule **suppresses auto-block for that IP for 24 h** (persisted), so removed rules stay gone across restarts
@@ -328,11 +364,41 @@ Set **Settings → Webhook URL** to push Critical threats off the machine — th
 - Settings stored machine-wide in `%ProgramData%\NetworkSentinel\settings.json` — shared by the GUI, TUI, and the web service (which runs as SYSTEM); falls back to `%LocalAppData%` if ProgramData is not writable
 - **Run as Admin** when elevation is required
 
-### Firewall Config — write your own rules
+### Firewall Config — the whole host firewall (rebuilt in 0.7.4)
 
 A **Firewall Config** page under *Firewall & Block* (and a tab in the web console) that adds, edits and deletes inbound and outbound rules, shaped like the Linode Cloud Manager firewall page (and [FireWallConfig](https://github.com/davidfweiser/FireWallConfig) on Ubuntu): one list per direction, Label / Action / Protocol / Port range / Sources, one form for both add and edit, and labels minted from the port's service (`block-inbound-rdp`) when you leave the field blank.
 
 Rules are written as ordinary `NetworkSentinel-Rule-*` Windows Firewall rules, so they apply system-wide, show up in `wf.msc`, and appear in every one of this app's rule lists.
+
+**Since 0.7.4 the page reads the host firewall rather than this app's own rules.** Until then it listed the `NetworkSentinel-*` rules and nothing else, which on a real Windows box is a handful of rows sitting beside a firewall holding well over a thousand — Windows' own **Core Networking** and **File and Printer Sharing** groups, every installer that ever asked for an exception, and whatever a `netsh` line in a setup script left behind. One machine has one firewall; the page now shows all of it, named after the host:
+
+| Source | Read with |
+|---|---|
+| **Rules** | `netsh advfirewall firewall show rule name=all verbose` — verbose because *Grouping*, *Program* and *Service* are what "who wrote this" is read from |
+| **Profiles** | `netsh advfirewall show allprofiles` and `show currentprofile` — both default actions, and which profile is in force |
+| **Listeners** | the same IP Helper tables the monitor already polls, so no second inventory of the machine can disagree with the first |
+
+None of those reads needs elevation, which is the one place Windows is kinder than the Linux build: the rule list is complete whether or not you are running as Administrator, and only writing needs UAC.
+
+**Created by** names the rule's group (`Core Networking`, `Microsoft Teams`), or the program it is scoped to when it has no group, or the service, or `Local rule` for one typed in by hand. Store-app rules carry a package identity where a name should be — `@{Microsoft.People_10.2202.100.0_x64__8wekyb3d8bbwe?ms-resource://…}` — so the package name is lifted out of it; every other rule keeps the name `wf.msc` shows.
+
+**Disabled rules are counted, not listed.** They are configuration, not enforcement, and listing them beside the rules in force would describe a firewall this host is not running. The summary line says how many were left out.
+
+**Identical rules are folded into one row and counted.** Windows does not stop a setup script adding its rule on every run: the machine this was written on holds 685 rules called `allow 9009`. One row marked `×685` says so, and deleting it removes every copy — which is the point, but not something to discover afterwards, so the confirmation says it too.
+
+**Listening services.** Under the two rule lists, what is actually listening — protocol, bind address, port, service name, owning process — with the verdict the rules above pass on it: **Open** (an allow rule admits it from anywhere), **Restricted** (admitted only from named addresses, e.g. `LocalSubnet`), **Blocked** (a block rule covers it, and Windows evaluates blocks first), **Local only** (bound to loopback), **Not allowed** (listening into a closed door), **No firewall**. Every socket is listed separately, so a service like NetBIOS shows its rows on `0.0.0.0`, the LAN address and the broadcast address rather than one collapsed entry.
+
+Three things decide whether a rule counts towards that verdict, and each of them was a wrong answer before it was handled:
+
+- **Address scope.** A block rule scoped to one address closes that address, not the port. Auto-block writes one rule per attacker, so reading those as "this port is blocked" marked every socket on the machine Blocked.
+- **Program and service scope.** A rule scoped to a program only admits that program's sockets, matched by image name; a rule scoped to a Windows service is credited to a service host, since which service inside `svchost.exe` owns a socket is not visible from here.
+- **Store-app rules.** Windows scopes those to a package SID, which `netsh` does not print — the row names no program, no service and no port. Reading them as "every socket" marked all 159 listeners on a live host **Open**, SMB and RDP included, so a foreign rule with none of the three is not credited to anything.
+
+**New rule** on a listener row opens the editor with that socket's protocol and port already filled in. The bind address deliberately does *not* carry into Sources: that field matches the far end of a connection, so seeding it with `0.0.0.0`, `::` or this host's own LAN address would write a rule that matches nothing an attacker sends. The editor note says so on the spot.
+
+**Editing a rule this app did not write** deletes it and writes the new values as a `NetworkSentinel-Rule-*` rule — Windows has no edit-in-place for somebody else's rule, and rewriting one under its own name would leave two rules claiming it. If the delete fails the save stops rather than leaving both in force. Deletes name the rule's whole shape (direction, protocol, both port fields, remote addresses, program), because Windows rule names are not unique and a delete by name alone would take the neighbours with it.
+
+**The scan is cached.** The web console polls `/api/state` every 2.5 s, and shelling out to `netsh` twice at that rate would be absurd; the host firewall rides on its own endpoint (`/api/hostfirewall`), fetched when the tab is opened, invalidated by any write, and re-read on demand by **Rescan the host firewall**. The desktop page runs the same scan off the UI thread with a *Scanning…* indicator.
 
 **Precedence needs no work here, unlike the other builds.** Windows Firewall is not evaluated in creation order: it groups rules by type and evaluates connection-security rules, then authenticated bypass, then **block**, then **allow**, then the profile default. A block therefore beats an allow whichever was written first, so a config *Allow* can never reopen an address auto-block just shut. (The Linux build has to insert app blocks at the head of a first-match-wins chain to get the same guarantee.) The one rule type that *would* outrank a block is an authenticated bypass, and this page offers no way to author one.
 
@@ -346,7 +412,7 @@ Other details:
 - An unparseable port range is **rejected, not dropped**: validation runs before canonicalisation, because canonicalising first would turn a typo'd `443-80` into an empty port field — and an empty port field means *every port*.
 - One rule usually needs exactly one firewall rule: `remoteip` takes a whole address list, IPv4 and IPv6 together. Two cases still split, because netsh rejects them outright — a port range under protocol *Any* becomes one TCP and one UDP rule, and ICMP becomes icmpv4 and icmpv6. Every fragment shares one rule name and is folded back together on read, so you see the one rule you wrote.
 
-The page header shows the running version — check it after an upgrade to confirm the new build is live. An open web console tab now says so itself: the page carries the build it was served from, and when the server reports a different one a banner offers a reload (it never reloads on its own — you may be mid-rule in the editor).
+The navigation rail shows the running version — check it after an upgrade to confirm the new build is live. An open web console tab now says so itself: the page carries the build it was served from, and when the server reports a different one a banner offers a reload (it never reloads on its own — you may be mid-rule in the editor).
 
 ### Known-good allowlist (never block)
 Trusted sites are protected so auto-block (and manual block) will not cut off everyday tools:
@@ -439,11 +505,11 @@ Self-contained by default — the server does **not** need the .NET SDK or a com
 
 ```powershell
 # Copy the .install.cmd to the server, then run it (UAC prompt if not elevated):
-.\NetworkSentinel-windows-server-x64-0.6.5.install.cmd
+.\NetworkSentinel-windows-server-x64-0.7.4.install.cmd
 # optional port:
-.\NetworkSentinel-windows-server-x64-0.6.5.install.cmd -Port 18765
+.\NetworkSentinel-windows-server-x64-0.7.4.install.cmd -Port 18765
 # unpack without installing:
-.\NetworkSentinel-windows-server-x64-0.6.5.install.cmd --extract-only
+.\NetworkSentinel-windows-server-x64-0.7.4.install.cmd --extract-only
 ```
 
 The one-file installer is a `.cmd`, not a `.ps1`: `cmd.exe` stops reading the script at `exit /b`, so the ZIP appended to it is never parsed. PowerShell tokenizes an entire `-File` script before running any of it, and the cost on appended binary is quadratic (16 MB ≈ 5½ minutes) before it fails to parse at all — so the shell-style "payload after exit" trick only works with a `cmd` entry point.
@@ -505,7 +571,7 @@ No URL ACL is reserved. That was an `HttpListener` requirement; Kestrel binds th
 
 #### Upgrades and uninstall
 
-Re-running the installer **upgrades in place**: it stops the running task, replaces the binaries, and restarts. `%ProgramData%\NetworkSentinel` is both the install folder and the data directory, so the installer removes **only the files the package ships** — the master password hash, settings, allowlist, logs, host history, threat log, `duckdns.json`, `tls\`, and `acme\` all survive. The web page header shows the running version (e.g. `v0.6.5`) — check it after an upgrade to confirm the new build is live.
+Re-running the installer **upgrades in place**: it stops the running task, replaces the binaries, and restarts. `%ProgramData%\NetworkSentinel` is both the install folder and the data directory, so the installer removes **only the files the package ships** — the master password hash, settings, allowlist, logs, host history, threat log, `duckdns.json`, `tls\`, and `acme\` all survive. The web console's navigation rail shows the running version (e.g. `v0.7.4`) — check it after an upgrade to confirm the new build is live.
 
 Uninstall keeps that same data by default so a reinstall picks up where you left off:
 
@@ -516,16 +582,20 @@ powershell -ExecutionPolicy Bypass -File .\uninstall-web-service.ps1 -PurgeData 
 
 `-PurgeData` also deletes the Posh-ACME account, which cannot be recovered — a reinstall registers a new one, counting against Let's Encrypt's rate limits.
 
+#### Web console layout
+
+The console is laid out like the desktop window (0.7.4), because they are the same product and the menus should not be a different shape in each: a **230px navigation rail** on the left carrying the desktop's menu names and hierarchy — Firewall Config and Allowlist indented under **Firewall & Block**, Help under **Settings** — with a **STATUS** block pinned to its foot (monitor state, firewall privilege, and the **Enable auto-block** checkbox with the engine's own wording under it). To the right, the same hero header the desktop carries: clock, **Network Defense Console**, the `high/critical · blocked · auto-block` subtitle from the same three numbers, and the action row. Below ~900px the rail folds into a wrapping row above the content.
+
 #### Web console tabs
 
 | Tab | What you can do |
 |-----|-----------------|
-| **Dashboard** | Live counters, **5-minute activity chart** (connections + threat markers), **data-flow charts** (live in/out throughput, this month's totals, paired bars per day or per month), monitoring/firewall status, recent threats |
-| **Connections / Threats** | Live traffic with a **Block** button on every row |
-| **Hosts** | Remote peers; block / unblock by row or by typed IP |
-| **Ports** | Local listeners; one-click **Block port** |
-| **Firewall** | Managed rules grouped as In/Out pairs; manual IP and port blocking; **Restore allowlisted** |
-| **Firewall Config** | Write your own inbound and outbound rules — Label / Action / Protocol / Port range / Sources, with service presets, plus edit and delete |
+| **Dashboard** | Live counters, **5-minute activity chart** (connections + threat markers), **data-flow charts** (live in/out throughput, this month's totals, paired bars per day or per month), recent threats |
+| **Live Connections / Break-in Attempts** | Live traffic with a **Block** button on every row |
+| **Remote Computers** | Remote peers; block / unblock by row or by typed IP |
+| **Open Ports** | Local listeners; one-click **Block port** |
+| **Firewall & Block** | Managed rules grouped as In/Out pairs; manual IP and port blocking; **Restore allowlisted** |
+| **Firewall Config** (rebuilt 0.7.4) | The whole host firewall — Windows' own rules, Network Sentinel's, and everyone else's — plus listening services and their firewall verdict; add / edit / delete any of them |
 | **Allowlist** | Add/remove trusted domains and IPs; refresh the feed |
 | **Settings** | Monitoring on/off, page refresh speed, geo lookups, failed-logon monitoring, closed-port scan detection, the intrusion detectors (threat intel, new-listener, process reputation, ARP watch, startup-item watch, exfiltration, honeypot), **kernel flow events**, **DNS hygiene** (with approved resolvers), **WireGuard peer monitoring**, **Suricata signature ingestion** (EVE path), **auto-block dry run**, **HTTPS + DuckDNS remote access** (including **Issue certificate**), webhook alerts, auto-block + minimum severity + expiry, block direction (in/out), allowlist feed, **change master password**, **Remove all rules** |
 
@@ -535,7 +605,7 @@ A tab left open across an upgrade keeps its old markup — the page polls `/api/
 
 #### Sleep / Wake
 
-The first button in the web console header is a single **Sleep ⇄ Wake** toggle:
+The first button in the web console's hero action row is a single **Sleep ⇄ Wake** toggle:
 
 - **Sleep** stops *everything the console watches* — the connection/port poll plus the failed-logon, closed-port probe, ARP, startup-item, exfiltration and honeypot watchers — and parks the page: the live tabs dim, a banner explains the state, and the browser drops its 2.5-second refresh so a sleeping console costs nothing on either end
 - **Wake** starts monitoring again from live data and restores the normal refresh
@@ -835,7 +905,8 @@ The token is written to `duckdns.json`, not `settings.json`; the GUI, TUI, and w
 | `Services/WebhookNotifier.cs` | ntfy / Slack / Discord / generic JSON alerts, each carrying the block verdict |
 | `Services/DesktopNotifier.cs` | Critical Windows toasts, blocked-or-not in the title |
 | `Services/GeoIpService.cs` | Reverse DNS + public geo lookup |
-| `Services/FirewallService.cs` | Windows Firewall rule create/list/remove (netsh, cached rule list); auto-block expiry sweep |
+| `Services/FirewallService.cs` | Windows Firewall rule create/list/remove (netsh, cached rule list); auto-block expiry sweep; delete of a rule this app did not write |
+| `Services/HostFirewallScan.cs` | Reads the whole host firewall — every rule, the profile defaults, and the listening sockets with the verdict the rules pass on them |
 | `Services/FirewallRuleSpec.cs` | Firewall Config rule parsing, validation and netsh rendering (no privilege, no I/O) |
 | `Services/AppSettings.cs` | Auto-block preferences + suppress list (JSON on disk) |
 | `Services/DuckDnsUpdater.cs` | DuckDNS dynamic-DNS refresh loop; token file with an admins-only ACL |

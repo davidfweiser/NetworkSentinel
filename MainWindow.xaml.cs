@@ -29,7 +29,29 @@ public partial class MainWindow : Window
             _syncingDuckDnsToken = true;
             DuckDnsTokenBox.Password = vm.DuckDnsToken;
             _syncingDuckDnsToken = false;
+
+            // Unsubscribe first: Loaded fires again if the window is ever re-shown,
+            // and a second subscription would scroll twice for one open.
+            vm.PropertyChanged -= OnViewModelPropertyChanged;
+            vm.PropertyChanged += OnViewModelPropertyChanged;
         }
+    }
+
+    /// <summary>
+    /// The rule editor sits above the rule lists, so "New rule" on a listening-services
+    /// row near the bottom of a scrolled page would otherwise fill in a form the
+    /// operator cannot see and read as a button that did nothing. Posted, not called:
+    /// the Border is still collapsed at the moment IsRuleEditorOpen flips, and a
+    /// control with no layout slot cannot be scrolled to.
+    /// </summary>
+    private void OnViewModelPropertyChanged(object? sender, System.ComponentModel.PropertyChangedEventArgs e)
+    {
+        if (e.PropertyName != nameof(MainViewModel.IsRuleEditorOpen)) return;
+        if (sender is not MainViewModel vm || !vm.IsRuleEditorOpen) return;
+
+        Dispatcher.BeginInvoke(
+            new Action(() => RuleEditorCard?.BringIntoView()),
+            System.Windows.Threading.DispatcherPriority.Loaded);
     }
 
     private void OnDuckDnsTokenChanged(object sender, RoutedEventArgs e)
