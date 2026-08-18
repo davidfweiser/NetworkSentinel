@@ -323,7 +323,7 @@ action row. Below ~900px the rail folds into a wrapping row above the content.
 | **Allowlist** | Add/remove trusted domains and IPs; refresh the feed |
 | **Settings** | Monitoring on/off, poll interval, geo lookups, auth-log and closed-port scan detection, the 0.4.0 detectors (threat intel, new-listener alerts, process reputation, ARP/gateway watch, startup-item watch, exfiltration threshold, honeypot ports), **kernel flow events**, **DNS hygiene** (with approved resolvers), **WireGuard peer monitoring** (with a live peer table), **Suricata signature ingestion** (EVE path, maximum severity, muted sids), **auto-block dry run**, **HTTPS + DuckDNS remote access** (including **Issue certificate**), webhook URL, auto-block + minimum severity + expiry, block direction (in/out), allowlist feed, **change master password**, **Remove all rules** |
 
-The navigation rail shows the running version (e.g. `v0.7.2`) — check it after an upgrade to confirm the new build is live. Since 0.7.2 the console notices this for you: a tab left open across an upgrade shows a banner naming both versions and offering a reload, because the page polls `/api/state` but never re-requests its own HTML, so the old UI would otherwise stay put and look like the upgrade never installed.
+The navigation rail shows the running version (e.g. `v0.7.3`) — check it after an upgrade to confirm the new build is live. Since 0.7.2 the console notices this for you: a tab left open across an upgrade shows a banner naming both versions and offering a reload, because the page polls `/api/state` but never re-requests its own HTML, so the old UI would otherwise stay put and look like the upgrade never installed.
 
 ### Sleep / Wake
 
@@ -404,8 +404,9 @@ The token is stored in `~/.local/share/NetworkSentinel/duckdns.json` with mode `
 - For **server package**: nothing on the target — self-contained binary (no .NET install)
 - Desktop libraries for Avalonia GUI (usual X11/Wayland desktop)
 - **policykit-1** (`pkexec`) recommended for firewall password prompts
-- `nft` (nftables) or `iptables` for host firewall changes
-- `ss` (iproute2) for the exfiltration monitor — present on essentially every distro; without it that one feature reports itself unavailable
+- `ufw` when the host uses it — Firewall Config reads it and writes through it; the app never enables it for you (that can lock you out of SSH)
+- `nft` (nftables) or `iptables` for host firewall changes, and for reading the ruleset where UFW is not in use
+- `ss` (iproute2) for the exfiltration monitor and the Firewall Config listening-services table — present on essentially every distro; without it those report themselves unavailable
 - Read access to the system auth log (`adm` / `systemd-journal` group) for failed-logon and closed-port scan detection — optional, the app runs without it
 - **systemd** optional (used by `--web-service` installer)
 
@@ -444,17 +445,17 @@ Build on a machine with the .NET SDK; install on the server **without** .NET:
 
 ```bash
 # build machine
-scp dist/networksentinel-0.5.0-linux-x64.install.sh user@server:
+scp dist/networksentinel-0.7.3-linux-x64.install.sh user@server:
 
 # server
-chmod +x networksentinel-0.5.0-linux-x64.install.sh
-sudo ./networksentinel-0.5.0-linux-x64.install.sh --web-service
+chmod +x networksentinel-0.7.3-linux-x64.install.sh
+sudo ./networksentinel-0.7.3-linux-x64.install.sh --web-service
 ```
 
 Confirm the installer is current before using root:
 
 ```bash
-./networksentinel-0.5.0-linux-x64.install.sh --help
+./networksentinel-0.7.3-linux-x64.install.sh --help
 # Should list: --web-service
 ```
 
@@ -491,8 +492,8 @@ sudo ./….install.sh --web-service --port 18765
 ./….install.sh --user --desktop-shortcut    # ~/.local + icon on the Desktop
 
 # classic tarball
-tar xzf networksentinel-0.5.0-linux-x64.tar.gz
-cd networksentinel-0.5.0-linux-x64
+tar xzf networksentinel-0.7.3-linux-x64.tar.gz
+cd networksentinel-0.7.3-linux-x64
 sudo ./install.sh --web-service
 ```
 
@@ -679,27 +680,29 @@ When you block an IP/port (or click **Authorize firewall**), only `nft`/`iptable
 
 ### Firewall elevation on a headless server (no pkexec)
 
-`pkexec` needs a graphical polkit session (D-Bus + auth agent), which doesn't exist for a `systemd`-run web service with no display. On a headless box, block/unblock and **Authorize firewall** will fail with *"Elevation failed... Need admin rights for firewall changes"* until you grant the service user **passwordless sudo scoped to just `nft`/`iptables`**:
+`pkexec` needs a graphical polkit session (D-Bus + auth agent), which doesn't exist for a `systemd`-run web service with no display. On a headless box, block/unblock and **Authorize firewall** will fail with *"Elevation failed... Need admin rights for firewall changes"* until you grant the service user **passwordless sudo scoped to just the firewall binaries**:
 
 ```bash
 # 1. Confirm which user the service runs as
 systemctl show networksentinel-web -p User
 
 # 2. Find the exact binary paths (varies by distro)
-which nft iptables ip6tables
+which ufw nft iptables ip6tables
 
 # 3. Add a scoped sudoers rule (replace YOUR_USER and the paths below)
 sudo visudo -f /etc/sudoers.d/networksentinel
 ```
 ```
-YOUR_USER ALL=(root) NOPASSWD: /usr/sbin/nft, /usr/sbin/iptables, /usr/sbin/ip6tables
+YOUR_USER ALL=(root) NOPASSWD: /usr/sbin/ufw, /usr/sbin/nft, /usr/sbin/iptables, /usr/sbin/ip6tables
 ```
 ```bash
 sudo visudo -c                              # verify syntax
 sudo systemctl restart networksentinel-web  # retry block/unblock afterwards
 ```
 
-This keeps the service itself running as your unprivileged user for everything else, and only elevates the two firewall binaries — the headless equivalent of the pkexec prompt the desktop GUI uses.
+This keeps the service itself running as your unprivileged user for everything else, and only elevates the firewall binaries — the headless equivalent of the pkexec prompt the desktop GUI uses.
+
+Include `ufw` where the host uses it (0.7.3). The same grant does double duty: Firewall Config's *reads* (`ufw status verbose`, `nft -j list ruleset`, `iptables -S`) go through `sudo -n`, so without this rule the page lists only what is world-readable, and the writes go through `ufw` rather than `nft`. Drop `ufw` from the line on a host that does not run it — sudoers should not name binaries that are not there.
 
 ---
 
@@ -967,6 +970,9 @@ On GNOME / Pop!_OS the indicator appears in the top bar (StatusNotifier / AppInd
 | `Elevation failed... Need admin rights` on a **headless server** | `pkexec` can't work without a display/polkit session. Grant the service user passwordless sudo for `nft`/`iptables` — see [Firewall elevation on a headless server](#firewall-elevation-on-a-headless-server-no-pkexec). |
 | `.NET location: Not found` | Use the **server installer** / self-contained package, or set `DOTNET_ROOT` / `PATH`. |
 | Process names missing | Expected for other users’ sockets without root; monitoring still works. |
+| **Firewall Config lists fewer rules than `ufw status`** | Reading UFW and nftables needs root. The scan runs as you and retries once under `sudo -n`, so with neither it sees only what is world-readable. The policy line under the summary says which case you are in. Fixes: run the app (or the web service) elevated, or give the service user passwordless sudo for `ufw`/`nft` — the same grant described in [Firewall elevation on a headless server](#firewall-elevation-on-a-headless-server-no-pkexec). |
+| Firewall Config is empty and says no backend returned rules | Neither `ufw`, `nft` nor `iptables` answered. On a container or a minimal image none may be installed; `command -v ufw nft iptables` says which. |
+| A rule added here does not appear in `ufw status` | Only rules written **while UFW is active** go through UFW. If UFW was installed but inactive when you added it, the rule went into nftables and is still enforced — it just is not UFW's. Enable UFW first (deliberately: `sudo ufw enable` can end an SSH session), then re-add it. |
 | No tray icon | DE must support StatusNotifier/AppIndicator; window title still updates when minimized. |
 | Web UI asks for password every time | Expected after sign-out, browser close, or 12h idle. Reset: delete `web-master.json`. |
 | `networksentinel-web` won’t start | `journalctl -u networksentinel-web -e`; check port in `/etc/networksentinel/web.env`; confirm binary exists at `/usr/local/bin/networksentinel`. |
