@@ -1233,6 +1233,8 @@
                                                                 ElementStyle="{StaticResource DataGridTextElementWide}"/>
                                             <DataGridTextColumn Header="Created by" Binding="{Binding OriginText}" Width="150"
                                                                 ElementStyle="{StaticResource DataGridTextElementWide}"/>
+                                            <DataGridTextColumn Header="Profiles" Binding="{Binding ProfileScopeText}" Width="110"
+                                                                ElementStyle="{StaticResource DataGridTextElement}"/>
                                             <DataGridTextColumn Header="Copies" Binding="{Binding CopiesText}" Width="60"
                                                                 ElementStyle="{StaticResource DataGridTextElement}"/>
                                             <!-- Auto, not a pinned width: Edit and Delete are shown together here
@@ -1292,6 +1294,8 @@
                                                                 ElementStyle="{StaticResource DataGridTextElementWide}"/>
                                             <DataGridTextColumn Header="Created by" Binding="{Binding OriginText}" Width="150"
                                                                 ElementStyle="{StaticResource DataGridTextElementWide}"/>
+                                            <DataGridTextColumn Header="Profiles" Binding="{Binding ProfileScopeText}" Width="110"
+                                                                ElementStyle="{StaticResource DataGridTextElement}"/>
                                             <DataGridTextColumn Header="Copies" Binding="{Binding CopiesText}" Width="60"
                                                                 ElementStyle="{StaticResource DataGridTextElement}"/>
                                             <!-- Auto, not a pinned width: Edit and Delete are shown together here

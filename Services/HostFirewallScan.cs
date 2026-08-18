@@ -524,6 +524,17 @@ public sealed class HostFirewallScanner
     /// counts them. Windows does not stop a setup script adding its rule on every
     /// run, so a host really can hold hundreds of identical copies; printing them is
     /// noise, and silently dropping them would understate what is in the firewall.
+    ///
+    /// The profile a rule applies to is deliberately <em>not</em> part of the fold.
+    /// Windows stores its built-in groups once per profile — File and Printer Sharing
+    /// and Cast to Device arrive two and three times over, identical but for Domain
+    /// against Private,Public — and every consumer of this list keys a row by the shape
+    /// it displays, which does not include the profile. So they arrived as separate
+    /// rows that no front-end could tell apart, and a delete aimed at one of them was
+    /// refused as ambiguous. They fold into one row now, carrying the union of the
+    /// profiles they came from, which is also exactly what a delete does to them:
+    /// <see cref="FirewallService.DeleteHostRule"/> filters netsh on the fields the row
+    /// shows and no profile, so it takes every copy anyway.
     /// </summary>
     internal static List<FirewallRuleInfo> Dedupe(IEnumerable<FirewallRuleInfo> rules)
     {
@@ -535,11 +546,12 @@ public sealed class HostFirewallScanner
             var key = string.Join("|",
                 rule.Name, rule.DirectionText, rule.ActionText, rule.ProtocolText,
                 rule.LocalPortsRaw, rule.RemotePortsRaw, rule.RemoteAddresses,
-                rule.Program, rule.Service, rule.Profiles);
+                rule.Program, rule.Service);
 
             if (byKey.TryGetValue(key, out var seen))
             {
                 seen.Copies++;
+                seen.Profiles = MergeProfiles(seen.Profiles, rule.Profiles);
                 continue;
             }
 
@@ -548,6 +560,33 @@ public sealed class HostFirewallScanner
         }
 
         return order.Select(k => byKey[k]).ToList();
+    }
+
+    /// <summary>
+    /// The union of two netsh profile lists, in the order Windows names them. A rule
+    /// folded across all three reads "Domain,Private,Public", which is how netsh spells
+    /// "every profile" — so a row that says nothing less than that is scoped to nothing
+    /// less than the whole machine.
+    /// </summary>
+    internal static string MergeProfiles(string? left, string? right)
+    {
+        var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var list in new[] { left, right })
+            foreach (var part in (list ?? "").Split(',', StringSplitOptions.RemoveEmptyEntries))
+                seen.Add(part.Trim());
+
+        if (seen.Count == 0) return "";
+
+        // Domain, Private, Public first and in that order; anything netsh calls something
+        // else (an "Any" from a hand-written rule) keeps its place after them.
+        var ordered = new List<string>();
+        foreach (var known in new[] { "Domain", "Private", "Public" })
+        {
+            var match = seen.FirstOrDefault(p => p.Equals(known, StringComparison.OrdinalIgnoreCase));
+            if (match != null) { ordered.Add(known); seen.Remove(match); }
+        }
+        ordered.AddRange(seen.OrderBy(p => p, StringComparer.OrdinalIgnoreCase));
+        return string.Join(",", ordered);
     }
 
     // ── Listeners ────────────────────────────────────────────────────────

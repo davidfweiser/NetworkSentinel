@@ -97,9 +97,18 @@ public sealed class WebApp : IDisposable
     /// holds 685 rules called "allow 9009" — so the key is the rule's whole shape,
     /// and an ambiguous match is refused rather than guessed at.
     /// </summary>
+    /// <summary>
+    /// A scanned rule's identity, as both front-ends address it. Everything the fold in
+    /// <see cref="HostFirewallScanner.Dedupe"/> keeps apart has to appear here: two rules
+    /// that survive as separate rows but share a key cannot be told apart by a list, and
+    /// a delete aimed at either is refused as ambiguous. Program and service are in for
+    /// exactly that reason — one rule scoped to svchost and one to System are two rules.
+    /// The profile is not, because the fold no longer separates on it.
+    /// </summary>
     private static string ScannedRuleKey(FirewallRuleInfo r) => string.Join("|",
         r.IsInbound ? "in" : "out", r.ActionText, r.ProtocolText,
-        r.PortRangeText, r.AddressListText, r.LabelText, r.OriginText);
+        r.PortRangeText, r.AddressListText, r.LabelText, r.OriginText,
+        r.Program, r.Service);
 
     private FirewallRuleInfo? FindScannedRule(string key, out string problem)
     {
@@ -1798,6 +1807,9 @@ public sealed class WebApp : IDisposable
                 isCustom = r.IsCustom,
                 isForeign = r.IsForeign,
                 copies = r.Copies,
+                // Empty on a rule that applies to every profile, which is most of them —
+                // see FirewallRuleInfo.ProfileScopeText for why it is not always printed.
+                profileScope = r.ProfileScopeText,
                 inbound = r.IsInbound,
                 action = r.ActionText,
                 direction = r.DirectionText,
@@ -3395,7 +3407,8 @@ public sealed class WebApp : IDisposable
     const rows = (list, addrHeader) => table(
       ['Label', 'Action', 'Protocol', 'Port range', addrHeader, 'Created by', 'Copies', ''],
       list.map(r => `<tr>
-        <td class="mono">${esc(r.label)}</td>
+        <td class="mono">${esc(r.label)}${r.profileScope
+          ? `<div class="muted" style="font-size:.8em">${esc(r.profileScope)} profile only</div>` : ''}</td>
         <td class="${r.action === 'Block' ? 'blocked' : ''}">${esc(r.action)}</td>
         <td>${esc(r.protocol)}</td>
         <td class="mono">${esc(r.ports)}</td>
@@ -4206,8 +4219,9 @@ public sealed class WebApp : IDisposable
                 'administer this host with.';
       }
       if (rule.copies > 1) {
-        warn += `\n\nWindows holds ${rule.copies} identical copies of this rule. Deleting it removes ` +
-                'every one of them.';
+        warn += `\n\nWindows holds ${rule.copies} copies of this rule` +
+                (rule.profileScope ? ` (${rule.profileScope} profile only)` : '') +
+                '. Deleting it removes every one of them.';
       }
       const detail = `${rule.action} · ${rule.direction} · ${rule.protocol} · ${rule.ports} · ${rule.addresses}`;
       if (confirm(`Delete "${rule.label}"?\n\n${detail}${warn}\n\n(Requires Administrator)`)) {
