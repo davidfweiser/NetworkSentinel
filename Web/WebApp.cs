@@ -3289,8 +3289,23 @@ public sealed class WebApp : IDisposable
   let hostScan = null;
 
   async function fetchHostFirewall(rescan) {
-    const res = await fetch('/api/hostfirewall' + (rescan ? '?rescan=1' : ''),
-                            { cache: 'no-store', credentials: 'same-origin' });
+    // Bounded: the scan shells out to netsh twice and the payload is a few hundred
+    // KB, so a phone on a slow link can sit on this for a while — but not forever.
+    // Without a deadline a stalled request left the tab blank with nothing to read.
+    const stop = new AbortController();
+    const timer = setTimeout(() => stop.abort(), 60000);
+    let res;
+    try {
+      res = await fetch('/api/hostfirewall' + (rescan ? '?rescan=1' : ''),
+                        { cache: 'no-store', credentials: 'same-origin', signal: stop.signal });
+    }
+    catch (e) {
+      throw new Error(stop.signal.aborted
+        ? 'the server did not answer within 60s'
+        : (e.message || String(e)));
+    }
+    finally { clearTimeout(timer); }
+
     if (res.status === 401) {
       stopAllTimers();
       showAuth('login', 'Session expired. Sign in again.');
@@ -3301,11 +3316,33 @@ public sealed class WebApp : IDisposable
     return true;
   }
 
+  // The tab's own state, shown in the page rather than only in the status bar:
+  // this is the one tab whose contents arrive on a second request, so "still
+  // loading" and "that request failed" are states it can genuinely be in — and a
+  // silently empty page reads as "this host has no firewall rules".
+  function showFwConfigNotice(message, isError) {
+    $('fwCfgSummary').textContent = message;
+    $('fwCfgListeners').textContent = '';
+    $('fwCfgPolicy').textContent = '';
+    $('inboundCount').textContent = '';
+    $('outboundCount').textContent = '';
+    $('listenerCount').textContent = '';
+    $('listenHint').textContent = '';
+    const cell = `<div class="empty${isError ? ' blocked' : ''}">${esc(message)}</div>`;
+    $('tbl-fwconfig-in').innerHTML = cell;
+    $('tbl-fwconfig-out').innerHTML = cell;
+    $('tbl-fwconfig-listeners').innerHTML = cell;
+  }
+
   async function loadHostFirewall(rescan) {
+    if (!hostScan || rescan)
+      showFwConfigNotice('Reading the host firewall — netsh takes a moment on a machine with a few thousand rules…', false);
     try {
       if (await fetchHostFirewall(rescan)) renderFirewallConfig();
     } catch (e) {
-      setStatus('Could not read the host firewall: ' + (e.message || e), true);
+      const why = 'Could not read the host firewall: ' + (e.message || e);
+      showFwConfigNotice(why + ' — use “Rescan the host firewall” to try again.', true);
+      setStatus(why, true);
     }
   }
 
