@@ -1235,7 +1235,13 @@
                                                                 ElementStyle="{StaticResource DataGridTextElementWide}"/>
                                             <DataGridTextColumn Header="Copies" Binding="{Binding CopiesText}" Width="60"
                                                                 ElementStyle="{StaticResource DataGridTextElement}"/>
-                                            <DataGridTemplateColumn Header="" Width="150">
+                                            <!-- Auto, not a pinned width: Edit and Delete are shown together here
+                                                 (unlike the Block/Unblock pairs elsewhere, which swap), and two
+                                                 MinWidth=72 buttons plus their 4px gap need 148px inside a cell
+                                                 whose 8px padding each side leaves 134 of a 150px column — so
+                                                 Delete was clipped by 14px. Sizing to the content cannot drift
+                                                 out again when a label or a button style changes. -->
+                                            <DataGridTemplateColumn Header="" Width="Auto" MinWidth="164">
                                                 <DataGridTemplateColumn.CellTemplate>
                                                     <DataTemplate>
                                                         <StackPanel Orientation="Horizontal">
@@ -1288,7 +1294,13 @@
                                                                 ElementStyle="{StaticResource DataGridTextElementWide}"/>
                                             <DataGridTextColumn Header="Copies" Binding="{Binding CopiesText}" Width="60"
                                                                 ElementStyle="{StaticResource DataGridTextElement}"/>
-                                            <DataGridTemplateColumn Header="" Width="150">
+                                            <!-- Auto, not a pinned width: Edit and Delete are shown together here
+                                                 (unlike the Block/Unblock pairs elsewhere, which swap), and two
+                                                 MinWidth=72 buttons plus their 4px gap need 148px inside a cell
+                                                 whose 8px padding each side leaves 134 of a 150px column — so
+                                                 Delete was clipped by 14px. Sizing to the content cannot drift
+                                                 out again when a label or a button style changes. -->
+                                            <DataGridTemplateColumn Header="" Width="Auto" MinWidth="164">
                                                 <DataGridTemplateColumn.CellTemplate>
                                                     <DataTemplate>
                                                         <StackPanel Orientation="Horizontal">
