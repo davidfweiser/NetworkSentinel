@@ -176,24 +176,52 @@ public static class AppPaths
     ///
     /// Last writer still wins, exactly as before — this only stops a losing racer from
     /// failing outright.
+    ///
+    /// The schedule matters as much as the retry. The first version slept a flat 15 ms
+    /// for a fixed 12 attempts, which fails twice over under real contention: it gives
+    /// up after ~165 ms, and every loser of a race wakes at the same instant and
+    /// collides again in lockstep, so the herd never thins and the writers that keep
+    /// losing exhaust their attempts. A burst of two dozen writers reproduced that
+    /// reliably — <c>Access to the path is denied</c>, straight into a caller that
+    /// swallows it. Randomised backoff to a deadline fixes both halves.
     /// </summary>
     private static void ReplaceWithRetry(string tmp, string path)
     {
-        const int attempts = 12;
-        for (var attempt = 1; ; attempt++)
+        // A deadline, not an attempt count: what has to be bounded is how long a caller
+        // can be held up, and an attempt count ties that to the backoff schedule, so
+        // widening the backoff would silently shorten the budget.
+        var deadline = Environment.TickCount64 + ReplaceTimeoutMs;
+        var backoffMs = 1;
+
+        while (true)
         {
             try
             {
                 File.Move(tmp, path, overwrite: true);
                 return;
             }
-            catch (Exception ex) when (attempt < attempts &&
-                                       (ex is IOException || ex is UnauthorizedAccessException))
+            catch (Exception ex) when ((ex is IOException || ex is UnauthorizedAccessException) &&
+                                       Environment.TickCount64 < deadline)
             {
-                Thread.Sleep(15);
+                // Sleep somewhere in [1, backoff] rather than for the full backoff:
+                // spreading the wake-ups is the point, and a flat sleep would keep the
+                // same set of writers colliding on every round.
+                Thread.Sleep(Random.Shared.Next(1, backoffMs + 1));
+                backoffMs = Math.Min(backoffMs * 2, MaxBackoffMs);
             }
         }
     }
+
+    /// <summary>
+    /// How long a publish may spend losing races before it gives up and throws. Long
+    /// enough that contention between this app's own writers always resolves, short
+    /// enough that a file some other process is holding open for good cannot wedge a
+    /// background loop.
+    /// </summary>
+    private const int ReplaceTimeoutMs = 2000;
+
+    /// <summary>Ceiling on the backoff, so a long wait stays responsive to a freed file.</summary>
+    private const int MaxBackoffMs = 40;
 
     private static int _tmpSequence;
 

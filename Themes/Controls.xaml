@@ -333,6 +333,14 @@
         </Setter>
     </Style>
 
+    <!-- Submenu entry: indented under its parent nav item and a shade quieter,
+         so the sidebar reads as a hierarchy rather than a longer flat list. -->
+    <Style x:Key="SubNavButton" TargetType="RadioButton" BasedOn="{StaticResource NavButton}">
+        <Setter Property="Padding" Value="30,9"/>
+        <Setter Property="FontSize" Value="12.5"/>
+        <Setter Property="FontWeight" Value="Normal"/>
+    </Style>
+
     <Style x:Key="Card" TargetType="Border">
         <Setter Property="Background" Value="{StaticResource BgCardBrush}"/>
         <Setter Property="BorderBrush" Value="{StaticResource StrokeSoftBrush}"/>

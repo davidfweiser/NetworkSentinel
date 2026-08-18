@@ -214,12 +214,13 @@ public sealed class PreventionService
 
     /// <summary>
     /// Extra never-auto-block guard on top of the allowlist and the operator shield.
-    /// The frontends wire this to the monitor's WireGuard peer-endpoint check: a peer's
-    /// endpoint is the public address its encrypted tunnel packets come from, so a
-    /// detector that flags it (a "new peer" alert, a per-peer transfer alert, Suricata
-    /// on the tunnel port) would otherwise cut that client's VPN dead. Like the operator
-    /// shield, this only stops the machine deciding on its own — manual blocking is
-    /// deliberately unaffected.
+    /// The frontends wire this to the monitor's VPN tunnel-endpoint check, covering
+    /// WireGuard peers and IPSec peers alike: an endpoint is the public address a tunnel's
+    /// encrypted packets come from, so a detector that flags it (a "new peer" alert, a
+    /// per-peer transfer alert, Suricata on the tunnel port, a heuristic tripped by a
+    /// site-to-site peer's long-lived flows) would otherwise cut that VPN dead. Like the
+    /// operator shield, this only stops the machine deciding on its own — manual blocking
+    /// is deliberately unaffected.
     /// </summary>
     public Func<string, bool>? IsProtectedAddress { get; set; }
 
@@ -535,7 +536,7 @@ public sealed class PreventionService
                     Ip = normalized,
                     Action = PreventionAction.Skipped,
                     Message = $"Not blocking {normalized} ({threat.LevelText}: {threat.Title}) — " +
-                              "it is a WireGuard tunnel endpoint; blocking it would cut that VPN. Block it manually if you mean to.",
+                              "it is a VPN tunnel endpoint; blocking it would cut that tunnel. Block it manually if you mean to.",
                     Threat = threat
                 };
             }

@@ -50,6 +50,13 @@ public sealed class WebApp : IDisposable
     /// <summary>The one enforcement engine, shared with the GUI and TUI.</summary>
     private readonly PreventionService _prevention;
 
+    /// <summary>
+    /// Adapter byte counters behind the dashboard's data-flow card. Started by
+    /// <see cref="SentinelCore"/>, so a headless server has been recording the
+    /// daily history since the meter landed — this console just had no chart for it.
+    /// </summary>
+    private readonly TrafficMeterService _traffic;
+
     /// <summary>Stand-in shown in the settings page where a DuckDNS token is stored but must not be sent.</summary>
     private const string TokenPlaceholder = "••••••••";
 
@@ -81,6 +88,7 @@ public sealed class WebApp : IDisposable
         _firewall = _core.Firewall;
         _allowlist = _core.Allowlist;
         _prevention = _core.Prevention;
+        _traffic = _core.Traffic;
         // TLS flags touch only Web* settings, which nothing in the core graph reads,
         // so applying them after construction is safe.
         ApplyTlsOverrides(tlsOverrides);
@@ -363,7 +371,7 @@ public sealed class WebApp : IDisposable
 
         if (req.Method == "GET" && (path is "/" or "/index.html"))
         {
-            WriteHtml(res, IndexHtml);
+            WriteHtml(res, PageHtml());
             return;
         }
 
@@ -931,6 +939,14 @@ public sealed class WebApp : IDisposable
                             _settings.AllowlistUseRemoteFeed = on;
                             label = $"Allowlist remote feed: {(on ? "on" : "off")}";
                             break;
+                        case "trafficMeterEnabled":
+                            _settings.TrafficMeterEnabled = on;
+                            // Takes effect now rather than at the next restart: the
+                            // counters are cumulative, so a meter that stops and starts
+                            // still reports the traffic in between as one catch-up delta.
+                            if (on) _traffic.Start(); else _traffic.Stop();
+                            label = $"Traffic metering: {(on ? "on" : "off")}";
+                            break;
                         case "criticalAlertsEnabled":
                             _settings.CriticalAlertsEnabled = on;
                             label = $"Critical threat alerts: {(on ? "on" : "off")}";
@@ -1320,6 +1336,49 @@ public sealed class WebApp : IDisposable
                     return r.Success ? ActionResultDto.Success(r.Message) : ActionResultDto.Fail(r.Message);
                 }
 
+                case "save_config_rule":
+                {
+                    // Validate before normalising — see FirewallRuleSpecs.TryPrepare.
+                    // A port range the parser rejects would otherwise be dropped, and
+                    // an empty port field means every port, so a typo would arrive
+                    // here as a catch-all block.
+                    var typed = new FirewallRuleSpec
+                    {
+                        Label = req.Label ?? "",
+                        Action = req.RuleAction ?? FirewallRuleSpecs.ActionBlock,
+                        Direction = req.Direction ?? FirewallRuleSpecs.DirectionInbound,
+                        Protocol = req.Protocol ?? "TCP",
+                        PortRange = req.Ports ?? "",
+                        Addresses = req.Addresses ?? ""
+                    };
+
+                    if (!FirewallRuleSpecs.TryPrepare(typed, out var spec, out var invalid))
+                        return ActionResultDto.Fail(invalid);
+
+                    // The GUI asks the operator to confirm a rule that takes the
+                    // machine off the network. Over the web there is no one to ask —
+                    // the request that applies the rule is carried by the very
+                    // connection the rule would cut, so the answer would never arrive.
+                    // Refusing outright matches how block_port already treats this port.
+                    var guard = ConsoleSelfBlockReason(spec);
+                    if (guard != null)
+                        return ActionResultDto.Fail(guard);
+
+                    if (!_firewall.IsAdministrator)
+                        return ActionResultDto.Fail(
+                            "Cannot write rules — the web service must run as Administrator (or as SYSTEM, which the installed service does).");
+
+                    var replace = string.IsNullOrWhiteSpace(req.Replace)
+                        ? null
+                        : System.Net.WebUtility.HtmlDecode(req.Replace.Trim());
+
+                    var saved = _firewall.SaveCustomRule(spec, replace);
+                    _statusMessage = saved.Message;
+                    return saved.Success
+                        ? ActionResultDto.Success(saved.Message)
+                        : ActionResultDto.Fail(saved.Message);
+                }
+
                 case "remove_rule":
                 {
                     // Decode HTML entities if the browser sent an attribute-escaped name.
@@ -1404,6 +1463,8 @@ public sealed class WebApp : IDisposable
                 probeLogEnabled = _settings.ProbeLogEnabled,
                 probeLogStatus = _monitor.ProbeLogStatus,
                 allowlistUseRemoteFeed = _settings.AllowlistUseRemoteFeed,
+                trafficMeterEnabled = _settings.TrafficMeterEnabled,
+                trafficStatus = _traffic.Status,
                 criticalAlertsEnabled = _settings.CriticalAlertsEnabled,
                 threatIntelEnabled = _settings.ThreatIntelEnabled,
                 threatIntelStatus = _monitor.ThreatIntelStatus,
@@ -1550,6 +1611,84 @@ public sealed class WebApp : IDisposable
                 connections = a.ConnectionCount,
                 threats = a.ThreatCount,
                 hosts = a.RemoteHostCount
+            }),
+            traffic = TrafficSnapshot(),
+            // App-minted blocks first, then the operator's config rules. The Firewall
+            // Config tab shows both so it is clear which rules the page owns — and
+            // Windows Firewall evaluates every block ahead of every allow regardless
+            // of this order, which is what makes the listing safe to read as-is.
+            configRules = _firewall.GetConfigRules().Select(r => new
+            {
+                name = r.Name,
+                label = r.LabelText,
+                isProtected = IsOwnWebRule(r.Name),
+                isCustom = r.IsCustom,
+                inbound = r.IsInbound,
+                action = r.ActionText,
+                direction = r.DirectionText,
+                protocol = r.ProtocolText,
+                ports = r.PortRangeText,
+                addresses = r.AddressListText,
+                origin = r.OriginText,
+                expiry = r.ExpiryText
+            })
+        };
+    }
+
+    /// <summary>
+    /// Everything the data-flow card draws: the live rate series, the legends and
+    /// the month/12-month bars. Sent whole rather than as a delta — the series is
+    /// capped at 120 samples, so it costs less than the connection table.
+    /// </summary>
+    private object TrafficSnapshot()
+    {
+        var live = _traffic.Live;
+        var month = _traffic.MonthTotal(DateTime.Today);
+        var last = live.Count > 0 ? live[^1] : null;
+
+        var window = "measuring…";
+        if (live.Count >= 2)
+        {
+            var span = live[^1].Time - live[0].Time;
+            window = span.TotalMinutes >= 1
+                ? $"last {Math.Round(span.TotalMinutes)} min"
+                : $"last {Math.Max(1, (int)span.TotalSeconds)} s";
+        }
+        else if (!_settings.TrafficMeterEnabled)
+        {
+            window = "meter off";
+        }
+
+        return new
+        {
+            enabled = _settings.TrafficMeterEnabled,
+            status = _traffic.Status,
+            window,
+            inRate = last != null ? ByteSize.FormatRate(last.BytesInPerSecond) : "—",
+            outRate = last != null ? ByteSize.FormatRate(last.BytesOutPerSecond) : "—",
+            monthLabel = month.Label,
+            monthIn = month.InText,
+            monthOut = month.OutText,
+            monthTotal = month.TotalText,
+            monthDailyAverage = DateTime.Today.Day > 0
+                ? $"{ByteSize.Format(month.BytesTotal / (double)DateTime.Today.Day)} per day so far"
+                : "",
+            live = live.Select(s => new { inBps = s.BytesInPerSecond, outBps = s.BytesOutPerSecond }),
+            days = _traffic.DailyBuckets(DateTime.Today).Select(b => new
+            {
+                label = b.Label,
+                bytesIn = b.BytesIn,
+                bytesOut = b.BytesOut,
+                inText = b.InText,
+                outText = b.OutText
+            }),
+            months = _traffic.MonthlyBuckets(12).Select(b => new
+            {
+                label = b.Label,
+                bytesIn = b.BytesIn,
+                bytesOut = b.BytesOut,
+                inText = b.InText,
+                outText = b.OutText
             })
         };
     }
@@ -1558,13 +1697,24 @@ public sealed class WebApp : IDisposable
     /// WireGuard monitor state for the settings panel, plus the tunnel-endpoint shield —
     /// which runs whether or not peer monitoring is on, and is what a VPN operator needs
     /// to see before arming auto-block.
+    ///
+    /// The IPSec half of the shield has no toggle of its own to hang a row on, so it is
+    /// reported here — but only once it has something to say. A host with no IPSec would
+    /// otherwise carry a permanent line about a protocol it does not run.
     /// </summary>
     private string WireGuardStatusText()
     {
         var monitor = _settings.WireGuardMonitorEnabled
             ? _monitor.WireGuardStatus
             : "Off — WireGuard peers are invisible to the connection heuristics until this is on.";
-        return $"{monitor} · {_monitor.WireGuardProtectionStatus}";
+        var text = $"{monitor} · {_monitor.WireGuardProtectionStatus}";
+
+        var ipsec = _monitor.IpsecProtectionStatus;
+        if (_monitor.IpsecProtectedEndpoints.Count > 0 ||
+            ipsec.Contains("cannot be read", StringComparison.Ordinal))
+            text += $" · {ipsec}";
+
+        return text;
     }
 
     /// <summary>
@@ -1591,6 +1741,61 @@ public sealed class WebApp : IDisposable
     /// </summary>
     private bool IsOwnWebRule(string name)
         => string.Equals(name, $"{FirewallService.RulePrefix}-Web-{_port}", StringComparison.OrdinalIgnoreCase);
+
+    /// <summary>
+    /// Why a Firewall Config rule cannot be written from this console, or null when
+    /// it is safe. An inbound Block that covers the console's own port takes the page
+    /// down mid-request, which is indistinguishable from a crash — and unlike the GUI
+    /// there is no dialog that could warn first, because the warning would travel over
+    /// the connection being cut.
+    ///
+    /// Only rules that match <i>every</i> source are refused. A rule scoped to named
+    /// addresses is allowed through: the Firewall tab's Block IP button already blocks
+    /// a chosen address on every port, so refusing the same thing here would be an
+    /// inconsistency rather than a safeguard — and an operator who blocks the address
+    /// they are browsing from has done something they explicitly asked for.
+    /// </summary>
+    private string? ConsoleSelfBlockReason(FirewallRuleSpec spec)
+        => ConsoleSelfBlockReason(spec, _port, _httpsActive ? _httpsPort : null);
+
+    /// <summary>
+    /// The decision itself, with the console's ports passed in rather than read off
+    /// a live host, so the suite can exercise every branch. See the overload above
+    /// for why the rule is what it is.
+    /// </summary>
+    internal static string? ConsoleSelfBlockReason(FirewallRuleSpec spec, int httpPort, int? httpsPort)
+    {
+        if (!spec.Action.Equals(FirewallRuleSpecs.ActionBlock, StringComparison.OrdinalIgnoreCase))
+            return null;
+        if (!spec.Direction.Equals(FirewallRuleSpecs.DirectionInbound, StringComparison.OrdinalIgnoreCase))
+            return null;
+
+        // Scoped to specific sources — not a blanket self-block. See above.
+        if (FirewallRuleSpecs.TryParseAddresses(spec.Addresses, out var addresses, out _) && addresses.Count > 0)
+            return null;
+
+        if (FirewallRuleSpecs.IsCatchAll(spec))
+        {
+            return "That rule blocks every inbound connection on every port, which includes this console — " +
+                   "the page would go down as the rule loaded and look like a crash. Write it from the " +
+                   "desktop app or the TUI on the server itself.";
+        }
+
+        var ports = new List<int> { httpPort };
+        if (httpsPort.HasValue) ports.Add(httpsPort.Value);
+
+        foreach (var port in ports)
+        {
+            if (FirewallRuleSpecs.CoversPort(spec, port))
+            {
+                return $"That rule blocks inbound port {port}, which serves this web console — " +
+                       "applying it would cut off this page mid-request. Choose another port, or write " +
+                       "the rule from the desktop app or the TUI on the server itself.";
+            }
+        }
+
+        return null;
+    }
 
     private FirewallDirection ResolveDirection() => _prevention.ResolveDirection();
 
@@ -1658,6 +1863,14 @@ public sealed class WebApp : IDisposable
         }
     }
 
+    /// <summary>
+    /// The console page with this build's version stamped into it, so the script
+    /// can tell that the server it is talking to has since been upgraded. Rebuilt
+    /// per request rather than cached: a page load is rare next to the state poll,
+    /// and one string replace is cheaper than reasoning about when to invalidate.
+    /// </summary>
+    private string PageHtml() => IndexHtml.Replace("__NS_VERSION__", _appVersion);
+
     private static void WriteHtml(HttpResponse res, string html)
     {
         var bytes = Encoding.UTF8.GetBytes(html);
@@ -1701,6 +1914,18 @@ public sealed class WebApp : IDisposable
         public string? Name { get; set; }
         public string? Kind { get; set; }
         public string? Direction { get; set; }
+
+        // Firewall Config rule fields. Separate from Kind/Value because a rule
+        // carries six of them at once and reusing the generic slots would make
+        // the handler unreadable.
+        public string? Label { get; set; }
+        public string? RuleAction { get; set; }
+        public string? Protocol { get; set; }
+        public string? Ports { get; set; }
+        public string? Addresses { get; set; }
+
+        /// <summary>Name of the rule being replaced, when the form is editing rather than adding.</summary>
+        public string? Replace { get; set; }
     }
 
     private sealed class AuthBody
@@ -1795,6 +2020,13 @@ public sealed class WebApp : IDisposable
     border: none;
   }
   .actions button.danger { border-color: rgba(255,93,120,.4); color: #ffa8b6; }
+  /* Same emphasis inside a toolbar — the Firewall Config editor's save button is
+     the one press that writes a firewall rule, so it should not look like Cancel. */
+  .toolbar button.primary {
+    color: var(--bg-deep); font-weight: 600;
+    background: linear-gradient(135deg, var(--cyan), var(--blue));
+    border: none;
+  }
   /* Wake reads as the one thing worth pressing while the console is asleep. */
   .actions button.wake {
     color: var(--bg-deep); font-weight: 600;
@@ -1808,6 +2040,13 @@ public sealed class WebApp : IDisposable
     color: #f6d089; font-size: .88rem;
   }
   .sleep-banner strong { color: var(--amber); letter-spacing: .04em; text-transform: uppercase; font-size: .78rem; }
+  /* An upgrade is news, not a warning — same shape as the sleep banner, cyan
+     rather than amber, so it does not read as something being wrong. */
+  .sleep-banner.upgrade {
+    background: rgba(59,200,180,.08); border-color: rgba(59,200,180,.45); color: #a9e7dd;
+  }
+  .sleep-banner.upgrade strong { color: var(--cyan); }
+  .sleep-banner.upgrade button { background: linear-gradient(135deg, var(--cyan), var(--blue)); }
   .sleep-banner .spacer { flex: 1; }
   .sleep-banner button {
     appearance: none; border: none; border-radius: 8px; padding: 7px 14px; cursor: pointer;
@@ -2106,6 +2345,7 @@ public sealed class WebApp : IDisposable
     <button data-tab="threats">Threats</button>
     <button data-tab="ports">Ports</button>
     <button data-tab="firewall">Firewall</button>
+    <button data-tab="fwconfig">Firewall Config</button>
     <button data-tab="allowlist">Allowlist</button>
     <button data-tab="settings">Settings</button>
     <button data-tab="help">Help</button>
@@ -2127,6 +2367,15 @@ public sealed class WebApp : IDisposable
     <span class="spacer"></span>
     <button type="button" id="btnWakeBanner">Wake up</button>
   </div>
+  <!-- Shown when the server has been upgraded under an open tab. The page only
+       ever re-fetches /api/state, never its own HTML, so no cache header can get
+       the new markup in here — only a reload can. -->
+  <div class="sleep-banner upgrade hidden" id="upgradeBanner">
+    <strong>Updated</strong>
+    <span id="upgradeText">The server is running a newer version than this page.</span>
+    <span class="spacer"></span>
+    <button type="button" id="btnReloadPage">Reload</button>
+  </div>
 
   <section id="tab-dashboard">
     <div class="cards" id="cards"></div>
@@ -2137,6 +2386,19 @@ public sealed class WebApp : IDisposable
     </div>
     <h3 style="margin:18px 0 8px;font-size:.95rem;color:var(--text2)">Activity — last 5 minutes</h3>
     <div class="chart-card" id="dash-chart"></div>
+    <h3 style="margin:18px 0 8px;font-size:.95rem;color:var(--text2)">
+      Data flow <span class="muted" id="traffic-window" style="font-weight:400"></span>
+    </h3>
+    <div class="chart-card" id="dash-traffic"></div>
+    <div class="toolbar" style="margin-top:10px">
+      <span class="muted" style="font-size:.85rem">Totals by</span>
+      <select id="trafficRange">
+        <option value="days">This month, by day</option>
+        <option value="months">Last 12 months</option>
+      </select>
+      <span class="muted" id="traffic-summary" style="font-size:.85rem"></span>
+    </div>
+    <div class="chart-card" id="dash-traffic-bars"></div>
     <h3 style="margin:18px 0 8px;font-size:.95rem;color:var(--text2)">Recent threats</h3>
     <div id="dash-threats"></div>
   </section>
@@ -2181,6 +2443,47 @@ public sealed class WebApp : IDisposable
     </div>
     <p class="muted" id="fwHint" style="margin:0 0 10px;font-size:.85rem">Each row is one block — Remove deletes its inbound and outbound rules together and keeps auto-block from re-adding it for 24h. Live refresh is off on this tab; click Refresh list to update. Requires Administrator.</p>
     <div id="tbl-firewall"></div>
+  </section>
+
+  <section id="tab-fwconfig" class="hidden">
+    <div class="toolbar">
+      <button id="btnAddInbound">Add an Inbound Rule</button>
+      <button id="btnAddOutbound">Add an Outbound Rule</button>
+      <button id="btnRefreshFwCfg">Refresh list</button>
+    </div>
+    <p class="muted" id="fwCfgPolicy" style="margin:0 0 10px;font-size:.85rem"></p>
+    <p class="muted" id="fwCfgSummary" style="margin:0 0 10px;font-size:.85rem"></p>
+
+    <div id="ruleEditor" class="settings-group hidden" style="margin-bottom:14px">
+      <h3 id="ruleEditorTitle" style="margin:0 0 4px;font-size:.95rem">Add an Inbound Rule</h3>
+      <p class="muted" id="ruleEditorNote" style="margin:0 0 10px;font-size:.85rem"></p>
+      <div class="toolbar" style="flex-wrap:wrap">
+        <select id="rulePreset" title="Fill protocol and port from a well-known service">
+          <option value="">Custom</option>
+        </select>
+        <select id="ruleAction"><option>Block</option><option>Allow</option></select>
+        <select id="ruleDirection"><option>Inbound</option><option>Outbound</option></select>
+        <select id="ruleProtocol">
+          <option>TCP</option><option>UDP</option><option>ICMP</option><option>Any</option>
+        </select>
+      </div>
+      <div class="toolbar" style="flex-wrap:wrap">
+        <input id="ruleLabel" placeholder="Label (optional — named from the port if left empty)" style="min-width:260px" />
+        <input id="rulePorts" class="mono" placeholder="3389   or  8000-8001   or  80, 443" style="min-width:200px" />
+        <input id="ruleAddresses" class="mono" placeholder="All IPv4, All IPv6   or  10.0.0.0/8" style="min-width:220px" />
+      </div>
+      <p class="muted" id="ruleAddrHint" style="margin:0 0 8px;font-size:.8rem">Sources — leave empty for every address.</p>
+      <p id="ruleEditorError" class="muted" style="margin:0 0 8px;font-size:.85rem;color:var(--danger)"></p>
+      <div class="toolbar">
+        <button id="btnSaveRule" class="primary">Add Rule</button>
+        <button id="btnCancelRule">Cancel</button>
+      </div>
+    </div>
+
+    <h3 style="margin:14px 0 8px;font-size:.95rem;color:var(--text2)">Inbound rules <span class="muted" id="inboundCount"></span></h3>
+    <div id="tbl-fwconfig-in"></div>
+    <h3 style="margin:18px 0 8px;font-size:.95rem;color:var(--text2)">Outbound rules <span class="muted" id="outboundCount"></span></h3>
+    <div id="tbl-fwconfig-out"></div>
   </section>
 
   <section id="tab-allowlist" class="hidden">
@@ -2237,6 +2540,11 @@ public sealed class WebApp : IDisposable
 
 <script>
 (() => {
+  // Stamped into the page when it is served, so it records the build this markup
+  // came from. state.version is whatever the server is running now; the two
+  // diverge exactly when the service has been upgraded under an open tab.
+  const BUILD_VERSION = '__NS_VERSION__';
+
   let state = null;
   let tab = 'dashboard';
   let lastError = '';
@@ -2346,7 +2654,9 @@ public sealed class WebApp : IDisposable
   // Allowlist / Firewall / Settings tabs freeze live redraw so you can scroll and act
   // on rows. Dashboard/connections/etc. keep the periodic poll.
   function isFrozenTab() {
-    return tab === 'allowlist' || tab === 'firewall' || tab === 'settings';
+    // Firewall Config joins them: a redraw mid-edit would wipe the form, and the
+    // rule tables are something you read and act on rather than watch.
+    return tab === 'allowlist' || tab === 'firewall' || tab === 'settings' || tab === 'fwconfig';
   }
 
   function getRefreshMs() {
@@ -2523,6 +2833,224 @@ public sealed class WebApp : IDisposable
       </div>`;
   }
 
+  // ── Upgrade detection ─────────────────────────────────────────────────────
+  // A tab left open across an upgrade keeps its old markup: the page polls
+  // /api/state but never re-requests its own HTML, so no cache header can
+  // deliver the new UI. The features simply appear to be missing, which is
+  // exactly how it looked the first time. Offer the reload instead.
+  //
+  // Never reload automatically — an operator may be mid-rule in the Firewall
+  // Config form, and throwing that away to pick up a cosmetic change would be a
+  // worse bug than the one this fixes.
+
+  function checkForUpgrade() {
+    const running = state && state.version;
+    // The placeholder survives only if the page was served by a build that does
+    // not stamp it; treat that as "cannot tell" rather than "upgraded".
+    if (!running || BUILD_VERSION.startsWith('__')) return;
+    if (running === BUILD_VERSION) return;
+
+    $('upgradeText').textContent =
+      `This page was loaded from v${BUILD_VERSION}; the server is now running v${running}. ` +
+      'Reload to pick up the new console.';
+    $('upgradeBanner').classList.remove('hidden');
+  }
+
+  // ── Data flow ─────────────────────────────────────────────────────────────
+  // Both directions share one zero-based scale. Two independent scales would draw
+  // a trickle of uploads at the same height as a saturated download, which is the
+  // one thing this card exists to tell apart.
+
+  function trafficChartHtml(tr) {
+    const live = (tr && tr.live) || [];
+    if (!tr || !tr.enabled)
+      return '<div class="chart-meta" style="padding:26px 4px">Traffic metering is off — turn it on in Settings.</div>';
+    if (live.length < 2)
+      return '<div class="chart-meta" style="padding:26px 4px">Measuring… the chart appears after a few samples (5s each).</div>';
+
+    const W = 1000, H = 170, padT = 12, padB = 6;
+    const ih = H - padT - padB;
+    const peak = Math.max(1, ...live.map(s => Math.max(s.inBps, s.outBps)));
+    const x = i => (W * i / (live.length - 1));
+    const y = v => padT + ih * (1 - v / peak);
+    const line = key => live.map((s, i) => `${x(i).toFixed(1)},${y(s[key]).toFixed(1)}`).join(' ');
+    const inPts = line('inBps'), outPts = line('outBps');
+    const grid = [0.25, 0.5, 0.75].map(f =>
+      `<line x1="0" y1="${(padT + ih * f).toFixed(1)}" x2="${W}" y2="${(padT + ih * f).toFixed(1)}" stroke="rgba(255,255,255,.07)" stroke-width="1"/>`).join('');
+
+    return `
+      <svg viewBox="0 0 ${W} ${H}" preserveAspectRatio="none" role="img" aria-label="Data in and out">
+        ${grid}
+        <polygon points="0,${H - padB} ${inPts} ${W},${H - padB}" fill="rgba(74,158,255,.13)"/>
+        <polyline points="${inPts}" fill="none" stroke="#4a9eff" stroke-width="2"
+          vector-effect="non-scaling-stroke" stroke-linejoin="round" stroke-linecap="round"/>
+        <polyline points="${outPts}" fill="none" stroke="#3bc8b4" stroke-width="2"
+          vector-effect="non-scaling-stroke" stroke-linejoin="round" stroke-linecap="round"/>
+      </svg>
+      <div class="chart-meta">
+        <span><span style="color:#4a9eff">●</span> in ${esc(tr.inRate)}
+          &nbsp; <span style="color:#3bc8b4">●</span> out ${esc(tr.outRate)}</span>
+        <span>${esc(tr.monthLabel)}: ${esc(tr.monthIn)} in / ${esc(tr.monthOut)} out
+          · ${esc(tr.monthTotal)} total · ${esc(tr.monthDailyAverage || '')}</span>
+        <span class="muted">${esc(tr.status || '')}</span>
+      </div>`;
+  }
+
+  // Bars, not a line: these are totals over discrete periods, and a line between
+  // two days implies a value at 12:00 that nothing measured.
+  function trafficBarsHtml(buckets) {
+    if (!buckets || !buckets.length)
+      return '<div class="chart-meta" style="padding:26px 4px">No history yet.</div>';
+
+    const W = 1000, H = 170, padT = 10, padB = 20;
+    const ih = H - padT - padB;
+    const peak = Math.max(1, ...buckets.map(b => Math.max(b.bytesIn, b.bytesOut)));
+    const slot = W / buckets.length;
+    const bw = Math.max(1.5, Math.min(14, slot / 2.6));
+
+    const bars = buckets.map((b, i) => {
+      const cx = slot * (i + 0.5);
+      const hIn = ih * (b.bytesIn / peak), hOut = ih * (b.bytesOut / peak);
+      const title = `${b.label}: ${b.inText} in / ${b.outText} out`;
+      return `<g><title>${esc(title)}</title>` +
+        `<rect x="${(cx - bw - 1).toFixed(1)}" y="${(padT + ih - hIn).toFixed(1)}" width="${bw.toFixed(1)}" height="${hIn.toFixed(1)}" fill="#4a9eff" rx="1"/>` +
+        `<rect x="${(cx + 1).toFixed(1)}" y="${(padT + ih - hOut).toFixed(1)}" width="${bw.toFixed(1)}" height="${hOut.toFixed(1)}" fill="#3bc8b4" rx="1"/>` +
+        `</g>`;
+    }).join('');
+
+    // Label every bar when they fit, otherwise roughly every fifth.
+    const step = buckets.length > 16 ? Math.ceil(buckets.length / 12) : 1;
+    const labels = buckets.map((b, i) => (i % step === 0)
+      ? `<text x="${(slot * (i + 0.5)).toFixed(1)}" y="${H - 6}" fill="rgba(255,255,255,.45)" font-size="11" text-anchor="middle">${esc(b.label)}</text>`
+      : '').join('');
+
+    return `
+      <svg viewBox="0 0 ${W} ${H}" preserveAspectRatio="none" role="img" aria-label="Data in and out per period">
+        ${bars}${labels}
+      </svg>
+      <div class="chart-meta">
+        <span><span style="color:#4a9eff">▮</span> data in &nbsp; <span style="color:#3bc8b4">▮</span> data out</span>
+      </div>`;
+  }
+
+  function renderTraffic() {
+    const tr = state.traffic || {};
+    $('dash-traffic').innerHTML = trafficChartHtml(tr);
+    $('traffic-window').textContent = tr.window ? '— ' + tr.window : '';
+
+    const useMonths = $('trafficRange').value === 'months';
+    const buckets = (useMonths ? tr.months : tr.days) || [];
+    $('dash-traffic-bars').innerHTML = trafficBarsHtml(buckets);
+
+    let totalIn = 0, totalOut = 0;
+    for (const b of buckets) { totalIn += b.bytesIn; totalOut += b.bytesOut; }
+    const scope = useMonths ? '12 months' : (tr.monthLabel || 'this month');
+    $('traffic-summary').textContent = buckets.length
+      ? `${scope} · ${fmtBytes(totalIn)} in · ${fmtBytes(totalOut)} out` : '';
+  }
+
+  // Decimal (SI) units, matching Models/ByteSize on the server — the convention
+  // link speeds and data caps use, so 1 GB is 1,000,000,000 bytes.
+  function fmtBytes(n) {
+    if (!n || n <= 0) return '0 B';
+    const units = ['B', 'kB', 'MB', 'GB', 'TB', 'PB'];
+    let u = 0;
+    while (n >= 1000 && u < units.length - 1) { n /= 1000; u++; }
+    const digits = u <= 1 ? 0 : (n >= 100 ? 0 : 1);
+    return n.toFixed(digits) + ' ' + units[u];
+  }
+
+  // ── Firewall Config ───────────────────────────────────────────────────────
+
+  const RULE_PRESETS = {
+    'RDP (3389/tcp)': ['TCP', '3389'],
+    'SMB (445/tcp)': ['TCP', '445'],
+    'HTTP (80/tcp)': ['TCP', '80'],
+    'HTTPS (443/tcp)': ['TCP', '443'],
+    'DNS (53/udp)': ['UDP', '53'],
+    'WinRM (5985,5986/tcp)': ['TCP', '5985, 5986'],
+    'SQL Server (1433/tcp)': ['TCP', '1433'],
+    'WireGuard (51820/udp)': ['UDP', '51820'],
+    'ICMP (ping)': ['ICMP', '']
+  };
+
+  let editingRuleName = '';
+
+  function renderFirewallConfig() {
+    const rules = state.configRules || [];
+    const inbound = rules.filter(r => r.inbound);
+    const outbound = rules.filter(r => !r.inbound);
+    const custom = rules.filter(r => r.isCustom).length;
+
+    $('fwCfgPolicy').textContent =
+      'Windows Defender Firewall evaluates block rules before allow rules, so an Allow rule here can ' +
+      'never reopen an address auto-block just closed — whichever was written first. What no rule can ' +
+      'change is a profile\'s default action for traffic nothing matches; that is a per-profile setting ' +
+      'in Windows Firewall (inbound blocked, outbound allowed on a stock install).';
+    $('fwCfgSummary').textContent =
+      `${rules.length} rule${rules.length === 1 ? '' : 's'} loaded ` +
+      `(${custom} from this page, ${rules.length - custom} from auto-block and manual blocks). ` +
+      'Live refresh is off on this tab; click Refresh list to update.';
+    $('inboundCount').textContent = `(${inbound.length})`;
+    $('outboundCount').textContent = `(${outbound.length})`;
+
+    const rows = (list, addrHeader) => table(
+      ['Label', 'Action', 'Protocol', 'Port range', addrHeader, 'Created by', ''],
+      list.map(r => `<tr>
+        <td class="mono">${esc(r.label)}</td>
+        <td class="${r.action === 'Block' ? 'blocked' : ''}">${esc(r.action)}</td>
+        <td>${esc(r.protocol)}</td>
+        <td class="mono">${esc(r.ports)}</td>
+        <td class="mono">${esc(r.addresses)}</td>
+        <td class="muted">${esc(r.origin)}</td>
+        <td class="row-actions">${r.isProtected
+          ? '<span class="muted" title="The allow rule that lets your browser reach this console">console</span>'
+          : (r.isCustom ? `<button data-editrule="${esc(r.name)}">Edit</button> ` : '') +
+            `<button data-delrule="${esc(r.name)}">Delete</button>`}</td>
+      </tr>`).join('')
+    );
+
+    $('tbl-fwconfig-in').innerHTML = rows(inbound, 'Sources');
+    $('tbl-fwconfig-out').innerHTML = rows(outbound, 'Destinations');
+  }
+
+  function openRuleEditor(rule, direction) {
+    editingRuleName = rule ? rule.name : '';
+    $('ruleLabel').value = rule ? rule.label : '';
+    $('ruleAction').value = rule ? rule.action : 'Block';
+    $('ruleDirection').value = rule ? (rule.inbound ? 'Inbound' : 'Outbound') : direction;
+    $('ruleProtocol').value = rule ? rule.protocol : 'TCP';
+    // "All ports" / "All IPv4, All IPv6" are display forms; the form wants the
+    // raw field back, and empty means the same thing to the parser.
+    $('rulePorts').value = rule && rule.ports !== 'All ports' ? rule.ports : '';
+    $('ruleAddresses').value = rule && rule.addresses !== 'All IPv4, All IPv6' ? rule.addresses : '';
+    $('rulePreset').value = '';
+    $('ruleEditorError').textContent = '';
+    $('ruleEditorTitle').textContent =
+      (rule ? 'Edit an ' : 'Add an ') + $('ruleDirection').value + ' Rule';
+    $('ruleEditorNote').textContent = rule
+      ? 'Replaces the loaded rule with these values.'
+      : 'Writes a rule into Windows Defender Firewall. The web service needs Administrator rights.';
+    $('btnSaveRule').textContent = rule ? 'Save Rule' : 'Add Rule';
+    updateRuleAddrHint();
+    $('ruleEditor').classList.remove('hidden');
+  }
+
+  function closeRuleEditor() {
+    editingRuleName = '';
+    $('ruleEditor').classList.add('hidden');
+    $('ruleEditorError').textContent = '';
+  }
+
+  function updateRuleAddrHint() {
+    const out = $('ruleDirection').value === 'Outbound';
+    $('ruleAddrHint').textContent = out
+      ? 'Destinations — leave empty for every address.'
+      : 'Sources — leave empty for every address.';
+    $('ruleEditorTitle').textContent =
+      (editingRuleName ? 'Edit an ' : 'Add an ') + $('ruleDirection').value + ' Rule';
+  }
+
   // ── Critical-threat warnings: tab-title badge + browser notification ───────
   // The badge always tracks live Critical rows; notifications additionally need
   // the criticalAlertsEnabled setting AND granted browser permission.
@@ -2579,6 +3107,7 @@ public sealed class WebApp : IDisposable
     const forceLists = !!opts.forceLists;
     $('ver').textContent = 'v' + (state.version || '?');
     $('clock').textContent = state.clock || '';
+    checkForUpgrade();
     // Don't overwrite a recent action result (add/remove/block) with the generic status.
     if (state.statusMessage && Date.now() > statusHoldUntil)
       setStatus(state.statusMessage, false);
@@ -2618,6 +3147,7 @@ public sealed class WebApp : IDisposable
       </div>`).join('');
 
     $('dash-chart').innerHTML = chartHtml(state.activity || []);
+    renderTraffic();
 
     const threats = state.threats || [];
     $('dash-threats').innerHTML = table(
@@ -2764,6 +3294,16 @@ public sealed class WebApp : IDisposable
       restoreScroll('tbl-firewall', fwScroll);
       restoreScroll('tbl-allowlist', alScroll);
       renderSettings();
+
+      // Never while the editor is open: redrawing the tables is harmless, but the
+      // operator is mid-rule and a refresh that reset the form would lose it.
+      if ($('ruleEditor').classList.contains('hidden')) {
+        const cfgIn = saveScroll('tbl-fwconfig-in');
+        const cfgOut = saveScroll('tbl-fwconfig-out');
+        renderFirewallConfig();
+        restoreScroll('tbl-fwconfig-in', cfgIn);
+        restoreScroll('tbl-fwconfig-out', cfgOut);
+      }
     }
 
     // Every state update funnels through here, so this is where the page learns it is
@@ -2820,6 +3360,7 @@ public sealed class WebApp : IDisposable
         ${row('Geo lookups', 'Resolve country and city for remote IPs (ipwho.is over HTTPS, ip-api.com fallback).', sw('geoLookupEnabled', s.geoLookupEnabled))}
         ${row('Failed-logon monitoring', 'Watch the Windows Security event log (4625 / 4771) for failed RDP, SMB, and WinRM logons and alert on brute-force bursts. ' + (s.authLogStatus || ''), sw('authLogMonitorEnabled', s.authLogMonitorEnabled))}
         ${row('Closed-port scan detection', 'Turn on Windows Firewall dropped-packet logging (needs elevation) and watch that log — catches port scans of closed ports that never appear as connections. ' + (s.probeLogStatus || ''), sw('probeLogEnabled', s.probeLogEnabled))}
+        ${row('Traffic metering', 'Sample the adapter byte counters for the dashboard\'s data-flow charts and the monthly in/out history. Physical adapters only, so VPN, Hyper-V and teaming traffic is counted once. ' + (s.trafficStatus || ''), sw('trafficMeterEnabled', s.trafficMeterEnabled))}
         ${row('Critical threat alerts', 'Badge the tab title and pop a browser notification when a Critical-level threat appears. Your browser asks for notification permission when you switch this on. ' + notifPermText(), sw('criticalAlertsEnabled', s.criticalAlertsEnabled))}
       </div>
       <div class="settings-group"><h3>Intrusion detection</h3>
@@ -2903,6 +3444,9 @@ public sealed class WebApp : IDisposable
 
   $('btnSleep').onclick = () => toggleSleep();
   $('btnWakeBanner').onclick = () => toggleSleep(false);
+  // true: bypass the bfcache, which would otherwise hand back the very markup
+  // this banner exists to replace.
+  $('btnReloadPage').onclick = () => location.reload(true);
   $('btnAuto').onclick = () => apiAction('toggle_autoblock');
   $('btnLevel').onclick = () => apiAction('cycle_min_level');
   $('btnAuth').onclick = () => apiAction('authorize');
@@ -2926,6 +3470,64 @@ public sealed class WebApp : IDisposable
     const ip = $('blockIp').value.trim();
     if (ip) apiAction('unblock', { ip });
   };
+  // ── Firewall Config controls ──────────────────────────────────────────────
+  (() => {
+    const preset = $('rulePreset');
+    for (const name of Object.keys(RULE_PRESETS)) {
+      const opt = document.createElement('option');
+      opt.value = name;
+      opt.textContent = name;
+      preset.appendChild(opt);
+    }
+    preset.onchange = () => {
+      const p = RULE_PRESETS[preset.value];
+      if (!p) return;
+      $('ruleProtocol').value = p[0];
+      $('rulePorts').value = p[1];
+      $('ruleEditorError').textContent = '';
+    };
+  })();
+
+  $('btnAddInbound').onclick = () => openRuleEditor(null, 'Inbound');
+  $('btnAddOutbound').onclick = () => openRuleEditor(null, 'Outbound');
+  $('btnRefreshFwCfg').onclick = () => refreshFrozenTab();
+  $('btnCancelRule').onclick = () => closeRuleEditor();
+  $('ruleDirection').onchange = () => updateRuleAddrHint();
+  $('trafficRange').onchange = () => { if (state) renderTraffic(); };
+
+  $('btnSaveRule').onclick = async () => {
+    const btn = $('btnSaveRule');
+    const payload = {
+      label: $('ruleLabel').value.trim(),
+      ruleAction: $('ruleAction').value,
+      direction: $('ruleDirection').value,
+      protocol: $('ruleProtocol').value,
+      ports: $('rulePorts').value.trim(),
+      addresses: $('ruleAddresses').value.trim(),
+      replace: editingRuleName || ''
+    };
+
+    // The blunt ones get a confirm here too. The server refuses anything that would
+    // cut this console off, so this only covers the drastic-but-permitted cases.
+    if (payload.ruleAction === 'Block' && !payload.ports && !payload.addresses) {
+      const side = payload.direction.toLowerCase();
+      if (!confirm(`This rule blocks every ${side} connection on every port, from every address.\n\nAdd it anyway?`))
+        return;
+    }
+
+    btn.disabled = true;
+    const label = btn.textContent;
+    btn.textContent = 'Applying…';
+    try {
+      const r = await apiAction('save_config_rule', payload);
+      if (r.ok) closeRuleEditor();
+      else $('ruleEditorError').textContent = r.message || 'The rule was not applied.';
+    } finally {
+      btn.disabled = false;
+      btn.textContent = label;
+    }
+  };
+
   $('btnAddAllow').onclick = () => {
     const value = $('allowInput').value.trim();
     if (value) apiAction('add_allowlist', { value }).then(r => { if (r.ok) $('allowInput').value = ''; });
@@ -3090,6 +3692,31 @@ public sealed class WebApp : IDisposable
       const proto = bp.dataset.proto || 'TCP';
       if (confirm(`Block inbound ${proto} port ${port}?\n\nThis firewalls the local service listening on that port for everyone, including LAN clients.`))
         apiAction('block_port', { value: port, kind: proto, direction: 'Inbound' });
+      return;
+    }
+    const er = e.target.closest('[data-editrule]');
+    if (er) {
+      const name = (er.dataset.editrule || '').trim();
+      const rule = (state.configRules || []).find(x => x.name === name);
+      if (rule) openRuleEditor(rule, rule.inbound ? 'Inbound' : 'Outbound');
+      return;
+    }
+    const dr = e.target.closest('[data-delrule]');
+    if (dr) {
+      const name = (dr.dataset.delrule || '').trim();
+      const rule = (state.configRules || []).find(x => x.name === name);
+      if (!rule) { setStatus('Could not read rule name from the row.', true); return; }
+      const warn = rule.isCustom ? ''
+        : `\n\nThis rule came from ${rule.origin.toLowerCase()}. Deleting it unblocks that traffic ` +
+          'until something detects it again.';
+      const detail = `${rule.action} · ${rule.direction} · ${rule.protocol} · ${rule.ports} · ${rule.addresses}`;
+      if (confirm(`Delete "${rule.label}"?\n\n${detail}${warn}\n\n(Requires Administrator)`)) {
+        dr.disabled = true;
+        dr.textContent = 'Deleting…';
+        apiAction('remove_rule', { value: name, name: name }).finally(() => {
+          if (dr.isConnected) { dr.disabled = false; dr.textContent = 'Delete'; }
+        });
+      }
       return;
     }
     const fr = e.target.closest('[data-rm-rule]');

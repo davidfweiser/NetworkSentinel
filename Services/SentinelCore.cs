@@ -21,6 +21,7 @@ public sealed class SentinelCore : IDisposable
     public FirewallService Firewall { get; } = new();
     public AllowlistService Allowlist { get; } = new();
     public PreventionService Prevention { get; }
+    public TrafficMeterService Traffic { get; } = new();
 
     public SentinelCore(AppSettings? settings = null)
     {
@@ -64,8 +65,9 @@ public sealed class SentinelCore : IDisposable
         // Lets the DNS monitor see every allowlist answer and catch poisoning of the never-block list.
         Allowlist.ResolutionObserver = Monitor.AllowlistResolutionObserver;
         Monitor.IsIpAllowlisted = ip => Allowlist.IsAllowed(ip, out _);
-        // A WireGuard peer's public endpoint must never be auto-blocked — that kills the tunnel.
-        Prevention.IsProtectedAddress = Monitor.IsWireGuardPeerEndpoint;
+        // A VPN peer's public endpoint must never be auto-blocked — that kills the tunnel.
+        // Covers WireGuard peers and IPSec (site-to-site included) alike.
+        Prevention.IsProtectedAddress = Monitor.IsVpnTunnelEndpoint;
         // Every batch is enforced before any warning about it goes out, so an alert that
         // names an address can also say whether that address is being blocked.
         Monitor.Enforce = Prevention.Apply;
@@ -77,6 +79,12 @@ public sealed class SentinelCore : IDisposable
             _ = Task.Run(() => Firewall.EnableProbeLogging());
 
         Allowlist.UseRemoteFeed = Settings.AllowlistUseRemoteFeed;
+
+        // Independent of the monitor's poll loop: the byte counters are cumulative,
+        // so the meter's own cadence is what makes its deltas comparable, and it
+        // keeps recording while monitoring is paused.
+        if (Settings.TrafficMeterEnabled)
+            Traffic.Start();
     }
 
     /// <summary>0 (and anything negative) means auto-block rules never expire.</summary>
@@ -87,5 +95,6 @@ public sealed class SentinelCore : IDisposable
     {
         Monitor.Dispose();
         Allowlist.Dispose();
+        Traffic.Dispose();
     }
 }

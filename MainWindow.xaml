@@ -189,6 +189,10 @@
                         <RadioButton Content="Firewall &amp; Block" Style="{StaticResource NavButton}"
                                      IsChecked="{Binding ShowFirewall, Mode=OneWay}"
                                      Command="{Binding NavigateCommand}" CommandParameter="Firewall"/>
+                        <RadioButton Content="Firewall Config" Style="{StaticResource SubNavButton}"
+                                     IsChecked="{Binding ShowFirewallConfig, Mode=OneWay}"
+                                     Command="{Binding NavigateCommand}" CommandParameter="FirewallConfig"
+                                     ToolTip="Add, edit and delete inbound and outbound rules"/>
                         <RadioButton Content="Settings" Style="{StaticResource NavButton}"
                                      IsChecked="{Binding ShowSettings, Mode=OneWay}"
                                      Command="{Binding NavigateCommand}" CommandParameter="Settings"/>
@@ -254,12 +258,18 @@
                 <Grid Grid.Row="1">
 
                     <!-- DASHBOARD -->
-                    <Grid Visibility="{Binding ShowDashboard, Converter={StaticResource BoolToVis}}">
+                    <!-- Scrolled: the stat row, two chart rows and the two lists together are
+                         taller than the window at its minimum height. -->
+                    <ScrollViewer Visibility="{Binding ShowDashboard, Converter={StaticResource BoolToVis}}"
+                                  HorizontalScrollBarVisibility="Disabled">
+                    <Grid Margin="0,0,6,0">
                         <Grid.RowDefinitions>
                             <RowDefinition Height="Auto"/>
-                            <!-- 250, not 220: the chart card now carries a legend row under the plot. -->
+                            <!-- 250, not 220: the chart cards carry a legend row under the plot. -->
                             <RowDefinition Height="250"/>
-                            <RowDefinition Height="*"/>
+                            <RowDefinition Height="230"/>
+                            <RowDefinition Height="Auto"/>
+                            <RowDefinition Height="Auto"/>
                         </Grid.RowDefinitions>
 
                         <!-- Stats: wrap on narrow widths so labels aren't clipped -->
@@ -399,8 +409,120 @@
                             </Border>
                         </Grid>
 
+                        <!-- DATA FLOW — live throughput beside the running month's totals. -->
+                        <Grid Grid.Row="2" Margin="0,0,0,14">
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="2*"/>
+                                <ColumnDefinition Width="*"/>
+                            </Grid.ColumnDefinitions>
+
+                            <Border Style="{StaticResource Card}" Margin="0,0,10,0">
+                                <Grid>
+                                    <Grid.RowDefinitions>
+                                        <RowDefinition Height="Auto"/>
+                                        <RowDefinition Height="*"/>
+                                        <RowDefinition Height="Auto"/>
+                                    </Grid.RowDefinitions>
+                                    <DockPanel>
+                                        <TextBlock Text="Data flow" FontWeight="Bold" FontSize="14"/>
+                                        <TextBlock DockPanel.Dock="Right" Text="{Binding TrafficWindowText}"
+                                                   Foreground="{StaticResource TextMutedBrush}" FontSize="11"
+                                                   HorizontalAlignment="Right" VerticalAlignment="Center"/>
+                                    </DockPanel>
+                                    <ctrl:DualSparkline Grid.Row="1" Margin="0,12,0,0"
+                                                        Inbound="{Binding TrafficInSeries}"
+                                                        Outbound="{Binding TrafficOutSeries}"
+                                                        InboundStroke="{StaticResource AccentBlueBrush}"
+                                                        OutboundStroke="{StaticResource AccentCyanBrush}"
+                                                        InboundFill="{StaticResource ChartFill}"
+                                                        StrokeThickness="2.2"/>
+
+                                    <Grid Grid.Row="2" Margin="0,8,0,0">
+                                        <Grid.ColumnDefinitions>
+                                            <ColumnDefinition Width="Auto"/>
+                                            <ColumnDefinition Width="*"/>
+                                            <ColumnDefinition Width="Auto"/>
+                                        </Grid.ColumnDefinitions>
+                                        <WrapPanel Grid.Column="1" HorizontalAlignment="Center">
+                                            <TextBlock Text="&#x25CF;" FontSize="11" Margin="0,0,4,0"
+                                                       Foreground="{StaticResource AccentBlueBrush}" VerticalAlignment="Center"/>
+                                            <TextBlock Text="{Binding TrafficInRateText}" FontSize="10" Margin="0,0,12,0"
+                                                       Foreground="{StaticResource TextSecondaryBrush}" VerticalAlignment="Center"/>
+                                            <TextBlock Text="&#x25CF;" FontSize="11" Margin="0,0,4,0"
+                                                       Foreground="{StaticResource AccentCyanBrush}" VerticalAlignment="Center"/>
+                                            <TextBlock Text="{Binding TrafficOutRateText}" FontSize="10"
+                                                       Foreground="{StaticResource TextSecondaryBrush}" VerticalAlignment="Center"/>
+                                        </WrapPanel>
+                                        <TextBlock Grid.Column="2" Text="{Binding TrafficStatusText}" FontSize="10"
+                                                   Foreground="{StaticResource TextMutedBrush}" VerticalAlignment="Center"
+                                                   TextTrimming="CharacterEllipsis" MaxWidth="320"/>
+                                    </Grid>
+                                </Grid>
+                            </Border>
+
+                            <Border Grid.Column="1" Style="{StaticResource Card}">
+                                <StackPanel VerticalAlignment="Center">
+                                    <TextBlock Text="THIS MONTH" FontSize="9" FontWeight="Bold"
+                                               Foreground="{StaticResource TextMutedBrush}"/>
+                                    <TextBlock Text="{Binding MonthLabelText}" FontSize="13" FontWeight="SemiBold" Margin="0,2,0,8"/>
+                                    <TextBlock Text="Data in" FontSize="10" Foreground="{StaticResource TextMutedBrush}"/>
+                                    <TextBlock Text="{Binding MonthInText}" FontSize="22" FontWeight="Bold"
+                                               Foreground="{StaticResource AccentBlueBrush}"/>
+                                    <TextBlock Text="Data out" FontSize="10" Margin="0,6,0,0"
+                                               Foreground="{StaticResource TextMutedBrush}"/>
+                                    <TextBlock Text="{Binding MonthOutText}" FontSize="22" FontWeight="Bold"
+                                               Foreground="{StaticResource AccentCyanBrush}"/>
+                                    <TextBlock Text="{Binding MonthTotalText, StringFormat='{}{0} total'}" FontSize="11"
+                                               Margin="0,10,0,0" Foreground="{StaticResource TextSecondaryBrush}"/>
+                                    <TextBlock Text="{Binding MonthDailyAverageText}" FontSize="11" Margin="0,2,0,0"
+                                               Foreground="{StaticResource TextMutedBrush}"/>
+                                </StackPanel>
+                            </Border>
+                        </Grid>
+
+                        <!-- MONTHLY DATA — one bar pair per day of the month, or per month of
+                             the year. Bars, not a line: these are totals over discrete periods. -->
+                        <Border Style="{StaticResource Card}" Grid.Row="3" Height="250" Margin="0,0,0,14">
+                            <Grid>
+                                <Grid.RowDefinitions>
+                                    <RowDefinition Height="Auto"/>
+                                    <RowDefinition Height="*"/>
+                                    <RowDefinition Height="Auto"/>
+                                </Grid.RowDefinitions>
+                                <Grid>
+                                    <Grid.ColumnDefinitions>
+                                        <ColumnDefinition Width="*"/>
+                                        <ColumnDefinition Width="Auto"/>
+                                    </Grid.ColumnDefinitions>
+                                    <StackPanel>
+                                        <TextBlock Text="Monthly data in and out" FontWeight="Bold" FontSize="14"/>
+                                        <TextBlock Text="{Binding TrafficRangeSummary}" FontSize="11" Margin="0,2,0,0"
+                                                   Foreground="{StaticResource TextSecondaryBrush}"/>
+                                    </StackPanel>
+                                    <ComboBox Grid.Column="1" Width="180" VerticalAlignment="Top"
+                                              Style="{StaticResource ModernComboBox}"
+                                              ItemsSource="{Binding TrafficRangeOptions}"
+                                              SelectedItem="{Binding SelectedTrafficRange}"/>
+                                </Grid>
+                                <ctrl:BarPairChart Grid.Row="1" Margin="0,12,0,0"
+                                                   Buckets="{Binding TrafficBuckets}"
+                                                   InboundBrush="{StaticResource AccentBlueBrush}"
+                                                   OutboundBrush="{StaticResource AccentCyanBrush}"/>
+                                <WrapPanel Grid.Row="2" Margin="0,8,0,0" HorizontalAlignment="Center">
+                                    <TextBlock Text="&#x25AE;" FontSize="11" Margin="0,0,4,0"
+                                               Foreground="{StaticResource AccentBlueBrush}" VerticalAlignment="Center"/>
+                                    <TextBlock Text="data in" FontSize="10" Margin="0,0,14,0"
+                                               Foreground="{StaticResource TextSecondaryBrush}" VerticalAlignment="Center"/>
+                                    <TextBlock Text="&#x25AE;" FontSize="11" Margin="0,0,4,0"
+                                               Foreground="{StaticResource AccentCyanBrush}" VerticalAlignment="Center"/>
+                                    <TextBlock Text="data out" FontSize="10"
+                                               Foreground="{StaticResource TextSecondaryBrush}" VerticalAlignment="Center"/>
+                                </WrapPanel>
+                            </Grid>
+                        </Border>
+
                         <!-- Bottom split: recent threats + top hosts -->
-                        <Grid Grid.Row="2">
+                        <Grid Grid.Row="4" Height="320">
                             <Grid.ColumnDefinitions>
                                 <ColumnDefinition Width="*"/>
                                 <ColumnDefinition Width="*"/>
@@ -524,6 +646,7 @@
                             </Border>
                         </Grid>
                     </Grid>
+                    </ScrollViewer>
 
                     <!-- CONNECTIONS -->
                     <Border Visibility="{Binding ShowConnections, Converter={StaticResource BoolToVis}}" Style="{StaticResource Card}">
@@ -929,6 +1052,233 @@
                         </Border>
                     </Grid>
 
+                    <!-- FIREWALL CONFIG — add/edit/delete inbound and outbound rules, laid out
+                         like the Linode Cloud Manager firewall page (and FireWallConfig on
+                         Ubuntu): one list per direction, one form for both add and edit. -->
+                    <ScrollViewer Visibility="{Binding ShowFirewallConfig, Converter={StaticResource BoolToVis}}"
+                                  HorizontalScrollBarVisibility="Disabled">
+                    <Grid Margin="0,0,6,0">
+                        <Grid.RowDefinitions>
+                            <RowDefinition Height="Auto"/>
+                            <RowDefinition Height="Auto"/>
+                            <RowDefinition Height="*"/>
+                        </Grid.RowDefinitions>
+
+                        <Border Style="{StaticResource Card}" Margin="0,0,0,12">
+                            <Grid>
+                                <Grid.ColumnDefinitions>
+                                    <ColumnDefinition Width="*"/>
+                                    <ColumnDefinition Width="Auto"/>
+                                </Grid.ColumnDefinitions>
+                                <StackPanel>
+                                    <TextBlock Text="Firewall configuration" FontWeight="Bold" FontSize="15"/>
+                                    <TextBlock Text="{Binding FirewallConfigSummary}" Margin="0,4,0,0" FontSize="12"
+                                               Foreground="{StaticResource AccentCyanBrush}" TextWrapping="Wrap"/>
+                                    <TextBlock Text="{Binding FirewallConfigPolicyText}" Margin="0,6,16,0" FontSize="11.5"
+                                               Foreground="{StaticResource TextSecondaryBrush}" TextWrapping="Wrap"/>
+                                    <TextBlock Text="{Binding FirewallConfigMessage}" Margin="0,6,0,0" FontSize="12"
+                                               Foreground="{StaticResource AccentAmberBrush}" TextWrapping="Wrap"/>
+                                </StackPanel>
+                                <StackPanel Grid.Column="1" VerticalAlignment="Top" Margin="16,0,0,0">
+                                    <Button Content="Add an Inbound Rule" Style="{StaticResource PrimaryButton}"
+                                            MinWidth="180" Margin="0,0,0,8"
+                                            Command="{Binding AddInboundRuleCommand}"/>
+                                    <Button Content="Add an Outbound Rule" Style="{StaticResource GhostButton}"
+                                            MinWidth="180" Margin="0,0,0,8"
+                                            Command="{Binding AddOutboundRuleCommand}"/>
+                                    <Button Content="Refresh" Style="{StaticResource GhostButton}"
+                                            MinWidth="180"
+                                            Command="{Binding RefreshFirewallConfigCommand}"/>
+                                </StackPanel>
+                            </Grid>
+                        </Border>
+
+                        <!-- Add/edit form. Inline rather than a modal: the rule lists stay
+                             visible while a rule is written, which is how you check you are not
+                             duplicating one. -->
+                        <Border Style="{StaticResource Card}" Grid.Row="1" Margin="0,0,0,12"
+                                Visibility="{Binding IsRuleEditorOpen, Converter={StaticResource BoolToVis}}">
+                            <StackPanel>
+                                <TextBlock Text="{Binding RuleEditorTitle}" FontWeight="Bold" FontSize="15"/>
+                                <TextBlock Text="{Binding RuleEditorNote}" FontSize="11.5" Margin="0,4,0,10"
+                                           Foreground="{StaticResource TextSecondaryBrush}" TextWrapping="Wrap"/>
+
+                                <Grid Margin="0,0,0,10">
+                                    <Grid.ColumnDefinitions>
+                                        <ColumnDefinition Width="*"/>
+                                        <ColumnDefinition Width="*"/>
+                                        <ColumnDefinition Width="*"/>
+                                    </Grid.ColumnDefinitions>
+                                    <StackPanel Margin="0,0,10,0">
+                                        <TextBlock Text="Preset" FontSize="11" Margin="0,0,0,4"
+                                                   Foreground="{StaticResource TextMutedBrush}"/>
+                                        <ComboBox Style="{StaticResource ModernComboBox}"
+                                                  ItemsSource="{Binding RulePresetOptions}"
+                                                  SelectedItem="{Binding RulePreset}"/>
+                                    </StackPanel>
+                                    <StackPanel Grid.Column="1" Margin="0,0,10,0">
+                                        <TextBlock Text="Action" FontSize="11" Margin="0,0,0,4"
+                                                   Foreground="{StaticResource TextMutedBrush}"/>
+                                        <ComboBox Style="{StaticResource ModernComboBox}"
+                                                  ItemsSource="{Binding RuleActionOptions}"
+                                                  SelectedItem="{Binding RuleAction}"/>
+                                    </StackPanel>
+                                    <StackPanel Grid.Column="2">
+                                        <TextBlock Text="Direction" FontSize="11" Margin="0,0,0,4"
+                                                   Foreground="{StaticResource TextMutedBrush}"/>
+                                        <ComboBox Style="{StaticResource ModernComboBox}"
+                                                  ItemsSource="{Binding RuleDirectionOptions}"
+                                                  SelectedItem="{Binding RuleDirection}"/>
+                                    </StackPanel>
+                                </Grid>
+
+                                <TextBlock Text="Label" FontSize="11" Margin="0,0,0,4"
+                                           Foreground="{StaticResource TextMutedBrush}"/>
+                                <TextBox Style="{StaticResource ModernTextBox}" Margin="0,0,0,10"
+                                         Text="{Binding RuleLabel, UpdateSourceTrigger=PropertyChanged}"
+                                         ToolTip="block-inbound-rdp   (optional — named from the port if left empty)"/>
+
+                                <Grid Margin="0,0,0,10">
+                                    <Grid.ColumnDefinitions>
+                                        <ColumnDefinition Width="*"/>
+                                        <ColumnDefinition Width="2*"/>
+                                    </Grid.ColumnDefinitions>
+                                    <StackPanel Margin="0,0,10,0">
+                                        <TextBlock Text="Protocol" FontSize="11" Margin="0,0,0,4"
+                                                   Foreground="{StaticResource TextMutedBrush}"/>
+                                        <ComboBox Style="{StaticResource ModernComboBox}"
+                                                  ItemsSource="{Binding RuleProtocolOptions}"
+                                                  SelectedItem="{Binding RuleProtocol}"/>
+                                    </StackPanel>
+                                    <StackPanel Grid.Column="1">
+                                        <TextBlock Text="Port range" FontSize="11" Margin="0,0,0,4"
+                                                   Foreground="{StaticResource TextMutedBrush}"/>
+                                        <TextBox Style="{StaticResource ModernTextBox}"
+                                                 Text="{Binding RulePortRange, UpdateSourceTrigger=PropertyChanged}"
+                                                 ToolTip="3389   or  8000-8001   or  80, 443   (empty = every port)"/>
+                                    </StackPanel>
+                                </Grid>
+
+                                <TextBlock Text="{Binding RuleAddressLabel}" FontSize="11" Margin="0,0,0,4"
+                                           Foreground="{StaticResource TextMutedBrush}"/>
+                                <TextBox Style="{StaticResource ModernTextBox}" Margin="0,0,0,10"
+                                         Text="{Binding RuleAddresses, UpdateSourceTrigger=PropertyChanged}"
+                                         ToolTip="All IPv4, All IPv6   or  10.0.0.0/8   or  203.0.113.5"/>
+
+                                <TextBlock Text="{Binding RuleEditorError}" FontSize="12" TextWrapping="Wrap"
+                                           Margin="0,0,0,10"
+                                           Foreground="{StaticResource DangerBrush}"/>
+
+                                <StackPanel Orientation="Horizontal" HorizontalAlignment="Right">
+                                    <Button Content="Cancel" Style="{StaticResource GhostButton}" MinWidth="110"
+                                            Margin="0,0,8,0" Command="{Binding CancelRuleEditorCommand}"/>
+                                    <Button Content="{Binding RuleEditorSaveText}" Style="{StaticResource PrimaryButton}"
+                                            MinWidth="130" Command="{Binding SaveConfigRuleCommand}"/>
+                                </StackPanel>
+                            </StackPanel>
+                        </Border>
+
+                        <!-- MinHeight, not a fixed height: the two lists share whatever the window
+                             leaves them, but never shrink to a single row when the editor is open. -->
+                        <Grid Grid.Row="2">
+                            <Grid.RowDefinitions>
+                                <RowDefinition Height="*"/>
+                                <RowDefinition Height="*"/>
+                            </Grid.RowDefinitions>
+
+                            <Border Style="{StaticResource Card}" Margin="0,0,0,12" MinHeight="230">
+                                <DockPanel>
+                                    <Grid DockPanel.Dock="Top" Margin="0,0,0,10">
+                                        <Grid.ColumnDefinitions>
+                                            <ColumnDefinition Width="*"/>
+                                            <ColumnDefinition Width="Auto"/>
+                                        </Grid.ColumnDefinitions>
+                                        <StackPanel>
+                                            <TextBlock Text="Inbound rules" FontWeight="Bold" FontSize="15"/>
+                                            <TextBlock Text="{Binding InboundCountText}" FontSize="11.5" Margin="0,2,0,0"
+                                                       Foreground="{StaticResource TextSecondaryBrush}"/>
+                                        </StackPanel>
+                                        <Button Grid.Column="1" Content="Add an Inbound Rule"
+                                                Style="{StaticResource GhostButton}" VerticalAlignment="Center"
+                                                Command="{Binding AddInboundRuleCommand}"/>
+                                    </Grid>
+                                    <DataGrid ItemsSource="{Binding InboundRules}" SelectedItem="{Binding SelectedInboundRule}"
+                                              Style="{StaticResource ModernDataGrid}" AutoGenerateColumns="False">
+                                        <DataGrid.Columns>
+                                            <DataGridTextColumn Header="Label" Binding="{Binding LabelText}" Width="*"/>
+                                            <DataGridTextColumn Header="Action" Binding="{Binding ActionText}" Width="80"/>
+                                            <DataGridTextColumn Header="Protocol" Binding="{Binding ProtocolText}" Width="90"/>
+                                            <DataGridTextColumn Header="Port range" Binding="{Binding PortRangeText}" Width="120"/>
+                                            <DataGridTextColumn Header="Sources" Binding="{Binding AddressListText}" Width="180"/>
+                                            <DataGridTextColumn Header="Created by" Binding="{Binding OriginText}" Width="140"/>
+                                            <DataGridTemplateColumn Header="" Width="150">
+                                                <DataGridTemplateColumn.CellTemplate>
+                                                    <DataTemplate>
+                                                        <StackPanel Orientation="Horizontal">
+                                                            <Button Content="Edit" Style="{StaticResource MiniGhostButton}"
+                                                                    Margin="0,0,4,0"
+                                                                    Command="{Binding DataContext.EditConfigRuleCommand, RelativeSource={RelativeSource AncestorType=Window}}"
+                                                                    CommandParameter="{Binding}"/>
+                                                            <Button Content="Delete" Style="{StaticResource MiniDangerButton}"
+                                                                    Command="{Binding DataContext.DeleteConfigRuleCommand, RelativeSource={RelativeSource AncestorType=Window}}"
+                                                                    CommandParameter="{Binding}"/>
+                                                        </StackPanel>
+                                                    </DataTemplate>
+                                                </DataGridTemplateColumn.CellTemplate>
+                                            </DataGridTemplateColumn>
+                                        </DataGrid.Columns>
+                                    </DataGrid>
+                                </DockPanel>
+                            </Border>
+
+                            <Border Style="{StaticResource Card}" Grid.Row="1" MinHeight="230">
+                                <DockPanel>
+                                    <Grid DockPanel.Dock="Top" Margin="0,0,0,10">
+                                        <Grid.ColumnDefinitions>
+                                            <ColumnDefinition Width="*"/>
+                                            <ColumnDefinition Width="Auto"/>
+                                        </Grid.ColumnDefinitions>
+                                        <StackPanel>
+                                            <TextBlock Text="Outbound rules" FontWeight="Bold" FontSize="15"/>
+                                            <TextBlock Text="{Binding OutboundCountText}" FontSize="11.5" Margin="0,2,0,0"
+                                                       Foreground="{StaticResource TextSecondaryBrush}"/>
+                                        </StackPanel>
+                                        <Button Grid.Column="1" Content="Add an Outbound Rule"
+                                                Style="{StaticResource GhostButton}" VerticalAlignment="Center"
+                                                Command="{Binding AddOutboundRuleCommand}"/>
+                                    </Grid>
+                                    <DataGrid ItemsSource="{Binding OutboundRules}" SelectedItem="{Binding SelectedOutboundRule}"
+                                              Style="{StaticResource ModernDataGrid}" AutoGenerateColumns="False">
+                                        <DataGrid.Columns>
+                                            <DataGridTextColumn Header="Label" Binding="{Binding LabelText}" Width="*"/>
+                                            <DataGridTextColumn Header="Action" Binding="{Binding ActionText}" Width="80"/>
+                                            <DataGridTextColumn Header="Protocol" Binding="{Binding ProtocolText}" Width="90"/>
+                                            <DataGridTextColumn Header="Port range" Binding="{Binding PortRangeText}" Width="120"/>
+                                            <DataGridTextColumn Header="Destinations" Binding="{Binding AddressListText}" Width="180"/>
+                                            <DataGridTextColumn Header="Created by" Binding="{Binding OriginText}" Width="140"/>
+                                            <DataGridTemplateColumn Header="" Width="150">
+                                                <DataGridTemplateColumn.CellTemplate>
+                                                    <DataTemplate>
+                                                        <StackPanel Orientation="Horizontal">
+                                                            <Button Content="Edit" Style="{StaticResource MiniGhostButton}"
+                                                                    Margin="0,0,4,0"
+                                                                    Command="{Binding DataContext.EditConfigRuleCommand, RelativeSource={RelativeSource AncestorType=Window}}"
+                                                                    CommandParameter="{Binding}"/>
+                                                            <Button Content="Delete" Style="{StaticResource MiniDangerButton}"
+                                                                    Command="{Binding DataContext.DeleteConfigRuleCommand, RelativeSource={RelativeSource AncestorType=Window}}"
+                                                                    CommandParameter="{Binding}"/>
+                                                        </StackPanel>
+                                                    </DataTemplate>
+                                                </DataGridTemplateColumn.CellTemplate>
+                                            </DataGridTemplateColumn>
+                                        </DataGrid.Columns>
+                                    </DataGrid>
+                                </DockPanel>
+                            </Border>
+                        </Grid>
+                    </Grid>
+                    </ScrollViewer>
+
                     <!-- SETTINGS — mirrors the web console's Settings tab so both front-ends
                          drive the same keys in settings.json. Auto-block lives in the sidebar
                          and the Firewall view, so it is not duplicated here. -->
@@ -995,6 +1345,24 @@
                                             <CheckBox Grid.Column="1" VerticalAlignment="Center"
                                                       Style="{StaticResource ModernCheckBox}"
                                                       IsChecked="{Binding GeoLookupEnabled}"/>
+                                        </Grid>
+
+                                        <Grid Margin="0,0,0,14">
+                                            <Grid.ColumnDefinitions>
+                                                <ColumnDefinition Width="*"/>
+                                                <ColumnDefinition Width="Auto"/>
+                                            </Grid.ColumnDefinitions>
+                                            <StackPanel Margin="0,0,16,0">
+                                                <TextBlock Text="Traffic metering" FontWeight="Bold" FontSize="13"/>
+                                                <TextBlock Text="Sample the adapter byte counters for the dashboard's data-flow charts and the monthly in/out history. Physical adapters only, so VPN, Hyper-V and teaming traffic is counted once."
+                                                           Foreground="{StaticResource TextSecondaryBrush}" FontSize="11"
+                                                           Margin="0,2,0,0" TextWrapping="Wrap"/>
+                                                <TextBlock Text="{Binding TrafficStatusText}" FontSize="11" Margin="0,4,0,0"
+                                                           Foreground="{StaticResource AccentCyanBrush}" TextWrapping="Wrap"/>
+                                            </StackPanel>
+                                            <CheckBox Grid.Column="1" VerticalAlignment="Center"
+                                                      Style="{StaticResource ModernCheckBox}"
+                                                      IsChecked="{Binding TrafficMeterEnabled}"/>
                                         </Grid>
 
                                         <Grid Margin="0,0,0,14">

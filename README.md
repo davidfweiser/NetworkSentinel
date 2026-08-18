@@ -112,6 +112,7 @@ Two Windows-specific notes:
 | **Live connections** | Process name, local/remote endpoints, TCP state, origin summary |
 | **Remote computers** | Peers observed talking to this PC, reverse DNS, geo/ISP when public |
 | **Activity chart** | 5-minute connection chart with **threat markers**, in both the desktop app and the web console |
+| **Data-flow charts** | Bytes in/out sampled from the adapter counters: live throughput, this month's totals, and paired bars per day or per month — desktop app and web console |
 
 ### Threat awareness
 Heuristics flag patterns such as:
@@ -248,6 +249,45 @@ Endpoints are collected from three places, so there is no window where one is bl
 - When a detector does flag a peer endpoint, the console now says so — `Not blocking 203.0.113.9 (Critical: …) — it is a WireGuard tunnel endpoint` — instead of leaving you to wonder why no rule appeared. Rate-limited per address.
 - **Manual blocking is unaffected**, here as with the operator shield: a hostile tunnel peer is a real case. Cutting off a peer for good belongs in WireGuard's own configuration (`wg set <iface> peer <key> remove`), not in a monitoring console acting behind your back.
 
+#### The same shield for IPSec, including site-to-site
+
+The argument above is not WireGuard's; it is any tunnel's. **IPSec peers are shielded from auto-block on the same terms**, which matters most for a **site-to-site** tunnel — the case where the peer cannot phone you to say it went down:
+
+- the far end is another site's router at a **fixed public address**, indistinguishable from any stranger's to every heuristic here;
+- its traffic is the exact shape the heuristics look for — one remote address holding long-lived flows to whatever the tunnel carries, re-keying on a timer, and **retrying hard whenever the link flaps**, which reads like a brute-force or scan pattern;
+- so a single auto-block drops the tunnel for **both** sites at once, and nothing at this end looks wrong afterwards: the rule applied, the console still answers, and the other office simply loses the VPN.
+
+Peers are collected the same belt-and-braces way, on the same 60 s cadence, and remembered for the same 24 h:
+
+| Source | Covers |
+|--------|--------|
+| `netsh advfirewall monitor show mmsa` / `qmsa` | Live security associations. **Implementation-independent** — an IKEv2 client VPN, an RRAS site-to-site tunnel and a domain-isolation policy all install SAs the same Windows Filtering Platform reports. Main mode is up before quick mode, so reading both covers the window a flapping tunnel spends most of its time in |
+| `netsh advfirewall consec show rule name=all` | Connection-security rules — the peer named in *configuration*, still there with the tunnel **down**, which is the state a site is in after the very block this prevents |
+| `Ras\router.pbk` (RRAS demand-dial) and `rasphone.pbk` (client VPNs) | The far end of a site-to-site interface or a dialled VPN, read straight from the phonebook with no subprocess and no elevation |
+| A persisted 24 h memory (`ipsec-endpoints.json`) | Restarts, re-keying windows, a momentary command failure, and a tunnel that has **already** dropped |
+
+- **Subnets and ranges are never read.** A tunnel rule's endpoint can be a whole network, and a shield that swallowed `0.0.0.0/0` would silently disable auto-block for the entire internet. Only bare single addresses are taken; anything with a prefix or written as a range is skipped, as is a rule's own name, which is operator-chosen text that can be anything at all.
+- Hostnames contribute nothing — a phonebook overwhelmingly holds them — for the same reason as WireGuard's `Endpoint =`. The live SA views report the address itself.
+- Both ends of an SA are kept rather than guessing which is remote: which one is the peer depends on who initiated, and this host's own addresses are refused by an earlier gate anyway.
+- The parser is deliberately **label-blind**. netsh output is localized, so keying on "Remote IP Address" would make the shield work on English installs only.
+- Reading SA state needs **Administrator**. A caveat worth knowing: `netsh` reports that refusal on stdout and still **exits 0**, so a naive reading would call an unelevated host "no IPSec configured" — precisely the silence this guard exists to prevent. The privilege is checked up front instead, and the status says what is true on Windows: a process that cannot read the tunnel state cannot write a firewall rule either, so nothing is at risk while it is off.
+- Detection is unchanged: this gate only stops the machine deciding on its own. **Manual blocking still works**, and a peer that really is hostile belongs in the IPSec configuration, not in a firewall rule that also takes the tunnel down.
+
+### Data flow — how much, not just who
+
+The dashboard has always answered *who is talking to this machine*. It also answers *how much went in and out*.
+
+`TrafficMeterService` reads the cumulative per-adapter octet counters Windows keeps (`NetworkInterface.GetIPStatistics`) every 5 s and diffs them — no packet capture, no elevation, no subprocess. Three cards: live in/out throughput on one shared zero-based scale (two independent scales would make a trickle of uploads look like a saturated download), this month's totals, and paired bars per day of the month or per month of the year.
+
+Two details decide whether the numbers are right, and each has a test:
+
+- **Physical links only.** A tunnel, a Hyper-V or VMware virtual switch port, a teaming multiplexor above its own members, and an OpenVPN TAP adapter all carry bytes that already crossed a physical adapter — counting both would double every tunnelled byte. Loopback never leaves the machine. The adapter *type* does not settle it: a WireGuard (Wintun) adapter, a Hyper-V switch port and the KM-TEST loopback adapter all present as ordinary Ethernet, so the driver description is read too, and the marker list names families (`vEthernet`, `TAP-`, `Multiplexor`) rather than products. Team **members** are metered and the multiplexor is not, which gives the total exactly once.
+- **Counters reset.** A reboot or an adapter bounce restarts them at zero; a counter that moved backwards is treated as a fresh start and its current value is the delta.
+
+Daily totals and the last raw counters persist to `traffic-history.json`, so the diff continues across a restart — but that first catch-up delta spans however long the app was shut, so it counts toward the day and is deliberately **not** charted as a rate.
+
+Turn it off with `TrafficMeterEnabled` (Settings → Traffic metering); the history is kept but stops growing. The web console's toggle takes effect immediately rather than at the next restart.
+
 ### DNS hygiene
 
 Almost nothing connects without resolving a name first, so DNS is where a compromise usually shows earliest — and it is a standard exfiltration channel the exfiltration monitor cannot see, since that counts TCP socket bytes and DNS is UDP. Until now this app had no view of DNS at all.
@@ -276,7 +316,8 @@ Network Sentinel does not configure your resolver. Getting that wrong costs name
 Set **Settings → Webhook URL** to push Critical threats off the machine — the payload adapts automatically: **ntfy** (plain text + `Title`/`Priority` headers), **Slack** (`{"text": …}`), **Discord** (`{"content": …}`), anything else gets a generic JSON document. Per-source/type cooldown stops a burst from flooding the channel.
 
 ### Firewall & block
-- **Block / unblock** remote IPs (inbound, outbound, or both) — rules are created as an `-In`/`-Out` pair and removed together
+- **Block / unblock** remote IPs (inbound, outbound, or both) — rules are created as an `-In`/`-Out` pair and removed together (config rules are never paired, so their names are exempt from that)
+- Your own rules, written on the **Firewall Config** page — see below
 - **Block local ports** (TCP/UDP)
 - Only manages rules named `NetworkSentinel-*` so other firewall rules are left alone
 - All firewall changes go through **`netsh` in a separate process** (never firewall COM — COM from web/thread-pool threads can crash the host)
@@ -286,6 +327,26 @@ Set **Settings → Webhook URL** to push Critical threats off the machine — th
 - The expiry side-file is **reconciled with the firewall at startup**: a rule deleted outside the app (wf.msc, Group Policy, another administrator) would otherwise leave its expiry entry behind forever, and the sweep would retry a delete every minute for a rule that is already gone. Listing rules needs no elevation, so this never raises a UAC prompt at startup
 - Settings stored machine-wide in `%ProgramData%\NetworkSentinel\settings.json` — shared by the GUI, TUI, and the web service (which runs as SYSTEM); falls back to `%LocalAppData%` if ProgramData is not writable
 - **Run as Admin** when elevation is required
+
+### Firewall Config — write your own rules
+
+A **Firewall Config** page under *Firewall & Block* (and a tab in the web console) that adds, edits and deletes inbound and outbound rules, shaped like the Linode Cloud Manager firewall page (and [FireWallConfig](https://github.com/davidfweiser/FireWallConfig) on Ubuntu): one list per direction, Label / Action / Protocol / Port range / Sources, one form for both add and edit, and labels minted from the port's service (`block-inbound-rdp`) when you leave the field blank.
+
+Rules are written as ordinary `NetworkSentinel-Rule-*` Windows Firewall rules, so they apply system-wide, show up in `wf.msc`, and appear in every one of this app's rule lists.
+
+**Precedence needs no work here, unlike the other builds.** Windows Firewall is not evaluated in creation order: it groups rules by type and evaluates connection-security rules, then authenticated bypass, then **block**, then **allow**, then the profile default. A block therefore beats an allow whichever was written first, so a config *Allow* can never reopen an address auto-block just shut. (The Linux build has to insert app blocks at the head of a first-match-wins chain to get the same guarantee.) The one rule type that *would* outrank a block is an authenticated bypass, and this page offers no way to author one.
+
+What no rule can change is a **profile's default action** for traffic nothing matches — that is a per-profile setting in Windows Firewall (inbound blocked, outbound allowed on a stock install), and the page says so rather than implying an Allow rule is what grants access.
+
+Other details:
+
+- Blocking everything, or blocking inbound **RDP**, is **confirmed before it is written**.
+- The **web console refuses** an inbound block that matches every source and covers its own port. The desktop app can ask you to confirm cutting the machine off; over the web the confirmation would travel down the connection being cut. Rules scoped to named addresses go through — the Firewall tab's *Block IP* already does exactly that.
+- A rule the firewall rejects is **rolled back** instead of being left behind claiming to be in force.
+- An unparseable port range is **rejected, not dropped**: validation runs before canonicalisation, because canonicalising first would turn a typo'd `443-80` into an empty port field — and an empty port field means *every port*.
+- One rule usually needs exactly one firewall rule: `remoteip` takes a whole address list, IPv4 and IPv6 together. Two cases still split, because netsh rejects them outright — a port range under protocol *Any* becomes one TCP and one UDP rule, and ICMP becomes icmpv4 and icmpv6. Every fragment shares one rule name and is folded back together on read, so you see the one rule you wrote.
+
+The page header shows the running version — check it after an upgrade to confirm the new build is live. An open web console tab now says so itself: the page carries the build it was served from, and when the server reports a different one a banner offers a reload (it never reloads on its own — you may be mid-rule in the editor).
 
 ### Known-good allowlist (never block)
 Trusted sites are protected so auto-block (and manual block) will not cut off everyday tools:
@@ -459,15 +520,18 @@ powershell -ExecutionPolicy Bypass -File .\uninstall-web-service.ps1 -PurgeData 
 
 | Tab | What you can do |
 |-----|-----------------|
-| **Dashboard** | Live counters, **5-minute activity chart** (connections + threat markers), monitoring/firewall status, recent threats |
+| **Dashboard** | Live counters, **5-minute activity chart** (connections + threat markers), **data-flow charts** (live in/out throughput, this month's totals, paired bars per day or per month), monitoring/firewall status, recent threats |
 | **Connections / Threats** | Live traffic with a **Block** button on every row |
 | **Hosts** | Remote peers; block / unblock by row or by typed IP |
 | **Ports** | Local listeners; one-click **Block port** |
 | **Firewall** | Managed rules grouped as In/Out pairs; manual IP and port blocking; **Restore allowlisted** |
+| **Firewall Config** | Write your own inbound and outbound rules — Label / Action / Protocol / Port range / Sources, with service presets, plus edit and delete |
 | **Allowlist** | Add/remove trusted domains and IPs; refresh the feed |
 | **Settings** | Monitoring on/off, page refresh speed, geo lookups, failed-logon monitoring, closed-port scan detection, the intrusion detectors (threat intel, new-listener, process reputation, ARP watch, startup-item watch, exfiltration, honeypot), **kernel flow events**, **DNS hygiene** (with approved resolvers), **WireGuard peer monitoring**, **Suricata signature ingestion** (EVE path), **auto-block dry run**, **HTTPS + DuckDNS remote access** (including **Issue certificate**), webhook alerts, auto-block + minimum severity + expiry, block direction (in/out), allowlist feed, **change master password**, **Remove all rules** |
 
-The console protects itself: it refuses to remove its own firewall access rule or block its own port (doing so would cut off your browser mid-request and look exactly like a crash).
+The console protects itself: it refuses to remove its own firewall access rule, block its own port, or write a Firewall Config rule that would do the same (doing so would cut off your browser mid-request and look exactly like a crash).
+
+A tab left open across an upgrade keeps its old markup — the page polls `/api/state` but never re-requests its own HTML, so no cache header can deliver the new UI, and the new features simply look absent. The page now carries the build it was served from, and when the server reports a different one a banner offers a reload. It never reloads on its own: you may be mid-rule in the Firewall Config editor.
 
 #### Sleep / Wake
 
@@ -764,27 +828,32 @@ The token is written to `duckdns.json`, not `settings.json`; the GUI, TUI, and w
 | `Services/PreventionService.cs` | The single auto-block enforcement engine: gates, dry run, operator shield |
 | `Services/SuricataService.cs` | Tails Suricata EVE JSON and converts alerts to threat events |
 | `Services/WireGuardMonitor.cs` | WireGuard peer baseline, endpoint drift, per-peer transfer |
-| `Services/WireGuardEndpointGuard.cs` | The never-auto-block tunnel endpoint set, independent of peer monitoring |
+| `Services/WireGuardEndpointGuard.cs` / `IpsecEndpointGuard.cs` | Tunnel endpoints that must never be auto-blocked |
+| `Services/TrafficMeterService.cs` | Adapter byte-counter sampling + daily history behind the data-flow charts |
 | `Services/DnsHygieneMonitor.cs` | Plaintext/encrypted DNS, unapproved resolvers, allowlist resolution drift |
 | `Services/HostHistoryStore.cs` | Persistent host + listener baseline, threat log |
 | `Services/WebhookNotifier.cs` | ntfy / Slack / Discord / generic JSON alerts, each carrying the block verdict |
 | `Services/DesktopNotifier.cs` | Critical Windows toasts, blocked-or-not in the title |
 | `Services/GeoIpService.cs` | Reverse DNS + public geo lookup |
 | `Services/FirewallService.cs` | Windows Firewall rule create/list/remove (netsh, cached rule list); auto-block expiry sweep |
+| `Services/FirewallRuleSpec.cs` | Firewall Config rule parsing, validation and netsh rendering (no privilege, no I/O) |
 | `Services/AppSettings.cs` | Auto-block preferences + suppress list (JSON on disk) |
 | `Services/DuckDnsUpdater.cs` | DuckDNS dynamic-DNS refresh loop; token file with an admins-only ACL |
 | `Services/TlsCertificateProvider.cs` | Loads the console's PEM/`.pfx` and re-reads it after an ACME renewal |
 | `Services/CertIssuanceService.cs` | Drives `issue-duckdns-cert.ps1` behind the **Issue certificate** button |
 | `Services/LoginThrottle.cs` | Per-client-IP lockout for the console's password endpoints |
 | `ViewModels/MainViewModel.cs` | UI state, commands, auto-block wiring |
+| `ViewModels/MainViewModel.FirewallConfig.cs` / `.Traffic.cs` | Firewall Config page; data-flow chart series and legends |
 | `Web/WebApp.cs` | Headless web console (Kestrel HTTP/HTTPS host + embedded single-page UI) |
 | `Web/WebAuthStore.cs` | Master password hash + session tokens |
 | `Web/WebTlsOptions.cs` | TLS values from the command line, overlaid on the saved settings |
 | `scripts/issue-duckdns-cert.ps1` | Let's Encrypt DNS-01 issuance via Posh-ACME + renewal scheduled task |
+| `scripts/diagnose-ipsec.ps1` | Read-only triage for a site-to-site tunnel that won't come up |
 | `Tui/TuiApp.cs` | Terminal UI (Spectre.Console) |
 | `MainWindow.xaml` | Dashboard UI |
 | `Themes/` | Colors and control styles |
 | `Controls/Sparkline.cs` | Live activity chart |
+| `Controls/TrafficChart.cs` | Dual sparkline + paired bar chart for the data-flow cards |
 
 ---
 
@@ -797,6 +866,7 @@ The token is written to `duckdns.json`, not `settings.json`; the GUI, TUI, and w
 - **Closed-port scan detection** is off by default because it turns on Windows Firewall **dropped-packet logging** (a firewall setting, not a rule — nothing extra is blocked or allowed). Enable it under **Settings → Closed-port scan detection** while elevated, or set `"ProbeLogEnabled": true`. The watcher tails `%windir%\System32\LogFiles\Firewall\pfirewall.log` (readable by Administrators/SYSTEM), counts pure SYNs only, and the toggle turns the logging back off.
 - **Monitor poll interval** (desktop **Settings**, default 1.2 s, `"MonitorPollMs"`) is also the activity-chart sample rate, so a slower interval widens the window the chart covers rather than thinning it.
 - The allowlist remote feed can likewise be toggled in **Settings** or via `"AllowlistUseRemoteFeed": false` in the same file.
+- **Traffic metering** samples the adapter byte counters for the data-flow charts and the monthly history in `traffic-history.json`. On by default (unprivileged and cheap); turn it off in **Settings → Traffic metering** or with `"TrafficMeterEnabled": false`, which keeps the history but stops it growing.
 - **Threat-intel feeds** download FireHOL level1 and Spamhaus DROP once a day to `threat-intel-cache.json` and fall back to the cache when offline; turn them off with `"ThreatIntelEnabled": false`.
 - The **honeypot** is off by default because it binds real ports — enable it under **Settings → Honeypot decoy ports** once you have confirmed the chosen ports are free. The decoy sockets bind exclusively, so a port already served by a real service is skipped rather than hijacked.
 - The **exfiltration monitor** enables per-connection TCP ESTATS counters, which requires Administrator. Unelevated it reports itself unavailable and stays quiet; the web service (SYSTEM) is unaffected.
@@ -805,6 +875,30 @@ The token is written to `duckdns.json`, not `settings.json`; the GUI, TUI, and w
 - Some system sockets may show as `System` or `PID n` depending on permissions.
 - Existing TCP sessions may remain until they reconnect after a block; new matching traffic is stopped by the firewall.
 - A port that shows `LISTEN` locally but is unreachable from outside is usually a **network** firewall, not this app: on a cloud VM (Azure, AWS, …) the provider's security group can drop inbound traffic before it reaches the host. Open the port there too.
+
+---
+
+## A site-to-site tunnel that won't come up
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\diagnose-ipsec.ps1 203.0.113.7   # the peer's public address
+```
+
+Run it from an **elevated** prompt. Read-only, takes about 25 s, changes nothing. It answers three questions in order: **is this host blocking the peer or the IKE ports**, **is the peer's traffic arriving at all and from which address**, and **what does Windows say about the negotiation**. Where that lands tells you which of these it is:
+
+| What the script shows | What it means |
+|---|---|
+| A firewall rule naming the peer | This host blocked it. Allowlist the address (TUI `n`, or the web console's Allowlist tab) — that also removes the rule. A plain unblock only suppresses re-blocking for 24 h, so the tunnel would drop again tomorrow |
+| No local rule, and **no packets captured** | Nothing is reaching the box, so the drop is upstream. On a cloud VM this is nearly always the **provider's** security group, which is invisible from inside the machine — see the note below |
+| Packets arriving from a **different address** than the configuration names | The far end's WAN address changed. Classic on a dynamic residential line, and it looks exactly like a failure with no cause: worked for months, then stopped, nobody touched either end |
+| Packets from the right address, IKE still failing | A negotiation problem — the IPsec audit and IKEEXT events name it (auth failure, proposal mismatch, no matching peer) |
+
+**On a cloud VM, check the provider firewall first.** IPSec needs **UDP 500** (IKE) and **UDP 4500** (NAT-T) inbound, and these are not open by default. Two traps here:
+
+- **Some providers cannot express ESP at all.** Where the security group offers only TCP, UDP and ICMP, raw protocol 50 can never be allowed. If IKE completes but no traffic crosses the tunnel, force UDP encapsulation so ESP travels inside UDP 4500.
+- **A peer on a dynamic address outgrows a pinned rule.** Scoping the source to the peer's `/32` is the right instinct, but every ISP rotation then breaks the tunnel until someone edits both the provider firewall *and* the local configuration. Identify the peer by certificate or a strong PSK instead and the address stops mattering — the provider rule still has to widen to all sources, so the authentication is doing the work the address filter used to.
+
+**This app never auto-blocks a tunnel endpoint** — see [The same shield for IPSec](#the-same-shield-for-ipsec-including-site-to-site). If the script does find a rule naming your peer, it was a manual block or predates the shield.
 
 ---
 
