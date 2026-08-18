@@ -209,10 +209,15 @@ public sealed class FirewallService
 
             // Blocks are created as an -In/-Out pair. Removing only the clicked row left
             // the sibling active, so the IP stayed blocked and remove "didn't work".
+            //
+            // Config rules are never paired, and their names end in an operator's
+            // label — a rule labelled "vpn-In" would otherwise drag an unrelated
+            // "vpn-Out" rule out of the firewall with it.
+            var isPaired = !IsConfigRuleName(name);
             var siblings = new List<string> { name };
-            if (name.EndsWith("-In", StringComparison.OrdinalIgnoreCase))
+            if (isPaired && name.EndsWith("-In", StringComparison.OrdinalIgnoreCase))
                 siblings.Add(name[..^"-In".Length] + "-Out");
-            else if (name.EndsWith("-Out", StringComparison.OrdinalIgnoreCase))
+            else if (isPaired && name.EndsWith("-Out", StringComparison.OrdinalIgnoreCase))
                 siblings.Add(name[..^"-Out".Length] + "-In");
 
             var removed = new List<string>();
@@ -306,6 +311,142 @@ public sealed class FirewallService
             $"Restored {removed} allowlisted address(es): {string.Join("; ", notes.Take(12))}" +
             (notes.Count > 12 ? "…" : ""));
     }
+
+    // ── Firewall Config rules (operator-authored) ────────────────────────
+
+    /// <summary>
+    /// Why an operator's Allow rule can never reopen an address auto-block just
+    /// shut — and why, unlike the other builds, this one has to do nothing to get
+    /// that.
+    ///
+    /// The macOS build regenerates one PF anchor from the ledger on every change
+    /// and fixes precedence by emitting app-minted blocks first; the Linux build
+    /// adds rules to live nft/iptables chains that are first-match-wins, so it has
+    /// to insert app blocks at the head of the chain and append config rules.
+    ///
+    /// Windows Firewall is not evaluated in creation order at all. It groups rules
+    /// by type and evaluates the groups: connection-security rules, then
+    /// authenticated bypass, then <b>block</b>, then <b>allow</b>, then the
+    /// profile default. A block therefore beats an allow whatever order they were
+    /// written in, so an operator's Allow rule cannot reopen an address auto-block
+    /// just shut, and the app never needs to order its writes.
+    ///
+    /// The one thing that <em>would</em> defeat an app-minted block is an
+    /// authenticated-bypass rule (netsh's <c>security=authenticate</c> with
+    /// <c>action=bypass</c>), which outranks block rules. The Firewall Config view
+    /// writes plain allow/block rules and offers no way to author one.
+    /// </summary>
+    internal const string PrecedenceNote =
+        "Windows Firewall evaluates block rules ahead of allow rules, so write order does not matter";
+
+    /// <summary>Name prefix for the rules the Firewall Config view writes.</summary>
+    internal const string ConfigRulePrefix = RulePrefix + "-Rule-";
+
+    /// <summary>
+    /// Every managed rule with the operator's config rules last. The flat rule
+    /// list sorts for display; this is the order the Firewall Config view shows,
+    /// where app-minted blocks are listed first because they are the ones that
+    /// take effect first (see <see cref="PrecedenceNote"/>).
+    /// </summary>
+    public IReadOnlyList<FirewallRuleInfo> GetConfigRules()
+        => GetManagedRules()
+            .OrderBy(r => r.Kind == FirewallRuleKind.Custom ? 1 : 0)
+            .ToList();
+
+    /// <summary>
+    /// Creates or replaces one operator-authored rule. Passing
+    /// <paramref name="replaceName"/> edits in place: the old firewall rule is
+    /// dropped and the new one written in its place.
+    /// </summary>
+    public FirewallOperationResult SaveCustomRule(FirewallRuleSpec spec, string? replaceName = null)
+    {
+        // Validate before normalising — see FirewallRuleSpecs.TryPrepare for why the
+        // other order turns an unparseable port range into "every port".
+        if (!FirewallRuleSpecs.TryPrepare(spec, out var normalized, out var error))
+            return FirewallOperationResult.Fail(error);
+
+        if (!IsAdministrator)
+            return FirewallOperationResult.Fail("Administrator rights are required to modify the Windows Firewall.");
+
+        if (!string.IsNullOrWhiteSpace(replaceName))
+        {
+            var existing = GetManagedRules().FirstOrDefault(r =>
+                string.Equals(r.Name, replaceName, StringComparison.OrdinalIgnoreCase));
+            if (existing == null)
+                return FirewallOperationResult.Fail($"No rule named \"{replaceName}\" to edit — it may have been removed.");
+            if (existing.Kind != FirewallRuleKind.Custom)
+                return FirewallOperationResult.Fail("Only Firewall Config rules can be edited here.");
+
+            RemoveRuleByName(replaceName!);
+            // The replaced name has to be free again before the new one is minted,
+            // or an edit that keeps the label would come back as "…-2".
+            InvalidateRuleCache();
+        }
+
+        var name = UniqueCustomRuleName(normalized.Label, GetManagedRules());
+        var rule = FirewallRuleSpecs.ToRule(normalized, name);
+        var applied = ApplyCustomRule(rule);
+        InvalidateRuleCache();
+
+        if (!applied.Success)
+        {
+            // A rule the firewall would not take must not stay behind claiming to be
+            // in force. Any fragment that did load is torn back out, so a
+            // half-applied rule cannot survive as a silent partial block.
+            RemoveRuleByName(name);
+            InvalidateRuleCache();
+            return FirewallOperationResult.Fail($"The rule was rejected, so it was not kept: {applied.Message}");
+        }
+
+        return FirewallOperationResult.Ok(string.IsNullOrWhiteSpace(replaceName)
+            ? $"Added rule \"{normalized.Label}\"."
+            : $"Saved rule \"{normalized.Label}\".");
+    }
+
+    /// <summary>
+    /// Writes one config rule's firewall rules. A spec usually needs exactly one —
+    /// netsh takes a whole address list, both families together, in a single rule —
+    /// but a port range under protocol Any splits into TCP and UDP, and ICMP splits
+    /// into icmpv4 and icmpv6. Every fragment carries the same rule name, so a
+    /// later delete by name takes all of them.
+    /// </summary>
+    private FirewallOperationResult ApplyCustomRule(FirewallRuleInfo rule)
+    {
+        var matches = FirewallRuleSpecs.BuildNetshMatches(rule);
+        if (matches.Count == 0)
+            return FirewallOperationResult.Fail("The rule matched nothing to write.");
+
+        var dir = rule.IsInbound ? "in" : "out";
+        var action = rule.IsBlock ? "block" : "allow";
+
+        foreach (var fragment in matches)
+        {
+            var netsh = RunNetsh(
+                $"advfirewall firewall add rule name=\"{rule.Name}\" dir={dir} action={action} " +
+                $"{fragment.Match} enable={(rule.Enabled ? "yes" : "no")} profile=any " +
+                $"description=\"{Escape(rule.Description)}\"");
+            if (!netsh.Success)
+                return FirewallOperationResult.Fail($"Failed to add rule {rule.Name}: {netsh.Message}");
+        }
+
+        return FirewallOperationResult.Ok($"Rule \"{rule.Name}\" applied.");
+    }
+
+    /// <summary>Rule names are the key, so a repeated label gets a suffix.</summary>
+    private static string UniqueCustomRuleName(string label, IReadOnlyList<FirewallRuleInfo> existing)
+    {
+        var baseName = ConfigRulePrefix + Sanitize(label);
+        var name = baseName;
+        var suffix = 2;
+        while (existing.Any(r => string.Equals(r.Name, name, StringComparison.OrdinalIgnoreCase)))
+            name = $"{baseName}-{suffix++}";
+        return name;
+    }
+
+    /// <summary>True for the rules the Firewall Config view writes.</summary>
+    internal static bool IsConfigRuleName(string? name)
+        => !string.IsNullOrWhiteSpace(name) &&
+           name.StartsWith(ConfigRulePrefix, StringComparison.OrdinalIgnoreCase);
 
     public IReadOnlyList<FirewallRuleInfo> GetManagedRules()
     {
@@ -593,11 +734,18 @@ public sealed class FirewallService
         if (string.IsNullOrWhiteSpace(name)) return false;
         return name.StartsWith(RulePrefix + "-IP-", StringComparison.OrdinalIgnoreCase)
                || name.StartsWith(RulePrefix + "-Port-", StringComparison.OrdinalIgnoreCase)
-               || name.StartsWith(RulePrefix + "-Web-", StringComparison.OrdinalIgnoreCase);
+               || name.StartsWith(RulePrefix + "-Web-", StringComparison.OrdinalIgnoreCase)
+               || name.StartsWith(ConfigRulePrefix, StringComparison.OrdinalIgnoreCase);
     }
 
     private static FirewallRuleKind ClassifyRuleKind(string name, string remote, string localPorts)
     {
+        // Tested first: the rest of this method matches on "-IP-" and "-Port-"
+        // anywhere in the name, and an operator is free to label a config rule
+        // "block-IP-scanner".
+        if (IsConfigRuleName(name))
+            return FirewallRuleKind.Custom;
+
         if (name.StartsWith(RulePrefix + "-IP-", StringComparison.OrdinalIgnoreCase)
             || name.Contains("-IP-", StringComparison.OrdinalIgnoreCase))
             return FirewallRuleKind.IpBlock;
@@ -616,65 +764,125 @@ public sealed class FirewallService
 
     private static List<FirewallRuleInfo> GetManagedRulesNetsh()
     {
-        var list = new List<FirewallRuleInfo>();
         // Non-verbose still includes every field we parse (name, enabled, direction,
-        // remote IP, local port, protocol, action) at a fraction of the output size.
+        // remote IP, local/remote port, protocol, action, description) at a fraction
+        // of the output size.
         var result = RunNetsh("advfirewall firewall show rule name=all");
         if (!result.Success && string.IsNullOrWhiteSpace(result.Message))
-            return list;
+            return new List<FirewallRuleInfo>();
 
-        // Parse netsh dump for our prefix
+        return MergeConfigFragments(ParseNetshRules(result.Message));
+    }
+
+    /// <summary>
+    /// Parses a <c>netsh advfirewall firewall show rule</c> dump into one entry per
+    /// firewall rule. Split out from the netsh call so the parsing is testable.
+    /// </summary>
+    internal static List<FirewallRuleInfo> ParseNetshRules(string dump)
+    {
+        var list = new List<FirewallRuleInfo>();
+
         string? currentName = null;
         string enabled = "";
         string direction = "";
-        string profiles = "";
+        string description = "";
         string remoteIp = "";
         string localPort = "";
+        string remotePort = "";
         string protocol = "";
         string action = "";
+
+        // netsh wraps a long address or port list onto following indented lines, so
+        // the field it belongs to has to stay selected across them.
+        string? continuing = null;
 
         void Flush()
         {
             if (string.IsNullOrWhiteSpace(currentName) || !IsManagedRuleName(currentName))
                 return;
 
-            var remoteNorm = NormalizeRemote(remoteIp);
-            var portsNorm = string.IsNullOrWhiteSpace(localPort) || localPort is "*" ? "" : localPort.Trim();
-            var protoNorm = string.IsNullOrWhiteSpace(protocol) ? "Any" : protocol;
+            var isOutbound = direction.Contains("Out", StringComparison.OrdinalIgnoreCase);
+            var isConfig = IsConfigRuleName(currentName);
+
+            // A config rule owns its whole address list, CIDR and all. Everything
+            // else targets one address, and the display has always shown just that.
+            var remoteNorm = isConfig ? NormalizeRemoteList(remoteIp) : NormalizeRemote(remoteIp);
+
+            // Config rules write the port the operator meant: the local port on the
+            // way in, the port being reached on the way out. App-minted port blocks
+            // use the local port in both directions.
+            var portField = isConfig && isOutbound ? remotePort : localPort;
+            var portsNorm = NormalizePorts(portField);
+
+            var protoNorm = string.IsNullOrWhiteSpace(protocol) ? "Any" : protocol.Trim();
+            if (isConfig && protoNorm.StartsWith("ICMP", StringComparison.OrdinalIgnoreCase))
+                protoNorm = "ICMP"; // netsh spells the two families apart; the spec does not
+
             list.Add(new FirewallRuleInfo
             {
                 Name = currentName,
+                Label = isConfig ? currentName[ConfigRulePrefix.Length..] : "",
                 Enabled = enabled.Contains("Yes", StringComparison.OrdinalIgnoreCase),
                 IsBlock = action.Contains("Block", StringComparison.OrdinalIgnoreCase),
-                Direction = direction.Contains("Out", StringComparison.OrdinalIgnoreCase)
-                    ? FirewallDirection.Outbound
-                    : FirewallDirection.Inbound,
+                Direction = isOutbound ? FirewallDirection.Outbound : FirewallDirection.Inbound,
                 RemoteAddresses = remoteNorm,
                 LocalPorts = portsNorm,
                 Protocol = protoNorm,
                 Kind = ClassifyRuleKind(currentName, remoteNorm, portsNorm),
-                Description = profiles,
+                Description = description,
                 ExpiresUtc = ExpiryLedger.Get(currentName)
             });
         }
 
-        foreach (var raw in result.Message.Split('\n'))
+        foreach (var raw in dump.Split('\n'))
         {
             var line = raw.TrimEnd('\r');
+
+            // Indented and not a key of its own: the tail of the list above it.
+            if (continuing != null && line.Length > 0 && char.IsWhiteSpace(line[0]))
+            {
+                var tail = line.Trim();
+                if (tail.Length > 0)
+                {
+                    switch (continuing)
+                    {
+                        case "remoteip": remoteIp = Append(remoteIp, tail); break;
+                        case "localport": localPort = Append(localPort, tail); break;
+                        case "remoteport": remotePort = Append(remotePort, tail); break;
+                    }
+                    continue;
+                }
+            }
+
+            continuing = null;
+
             if (line.StartsWith("Rule Name:", StringComparison.OrdinalIgnoreCase))
             {
                 Flush();
                 currentName = line["Rule Name:".Length..].Trim();
-                enabled = direction = remoteIp = localPort = protocol = action = profiles = "";
+                enabled = direction = remoteIp = localPort = remotePort = protocol = action = description = "";
             }
             else if (line.StartsWith("Enabled:", StringComparison.OrdinalIgnoreCase))
                 enabled = line["Enabled:".Length..].Trim();
             else if (line.StartsWith("Direction:", StringComparison.OrdinalIgnoreCase))
                 direction = line["Direction:".Length..].Trim();
+            else if (line.StartsWith("Description:", StringComparison.OrdinalIgnoreCase))
+                description = line["Description:".Length..].Trim();
             else if (line.StartsWith("RemoteIP:", StringComparison.OrdinalIgnoreCase))
+            {
                 remoteIp = line["RemoteIP:".Length..].Trim();
+                continuing = "remoteip";
+            }
             else if (line.StartsWith("LocalPort:", StringComparison.OrdinalIgnoreCase))
+            {
                 localPort = line["LocalPort:".Length..].Trim();
+                continuing = "localport";
+            }
+            else if (line.StartsWith("RemotePort:", StringComparison.OrdinalIgnoreCase))
+            {
+                remotePort = line["RemotePort:".Length..].Trim();
+                continuing = "remoteport";
+            }
             else if (line.StartsWith("Protocol:", StringComparison.OrdinalIgnoreCase))
                 protocol = line["Protocol:".Length..].Trim();
             else if (line.StartsWith("Action:", StringComparison.OrdinalIgnoreCase))
@@ -683,6 +891,160 @@ public sealed class FirewallService
 
         Flush();
         return list;
+    }
+
+    private static string Append(string list, string tail)
+        => list.Length == 0 ? tail : list.TrimEnd(',') + "," + tail;
+
+    /// <summary>
+    /// One config rule can need more than one firewall rule — a port range under
+    /// protocol Any becomes TCP and UDP, ICMP becomes icmpv4 and icmpv6 — and every
+    /// fragment carries the same name. Reading them back as separate rows would show
+    /// the operator two rules they did not write, and would hand the Edit button a
+    /// spec that is not the one they typed, so the fragments are folded back into
+    /// the rule they came from.
+    /// </summary>
+    internal static List<FirewallRuleInfo> MergeConfigFragments(List<FirewallRuleInfo> rules)
+    {
+        var merged = new List<FirewallRuleInfo>();
+        var index = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+
+        foreach (var rule in rules)
+        {
+            if (rule.Kind != FirewallRuleKind.Custom)
+            {
+                merged.Add(rule);
+                continue;
+            }
+
+            if (index.TryGetValue(rule.Name, out var at))
+                merged[at] = Combine(merged[at], rule);
+            else
+            {
+                index[rule.Name] = merged.Count;
+                merged.Add(rule);
+            }
+        }
+
+        return merged;
+    }
+
+    private static FirewallRuleInfo Combine(FirewallRuleInfo first, FirewallRuleInfo second)
+    {
+        // Only fragments of one spec ever share a name, so TCP alongside UDP can
+        // only have come from protocol Any — which is the one form netsh will not
+        // take with a port.
+        var protocol = first.Protocol;
+        if (!string.Equals(first.Protocol, second.Protocol, StringComparison.OrdinalIgnoreCase))
+        {
+            var pair = new[] { first.Protocol, second.Protocol };
+            protocol = pair.All(p => p.Equals("TCP", StringComparison.OrdinalIgnoreCase) ||
+                                     p.Equals("UDP", StringComparison.OrdinalIgnoreCase))
+                ? FirewallRuleSpecs.ProtocolAny
+                : first.Protocol;
+        }
+
+        var addresses = new List<string>();
+        foreach (var token in SplitList(first.RemoteAddresses).Concat(SplitList(second.RemoteAddresses)))
+        {
+            if (!addresses.Contains(token, StringComparer.OrdinalIgnoreCase))
+                addresses.Add(token);
+        }
+
+        return new FirewallRuleInfo
+        {
+            Name = first.Name,
+            Label = first.Label,
+            Description = first.Description,
+            Enabled = first.Enabled && second.Enabled,
+            IsBlock = first.IsBlock,
+            Direction = first.Direction,
+            RemoteAddresses = string.Join(", ", addresses),
+            LocalPorts = first.LocalPorts.Length > 0 ? first.LocalPorts : second.LocalPorts,
+            Protocol = protocol,
+            Kind = first.Kind,
+            ExpiresUtc = first.ExpiresUtc
+        };
+    }
+
+    private static IEnumerable<string> SplitList(string value)
+        => value.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+
+    private static string NormalizePorts(string port)
+    {
+        var value = (port ?? "").Trim();
+        if (value.Length == 0 || value is "*" || value.Equals("Any", StringComparison.OrdinalIgnoreCase))
+            return "";
+        return string.Join(", ", SplitList(value));
+    }
+
+    /// <summary>
+    /// The whole remote-address list as the spec spells it. netsh writes a mask
+    /// where the operator typed a prefix length (<c>10.0.0.0/255.0.0.0</c>), and
+    /// writes a full-length mask on a single host, so both are converted back or
+    /// the Edit button would hand the form something it cannot parse.
+    /// </summary>
+    private static string NormalizeRemoteList(string remote)
+    {
+        if (string.IsNullOrWhiteSpace(remote)) return "";
+        if (remote.Trim() is "Any" or "*") return "";
+
+        var tokens = new List<string>();
+        foreach (var token in SplitList(remote))
+        {
+            var slash = token.IndexOf('/');
+            if (slash < 0)
+            {
+                tokens.Add(token);
+                continue;
+            }
+
+            var address = token[..slash].Trim();
+            var suffix = token[(slash + 1)..].Trim();
+
+            // "10.0.0.0/255.0.0.0" → "10.0.0.0/8"; a numeric suffix is already right.
+            if (!int.TryParse(suffix, out var prefix))
+            {
+                if (!TryMaskToPrefix(suffix, out prefix))
+                {
+                    tokens.Add(token);
+                    continue;
+                }
+            }
+
+            var full = IPAddress.TryParse(address, out var parsed) &&
+                       parsed.AddressFamily == System.Net.Sockets.AddressFamily.InterNetworkV6
+                ? 128
+                : 32;
+
+            tokens.Add(prefix >= full ? address : $"{address}/{prefix}");
+        }
+
+        return string.Join(", ", tokens);
+    }
+
+    /// <summary>Dotted IPv4 mask to prefix length; false when it is not a contiguous mask.</summary>
+    private static bool TryMaskToPrefix(string mask, out int prefix)
+    {
+        prefix = 0;
+        if (!IPAddress.TryParse(mask, out var parsed) ||
+            parsed.AddressFamily != System.Net.Sockets.AddressFamily.InterNetwork)
+            return false;
+
+        var bits = 0u;
+        foreach (var b in parsed.GetAddressBytes())
+            bits = (bits << 8) | b;
+
+        var ones = 0;
+        while (ones < 32 && (bits & 0x8000_0000u) != 0)
+        {
+            ones++;
+            bits <<= 1;
+        }
+
+        if (bits != 0) return false; // holes in the mask — not a prefix
+        prefix = ones;
+        return true;
     }
 
     /// <summary>
@@ -1060,12 +1422,27 @@ public enum FirewallRuleKind
 {
     IpBlock,
     PortBlock,
-    Other
+    Other,
+
+    /// <summary>
+    /// A rule the operator wrote in the Firewall Config view: any action, any
+    /// direction, a protocol, a port range and an address list. The other kinds
+    /// are minted by the app (auto-block, manual block, web console access).
+    /// </summary>
+    Custom
 }
 
 public sealed class FirewallRuleInfo
 {
     public string Name { get; init; } = "";
+
+    /// <summary>
+    /// Operator-facing name for a Firewall Config rule (<c>block-inbound-ssh</c>).
+    /// Empty on rules the app minted itself, which fall back to a description
+    /// derived from what they match.
+    /// </summary>
+    public string Label { get; init; } = "";
+
     public string Description { get; init; } = "";
     public bool Enabled { get; init; }
     public bool IsBlock { get; init; }
@@ -1089,9 +1466,57 @@ public sealed class FirewallRuleInfo
     {
         FirewallRuleKind.IpBlock => "IP block",
         FirewallRuleKind.PortBlock => "Port block",
+        FirewallRuleKind.Custom => "Config rule",
         _ when Name.Contains("-Web-", StringComparison.OrdinalIgnoreCase) => "Web UI",
         _ => IsBlock ? "Block rule" : "Allow rule"
     };
+
+    /// <summary>Only Firewall Config rules can be edited; the rest are app-minted.</summary>
+    public bool IsCustom => Kind == FirewallRuleKind.Custom;
+
+    public bool IsInbound => Direction != FirewallDirection.Outbound;
+
+    /// <summary>Label column: the operator's name, or a description of what the rule matches.</summary>
+    public string LabelText
+    {
+        get
+        {
+            if (!string.IsNullOrWhiteSpace(Label)) return Label;
+            return Kind switch
+            {
+                FirewallRuleKind.IpBlock => $"auto-block-{(IsInbound ? "inbound" : "outbound")}-{AddressText}",
+                FirewallRuleKind.PortBlock => $"block-{(IsInbound ? "inbound" : "outbound")}-port-{LocalPorts}",
+                _ => Name
+            };
+        }
+    }
+
+    /// <summary>Where the rule came from, so app-minted rules are not mistaken for config.</summary>
+    public string OriginText
+    {
+        get
+        {
+            if (Name.Contains("-Web-", StringComparison.OrdinalIgnoreCase))
+                return "Web console";
+
+            return Kind switch
+            {
+                FirewallRuleKind.IpBlock => "Auto/manual block",
+                FirewallRuleKind.PortBlock => "Port block",
+                FirewallRuleKind.Custom => "Firewall config",
+                _ => "Managed"
+            };
+        }
+    }
+
+    public string ProtocolText => string.IsNullOrWhiteSpace(Protocol) ? "Any" : Protocol;
+
+    public string PortRangeText => string.IsNullOrWhiteSpace(LocalPorts) ? "All ports" : LocalPorts;
+
+    /// <summary>Sources on an inbound rule, destinations on an outbound one.</summary>
+    public string AddressListText => string.IsNullOrWhiteSpace(RemoteAddresses)
+        ? FirewallRuleSpecs.AnyAddressText
+        : RemoteAddresses;
     /// <summary>Best-effort IP or port target for display (COM sometimes omits RemoteAddresses).</summary>
     public string AddressText
     {
