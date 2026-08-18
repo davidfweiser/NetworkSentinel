@@ -10,7 +10,29 @@ Three ways to run it (same idea as the Linux build):
 | **Terminal UI (`--tui`)** | Server Core, RDP console, SSH-style workflows |
 | **Headless web UI (`-w`)** | Browser dashboard on a server (master-password protected) |
 
-> Awareness / monitoring tooling — not a full IDS/IPS replacement. Version **0.6.5**.
+> Awareness / monitoring tooling — not a full IDS/IPS replacement. Version **0.7.2**.
+
+---
+
+## What's new in 0.7.2
+
+Brings the Windows build level with the Linux 0.7.2 release, plus the IPSec half of the tunnel shield. Two new features, one new guard, and a fix to a write path that was losing data quietly.
+
+| Area | What changed |
+|------|--------------|
+| **Data-flow charts** | The dashboard has always answered *who* is talking to this machine; it now also answers *how much went in and out*. Live in/out throughput on one shared zero-based scale (two independent scales draw a trickle of uploads at the same height as a saturated download), this month's totals, and paired bars per day of the month or per month of the year — in the desktop app **and** the web console. Sampled from the per-adapter octet counters every 5 s: no capture, no elevation, no subprocess. |
+| **Physical adapters only** | A tunnel, a Hyper-V or VMware switch port, a teaming multiplexor and an OpenVPN TAP adapter all carry bytes that already crossed a real adapter, so counting both would double every tunnelled byte. The adapter *type* does not settle it — Wintun, Hyper-V switch ports and the KM-TEST loopback adapter all claim to be Ethernet — so the driver description is read too. Team **members** are metered and the multiplexor is not, which gives the total exactly once. |
+| **Firewall Config** | A page in the desktop app and a tab in the web console for writing your own rules: Label / Action / Protocol / Port range / Sources, one form for both add and edit, service presets, and labels minted from the port (`block-inbound-rdp`) when you leave the field blank. Rules are ordinary `NetworkSentinel-Rule-*` Windows Firewall rules, so they apply system-wide and show up in `wf.msc`. |
+| **Precedence needs no work here** | Windows Firewall groups rules by type and evaluates **blocks before allows**, so a config *Allow* can never reopen an address auto-block just shut, whichever was written first. (The Linux build has to insert app blocks at the head of a first-match-wins chain to get the same guarantee.) What no rule can change is a profile's default action — the page says so rather than implying an Allow rule is what grants access. |
+| **Rules that would cut you off** | Blocking everything, or blocking inbound RDP, is confirmed before it is written. The **web console refuses outright** an inbound block that matches every source and covers its own port: the desktop app can ask you to confirm, but over the web the confirmation would travel down the connection being cut. A rule the firewall rejects is rolled back rather than left behind claiming to be in force. |
+| **A typo'd port range no longer means "every port"** | Validation now runs *before* canonicalisation. The other order silently dropped a range the parser rejected — and an empty port field means every port, so `443-80` armed a catch-all block. |
+| **IPSec tunnel endpoints are never auto-blocked** | The shield that already covered WireGuard now covers IPSec, which matters most for **site-to-site**: the peer is another site's router at a fixed public address, holding long-lived flows and retrying hard whenever the link flaps — the exact shape the heuristics look for. One auto-block drops the tunnel for both sites, and nothing at this end looks wrong afterwards. Peers are learned from live SAs, connection-security rules and the RAS phonebooks, and remembered for 24 h across restarts. Subnets, ranges and hostnames are never taken: a shield that swallowed `0.0.0.0/0` would disable auto-block for the whole internet. |
+| **The upgrade banner** | A tab left open across an upgrade keeps its old markup — the page polls `/api/state` but never re-requests its own HTML, so no cache header can deliver the new UI and the new features simply look absent. The page now carries the build it was served from, and when the server reports a different one a banner offers a reload. It never reloads on its own: you may be mid-rule in the editor. |
+| **Atomic writes stop losing bursts** | `WriteAtomic` retried a lost publish on a flat 15 ms sleep for 12 attempts — it gave up after ~165 ms, and every loser of a race woke at the same instant and collided again in lockstep. Since the callers swallow exceptions, that meant a **silently dropped write**; the firewall ledger has three concurrent writers and every frontend saves settings. Now randomised backoff to a 2 s deadline. |
+
+A hundred more tests arrive with it (**188 total**), including the netsh rule round-trip, the adapter filter, the IPSec parsers, the console's self-block guard, and a concurrency test rebuilt so it actually fails on the bug it guards (32 writers released together: 8 failures in 8 runs before the fix, 0 in 15 after).
+
+**Upgrading** is in place and non-destructive, as in 0.5.x. Re-run the installer and confirm the web header reads `v0.7.2` — and if a console tab was already open, it will now tell you itself.
 
 ---
 
@@ -439,11 +461,11 @@ Self-contained by default — the server does **not** need the .NET SDK or a com
 
 ```powershell
 # Copy the .install.cmd to the server, then run it (UAC prompt if not elevated):
-.\NetworkSentinel-windows-server-x64-0.6.5.install.cmd
+.\NetworkSentinel-windows-server-x64-0.7.2.install.cmd
 # optional port:
-.\NetworkSentinel-windows-server-x64-0.6.5.install.cmd -Port 18765
+.\NetworkSentinel-windows-server-x64-0.7.2.install.cmd -Port 18765
 # unpack without installing:
-.\NetworkSentinel-windows-server-x64-0.6.5.install.cmd --extract-only
+.\NetworkSentinel-windows-server-x64-0.7.2.install.cmd --extract-only
 ```
 
 The one-file installer is a `.cmd`, not a `.ps1`: `cmd.exe` stops reading the script at `exit /b`, so the ZIP appended to it is never parsed. PowerShell tokenizes an entire `-File` script before running any of it, and the cost on appended binary is quadratic (16 MB ≈ 5½ minutes) before it fails to parse at all — so the shell-style "payload after exit" trick only works with a `cmd` entry point.
@@ -505,7 +527,7 @@ No URL ACL is reserved. That was an `HttpListener` requirement; Kestrel binds th
 
 #### Upgrades and uninstall
 
-Re-running the installer **upgrades in place**: it stops the running task, replaces the binaries, and restarts. `%ProgramData%\NetworkSentinel` is both the install folder and the data directory, so the installer removes **only the files the package ships** — the master password hash, settings, allowlist, logs, host history, threat log, `duckdns.json`, `tls\`, and `acme\` all survive. The web page header shows the running version (e.g. `v0.6.5`) — check it after an upgrade to confirm the new build is live.
+Re-running the installer **upgrades in place**: it stops the running task, replaces the binaries, and restarts. `%ProgramData%\NetworkSentinel` is both the install folder and the data directory, so the installer removes **only the files the package ships** — the master password hash, settings, allowlist, logs, host history, threat log, `duckdns.json`, `tls\`, and `acme\` all survive. The web page header shows the running version (e.g. `v0.7.2`) — check it after an upgrade to confirm the new build is live.
 
 Uninstall keeps that same data by default so a reinstall picks up where you left off:
 
