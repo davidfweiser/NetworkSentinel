@@ -226,8 +226,22 @@ public sealed class HostFirewallScanner
         var note = PrivilegeNote();
         if (backend == "none")
         {
-            return HostFirewallSnapshot.Unreadable(
-                "No firewall backend returned rules. " + note, errors);
+            // Keep the listeners. They come from `ss`, which needs no privilege, so a
+            // host whose firewall could not be read still knows what is listening on
+            // it — and "nothing readable" is the case where that matters most: an
+            // unprivileged run, or a box with no firewall configured at all.
+            // Unreadable() carries no listeners, so returning it here emptied the
+            // listening-services table on exactly those hosts.
+            return new HostFirewallSnapshot
+            {
+                HostLabel = Environment.MachineName,
+                Backend = "none",
+                Status = "Unknown",
+                Description = "No UFW, nftables, or iptables rules could be read.",
+                PrivilegeNote = "No firewall backend returned rules. " + note,
+                Listeners = listeners,
+                Errors = errors
+            };
         }
 
         var description = backend.Equals("UFW", StringComparison.OrdinalIgnoreCase)

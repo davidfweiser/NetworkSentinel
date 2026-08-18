@@ -1724,6 +1724,9 @@ public sealed class WebApp : IDisposable
             {
                 protocol = p.Protocol,
                 endpoint = p.DisplayEndpoint,
+                // Split out so the Firewall Config list can show a bind-address
+                // column of its own instead of only the "addr:port" display form.
+                address = p.Address,
                 port = p.Port,
                 process = p.ProcessName,
                 pid = p.ProcessId,
@@ -2766,6 +2769,7 @@ public sealed class WebApp : IDisposable
     <!-- A rule list alone does not answer "is this port actually reachable" —
          the listeners and the rules above them together do. -->
     <h3 style="margin:18px 0 8px;font-size:.95rem;color:var(--text2)">Listening services <span class="muted" id="listenerCount"></span></h3>
+    <p class="muted" id="listenHint" style="margin:0 0 10px;font-size:.85rem"></p>
     <div id="tbl-fwconfig-listeners"></div>
   </section>
 
@@ -3315,8 +3319,15 @@ public sealed class WebApp : IDisposable
     $('tbl-fwconfig-in').innerHTML = rows(inbound, 'Sources');
     $('tbl-fwconfig-out').innerHTML = rows(outbound, 'Destinations');
 
+    // The sockets a rule here is written against, and what the rules above do to
+    // them. Without this you read `ss -tuln` in a terminal and retype the port,
+    // which is how ports and bind addresses go missing from the rule set.
+    $('listenHint').textContent =
+      `${listeners.length} listening socket${listeners.length === 1 ? '' : 's'} — the same set ` +
+      '"ss -tuln" prints, with what the inbound rules above do to each one. ' +
+      '"New rule" fills the form above in with that socket\'s protocol and port.';
     $('tbl-fwconfig-listeners').innerHTML = table(
-      ['Process', 'Protocol', 'Port', 'Service', 'Bind address', 'Firewall'],
+      ['Process', 'Protocol', 'Port', 'Service', 'Bind address', 'Firewall', ''],
       listeners.map(l => `<tr>
         <td>${esc(l.process)}</td>
         <td>${esc(l.protocol)}</td>
@@ -3324,8 +3335,36 @@ public sealed class WebApp : IDisposable
         <td class="muted">${esc(l.service)}</td>
         <td class="mono">${esc(l.address)}</td>
         <td class="${COVERED_CLASS[l.covered] || ''}">${esc(l.covered)}</td>
-      </tr>`).join('')
+        <td class="row-actions"><button data-portrule="${esc(l.port)}" data-proto="${esc(l.protocol)}"
+            data-endpoint="${esc(l.address ? l.address + ':' + l.port : 'port ' + l.port)}"
+            data-process="${esc(l.process)}">New rule</button></td>
+      </tr>`).join('') || '<tr><td colspan="7" class="muted">No listening sockets reported.</td></tr>'
     );
+  }
+
+  // Protocol and port carry over from the socket; the bind address deliberately
+  // does not. Sources matches the far end of a connection, so seeding it with
+  // 0.0.0.0, :: or this host's own LAN address would match nothing an attacker sends.
+  function openRuleEditorForPort(port, proto, endpoint, process) {
+    // A scan row whose port is not a plain number has nothing to prefill.
+    if (!/^\d+$/.test(String(port))) {
+      setStatus(`"${port}" is not a single port number, so there is nothing to prefill — ` +
+                'write the rule by hand with Add an Inbound Rule.', true);
+      return;
+    }
+    openRuleEditor(null, 'Inbound');
+    $('ruleProtocol').value = String(proto).toUpperCase() === 'UDP' ? 'UDP' : 'TCP';
+    $('rulePorts').value = String(port);
+    // Same sentence the GUI's MainViewModel.DescribeListener builds, so an operator
+    // moving between the two front-ends reads the same note about the same socket.
+    const who = !process || process.trim() === '' || process.trim() === '—'
+      ? 'an unidentified process'
+      : process;
+    $('ruleEditorNote').textContent =
+      `Writes a rule for ${$('ruleProtocol').value} port ${port}, which ${who} on ${endpoint} is listening on. ` +
+      'Sources is left empty (every address) — it matches the remote end, not the address the service is ' +
+      'bound to. The web service needs root or pkexec/sudo.';
+    $('ruleEditor').scrollIntoView({ block: 'nearest' });
   }
 
   function openRuleEditor(rule, direction) {
@@ -4037,6 +4076,12 @@ public sealed class WebApp : IDisposable
       const proto = bp.dataset.proto || 'TCP';
       if (confirm(`Block inbound ${proto} port ${port}?\n\nThis firewalls the local service listening on that port for everyone, including LAN clients.`))
         apiAction('block_port', { value: port, kind: proto, direction: 'Inbound' });
+      return;
+    }
+    const pr = e.target.closest('[data-portrule]');
+    if (pr) {
+      openRuleEditorForPort(pr.dataset.portrule, pr.dataset.proto || 'TCP',
+                            pr.dataset.endpoint || '', pr.dataset.process || '');
       return;
     }
     const er = e.target.closest('[data-editrule]');

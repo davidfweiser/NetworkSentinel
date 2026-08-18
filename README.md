@@ -279,6 +279,10 @@ The web console additionally refuses an inbound Block that matches every source 
 
 One consequence, accepted deliberately: the probe-log rule is appended too, so a SYN from an address that is already blocked is now dropped before it reaches the log. Probe logging exists to catch scans from hosts that are *not* blocked yet.
 
+**Listening ports are on the page (0.7.3).** A rule here is written against a socket, so the page lists the sockets: protocol, **bind address**, port, service, process and PID for every TCP LISTEN and bound UDP socket — the same set `ss -tuln` prints, including the several rows a service like NetBIOS puts on one port across `0.0.0.0`, the LAN address and the broadcast address. **New rule** on a row opens the editor with that socket's protocol and port already filled in.
+
+The bind address deliberately does *not* carry into Sources. That field matches the far end of a connection, so seeding it with `0.0.0.0`, `::` or this host's own LAN address would write a rule that matches nothing an attacker sends. The editor note says so on the spot.
+
 Other details:
 
 - The page states the **real** default policies read off the kernel (`Drop inbound, Accept outbound`), and words the consequence to match — on an accept-by-default chain an Allow rule opens a path through the rules above it rather than granting access on its own; on a drop-by-default one a service is only reachable if a rule admits it.
@@ -423,9 +427,15 @@ Build on a machine with the .NET SDK; install on the server **without** .NET:
 
 | Artifact | Purpose |
 |----------|---------|
-| `dist/networksentinel-*-linux-x64.install.sh` | **One-file installer** (copy + run) |
-| `dist/networksentinel-*-linux-x64.tar.gz` | Classic tarball |
-| `dist/*.sha256` | Checksums |
+| `dist/networksentinel-*-linux-x64.install.sh` | **One-file installer** for x86-64 (copy + run) |
+| `dist/networksentinel-*-linux-arm64.install.sh` | Same, for ARM64 servers and the Raspberry Pi |
+| `dist/networksentinel-*-linux-*.tar.gz` | Classic tarball |
+| `dist/*.sha256` | Checksums — verify with `sha256sum -c` before running anything as root |
+
+Both installers are self-extracting: the script carries the tarball after an
+`__ARCHIVE_BELOW__` marker, unpacks it to a temp dir and runs the `install.sh`
+inside. `--help` works without extracting, so it is safe to run unprivileged
+first. The build is self-contained — the server needs no .NET runtime.
 
 ### Installer flags vs app flags
 
@@ -434,6 +444,8 @@ Build on a machine with the .NET SDK; install on the server **without** .NET:
 | `--web-service` | **Installer only** (`*.install.sh` / `install.sh`) | Install app **and** enable systemd auto-start |
 | `--desktop-shortcut` | **Installer only** | Also drop an icon on the Desktop (opt-in; desktops only) |
 | `--no-desktop` | **Installer only** | Skip the application-menu entry entirely |
+| `--service-user NAME` | **Installer only**, with `--web-service` | Run the unit as this user (default: the invoking user). It also decides where the data dir lives — settings and the master-password hash go to that user's `~/.local/share/NetworkSentinel`, and the unit's `ReadWritePaths=` is set to it |
+| `--port N` | **Installer only**, with `--web-service` | Web console port (default 18765); written to `web.env` |
 | `-w` / `--web` | **App** (`networksentinel`) | Run headless web UI in the foreground |
 | `--tui` | **App** | Terminal UI |
 | `--https` (+ `--tls-cert` / `--tls-key`) | **App**, with `-w` | Serve the console over TLS — see [HTTPS and remote access](#https-and-remote-access-050) |
@@ -465,6 +477,19 @@ What you get:
 - systemd unit `networksentinel-web.service` (starts on boot)
 - Port **18765** (configurable)
 - Process runs as **your user** (`SUDO_USER`), not as root — **do not** launch daily with `sudo`
+
+**Two things to settle before the console faces a network.** Neither is a bug, and
+both look like one the first time you hit them:
+
+1. **`pkexec` cannot work under systemd.** It needs a graphical polkit session, which
+   a headless service does not have, so *Block*, *Unblock* and *Authorize firewall*
+   fail with *"Need admin rights for firewall changes"* until the service user has
+   passwordless sudo scoped to `nft`/`iptables` — see
+   [Firewall elevation on a headless server](#firewall-elevation-on-a-headless-server-no-pkexec).
+2. **The unit serves plain HTTP.** `ExecStart` is `networksentinel -w ${WEB_PORT}`, so a
+   master password typed into a routable server crosses the wire in the clear. Put it
+   behind a tunnel or a LAN, or serve TLS — see
+   [HTTPS and remote access](#https-and-remote-access-050).
 
 ```text
 http://YOUR_SERVER_IP:18765/
