@@ -157,6 +157,13 @@ $StartMenuShortcut = Join-Path $StartMenuDir "Network Sentinel.lnk"
 Write-Host "Creating Start Menu shortcut (Run as administrator)..." -ForegroundColor Yellow
 New-Shortcut -Path $StartMenuShortcut -Target $InstalledExe -WorkingDirectory $InstallDir -IconLocation $IconPath -RunAsAdmin
 
+# Collected rather than tracked in a single variable: the loop below tries several
+# folders and some of them legitimately fail, so a lone "$desktopShortcut" held
+# whichever path was attempted last — normally Public\Desktop, which needs elevation
+# and is exactly the one that did NOT get a shortcut. The summary then named the only
+# path the user would not find an icon at.
+$DesktopShortcuts = @()
+
 if (-not $SkipDesktop) {
     # OneDrive can redirect "Desktop"; also try classic and Public so the icon is visible.
     $desktopDirs = @(
@@ -175,6 +182,8 @@ if (-not $SkipDesktop) {
             }
             $desktopShortcut = Join-Path $desk "Network Sentinel.lnk"
             New-Shortcut -Path $desktopShortcut -Target $InstalledExe -WorkingDirectory $InstallDir -IconLocation $IconPath -RunAsAdmin
+            # Only after New-Shortcut returns: a throw here means no icon was written.
+            $DesktopShortcuts += $desktopShortcut
             Write-Host "  -> $desktopShortcut"
         }
         catch {
@@ -205,7 +214,16 @@ Write-Host "Installed successfully." -ForegroundColor Green
 Write-Host "  App       : $InstalledExe"
 Write-Host "  Start Menu: $StartMenuShortcut"
 if (-not $SkipDesktop) {
-    Write-Host "  Desktop   : $DesktopShortcut"
+    if ($DesktopShortcuts.Count -gt 0) {
+        foreach ($shortcut in $DesktopShortcuts) {
+            Write-Host "  Desktop   : $shortcut"
+        }
+    }
+    else {
+        # Worth saying plainly: the install itself succeeded and the Start Menu entry
+        # is there, so silence here would read as "your desktop icon is somewhere".
+        Write-Host "  Desktop   : none created - see the skipped notes above; use the Start Menu entry" -ForegroundColor DarkYellow
+    }
 }
 Write-Host ""
 Write-Host "Open Start and type Network Sentinel, or double-click the desktop icon."
