@@ -1,6 +1,8 @@
 using System.Collections.ObjectModel;
+using System.Globalization;
 using CommunityToolkit.Mvvm.ComponentModel;
 using CommunityToolkit.Mvvm.Input;
+using NetworkSentinel.Models;
 using NetworkSentinel.Services;
 
 namespace NetworkSentinel.ViewModels;
@@ -124,6 +126,38 @@ public partial class MainViewModel
 
     [RelayCommand]
     private void AddInboundRule() => OpenRuleEditor(null, FirewallRuleSpecs.DirectionInbound);
+
+    /// <summary>
+    /// Starts an inbound rule from a socket in the listening-ports list — the
+    /// sockets are what a rule on this page is written against, so the page shows
+    /// them rather than making you read them off <c>ss -tuln</c> in a terminal.
+    ///
+    /// Protocol and port carry over; the bind address deliberately does not.
+    /// Sources matches the far end of a connection, so seeding it with 0.0.0.0,
+    /// ::, or this host's own LAN address would produce a rule that matches
+    /// nothing an attacker sends.
+    /// </summary>
+    [RelayCommand]
+    private void NewRuleForPort(ListeningPort? port)
+    {
+        if (port == null) return;
+
+        OpenRuleEditor(null, FirewallRuleSpecs.DirectionInbound);
+        RuleProtocol = port.Protocol.Equals("UDP", StringComparison.OrdinalIgnoreCase) ? "UDP" : "TCP";
+        RulePortRange = port.Port.ToString(CultureInfo.InvariantCulture);
+        RuleEditorNote =
+            $"Writes a rule for {RuleProtocol} port {port.Port}, which {DescribeListener(port)} is listening on. " +
+            "Sources is left empty (every address) — it matches the remote end, not the address the " +
+            "service is bound to. Applying asks for elevation (pkexec or sudo).";
+    }
+
+    private static string DescribeListener(ListeningPort port)
+    {
+        var name = string.IsNullOrWhiteSpace(port.ProcessName) || port.ProcessName == "\u2014"
+            ? "an unidentified process"
+            : port.ProcessName;
+        return $"{name} on {port.DisplayEndpoint}";
+    }
 
     [RelayCommand]
     private void AddOutboundRule() => OpenRuleEditor(null, FirewallRuleSpecs.DirectionOutbound);

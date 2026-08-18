@@ -259,6 +259,10 @@ The web console additionally refuses an inbound Block that matches every source 
 
 One consequence, accepted deliberately: the probe-log rule is appended too, so a SYN from an address that is already blocked is now dropped before it reaches the log. Probe logging exists to catch scans from hosts that are *not* blocked yet.
 
+**Listening ports are on the page (0.7.3).** A rule here is written against a socket, so the page lists the sockets: protocol, **bind address**, port, service, process and PID for every TCP LISTEN and bound UDP socket — the same set `ss -tuln` prints, including the several rows a service like NetBIOS puts on one port across `0.0.0.0`, the LAN address and the broadcast address. **New rule** on a row opens the editor with that socket's protocol and port already filled in.
+
+The bind address deliberately does *not* carry into Sources. That field matches the far end of a connection, so seeding it with `0.0.0.0`, `::` or this host's own LAN address would write a rule that matches nothing an attacker sends. The editor note says so on the spot.
+
 Other details:
 
 - The page states plainly that the managed chains **accept** anything no rule matches, so an Allow rule opens a path through the rules above it rather than granting access on its own.
@@ -286,7 +290,7 @@ Domains are DNS-resolved to current IPs. Auto-block never touches allowlisted IP
 | **Hosts** | Remote peers; block / unblock by row or by typed IP |
 | **Ports** | Local listeners; one-click **Block port** |
 | **Firewall** | Managed rules grouped as In/Out pairs; manual IP and port blocking; **Restore allowlisted** |
-| **Firewall Config** (0.7.1) | Add / edit / delete your own inbound and outbound rules; shows app-minted blocks alongside them in evaluation order |
+| **Firewall Config** (0.7.3) | Add / edit / delete your own inbound and outbound rules; shows app-minted blocks alongside them in evaluation order, and every listening socket with its bind address |
 | **Allowlist** | Add/remove trusted domains and IPs; refresh the feed |
 | **Settings** | Monitoring on/off, poll interval, geo lookups, auth-log and closed-port scan detection, the 0.4.0 detectors (threat intel, new-listener alerts, process reputation, ARP/gateway watch, startup-item watch, exfiltration threshold, honeypot ports), **kernel flow events**, **DNS hygiene** (with approved resolvers), **WireGuard peer monitoring** (with a live peer table), **Suricata signature ingestion** (EVE path, maximum severity, muted sids), **auto-block dry run**, **HTTPS + DuckDNS remote access** (including **Issue certificate**), webhook URL, auto-block + minimum severity + expiry, block direction (in/out), allowlist feed, **change master password**, **Remove all rules** |
 
