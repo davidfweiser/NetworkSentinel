@@ -12,7 +12,7 @@ Three ways to run it:
 
 > **Host-based** intrusion detection and prevention. It detects on its own heuristics and, with Suricata attached (0.6.0), on signature/payload inspection — then enforces in the kernel via `nftables`. It is not an inline network appliance: it protects the machine it runs on, not a segment, and it does not sit in the forwarding path.
 
-Linux port of the original Windows WPF Network Sentinel. Platform layers use `/proc/net`, `ss`, conntrack netlink, `nftables`/`iptables` (elevated via **pkexec**), and XDG data paths. Version **0.7.2**.
+Linux port of the original Windows WPF Network Sentinel. Platform layers use `/proc/net`, `ss`, conntrack netlink, `nftables`/`iptables` (elevated via **pkexec**), and XDG data paths. Version **0.7.3**.
 
 ---
 
@@ -68,7 +68,7 @@ Desktop notifications lead with it in the title (`Blocked · critical threat: Po
 
 The threat tables answer it too, so the screen you land on after a warning agrees with the warning: a **Blocked** column in the GUI (hover for the full reason) and the web console, and a `Blk` column in the TUI — red when the address is being dropped, amber for a block that failed or was only simulated, muted when it was deliberately left alone. A row whose address is already blocked offers **Unblock** in place of **Block**, as the Remote Computers views do; re-blocking would only rewrite a rule that is already in force.
 
-Every status line that reports auto-block state — the GUI hero subtitle and tray tooltip, the TUI footer, the web console's header pill, and the message each shows when you flip the toggle — comes from the engine itself, so **DRY RUN** is never mistaken for armed.
+Every status line that reports auto-block state — the GUI hero subtitle and tray tooltip, the TUI footer, the web console's sidebar status block, and the message each shows when you flip the toggle — comes from the engine itself, so **DRY RUN** is never mistaken for armed.
 
 ### Remote alerting (webhook)
 Set **Settings → Webhook URL** to push Critical threats off the machine — the payload adapts automatically: **ntfy** (plain text + `Title`/`Priority` headers), **Slack** (`{"text": …}`), **Discord** (`{"content": …}`), anything else gets a generic JSON document. Per-source/type cooldown stops a burst from flooding the channel.
@@ -212,8 +212,8 @@ Polling `/proc/net` can only ever describe the moment the file was read — on t
 ### Firewall & block
 - **Block / unblock** remote IPs (inbound, outbound, or both)
 - **Block local ports** (TCP/UDP)
-- Dedicated **nftables** table `inet networksentinel` when `nft` is available; otherwise **iptables** with `NetworkSentinel-*` comments
-- Only manages rules owned by this app; other firewall rules are left alone
+- Rules go through **UFW** where it is active (it owns the chains and re-applies them on reload); otherwise a dedicated **nftables** table `inet networksentinel` when `nft` is available, or **iptables** with `NetworkSentinel-*` comments
+- Only *manages* rules owned by this app — auto-block, manual blocks and expiry never touch anything else. Since 0.7.3 the Firewall Config page can also **show and edit the rest of the host firewall** on request, but nothing automatic acts on a foreign rule
 - The rule ledger is **reconciled with the kernel at startup**: nft/iptables rules don't survive a reboot while the ledger file does, so entries with no live kernel rule are dropped instead of masquerading as active blocks (runs only when elevation is silent — root or passwordless/cached sudo — never a startup password prompt)
 - Block rules are created as an `-In`/`-Out` pair and **removed together** in one click (config rules are never paired, so their names are exempt from that)
 - Your own rules, written on the **Firewall Config** page (0.7.0) — see below
@@ -245,11 +245,31 @@ The charts are on the **GUI dashboard and the web console** (0.7.1). The meter i
 
 > **Difference from the macOS build:** that one meters `ppp*` too. Here it does not — a PPPoE link is carried by an Ethernet interface that is already metered, so counting both would double every byte on a DSL connection.
 
-### Firewall Config — write your own rules (0.7.0)
+### Firewall Config — the whole host firewall (0.7.0, rebuilt in 0.7.3)
 
-A **Firewall Config** page under *Firewall & Block* that adds, edits and deletes inbound and outbound rules, shaped like the Linode Cloud Manager firewall page (and [FireWallConfig](https://github.com/davidfweiser/FireWallConfig) on Ubuntu): one list per direction, Label / Action / Protocol / Port range / Sources, one form for both add and edit, and labels minted from the port's service (`block-inbound-ssh`) when you leave the field blank.
+A **Firewall Config** page under *Firewall & Block* that adds, edits and deletes inbound and outbound rules, shaped like the Linode Cloud Manager firewall page: one list per direction, Label / Action / Protocol / Port range / Sources, one form for both add and edit, and labels minted from the port's service (`block-inbound-ssh`) when you leave the field blank.
 
-Rules land in the same `inet networksentinel` table (or the same `NetworkSentinel-*` iptables comments) and the same ledger as the app's own blocks.
+**Since 0.7.3 the page reads the host firewall rather than this app's ledger**, the way [FireWallConfig](https://github.com/davidfweiser/FireWallConfig) does on Ubuntu — and for the same reason. Until then it listed only rules Network Sentinel had written itself, out of `firewall-rules.json`. On a box running UFW that is a near-empty page sitting next to a firewall full of rules, and the rules this app added were invisible in `ufw status` in turn. One machine has one firewall; the page now shows all of it, named after the host:
+
+| Source | Read with |
+|---|---|
+| **UFW** | `ufw status verbose` — status, both default policies, and every rule |
+| **UFW without root** | `/etc/ufw/user.rules`, `user6.rules` — the same allow list, usually readable unprivileged |
+| **nftables** | `nft -j list ruleset`, keeping each rule's handle so it can be deleted again |
+| **iptables** | `iptables -S`, skipped when it is only the nft shim over the ruleset nft already reported |
+| **Listeners** | `ss -tulpnH` |
+
+UFW's own helper chains (`ufw-before-*`, `ufw-track-*`, the logging chains) and the established/loopback boilerplate every ruleset opens with are folded out, so the list is rules somebody chose. Everything else stays: UFW's rules, WireGuard's, Docker's, and Network Sentinel's own, each named in a **Created by** column so a foreign rule is never mistaken for one this app is responsible for. These are read-only inspections and never raise a password dialog — they run as you, retry once under `sudo -n`, and say in the policy line when a short list is a privilege problem rather than an empty firewall.
+
+**Listening services.** Under the two rule lists, what is actually listening (`ss -tulpnH`) with the verdict the rules above pass on it: **Open** (reachable from anywhere), **Restricted** (admitted, but only from named addresses), **Local only** (bound to loopback), **Not allowed** (listening into a closed door), **No firewall**. A rule list on its own does not answer "is this port reachable"; the two together do.
+
+**Writes follow the host.** Where UFW is active it owns the chains — it re-applies its rule set at boot and on `ufw reload`, so a rule written into nftables underneath it was invisible in `ufw status` and did not survive a reload, which looks exactly like a block quietly failing. So rules now go through `ufw allow` / `deny` where UFW is running, and into nftables (or iptables) where it is not. Installed-but-inactive does not count: enabling UFW can lock you out of SSH and that is never this app's decision to make.
+
+Deletes go back out the way the rule went in — `ufw status numbered` then `ufw delete N`, highest number first so the renumbering cannot bite; or `nft delete rule … handle N` for a bare nftables rule. Editing a rule the host owns deletes it where it lives and writes the new values, because UFW has no in-place edit; if the delete fails the save stops rather than leaving both rules in force.
+
+Rules this app writes still carry a `NetworkSentinel-*` comment and a ledger entry, which is how a rescan tells them apart from everyone else's.
+
+**Auto-block deliberately does not go through UFW.** Only rules you write on this page do. Two reasons: the precedence guarantee below depends on inserting at the *head* of a chain this app owns, and UFW appends; and a detector can mint hundreds of short-lived address blocks, which would bury `ufw status` under rows that expire in an hour. Auto-block therefore keeps writing into `inet networksentinel` — a separate nftables table, which the kernel still evaluates, so the blocks are in force under UFW exactly as before, and `ufw reload` cannot drop them. They appear in the Firewall Config list all the same, because the scan reads the whole ruleset rather than one table, and their comment identifies them in the **Created by** column.
 
 The editor is in the **GUI and the web console** (0.7.1). The rules it writes are ordinary kernel rules and ordinary ledger entries, so they apply system-wide and also show up in the TUI's Firewall list, where they read as kind **Config rule** — the TUI just cannot add or edit them.
 
@@ -265,7 +285,8 @@ The bind address deliberately does *not* carry into Sources. That field matches 
 
 Other details:
 
-- The page states plainly that the managed chains **accept** anything no rule matches, so an Allow rule opens a path through the rules above it rather than granting access on its own.
+- The page states the **real** default policies read off the kernel (`Drop inbound, Accept outbound`), and words the consequence to match — on an accept-by-default chain an Allow rule opens a path through the rules above it rather than granting access on its own; on a drop-by-default one a service is only reachable if a rule admits it.
+- The scan is **cached**. The web console polls `/api/state` every 2.5s and shelling out to four tools that often would be absurd; the tab's **Rescan the host firewall** button forces a fresh read, and any write invalidates the cache.
 - Blocking everything, or blocking inbound SSH, is **confirmed before it loads**.
 - A rule the kernel rejects is rolled back out of the ledger instead of being left there claiming to be in force.
 - One rule can need more than one kernel rule: a mixed IPv4/IPv6 address list splits by family (v6 goes to `ip6tables` when nft is unavailable), and a port range under protocol *Any* splits into TCP and UDP, because a port match without a protocol is not expressible in iptables.
@@ -281,24 +302,36 @@ Trusted sites are protected so auto-block (and manual block) will not cut off ev
 
 Domains are DNS-resolved to current IPs. Auto-block never touches allowlisted IPs. **Restore good sites** removes Network Sentinel blocks that hit allowlisted addresses.
 
+### Web console layout
+
+The console is laid out like the desktop window (0.7.3), because they are the same
+product and the menus should not be a different shape in each: a **230px navigation
+rail** on the left carrying the desktop's menu names and hierarchy — Firewall Config
+and Allowlist indented under **Firewall & Block**, Help under **Settings** — with a
+**STATUS** block pinned to its foot (monitor state, firewall privilege, and the
+**Enable auto-block** checkbox with the engine's own wording under it). To the right,
+the same hero header the desktop carries: clock, **Network Defense Console**, the
+`high/critical · blocked · auto-block` subtitle from the same three numbers, and the
+action row. Below ~900px the rail folds into a wrapping row above the content.
+
 ### Web console tabs
 
 | Tab | What you can do |
 |-----|-----------------|
-| **Dashboard** | Live counters, **5-minute activity chart** (connections + threat markers), monitoring/firewall status, recent threats |
-| **Connections / Threats** | Live traffic with a **Block** button on every row |
-| **Hosts** | Remote peers; block / unblock by row or by typed IP |
-| **Ports** | Local listeners; one-click **Block port** |
-| **Firewall** | Managed rules grouped as In/Out pairs; manual IP and port blocking; **Restore allowlisted** |
-| **Firewall Config** (0.7.3) | Add / edit / delete your own inbound and outbound rules; shows app-minted blocks alongside them in evaluation order, and every listening socket with its bind address |
+| **Dashboard** | Live counters, **5-minute activity chart** (connections + threat markers), data-flow charts, recent threats |
+| **Live Connections / Break-in Attempts** | Live traffic with a **Block** button on every row |
+| **Remote Computers** | Remote peers; block / unblock by row or by typed IP |
+| **Open Ports** | Local listeners; one-click **Block port** |
+| **Firewall & Block** | Managed rules grouped as In/Out pairs; manual IP and port blocking; **Restore allowlisted** |
+| **Firewall Config** (0.7.1, rebuilt 0.7.3) | The whole host firewall — UFW's rules, Network Sentinel's, and everyone else's — plus listening services and their firewall verdict; add / edit / delete any of them |
 | **Allowlist** | Add/remove trusted domains and IPs; refresh the feed |
 | **Settings** | Monitoring on/off, poll interval, geo lookups, auth-log and closed-port scan detection, the 0.4.0 detectors (threat intel, new-listener alerts, process reputation, ARP/gateway watch, startup-item watch, exfiltration threshold, honeypot ports), **kernel flow events**, **DNS hygiene** (with approved resolvers), **WireGuard peer monitoring** (with a live peer table), **Suricata signature ingestion** (EVE path, maximum severity, muted sids), **auto-block dry run**, **HTTPS + DuckDNS remote access** (including **Issue certificate**), webhook URL, auto-block + minimum severity + expiry, block direction (in/out), allowlist feed, **change master password**, **Remove all rules** |
 
-The page header shows the running version (e.g. `v0.7.2`) — check it after an upgrade to confirm the new build is live. Since 0.7.2 the console notices this for you: a tab left open across an upgrade shows a banner naming both versions and offering a reload, because the page polls `/api/state` but never re-requests its own HTML, so the old UI would otherwise stay put and look like the upgrade never installed.
+The navigation rail shows the running version (e.g. `v0.7.3`) — check it after an upgrade to confirm the new build is live. Since 0.7.2 the console notices this for you: a tab left open across an upgrade shows a banner naming both versions and offering a reload, because the page polls `/api/state` but never re-requests its own HTML, so the old UI would otherwise stay put and look like the upgrade never installed.
 
 ### Sleep / Wake
 
-The first button in the web console header is a single **Sleep ⇄ Wake** toggle:
+The first button in the web console's hero action row is a single **Sleep ⇄ Wake** toggle:
 
 - **Sleep** stops *everything the console watches* — the connection/port poll plus the auth-log, closed-port probe, ARP, startup-item, exfiltration and honeypot watchers — and parks the page: the live tabs dim, a banner explains the state, and the browser drops its 2.5-second refresh so a sleeping console costs nothing on either end
 - **Wake** starts monitoring again from live data and restores the normal refresh
@@ -375,8 +408,9 @@ The token is stored in `~/.local/share/NetworkSentinel/duckdns.json` with mode `
 - For **server package**: nothing on the target — self-contained binary (no .NET install)
 - Desktop libraries for Avalonia GUI (usual X11/Wayland desktop)
 - **policykit-1** (`pkexec`) recommended for firewall password prompts
-- `nft` (nftables) or `iptables` for host firewall changes
-- `ss` (iproute2) for the exfiltration monitor — present on essentially every distro; without it that one feature reports itself unavailable
+- `ufw` when the host uses it — Firewall Config reads it and writes through it; the app never enables it for you (that can lock you out of SSH)
+- `nft` (nftables) or `iptables` for host firewall changes, and for reading the ruleset where UFW is not in use
+- `ss` (iproute2) for the exfiltration monitor and the Firewall Config listening-services table — present on essentially every distro; without it those report themselves unavailable
 - Read access to the system auth log (`adm` / `systemd-journal` group) for failed-logon and closed-port scan detection — optional, the app runs without it
 - **systemd** optional (used by `--web-service` installer)
 
@@ -671,27 +705,29 @@ When you block an IP/port (or click **Authorize firewall**), only `nft`/`iptable
 
 ### Firewall elevation on a headless server (no pkexec)
 
-`pkexec` needs a graphical polkit session (D-Bus + auth agent), which doesn't exist for a `systemd`-run web service with no display. On a headless box, block/unblock and **Authorize firewall** will fail with *"Elevation failed... Need admin rights for firewall changes"* until you grant the service user **passwordless sudo scoped to just `nft`/`iptables`**:
+`pkexec` needs a graphical polkit session (D-Bus + auth agent), which doesn't exist for a `systemd`-run web service with no display. On a headless box, block/unblock and **Authorize firewall** will fail with *"Elevation failed... Need admin rights for firewall changes"* until you grant the service user **passwordless sudo scoped to just the firewall binaries**:
 
 ```bash
 # 1. Confirm which user the service runs as
 systemctl show networksentinel-web -p User
 
 # 2. Find the exact binary paths (varies by distro)
-which nft iptables ip6tables
+which ufw nft iptables ip6tables
 
 # 3. Add a scoped sudoers rule (replace YOUR_USER and the paths below)
 sudo visudo -f /etc/sudoers.d/networksentinel
 ```
 ```
-YOUR_USER ALL=(root) NOPASSWD: /usr/sbin/nft, /usr/sbin/iptables, /usr/sbin/ip6tables
+YOUR_USER ALL=(root) NOPASSWD: /usr/sbin/ufw, /usr/sbin/nft, /usr/sbin/iptables, /usr/sbin/ip6tables
 ```
 ```bash
 sudo visudo -c                              # verify syntax
 sudo systemctl restart networksentinel-web  # retry block/unblock afterwards
 ```
 
-This keeps the service itself running as your unprivileged user for everything else, and only elevates the two firewall binaries — the headless equivalent of the pkexec prompt the desktop GUI uses.
+This keeps the service itself running as your unprivileged user for everything else, and only elevates the firewall binaries — the headless equivalent of the pkexec prompt the desktop GUI uses.
+
+Include `ufw` where the host uses it (0.7.3). The same grant does double duty: Firewall Config's *reads* (`ufw status verbose`, `nft -j list ruleset`, `iptables -S`) go through `sudo -n`, so without this rule the page lists only what is world-readable, and the writes go through `ufw` rather than `nft`. Drop `ufw` from the line on a host that does not run it — sudoers should not name binaries that are not there.
 
 ---
 
@@ -873,8 +909,10 @@ All three UIs write the same `~/.local/share/NetworkSentinel/settings.json`, so 
 | `Services/WebhookNotifier.cs` | ntfy / Slack / Discord / generic JSON alerts, each carrying the block verdict |
 | `Services/DesktopNotifier.cs` | Critical desktop popups (notify-send / gdbus), blocked-or-not in the title |
 | `Services/GeoIpService.cs` | Reverse DNS + public geo lookup |
-| `Services/FirewallService.cs` | nftables / iptables via pkexec; rule ledger; auto-block expiry sweep |
+| `Services/FirewallService.cs` | UFW / nftables / iptables via pkexec; rule ledger; auto-block expiry sweep |
 | `Services/FirewallRuleSpec.cs` | Firewall Config rule parsing, validation and nft/iptables rendering (no privilege, no I/O) |
+| `Services/HostFirewallScan.cs` | Reads the whole host firewall — ufw / nft / iptables / ss — into one rule list plus listeners |
+| `Services/UfwWriter.cs` | Builds the `ufw` add and delete commands, and matches `ufw status numbered` rows |
 | `Services/TrafficMeterService.cs` | `/proc/net/dev` byte-counter sampling + daily history behind the data-flow charts |
 | `Services/AppSettings.cs` / `AppPaths.cs` | XDG data dir + JSON settings |
 | `Services/DialogService.cs` | Avalonia confirm/info dialogs |
@@ -957,6 +995,9 @@ On GNOME / Pop!_OS the indicator appears in the top bar (StatusNotifier / AppInd
 | `Elevation failed... Need admin rights` on a **headless server** | `pkexec` can't work without a display/polkit session. Grant the service user passwordless sudo for `nft`/`iptables` — see [Firewall elevation on a headless server](#firewall-elevation-on-a-headless-server-no-pkexec). |
 | `.NET location: Not found` | Use the **server installer** / self-contained package, or set `DOTNET_ROOT` / `PATH`. |
 | Process names missing | Expected for other users’ sockets without root; monitoring still works. |
+| **Firewall Config lists fewer rules than `ufw status`** | Reading UFW and nftables needs root. The scan runs as you and retries once under `sudo -n`, so with neither it sees only what is world-readable. The policy line under the summary says which case you are in. Fixes: run the app (or the web service) elevated, or give the service user passwordless sudo for `ufw`/`nft` — the same grant described in [Firewall elevation on a headless server](#firewall-elevation-on-a-headless-server-no-pkexec). |
+| Firewall Config is empty and says no backend returned rules | Neither `ufw`, `nft` nor `iptables` answered. On a container or a minimal image none may be installed; `command -v ufw nft iptables` says which. |
+| A rule added here does not appear in `ufw status` | Only rules written **while UFW is active** go through UFW. If UFW was installed but inactive when you added it, the rule went into nftables and is still enforced — it just is not UFW's. Enable UFW first (deliberately: `sudo ufw enable` can end an SSH session), then re-add it. |
 | No tray icon | DE must support StatusNotifier/AppIndicator; window title still updates when minimized. |
 | Web UI asks for password every time | Expected after sign-out, browser close, or 12h idle. Reset: delete `web-master.json`. |
 | `networksentinel-web` won’t start | `journalctl -u networksentinel-web -e`; check port in `/etc/networksentinel/web.env`; confirm binary exists at `/usr/local/bin/networksentinel`. |

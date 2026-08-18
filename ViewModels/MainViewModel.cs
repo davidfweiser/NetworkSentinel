@@ -610,8 +610,10 @@ public partial class MainViewModel : ObservableObject, IDisposable
 
         if (ShowFirewall)
             RefreshFirewallRules();
+        // Fire-and-forget: navigation must not block on the host firewall scan,
+        // which shells out to ufw/nft/iptables/ss.
         if (ShowFirewallConfig)
-            RefreshFirewallConfig();
+            _ = RefreshFirewallConfigAsync();
         if (ShowSettings)
             RefreshMonitorStatusText();
     }
