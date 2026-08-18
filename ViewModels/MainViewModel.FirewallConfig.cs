@@ -87,6 +87,14 @@ public partial class MainViewModel
     /// <summary>What is listening on this host, and whether the firewall admits it.</summary>
     public ObservableCollection<HostListener> ListeningServices { get; } = new();
 
+    /// <summary>
+    /// What the listening-services list is, in the words the web console uses for it —
+    /// the two front-ends explain the same table the same way.
+    /// </summary>
+    public string FirewallConfigListenerHint =>
+        "The same set “netstat -ano” prints, with what the inbound rules above do to each one. " +
+        "“New rule” fills the form above in with that socket's protocol and port.";
+
     public ObservableCollection<string> RuleActionOptions { get; } = new(FirewallRuleSpecs.Actions);
     public ObservableCollection<string> RuleDirectionOptions { get; } = new(FirewallRuleSpecs.Directions);
     public ObservableCollection<string> RuleProtocolOptions { get; } = new(FirewallRuleSpecs.Protocols);
@@ -143,6 +151,9 @@ public partial class MainViewModel
         ListeningServices.Clear();
         foreach (var listener in scan.Listeners) ListeningServices.Add(listener);
 
+        // Every sentence below is built the same way in the web console's
+        // renderFirewallConfig(), from the same fields, so an operator moving between
+        // the two front-ends reads the same page about the same firewall.
         var total = scan.Inbound.Count + scan.Outbound.Count;
         var mine = scan.Inbound.Concat(scan.Outbound).Count(r => !r.IsForeign);
         var folded = scan.Inbound.Concat(scan.Outbound).Sum(r => r.Copies) - total;
@@ -150,7 +161,8 @@ public partial class MainViewModel
             $"{scan.HostLabel} · {scan.Backend} · {scan.Status} · {scan.RulesSummary} " +
             $"({mine} from Network Sentinel, {total - mine} from the rest of the host)" +
             (folded > 0 ? $" · {folded} duplicate rules folded into the rows they repeat" : "") +
-            (scan.DisabledRules > 0 ? $" · {scan.DisabledRules} disabled rules not listed" : "");
+            (scan.DisabledRules > 0 ? $" · {scan.DisabledRules} disabled rules not listed" : "") +
+            $" · Scanned {scan.ScannedUtc.ToLocalTime():HH:mm:ss}, not live — Rescan to re-read the firewall.";
 
         var openCount = scan.Listeners.Count(l => l.Covered == "Open");
         FirewallConfigListenerText = scan.Listeners.Count == 0

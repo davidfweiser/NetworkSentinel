@@ -407,6 +407,18 @@
         <Setter Property="TextTrimming" Value="CharacterEllipsis"/>
     </Style>
 
+    <!--
+        For columns whose values are routinely wider than any sensible column: a rule
+        label, an address list, an IPv6 range. The ellipsis says something was cut but
+        not what, so the cell carries its own full text as a tooltip. Kept separate from
+        the style above rather than made universal — a tooltip repeating "Block" on
+        every short cell is noise, and WPF exposes no "is this text actually trimmed"
+        trigger to decide it per cell.
+    -->
+    <Style x:Key="DataGridTextElementWide" TargetType="TextBlock" BasedOn="{StaticResource DataGridTextElement}">
+        <Setter Property="ToolTip" Value="{Binding Text, RelativeSource={RelativeSource Self}}"/>
+    </Style>
+
     <Style TargetType="DataGridColumnHeader">
         <Setter Property="Background" Value="#0DFFFFFF"/>
         <Setter Property="Foreground" Value="{StaticResource TextSecondaryBrush}"/>

@@ -82,7 +82,11 @@
                                 <TextBlock Text="🛡" FontSize="18" HorizontalAlignment="Center" VerticalAlignment="Center"/>
                             </Grid>
                             <StackPanel Grid.Column="1" VerticalAlignment="Center">
-                                <TextBlock Text="Network Sentinel" FontSize="16" FontWeight="Bold"/>
+                                <!-- Wraps rather than clipping: the rail is 230px and the mark takes
+                                     54 of them, which leaves the title a few pixels short of fitting
+                                     on one line — it read as "Network Sentine". -->
+                                <TextBlock Text="Network Sentinel" FontSize="16" FontWeight="Bold"
+                                           TextWrapping="Wrap"/>
                                 <TextBlock Text="Port &amp; intrusion watch" Foreground="{StaticResource TextMutedBrush}" FontSize="11"/>
                                 <TextBlock Text="{Binding AppVersion}" Foreground="{StaticResource TextMutedBrush}" FontSize="10" Margin="0,2,0,0" Opacity="0.85"/>
                             </StackPanel>
@@ -1213,13 +1217,24 @@
                                     <DataGrid ItemsSource="{Binding InboundRules}" SelectedItem="{Binding SelectedInboundRule}"
                                               Style="{StaticResource ModernDataGrid}" AutoGenerateColumns="False">
                                         <DataGrid.Columns>
-                                            <DataGridTextColumn Header="Label" Binding="{Binding LabelText}" Width="*"/>
-                                            <DataGridTextColumn Header="Action" Binding="{Binding ActionText}" Width="80"/>
-                                            <DataGridTextColumn Header="Protocol" Binding="{Binding ProtocolText}" Width="90"/>
-                                            <DataGridTextColumn Header="Port range" Binding="{Binding PortRangeText}" Width="120"/>
-                                            <DataGridTextColumn Header="Sources" Binding="{Binding AddressListText}" Width="180"/>
-                                            <DataGridTextColumn Header="Created by" Binding="{Binding OriginText}" Width="140"/>
-                                            <DataGridTextColumn Header="Copies" Binding="{Binding CopiesText}" Width="60"/>
+                                            <!-- Label and the address list share the slack: a rule name and an
+                                                 IPv6 range are both long, and fixing either at 180px cut them in
+                                                 half. ElementStyle gives every cell the ellipsis-and-tooltip
+                                                 treatment, so a value too wide for its column is still readable. -->
+                                            <DataGridTextColumn Header="Label" Binding="{Binding LabelText}" Width="*" MinWidth="220"
+                                                                ElementStyle="{StaticResource DataGridTextElementWide}"/>
+                                            <DataGridTextColumn Header="Action" Binding="{Binding ActionText}" Width="80"
+                                                                ElementStyle="{StaticResource DataGridTextElement}"/>
+                                            <DataGridTextColumn Header="Protocol" Binding="{Binding ProtocolText}" Width="90"
+                                                                ElementStyle="{StaticResource DataGridTextElement}"/>
+                                            <DataGridTextColumn Header="Port range" Binding="{Binding PortRangeText}" Width="120"
+                                                                ElementStyle="{StaticResource DataGridTextElement}"/>
+                                            <DataGridTextColumn Header="Sources" Binding="{Binding AddressListText}" Width="*" MinWidth="200"
+                                                                ElementStyle="{StaticResource DataGridTextElementWide}"/>
+                                            <DataGridTextColumn Header="Created by" Binding="{Binding OriginText}" Width="150"
+                                                                ElementStyle="{StaticResource DataGridTextElementWide}"/>
+                                            <DataGridTextColumn Header="Copies" Binding="{Binding CopiesText}" Width="60"
+                                                                ElementStyle="{StaticResource DataGridTextElement}"/>
                                             <DataGridTemplateColumn Header="" Width="150">
                                                 <DataGridTemplateColumn.CellTemplate>
                                                     <DataTemplate>
@@ -1259,13 +1274,20 @@
                                     <DataGrid ItemsSource="{Binding OutboundRules}" SelectedItem="{Binding SelectedOutboundRule}"
                                               Style="{StaticResource ModernDataGrid}" AutoGenerateColumns="False">
                                         <DataGrid.Columns>
-                                            <DataGridTextColumn Header="Label" Binding="{Binding LabelText}" Width="*"/>
-                                            <DataGridTextColumn Header="Action" Binding="{Binding ActionText}" Width="80"/>
-                                            <DataGridTextColumn Header="Protocol" Binding="{Binding ProtocolText}" Width="90"/>
-                                            <DataGridTextColumn Header="Port range" Binding="{Binding PortRangeText}" Width="120"/>
-                                            <DataGridTextColumn Header="Destinations" Binding="{Binding AddressListText}" Width="180"/>
-                                            <DataGridTextColumn Header="Created by" Binding="{Binding OriginText}" Width="140"/>
-                                            <DataGridTextColumn Header="Copies" Binding="{Binding CopiesText}" Width="60"/>
+                                            <DataGridTextColumn Header="Label" Binding="{Binding LabelText}" Width="*" MinWidth="220"
+                                                                ElementStyle="{StaticResource DataGridTextElementWide}"/>
+                                            <DataGridTextColumn Header="Action" Binding="{Binding ActionText}" Width="80"
+                                                                ElementStyle="{StaticResource DataGridTextElement}"/>
+                                            <DataGridTextColumn Header="Protocol" Binding="{Binding ProtocolText}" Width="90"
+                                                                ElementStyle="{StaticResource DataGridTextElement}"/>
+                                            <DataGridTextColumn Header="Port range" Binding="{Binding PortRangeText}" Width="120"
+                                                                ElementStyle="{StaticResource DataGridTextElement}"/>
+                                            <DataGridTextColumn Header="Destinations" Binding="{Binding AddressListText}" Width="*" MinWidth="200"
+                                                                ElementStyle="{StaticResource DataGridTextElementWide}"/>
+                                            <DataGridTextColumn Header="Created by" Binding="{Binding OriginText}" Width="150"
+                                                                ElementStyle="{StaticResource DataGridTextElementWide}"/>
+                                            <DataGridTextColumn Header="Copies" Binding="{Binding CopiesText}" Width="60"
+                                                                ElementStyle="{StaticResource DataGridTextElement}"/>
                                             <DataGridTemplateColumn Header="" Width="150">
                                                 <DataGridTemplateColumn.CellTemplate>
                                                     <DataTemplate>
@@ -1295,17 +1317,25 @@
                                         <TextBlock Text="Listening services" FontWeight="Bold" FontSize="15"/>
                                         <TextBlock Text="{Binding FirewallConfigListenerText}" FontSize="11.5" Margin="0,2,0,0"
                                                    Foreground="{StaticResource TextSecondaryBrush}"/>
+                                        <TextBlock Text="{Binding FirewallConfigListenerHint}" FontSize="11.5" Margin="0,2,0,0"
+                                                   Foreground="{StaticResource TextMutedBrush}" TextWrapping="Wrap"/>
                                     </StackPanel>
                                     <DataGrid ItemsSource="{Binding ListeningServices}"
                                               Style="{StaticResource ModernDataGrid}" AutoGenerateColumns="False"
                                               MaxHeight="420">
                                         <DataGrid.Columns>
-                                            <DataGridTextColumn Header="Process" Binding="{Binding Process}" Width="*"/>
-                                            <DataGridTextColumn Header="Protocol" Binding="{Binding Protocol}" Width="90"/>
-                                            <DataGridTextColumn Header="Port" Binding="{Binding Port}" Width="80"/>
-                                            <DataGridTextColumn Header="Service" Binding="{Binding ServiceName}" Width="150"/>
-                                            <DataGridTextColumn Header="Bind address" Binding="{Binding Address}" Width="170"/>
-                                            <DataGridTextColumn Header="Firewall" Binding="{Binding Covered}" Width="120"/>
+                                            <DataGridTextColumn Header="Process" Binding="{Binding Process}" Width="*" MinWidth="160"
+                                                                ElementStyle="{StaticResource DataGridTextElementWide}"/>
+                                            <DataGridTextColumn Header="Protocol" Binding="{Binding Protocol}" Width="90"
+                                                                ElementStyle="{StaticResource DataGridTextElement}"/>
+                                            <DataGridTextColumn Header="Port" Binding="{Binding Port}" Width="80"
+                                                                ElementStyle="{StaticResource DataGridTextElement}"/>
+                                            <DataGridTextColumn Header="Service" Binding="{Binding ServiceName}" Width="150"
+                                                                ElementStyle="{StaticResource DataGridTextElementWide}"/>
+                                            <DataGridTextColumn Header="Bind address" Binding="{Binding Address}" Width="*" MinWidth="170"
+                                                                ElementStyle="{StaticResource DataGridTextElementWide}"/>
+                                            <DataGridTextColumn Header="Firewall" Binding="{Binding Covered}" Width="120"
+                                                                ElementStyle="{StaticResource DataGridTextElement}"/>
                                             <DataGridTemplateColumn Header="" Width="130">
                                                 <DataGridTemplateColumn.CellTemplate>
                                                     <DataTemplate>
