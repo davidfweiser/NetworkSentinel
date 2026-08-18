@@ -393,9 +393,15 @@ Build on a machine with the .NET SDK; install on the server **without** .NET:
 
 | Artifact | Purpose |
 |----------|---------|
-| `dist/networksentinel-*-linux-x64.install.sh` | **One-file installer** (copy + run) |
-| `dist/networksentinel-*-linux-x64.tar.gz` | Classic tarball |
-| `dist/*.sha256` | Checksums |
+| `dist/networksentinel-*-linux-x64.install.sh` | **One-file installer** for x86-64 (copy + run) |
+| `dist/networksentinel-*-linux-arm64.install.sh` | Same, for ARM64 servers and the Raspberry Pi |
+| `dist/networksentinel-*-linux-*.tar.gz` | Classic tarball |
+| `dist/*.sha256` | Checksums — verify with `sha256sum -c` before running anything as root |
+
+Both installers are self-extracting: the script carries the tarball after an
+`__ARCHIVE_BELOW__` marker, unpacks it to a temp dir and runs the `install.sh`
+inside. `--help` works without extracting, so it is safe to run unprivileged
+first. The build is self-contained — the server needs no .NET runtime.
 
 ### Installer flags vs app flags
 
@@ -404,6 +410,8 @@ Build on a machine with the .NET SDK; install on the server **without** .NET:
 | `--web-service` | **Installer only** (`*.install.sh` / `install.sh`) | Install app **and** enable systemd auto-start |
 | `--desktop-shortcut` | **Installer only** | Also drop an icon on the Desktop (opt-in; desktops only) |
 | `--no-desktop` | **Installer only** | Skip the application-menu entry entirely |
+| `--service-user NAME` | **Installer only**, with `--web-service` | Run the unit as this user (default: the invoking user). It also decides where the data dir lives — settings and the master-password hash go to that user's `~/.local/share/NetworkSentinel`, and the unit's `ReadWritePaths=` is set to it |
+| `--port N` | **Installer only**, with `--web-service` | Web console port (default 18765); written to `web.env` |
 | `-w` / `--web` | **App** (`networksentinel`) | Run headless web UI in the foreground |
 | `--tui` | **App** | Terminal UI |
 | `--https` (+ `--tls-cert` / `--tls-key`) | **App**, with `-w` | Serve the console over TLS — see [HTTPS and remote access](#https-and-remote-access-050) |
@@ -415,17 +423,17 @@ Build on a machine with the .NET SDK; install on the server **without** .NET:
 
 ```bash
 # build machine
-scp dist/networksentinel-0.5.0-linux-x64.install.sh user@server:
+scp dist/networksentinel-0.7.3-linux-x64.install.sh user@server:
 
 # server
-chmod +x networksentinel-0.5.0-linux-x64.install.sh
-sudo ./networksentinel-0.5.0-linux-x64.install.sh --web-service
+chmod +x networksentinel-0.7.3-linux-x64.install.sh
+sudo ./networksentinel-0.7.3-linux-x64.install.sh --web-service
 ```
 
 Confirm the installer is current before using root:
 
 ```bash
-./networksentinel-0.5.0-linux-x64.install.sh --help
+./networksentinel-0.7.3-linux-x64.install.sh --help
 # Should list: --web-service
 ```
 
@@ -435,6 +443,19 @@ What you get:
 - systemd unit `networksentinel-web.service` (starts on boot)
 - Port **18765** (configurable)
 - Process runs as **your user** (`SUDO_USER`), not as root — **do not** launch daily with `sudo`
+
+**Two things to settle before the console faces a network.** Neither is a bug, and
+both look like one the first time you hit them:
+
+1. **`pkexec` cannot work under systemd.** It needs a graphical polkit session, which
+   a headless service does not have, so *Block*, *Unblock* and *Authorize firewall*
+   fail with *"Need admin rights for firewall changes"* until the service user has
+   passwordless sudo scoped to `nft`/`iptables` — see
+   [Firewall elevation on a headless server](#firewall-elevation-on-a-headless-server-no-pkexec).
+2. **The unit serves plain HTTP.** `ExecStart` is `networksentinel -w ${WEB_PORT}`, so a
+   master password typed into a routable server crosses the wire in the clear. Put it
+   behind a tunnel or a LAN, or serve TLS — see
+   [HTTPS and remote access](#https-and-remote-access-050).
 
 ```text
 http://YOUR_SERVER_IP:18765/
@@ -462,8 +483,8 @@ sudo ./….install.sh --web-service --port 18765
 ./….install.sh --user --desktop-shortcut    # ~/.local + icon on the Desktop
 
 # classic tarball
-tar xzf networksentinel-0.5.0-linux-x64.tar.gz
-cd networksentinel-0.5.0-linux-x64
+tar xzf networksentinel-0.7.3-linux-x64.tar.gz
+cd networksentinel-0.7.3-linux-x64
 sudo ./install.sh --web-service
 ```
 
