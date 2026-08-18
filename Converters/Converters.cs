@@ -100,6 +100,33 @@ public sealed class StringNotEmptyToVisibilityConverter : IValueConverter
         => Binding.DoNothing;
 }
 
+/// <summary>
+/// Colours the threat table's Blocked cell, on the theme's signal meanings: red for a
+/// dropped address (trouble, but handled), amber for a verdict that wants attention
+/// (a failed rule, a dry run that wrote nothing), muted for an address deliberately
+/// left alone. Reads <see cref="Models.ThreatEvent.BlockStatus"/>.
+/// </summary>
+public sealed class BlockStatusToBrushConverter : IValueConverter
+{
+    public object Convert(object value, Type targetType, object parameter, CultureInfo culture)
+        => (value as string) switch
+        {
+            "Blocked" => Brush("#F24059"),           // Critical red
+            "Failed" or "Dry run" => Brush("#F2BF40"), // Amber
+            _ => Brush("#7A869B")                    // TextMuted
+        };
+
+    public object ConvertBack(object value, Type targetType, object parameter, CultureInfo culture)
+        => Binding.DoNothing;
+
+    private static SolidColorBrush Brush(string hex)
+    {
+        var b = (SolidColorBrush)new BrushConverter().ConvertFrom(hex)!;
+        b.Freeze();
+        return b;
+    }
+}
+
 public sealed class NullToCollapsedConverter : IValueConverter
 {
     public object Convert(object value, Type targetType, object parameter, CultureInfo culture)

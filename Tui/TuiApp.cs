@@ -170,27 +170,15 @@ public sealed class TuiApp : IDisposable
         RefreshBlockedIps(force: false);
     }
 
-    private void OnThreatsDetected(IReadOnlyList<ThreatEvent> threats)
+    /// <summary>The monitor enforces the batch before raising this; we only report it.</summary>
+    private void OnThreatsDetected(IReadOnlyList<ThreatEvent> threats, PreventionResult prevention)
     {
-        if (!_prevention.Enabled || threats.Count == 0)
+        if (!prevention.HasMessages)
             return;
 
-        _ = Task.Run(() =>
-        {
-            try
-            {
-                var result = _prevention.Apply(threats);
-                if (!result.HasMessages)
-                    return;
-                _statusMessage = result.Summary;
-                if (result.RulesChanged)
-                    RefreshBlockedIps(force: true);
-            }
-            catch (Exception ex)
-            {
-                _statusMessage = $"Auto-block error: {ex.Message}";
-            }
-        });
+        _statusMessage = prevention.Summary;
+        if (prevention.RulesChanged)
+            RefreshBlockedIps(force: true);
     }
 
     private FirewallDirection ResolveDirection() => _prevention.ResolveDirection();
@@ -478,10 +466,8 @@ public sealed class TuiApp : IDisposable
         _prevention.Enabled = !_prevention.Enabled;
         _settings.AutoBlockEnabled = _prevention.Enabled;
         _settings.Save();
-        _statusMessage = _prevention.Enabled
-            ? $"Auto-block ON (≥ {_prevention.MinLevel})" +
-              (_firewall.IsAdministrator ? "" : " — need Administrator for firewall changes")
-            : "Auto-block OFF";
+        _statusMessage = _prevention.Describe() +
+            (_prevention.Enabled && !_firewall.IsAdministrator ? " — need Administrator for firewall changes" : "");
     }
 
     /// <summary>
@@ -569,16 +555,25 @@ public sealed class TuiApp : IDisposable
             return;
         }
 
-        if (!_firewall.IsAdministrator)
-        {
-            _statusMessage = "Cannot block — run as Administrator or run Authorize (u).";
-            return;
-        }
-
         // Same pre-flight the GUI and web console do, so all three frontends agree.
         if (!FirewallService.TryNormalizeIp(ip, out var normalized, out var error))
         {
             _statusMessage = error;
+            return;
+        }
+
+        // Before the elevation check, because re-blocking is a no-op worth naming rather
+        // than a reason to send the user off for a UAC prompt: the rule is already there.
+        // Rewriting it would also turn an expiring auto-block into a permanent manual one.
+        if (_prevention.IsBlocked(normalized))
+        {
+            _statusMessage = $"{normalized} is already blocked — press x to unblock it.";
+            return;
+        }
+
+        if (!_firewall.IsAdministrator)
+        {
+            _statusMessage = "Cannot block — run as Administrator or run Authorize (u).";
             return;
         }
 
@@ -936,9 +931,11 @@ public sealed class TuiApp : IDisposable
         var hosts = FilterHosts().Take(8).ToList();
 
         var threatTable = new Table().Expand().Border(TableBorder.Simple);
-        threatTable.AddColumns("Time", "Lvl", "IP", "Title");
+        // "Blk" mirrors the remote-hosts panel beside it: a warning on the dashboard
+        // should answer "is anything stopping this?" without a trip to the Threats view.
+        threatTable.AddColumns("Time", "Lvl", "IP", "Title", "Blk");
         if (threats.Count == 0)
-            threatTable.AddRow("-", "-", "-", "[dim]No threats yet[/]");
+            threatTable.AddRow("-", "-", "-", "[dim]No threats yet[/]", "-");
         else
         {
             for (var i = 0; i < threats.Count; i++)
@@ -949,7 +946,8 @@ public sealed class TuiApp : IDisposable
                     mark + t.TimeText,
                     ColorLevel(t.Level),
                     Markup.Escape(t.SourceIp),
-                    Markup.Escape(Truncate(t.Title, 40)));
+                    Markup.Escape(Truncate(t.Title, 40)),
+                    ShortBlockStatus(_prevention.DescribeEnforcement(t)));
             }
         }
 
@@ -1118,7 +1116,8 @@ public sealed class TuiApp : IDisposable
             new TableColumn("Type"),
             new TableColumn("Source IP"),
             new TableColumn("Title"),
-            new TableColumn("Origin"));
+            new TableColumn("Origin"),
+            new TableColumn("Blocked"));
 
         var w = TermWidth;
         var titleW = Math.Clamp(w / 4, 20, 48);
@@ -1127,7 +1126,7 @@ public sealed class TuiApp : IDisposable
 
         var visible = VisibleWindow(rows.Count);
         if (rows.Count == 0)
-            table.AddRow(" ", "[dim]No threat events[/]", "", "", "", "", "");
+            table.AddRow(" ", "[dim]No threat events[/]", "", "", "", "", "", "");
         else
         {
             for (var i = visible.start; i < visible.end; i++)
@@ -1141,7 +1140,9 @@ public sealed class TuiApp : IDisposable
                     Markup.Escape(Truncate(t.TypeText, 18)),
                     Markup.Escape(Truncate(t.SourceIp, ipW)),
                     Markup.Escape(Truncate(t.Title, titleW)),
-                    Markup.Escape(Truncate(t.Origin, originW)));
+                    Markup.Escape(Truncate(t.Origin, originW)),
+                    // Only the rows on screen: the backlog behind them can be 500 deep.
+                    ColorBlockStatus(_prevention.DescribeEnforcement(t)));
             }
         }
 
@@ -1201,9 +1202,7 @@ public sealed class TuiApp : IDisposable
 
         var info = new Markup(
             $"[bold]Privilege[/]: {Markup.Escape(_firewall.PrivilegeText)}\n" +
-            $"[bold]Auto-block[/]: {(_prevention.Enabled ? $"[red]ON ≥ {_prevention.MinLevel}[/]" : "[grey]off[/]")}" +
-            $"{(_prevention.DryRun ? " [yellow](dry run)[/]" : "")}  " +
-            $"in={_prevention.BlockInbound} out={_prevention.BlockOutbound}\n" +
+            $"{AutoBlockMarkup()}  in={_prevention.BlockInbound} out={_prevention.BlockOutbound}\n" +
             $"[bold]Allowlist[/]: {Markup.Escape(Truncate(_allowlist.StatusText, 70))}  [dim](view 7 · n add)[/]\n" +
             $"[bold]Blocked IPs (managed)[/]: {_prevention.BlockedCount}");
 
@@ -1376,6 +1375,42 @@ public sealed class TuiApp : IDisposable
         var end = Math.Min(count, start + height);
         return (start, end);
     }
+
+    /// <summary>
+    /// The blocked/not-blocked verdict for one threat row. Same vocabulary as the GUI
+    /// and web tables (<see cref="EnforcementStatus.ShortText"/>); a dash where the
+    /// threat names no blockable address.
+    /// </summary>
+    private static string ColorBlockStatus(EnforcementStatus? status) => status?.State switch
+    {
+        null => "[dim]·[/]",
+        BlockState.Blocked or BlockState.AlreadyBlocked => "[red]Blocked[/]",
+        BlockState.WouldBlock => "[yellow]Dry run[/]",
+        BlockState.Failed => "[yellow]Failed[/]",
+        _ => "[dim]No[/]"
+    };
+
+    /// <summary>
+    /// The engine's own auto-block line, coloured by how much it is actually doing:
+    /// red when it is writing rules, amber for dry run (deciding but writing nothing),
+    /// grey when it is off.
+    /// </summary>
+    private string AutoBlockMarkup()
+    {
+        var text = Markup.Escape(_prevention.Describe());
+        return !_prevention.Enabled ? $"[grey]{text}[/]"
+             : _prevention.DryRun ? $"[yellow]{text}[/]"
+             : $"[red]{text}[/]";
+    }
+
+    /// <summary>One-letter form for the dashboard's narrow column, matching the hosts panel.</summary>
+    private static string ShortBlockStatus(EnforcementStatus? status) => status?.State switch
+    {
+        null => "[dim]·[/]",
+        BlockState.Blocked or BlockState.AlreadyBlocked => "[red]Y[/]",
+        BlockState.WouldBlock or BlockState.Failed => "[yellow]![/]",
+        _ => "[dim]N[/]"
+    };
 
     private static string ColorLevel(ThreatLevel level) => level switch
     {

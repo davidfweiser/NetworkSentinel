@@ -10,7 +10,26 @@ Three ways to run it (same idea as the Linux build):
 | **Terminal UI (`--tui`)** | Server Core, RDP console, SSH-style workflows |
 | **Headless web UI (`-w`)** | Browser dashboard on a server (master-password protected) |
 
-> Awareness / monitoring tooling — not a full IDS/IPS replacement. Version **0.6.2**.
+> Awareness / monitoring tooling — not a full IDS/IPS replacement. Version **0.6.5**.
+
+---
+
+## What's new in 0.6.5
+
+Brings the Windows build level with the Linux 0.6.5 release. Two independent pieces: a tunnel-endpoint shield that stops auto-block severing your own VPN, and a block verdict carried into every warning.
+
+| Area | What changed |
+|------|--------------|
+| **Tunnel endpoints are never auto-blocked** | The never-block gate for WireGuard peer endpoints read the *live* peer list, so it was inert unless **WireGuard peer monitoring** was switched on — off by default, and therefore off on exactly the VPN gateways that needed it. It also went blind whenever the tunnel was already down: `wg` reports no endpoint then, so the one address that would restore the tunnel looked like any other stranger. Blocking an endpoint does not drop an attacker; it drops the tunnel and every service behind it, while the console keeps answering on the LAN. The new shield runs regardless of that setting, samples every 60 s, and **remembers every endpoint for 24 h** across restarts. Hostnames in a config are deliberately not resolved — whoever answers DNS could otherwise write their own address into a never-block list. |
+| **The gate stops being silent** | A threat against a protected endpoint now reports `Not blocking <ip> … it is a WireGuard tunnel endpoint` instead of leaving you to hunt for a rule that was never made. Rate-limited per address. |
+| **Every warning says whether the address is blocked** | A toast or webhook named an address and stopped there, and the alert went out *before* the prevention engine had looked at the batch — so at alert time there was no answer to give. Enforcement now runs before any alert leaves the machine, and the verdict rides along: toast titles (`Blocked · critical threat: Port Scan`), webhook bodies, ntfy first lines, generic JSON (`blocked` / `block_state` / `block_status`), and the web console's browser notifications. |
+| **Blocked column on every threat table** | The screen you land on after a warning now agrees with the warning — GUI (hover for the full reason), TUI and web console, red for a dropped address, amber for a block that failed or was only simulated, muted for one deliberately left alone. |
+| **Unblock in place of Block** | A threat row whose address is already blocked offers **Unblock**, as the Remote Computers grid already did. Re-blocking only rewrites a rule already in force — and because the manual path passes no expiry, a stray click turned an expiring auto-block into a permanent manual one. |
+| **Dry run means dry run** | Every frontend built its own auto-block status line and every one dropped the same thing: dry run. A console could read `Auto-block ON (≥High)` while the engine was deliberately writing nothing. All of them now come from the engine. Dry run also no longer demands elevation — it writes no rule, and refusing to *simulate* blocked the one workflow the mode exists for. |
+
+Twenty more tests arrive with it (88 total), including the tunnel-endpoint gate end to end and a `wg show all dump` parse asserting neither the interface private key nor a peer's preshared key survives.
+
+**Upgrading** is in place and non-destructive, as in 0.5.x. Re-run the installer and confirm the web header reads `v0.6.5`.
 
 ---
 
@@ -119,6 +138,24 @@ Heuristics flag patterns such as:
 
 Each alert includes **source IP**, **method**, and **where it’s coming from** (DNS + best-effort geo). Threat events and the host/listener baseline **persist across restarts** (`threat-log.jsonl`, `host-history.json`).
 
+### Every warning says whether the address is blocked
+
+A warning that names an address and stops there sends you to the console to find out whether anything was actually done about it. So each batch of threats is run past the prevention engine **before** any alert about it leaves the machine, and the alert carries the verdict:
+
+| Verdict | When |
+| --- | --- |
+| `BLOCKED — auto-block rule added` | A rule was just written for the address |
+| `BLOCKED — a rule for this address is already in place` | It was already blocked |
+| `NOT blocked — the firewall refused the rule: …` | A block was attempted and failed |
+| `NOT blocked — dry run (it would have been blocked)` | Prevention is in dry-run mode |
+| `NOT blocked — auto-block is off` / `Administrator rights are required` / `you released this address manually` / `allowlisted` / `below the auto-block level (≥High)` / … | The gate that stopped it — see [Prevention engine](#prevention-engine) |
+
+Windows toasts lead with it in the title (`Blocked · critical threat: Port Scan`, or `3 critical threats — 2 of 3 blocked`), the web console's browser notifications say the same, webhooks carry it in the message body, and generic JSON payloads add `blocked`, `block_state` and `block_status` fields. Threats that name no blockable address (a startup-item change, a new local listener) say nothing about blocking rather than guessing.
+
+The threat tables answer it too, so the screen you land on after a warning agrees with the warning: a **Blocked** column in the GUI (hover for the full reason) and the web console, and a `Blk` column in the TUI — red when the address is being dropped, amber for a block that failed or was only simulated, muted when it was deliberately left alone. A row whose address is already blocked offers **Unblock** in place of **Block IP**, as the Remote Computers grid does; re-blocking would only rewrite a rule that is already in force, and would quietly turn an expiring auto-block into a permanent manual one.
+
+Every status line that reports auto-block state — the GUI hero subtitle, the TUI footer, the web console's header pill, and the message each shows when you flip the toggle — comes from the engine itself, so **DRY RUN** is never mistaken for armed.
+
 ### Prevention engine
 
 Every automatic block — from any detector, in any of the three frontends — goes through **one** enforcement engine (`PreventionService`). It used to be three near-identical copies of the same logic in the GUI, TUI and web console, each with its own blocked-IP cache and retry map. Detection sources keep multiplying; the decision to drop traffic must not.
@@ -132,7 +169,7 @@ Gates, in order — a threat must clear all of them before a rule is written:
 | Routable public address | LAN, loopback, CGNAT (100.64/10 — Tailscale and many VPN tunnels) and multicast are never auto-blocked. CGNAT can still be blocked **manually**, behind a confirmation — a hostile tunnel peer is a real case, and only LAN/loopback/link-local/multicast are refused outright |
 | Not allowlisted | Known-good stays reachable |
 | Not this machine | A detector that attributes a threat to the wrong end of a flow can never firewall the host off from itself — matters most on a cloud VM whose own address is public |
-| Not a WireGuard peer endpoint | A peer's public endpoint is where its tunnel packets come from; blocking it kills that client's VPN (peer data comes from WireGuard monitoring, so enable it on a VPN server) |
+| Not a WireGuard tunnel endpoint | A peer's public endpoint is where its tunnel packets come from; blocking it does not drop an attacker, it drops the tunnel and everything reached through it. Independent of the WireGuard *monitoring* setting, and remembered for 24 h — see [tunnel endpoints are never auto-blocked](#tunnel-endpoints-are-never-auto-blocked) |
 | Not protected | See lockout protection below |
 | Not already blocked | No duplicate rules |
 | Not suppressed | An address you deliberately released stays released for 24 h |
@@ -185,13 +222,31 @@ This reads WireGuard's own state (`wg show all dump`, via the `wg.exe` that Wire
 | **Peer removed** | Low | Expected after revoking access; unexpected means the config changed underneath you |
 | **Per-peer transfer** | High | Optional (0 = off). Forwarded tunnel traffic has no local socket, so the exfiltration monitor cannot see it — this is the only place it is counted |
 
-- The first run adopts the existing peer list silently; the baseline persists in `wireguard-peers.json`, so a restart doesn't re-alert on peers you already know.
+- The first run adopts the existing peer list silently; the baseline persists in `wireguard-peers.json`, so a restart doesn't re-alert on peers you already know. Endpoint addresses are kept separately in `wireguard-endpoints.json` — see [tunnel endpoints are never auto-blocked](#tunnel-endpoints-are-never-auto-blocked).
 - **Key material never leaves the parser.** `wg show ... dump` prints the interface *private* key and each peer's *preshared* key. Both are dropped at parse time — they are never stored, logged, shown in the console, written to the baseline file, or sent to a webhook. Only public keys are used.
 - The web console shows a live peer table under **Settings → VPN (WireGuard)**: peer key (hover for the full key), interface, endpoint, allowed IPs, last handshake, and Rx/Tx. It is **read-only by design** — revoking a peer is a WireGuard configuration change, not something a monitoring console should do behind your back.
 - Needs **Administrator**; `wg.exe` cannot read the WireGuard service's device state otherwise. Without it the setting explains why rather than failing quietly.
 - Per-peer transfer alerting is **off by default**: a VPN user streaming video legitimately moves gigabytes, so any threshold low enough to catch a slow leak would fire constantly on normal use.
 
-> Tunnel addresses are private-range (RFC1918 or CGNAT 100.64/10), so auto-block will never act on a VPN client's tunnel IP — by design, since blocking a tunnel IP would be both ineffective and confusing. A peer's **public endpoint** is protected too: while WireGuard monitoring is on, the prevention engine refuses to auto-block any current peer's endpoint address, so a peer alert (or any other detector tripping on peer traffic) cannot cut a client's tunnel dead. Cutting off a peer belongs in WireGuard's own configuration (`wg set <iface> peer <key> remove`), not in a monitoring console acting behind your back.
+#### Tunnel endpoints are never auto-blocked
+
+Tunnel addresses are private-range (RFC1918 or CGNAT 100.64/10), so auto-block will never act on a VPN client's tunnel IP — by design, since blocking a tunnel IP would be both ineffective and confusing.
+
+A peer's **public endpoint** — the address its encrypted packets actually arrive from — is protected separately, and this protection does **not** depend on peer monitoring being switched on. It has to be unconditional, because the failure is silent and self-inflicted: dropping an endpoint does not stop an attacker, it severs the tunnel and every service behind it, while the console keeps answering happily on the LAN. On a gateway you administer *through* that tunnel, the block also takes away the way back in. (Until now the gate read the live peer list, so it was inert unless WireGuard monitoring was on, which is off by default.)
+
+Endpoints are collected from three places, so there is no window where one is blockable:
+
+| Source | Covers |
+|--------|--------|
+| `wg show all dump`, sampled every 60 s | Live peers, including a client that has just roamed to a new address |
+| `Endpoint =` in any plain-text `.conf` under `…\WireGuard\Data\Configurations` | The server a client dials — still named there when the tunnel is **down** |
+| A persisted 24 h memory (`wireguard-endpoints.json`) | Restarts, a momentary `wg.exe` failure, a peer that went quiet, and the case that matters most: a tunnel that has **already** dropped, where `wg` reports no endpoint at all and the one address that would restore it otherwise looks like any other stranger |
+
+- **Hostnames in a config are deliberately not resolved.** `Endpoint = vpn.example.org:51820` contributes nothing, because anyone able to answer DNS could otherwise write their own address into a never-block list — the same reasoning as the allowlist drift detector. The live dump reports the resolved address anyway.
+- WireGuard for Windows keeps imported tunnels as `<name>.conf.dpapi`, encrypted for the tunnel manager's own account. Those are **never** decrypted here, so the config source only sees a plain `.conf` you left in place. The live dump and the 24 h memory cover the rest.
+- WireGuard adapters are detected from the NIC table — no elevation, no subprocess — so a host with no tunnel spends nothing. A host that *has* one but cannot read its peers says so in **Settings → VPN (WireGuard)** rather than staying quiet: an unelevated run can still gain rights through UAC and start writing rules, so silence there would be the dangerous case.
+- When a detector does flag a peer endpoint, the console now says so — `Not blocking 203.0.113.9 (Critical: …) — it is a WireGuard tunnel endpoint` — instead of leaving you to wonder why no rule appeared. Rate-limited per address.
+- **Manual blocking is unaffected**, here as with the operator shield: a hostile tunnel peer is a real case. Cutting off a peer for good belongs in WireGuard's own configuration (`wg set <iface> peer <key> remove`), not in a monitoring console acting behind your back.
 
 ### DNS hygiene
 
@@ -323,11 +378,11 @@ Self-contained by default — the server does **not** need the .NET SDK or a com
 
 ```powershell
 # Copy the .install.cmd to the server, then run it (UAC prompt if not elevated):
-.\NetworkSentinel-windows-server-x64-0.6.2.install.cmd
+.\NetworkSentinel-windows-server-x64-0.6.5.install.cmd
 # optional port:
-.\NetworkSentinel-windows-server-x64-0.6.2.install.cmd -Port 18765
+.\NetworkSentinel-windows-server-x64-0.6.5.install.cmd -Port 18765
 # unpack without installing:
-.\NetworkSentinel-windows-server-x64-0.6.2.install.cmd --extract-only
+.\NetworkSentinel-windows-server-x64-0.6.5.install.cmd --extract-only
 ```
 
 The one-file installer is a `.cmd`, not a `.ps1`: `cmd.exe` stops reading the script at `exit /b`, so the ZIP appended to it is never parsed. PowerShell tokenizes an entire `-File` script before running any of it, and the cost on appended binary is quadratic (16 MB ≈ 5½ minutes) before it fails to parse at all — so the shell-style "payload after exit" trick only works with a `cmd` entry point.
@@ -389,7 +444,7 @@ No URL ACL is reserved. That was an `HttpListener` requirement; Kestrel binds th
 
 #### Upgrades and uninstall
 
-Re-running the installer **upgrades in place**: it stops the running task, replaces the binaries, and restarts. `%ProgramData%\NetworkSentinel` is both the install folder and the data directory, so the installer removes **only the files the package ships** — the master password hash, settings, allowlist, logs, host history, threat log, `duckdns.json`, `tls\`, and `acme\` all survive. The web page header shows the running version (e.g. `v0.6.2`) — check it after an upgrade to confirm the new build is live.
+Re-running the installer **upgrades in place**: it stops the running task, replaces the binaries, and restarts. `%ProgramData%\NetworkSentinel` is both the install folder and the data directory, so the installer removes **only the files the package ships** — the master password hash, settings, allowlist, logs, host history, threat log, `duckdns.json`, `tls\`, and `acme\` all survive. The web page header shows the running version (e.g. `v0.6.5`) — check it after an upgrade to confirm the new build is live.
 
 Uninstall keeps that same data by default so a reinstall picks up where you left off:
 
@@ -709,9 +764,11 @@ The token is written to `duckdns.json`, not `settings.json`; the GUI, TUI, and w
 | `Services/PreventionService.cs` | The single auto-block enforcement engine: gates, dry run, operator shield |
 | `Services/SuricataService.cs` | Tails Suricata EVE JSON and converts alerts to threat events |
 | `Services/WireGuardMonitor.cs` | WireGuard peer baseline, endpoint drift, per-peer transfer |
+| `Services/WireGuardEndpointGuard.cs` | The never-auto-block tunnel endpoint set, independent of peer monitoring |
 | `Services/DnsHygieneMonitor.cs` | Plaintext/encrypted DNS, unapproved resolvers, allowlist resolution drift |
 | `Services/HostHistoryStore.cs` | Persistent host + listener baseline, threat log |
-| `Services/WebhookNotifier.cs` | ntfy / Slack / Discord / generic JSON alerts |
+| `Services/WebhookNotifier.cs` | ntfy / Slack / Discord / generic JSON alerts, each carrying the block verdict |
+| `Services/DesktopNotifier.cs` | Critical Windows toasts, blocked-or-not in the title |
 | `Services/GeoIpService.cs` | Reverse DNS + public geo lookup |
 | `Services/FirewallService.cs` | Windows Firewall rule create/list/remove (netsh, cached rule list); auto-block expiry sweep |
 | `Services/AppSettings.cs` | Auto-block preferences + suppress list (JSON on disk) |

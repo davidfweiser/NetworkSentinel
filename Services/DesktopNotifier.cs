@@ -44,8 +44,18 @@ public sealed class DesktopNotifier
             ? "Windows PowerShell not found — desktop notifications unavailable."
             : "Desktop notifications need Windows 10 or later.";
 
-    /// <summary>One aggregated notification per batch of Critical threats.</summary>
-    public void NotifyCritical(IReadOnlyList<ThreatEvent> threats)
+    /// <summary>
+    /// One aggregated notification per batch of Critical threats.
+    ///
+    /// <paramref name="statusFor"/> answers "is this address being blocked?" for each
+    /// threat — wire it to <see cref="PreventionService.DescribeEnforcement"/>. A warning
+    /// that says an address attacked you and stops there sends the reader to the console
+    /// to find out whether anything was done about it; the toast is the one place that
+    /// question is cheap to answer. It returns null for threats with no blockable
+    /// address, and those lines stay as they were.
+    /// </summary>
+    public void NotifyCritical(IReadOnlyList<ThreatEvent> threats,
+                               Func<ThreatEvent, EnforcementStatus?>? statusFor = null)
     {
         if (_powerShellPath is null || threats.Count == 0)
             return;
@@ -74,11 +84,14 @@ public sealed class DesktopNotifier
         if (fresh.Count == 0)
             return;
 
-        var title = fresh.Count == 1
-            ? $"Critical threat: {fresh[0].TypeText}"
-            : $"{fresh.Count} critical threats detected";
-        var body = string.Join("\n", fresh.Take(4).Select(t =>
-            string.IsNullOrEmpty(t.SourceIp) ? t.Title : $"{t.Title} — {t.SourceIp}"));
+        // Resolved once: the same verdict has to drive the title and the body lines.
+        var statuses = fresh.Select(t => Resolve(statusFor, t)).ToList();
+        var title = BuildTitle(fresh, statuses);
+        var body = string.Join("\n", fresh.Take(4).Select((t, i) =>
+        {
+            var line = string.IsNullOrEmpty(t.SourceIp) ? t.Title : $"{t.Title} — {t.SourceIp}";
+            return statuses[i] is { } status ? $"{line}\n  {status.Text}" : line;
+        }));
         if (fresh.Count > 4)
             body += $"\n…and {fresh.Count - 4} more";
 
@@ -103,6 +116,45 @@ public sealed class DesktopNotifier
         {
             // Notifications are best-effort; never let them break monitoring.
         }
+    }
+
+    /// <summary>Never let a status lookup cost the user the warning itself.</summary>
+    private static EnforcementStatus? Resolve(Func<ThreatEvent, EnforcementStatus?>? statusFor, ThreatEvent threat)
+    {
+        try
+        {
+            return statusFor?.Invoke(threat);
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    /// <summary>
+    /// The blocked/not-blocked verdict belongs in the title: on a toast that is often the
+    /// only line the user reads before deciding whether to go to the machine.
+    /// </summary>
+    private static string BuildTitle(IReadOnlyList<ThreatEvent> fresh, IReadOnlyList<EnforcementStatus?> statuses)
+    {
+        if (fresh.Count == 1)
+        {
+            return statuses[0] switch
+            {
+                null => $"Critical threat: {fresh[0].TypeText}",
+                { IsBlocked: true } => $"Blocked · critical threat: {fresh[0].TypeText}",
+                _ => $"NOT blocked · critical threat: {fresh[0].TypeText}"
+            };
+        }
+
+        var known = statuses.Count(s => s is not null);
+        if (known == 0)
+            return $"{fresh.Count} critical threats detected";
+
+        var blocked = statuses.Count(s => s?.IsBlocked == true);
+        return blocked == known
+            ? $"{fresh.Count} critical threats — all blocked"
+            : $"{fresh.Count} critical threats — {blocked} of {known} blocked";
     }
 
     /// <summary>

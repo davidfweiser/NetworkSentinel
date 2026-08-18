@@ -455,6 +455,11 @@
                                                                        FontSize="11" TextWrapping="Wrap"/>
                                                             <TextBlock Text="{Binding Method}" Foreground="{StaticResource TextMutedBrush}"
                                                                        FontSize="11" Margin="0,2,0,0" TextWrapping="Wrap"/>
+                                                            <!-- Same verdict the Threats table and the toast carry. -->
+                                                            <TextBlock Text="{Binding BlockStatusDetail}" FontSize="11" FontWeight="SemiBold"
+                                                                       Margin="0,2,0,0" TextWrapping="Wrap"
+                                                                       Visibility="{Binding BlockStatusDetail, Converter={StaticResource NotEmptyVis}}"
+                                                                       Foreground="{Binding BlockStatus, Converter={StaticResource BlockStatusBrush}}"/>
                                                         </StackPanel>
                                                     </Grid>
                                                 </Border>
@@ -610,12 +615,32 @@
                                     <DataGridTextColumn ElementStyle="{StaticResource DataGridTextElement}" Header="Coming from" Binding="{Binding Origin}" Width="160"/>
                                     <DataGridTextColumn ElementStyle="{StaticResource DataGridTextElement}" Header="Method" Binding="{Binding Method}" Width="150"/>
                                     <DataGridTextColumn ElementStyle="{StaticResource DataGridTextElement}" Header="Detail" Binding="{Binding Detail}" Width="*"/>
+                                    <!-- Whether the source address is being blocked; hover for the reason. -->
+                                    <DataGridTemplateColumn Header="Blocked" Width="90">
+                                        <DataGridTemplateColumn.CellTemplate>
+                                            <DataTemplate>
+                                                <TextBlock Text="{Binding BlockStatus}" FontWeight="SemiBold" VerticalAlignment="Center"
+                                                           Foreground="{Binding BlockStatus, Converter={StaticResource BlockStatusBrush}}"
+                                                           ToolTip="{Binding BlockStatusDetail}"/>
+                                            </DataTemplate>
+                                        </DataGridTemplateColumn.CellTemplate>
+                                    </DataGridTemplateColumn>
+                                    <!-- Block/Unblock swap, as on the Remote Computers grid: offering "Block IP"
+                                         for an address already blocked only prompts for elevation to rewrite a
+                                         rule that is already in force. -->
                                     <DataGridTemplateColumn Header="Action" Width="100">
                                         <DataGridTemplateColumn.CellTemplate>
                                             <DataTemplate>
-                                                <Button Content="Block IP" Style="{StaticResource MiniDangerButton}"
-                                                        Command="{Binding DataContext.BlockThreatIpCommand, RelativeSource={RelativeSource AncestorType=Window}}"
-                                                        CommandParameter="{Binding}"/>
+                                                <StackPanel Orientation="Horizontal">
+                                                    <Button Content="Block IP" Style="{StaticResource MiniDangerButton}"
+                                                            Command="{Binding DataContext.BlockThreatIpCommand, RelativeSource={RelativeSource AncestorType=Window}}"
+                                                            CommandParameter="{Binding}"
+                                                            Visibility="{Binding IsSourceBlocked, Converter={StaticResource BoolToVis}, ConverterParameter=Invert}"/>
+                                                    <Button Content="Unblock" Style="{StaticResource MiniGhostButton}"
+                                                            Command="{Binding DataContext.UnblockThreatIpCommand, RelativeSource={RelativeSource AncestorType=Window}}"
+                                                            CommandParameter="{Binding}"
+                                                            Visibility="{Binding IsSourceBlocked, Converter={StaticResource BoolToVis}}"/>
+                                                </StackPanel>
                                             </DataTemplate>
                                         </DataGridTemplateColumn.CellTemplate>
                                     </DataGridTemplateColumn>

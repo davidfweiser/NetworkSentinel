@@ -33,8 +33,16 @@ public sealed class WebhookNotifier : IDisposable
         _http.DefaultRequestHeaders.UserAgent.ParseAdd("NetworkSentinel/1.0 (webhook)");
     }
 
-    /// <summary>Queues matching threats for delivery. Safe to call from the poll loop.</summary>
-    public void Notify(IReadOnlyList<ThreatEvent> threats, string url, ThreatLevel minLevel)
+    /// <summary>
+    /// Queues matching threats for delivery. Safe to call from the poll loop.
+    ///
+    /// <paramref name="statusFor"/> answers "is this address being blocked?" per threat
+    /// (wire it to <see cref="PreventionService.DescribeEnforcement"/>). It is resolved
+    /// here rather than inside the send task, so what goes out is the verdict as it stood
+    /// when the alert was raised and not whatever the engine happens to say a second later.
+    /// </summary>
+    public void Notify(IReadOnlyList<ThreatEvent> threats, string url, ThreatLevel minLevel,
+                       Func<ThreatEvent, EnforcementStatus?>? statusFor = null)
     {
         if (string.IsNullOrWhiteSpace(url)) return;
         if (!Uri.TryCreate(url.Trim(), UriKind.Absolute, out var uri) ||
@@ -71,15 +79,26 @@ public sealed class WebhookNotifier : IDisposable
         foreach (var t in toSend)
         {
             var threat = t;
-            _ = Task.Run(() => SendAsync(uri, threat));
+            EnforcementStatus? status;
+            try
+            {
+                status = statusFor?.Invoke(threat);
+            }
+            catch
+            {
+                status = null; // A status lookup must never cost the user the alert.
+            }
+            _ = Task.Run(() => SendAsync(uri, threat, status));
         }
     }
 
-    private async Task SendAsync(Uri uri, ThreatEvent t)
+    private async Task SendAsync(Uri uri, ThreatEvent t, EnforcementStatus? status)
     {
         try
         {
             var summary = $"[{t.LevelText}] {t.Title} — {t.SourceIp} · {t.Detail}";
+            if (status is not null)
+                summary += $"\n{status.Text}";
             using var request = new HttpRequestMessage(HttpMethod.Post, uri);
 
             var host = uri.Host;
@@ -95,10 +114,13 @@ public sealed class WebhookNotifier : IDisposable
             }
             else if (host.Contains("ntfy", StringComparison.OrdinalIgnoreCase))
             {
-                request.Content = new StringContent(t.Detail, Encoding.UTF8, "text/plain");
+                // Status first: a phone notification is read from the top and often no further.
+                var text = status is null ? t.Detail : $"{status.Text}\n{t.Detail}";
+                request.Content = new StringContent(text, Encoding.UTF8, "text/plain");
                 request.Headers.TryAddWithoutValidation("Title", $"Network Sentinel: {t.Title}");
                 request.Headers.TryAddWithoutValidation("Priority", t.Level >= ThreatLevel.Critical ? "urgent" : "high");
-                request.Headers.TryAddWithoutValidation("Tags", "shield,warning");
+                request.Headers.TryAddWithoutValidation("Tags",
+                    status?.IsBlocked == true ? "shield,warning,no_entry" : "shield,warning");
             }
             else
             {
@@ -112,7 +134,11 @@ public sealed class WebhookNotifier : IDisposable
                     detail = t.Detail,
                     origin = t.Origin,
                     method = t.Method,
-                    time = t.Timestamp.ToString("O")
+                    time = t.Timestamp.ToString("O"),
+                    // Null when the threat names no blockable address.
+                    blocked = status?.IsBlocked,
+                    block_state = status?.State.ToString(),
+                    block_status = status?.Text
                 });
             }
 
