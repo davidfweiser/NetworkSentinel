@@ -10,9 +10,21 @@ Three ways to run it (same idea as the Linux build):
 | **Terminal UI (`--tui`)** | Server Core, RDP console, SSH-style workflows |
 | **Headless web UI (`-w`)** | Browser dashboard on a server (master-password protected) |
 
-> Awareness / monitoring tooling — not a full IDS/IPS replacement. Version **0.7.4**.
+> Awareness / monitoring tooling — not a full IDS/IPS replacement. Version **0.7.5**.
 
 ---
+
+## What's new in 0.7.5
+
+One row is one rule now, in both front-ends and on the phone — plus the cut-off text and buttons that came with the 0.7.4 page.
+
+| Area | What changed |
+|------|--------------|
+| **A rule appears once** | Windows stores its built-in groups once per profile: *File and Printer Sharing* arrives for Domain and again for Private,Public, *Cast to Device* three times over, identical in every field a rule list shows. The 0.7.4 fold kept them apart because its key included the profile, and nothing downstream did — so the console drew each rule twice, an iOS browser logged duplicate row identities, and Edit or Delete on any of them was refused as ambiguous, a rule being addressed by the shape it shows. They fold into one row carrying the union of their profiles. A rule live on less than the whole machine now says which profiles those are; one live on all three says nothing, because "Domain,Private,Public" down three hundred rows buries the handful that are actually scoped. |
+| **Program and service are part of a rule's identity** | The other half of the same fix: what the fold keeps apart, the row has to be addressable by. One rule admitting `svchost` and one admitting `System` are two rules, and are now two rules you can edit and delete separately. |
+| **The desktop and the console say the same thing** | Both build the same three lines from the same fields, in the same order — summary, listening sockets, policy. The desktop gained the *Scanned HH:mm:ss, not live* stamp the console had; the console gained the listener count line the desktop had, and its policy paragraph moved below the summary where the desktop keeps it. |
+| **Nothing is cut off** | The rail title wrapped instead of reading "Network Sentine"; the Firewall Config grids were the only ones in the app not using the shared cell style, so long labels and IPv6 ranges stopped mid-value with no ellipsis and no way to read the rest — they trim and carry the full value as a tooltip now; and the action column was pinned at 150px where its two buttons need 164, which sliced the rounded edge off **Delete**. |
+| **The Firewall Config tab says what it is doing** | It is the one page whose contents arrive on a second request (`/api/hostfirewall`, because a Windows host carries some 670 rules where a Linux one carries a dozen). Between the tap and the answer, and on failure, it used to be blank — which reads exactly like a firewall with no rules in it. It now shows a reading notice, then the rules, or the reason it could not and what to press; the request has a 60s deadline. |
 
 ## What's new in 0.7.4
 
@@ -509,11 +521,11 @@ Self-contained by default — the server does **not** need the .NET SDK or a com
 
 ```powershell
 # Copy the .install.cmd to the server, then run it (UAC prompt if not elevated):
-.\NetworkSentinel-windows-server-x64-0.7.4.install.cmd
+.\NetworkSentinel-windows-server-x64-0.7.5.install.cmd
 # optional port:
-.\NetworkSentinel-windows-server-x64-0.7.4.install.cmd -Port 18765
+.\NetworkSentinel-windows-server-x64-0.7.5.install.cmd -Port 18765
 # unpack without installing:
-.\NetworkSentinel-windows-server-x64-0.7.4.install.cmd --extract-only
+.\NetworkSentinel-windows-server-x64-0.7.5.install.cmd --extract-only
 ```
 
 The one-file installer is a `.cmd`, not a `.ps1`: `cmd.exe` stops reading the script at `exit /b`, so the ZIP appended to it is never parsed. PowerShell tokenizes an entire `-File` script before running any of it, and the cost on appended binary is quadratic (16 MB ≈ 5½ minutes) before it fails to parse at all — so the shell-style "payload after exit" trick only works with a `cmd` entry point.
@@ -575,7 +587,7 @@ No URL ACL is reserved. That was an `HttpListener` requirement; Kestrel binds th
 
 #### Upgrades and uninstall
 
-Re-running the installer **upgrades in place**: it stops the running task, replaces the binaries, and restarts. `%ProgramData%\NetworkSentinel` is both the install folder and the data directory, so the installer removes **only the files the package ships** — the master password hash, settings, allowlist, logs, host history, threat log, `duckdns.json`, `tls\`, and `acme\` all survive. The web console's navigation rail shows the running version (e.g. `v0.7.4`) — check it after an upgrade to confirm the new build is live.
+Re-running the installer **upgrades in place**: it stops the running task, replaces the binaries, and restarts. `%ProgramData%\NetworkSentinel` is both the install folder and the data directory, so the installer removes **only the files the package ships** — the master password hash, settings, allowlist, logs, host history, threat log, `duckdns.json`, `tls\`, and `acme\` all survive. The web console's navigation rail shows the running version (e.g. `v0.7.5`) — check it after an upgrade to confirm the new build is live.
 
 Uninstall keeps that same data by default so a reinstall picks up where you left off:
 
