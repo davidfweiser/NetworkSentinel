@@ -3779,7 +3779,7 @@ public sealed class WebApp : IDisposable
       <div class="settings-group"><h3>Monitoring</h3>
         ${row('Live monitoring', 'Watch connections, listening ports, and threats in real time. Switching this off is the same as the Sleep button in the header — every watcher stops until you wake it again. Firewall blocks stay in force either way.', sw('monitoring', s.isMonitoring))}
         ${row('Page refresh speed', 'How often live tabs (Dashboard, Connections, Hosts…) update in this browser.', refreshSel)}
-        ${row('Geo lookups', 'Resolve country and city for remote IPs (ipwho.is over HTTPS, ip-api.com fallback).', sw('geoLookupEnabled', s.geoLookupEnabled))}
+        ${row('Geo lookups', 'Resolve country and city for remote IPs (ipwho.is, ipapi.co fallback — both over HTTPS).', sw('geoLookupEnabled', s.geoLookupEnabled))}
         ${row('Auth-log monitoring', 'Watch system auth logs for failed SSH/PAM logons and alert on brute-force bursts. ' + (s.authLogStatus || ''), sw('authLogMonitorEnabled', s.authLogMonitorEnabled))}
         ${row('Closed-port scan detection', 'Install a rate-limited firewall SYN-log rule (needs elevation) and watch the kernel log — catches port scans of closed ports that never appear as connections. ' + (s.probeLogStatus || ''), sw('probeLogEnabled', s.probeLogEnabled))}
         ${row('Kernel flow events', 'Sample the moment the kernel reports a new inbound flow instead of waiting out the poll interval — detection in well under a second instead of up to one full cycle. Needs root; falls back to timed polling otherwise. ' + (s.conntrackStatus || ''), sw('conntrackEventsEnabled', s.conntrackEventsEnabled))}

@@ -944,7 +944,7 @@
                   <Grid ColumnDefinitions="*,Auto" Margin="0,0,0,14">
                     <StackPanel Margin="0,0,16,0">
                       <TextBlock Text="Geo lookups" FontWeight="Bold" FontSize="13"/>
-                      <TextBlock Text="Resolve country and city for remote IPs (ipwho.is over HTTPS, ip-api.com fallback). Reverse DNS still runs when this is off."
+                      <TextBlock Text="Resolve country and city for remote IPs (ipwho.is, ipapi.co fallback — both over HTTPS). Reverse DNS still runs when this is off."
                                  Foreground="{DynamicResource TextSecondaryBrush}" FontSize="11"
                                  Margin="0,2,0,0" TextWrapping="Wrap"/>
                     </StackPanel>
