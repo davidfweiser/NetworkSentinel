@@ -97,6 +97,14 @@ public partial class MainViewModel
     /// <summary>What is listening on this host, and whether the firewall admits it.</summary>
     public ObservableCollection<HostListener> ListeningServices { get; } = new();
 
+    /// <summary>
+    /// What the listening-services list is, in the words the web console uses for it —
+    /// the two front-ends explain the same table the same way.
+    /// </summary>
+    public string FirewallConfigListenerHint =>
+        "The same set “ss -tuln” prints, with what the inbound rules above do to each one. " +
+        "“New rule” fills the form above in with that socket's protocol and port.";
+
     public string InboundCountText => $"{InboundRules.Count} inbound rule{(InboundRules.Count == 1 ? "" : "s")}";
     public string OutboundCountText => $"{OutboundRules.Count} outbound rule{(OutboundRules.Count == 1 ? "" : "s")}";
 
@@ -144,11 +152,15 @@ public partial class MainViewModel
         foreach (var listener in scan.Listeners.OrderBy(l => l.Protocol).ThenBy(l => l.Port.Length).ThenBy(l => l.Port))
             ListeningServices.Add(listener);
 
+        // Every sentence below is built the same way in the web console's
+        // renderFirewallConfig(), from the same fields, so an operator moving between
+        // the two front-ends reads the same page about the same firewall.
         var mine = scan.Inbound.Concat(scan.Outbound).Count(r => !r.IsForeign || r.Kind != FirewallRuleKind.Other);
         var total = scan.Inbound.Count + scan.Outbound.Count;
         FirewallConfigSummary =
             $"{scan.HostLabel} · {scan.Backend} · {scan.Status} · {scan.RulesSummary} " +
-            $"({mine} from Network Sentinel, {total - mine} from the rest of the host)";
+            $"({mine} from Network Sentinel, {total - mine} from the rest of the host)" +
+            $" · Scanned {scan.ScannedUtc.ToLocalTime():HH:mm:ss}, not live — Rescan to re-read the kernel.";
 
         var openCount = scan.Listeners.Count(l => l.Covered == "Open");
         FirewallConfigListenerText = scan.Listeners.Count == 0
@@ -193,7 +205,7 @@ public partial class MainViewModel
         if (!int.TryParse(listener.Port, NumberStyles.Integer, CultureInfo.InvariantCulture, out var port))
         {
             FirewallConfigMessage =
-                $"\u201c{listener.Port}\u201d is not a single port number, so there is nothing to prefill \u2014 " +
+                $"“{listener.Port}” is not a single port number, so there is nothing to prefill \u2014 " +
                 "write the rule by hand with Add an Inbound Rule.";
             return;
         }
