@@ -170,6 +170,14 @@ public sealed class AppSettings
     public bool WebHttpsRedirect { get; set; } = true;
 
     /// <summary>
+    /// Serve the web console over HTTPS only — don't bind the plain-HTTP listener, so the
+    /// master password can never cross the wire in the clear. Honored only when
+    /// <see cref="WebHttpsEnabled"/> is on and the certificate actually loads at startup;
+    /// otherwise plain HTTP stays up so a bad certificate can't lock the console out.
+    /// </summary>
+    public bool WebHttpsOnly { get; set; }
+
+    /// <summary>
     /// Address the Let's Encrypt account is registered against. Only read the first time
     /// acme.sh is installed; kept so a retry does not ask for it again. Not a credential.
     /// </summary>

@@ -92,6 +92,7 @@ public partial class MainViewModel : ObservableObject, IDisposable
     [ObservableProperty] private string _tlsCertPath = "";
     [ObservableProperty] private string _tlsKeyPath = "";
     [ObservableProperty] private bool _httpsRedirect = true;
+    [ObservableProperty] private bool _httpsOnly;
     [ObservableProperty] private bool _duckDnsEnabled;
     [ObservableProperty] private string _duckDnsDomain = "";
     [ObservableProperty] private string _duckDnsToken = "";
@@ -205,6 +206,7 @@ public partial class MainViewModel : ObservableObject, IDisposable
         _tlsCertPath = _settings.WebTlsCertPath;
         _tlsKeyPath = _settings.WebTlsKeyPath;
         _httpsRedirect = _settings.WebHttpsRedirect;
+        _httpsOnly = _settings.WebHttpsOnly;
         _duckDnsEnabled = _duckDns.Config.Enabled;
         _duckDnsDomain = _duckDns.Config.Domain;
         _duckDnsToken = _duckDns.Config.Token;
@@ -853,6 +855,23 @@ public partial class MainViewModel : ObservableObject, IDisposable
         RefreshRemoteAccessStatus(reloadCertificate: true);
     }
 
+    partial void OnHttpsOnlyChanged(bool value)
+    {
+        if (value && !_settings.WebHttpsEnabled)
+        {
+            SettingsMessage = "Switch HTTPS on first — turning off plain HTTP without it would leave no console at all.";
+            HttpsOnly = false;
+            return;
+        }
+
+        _settings.WebHttpsOnly = value;
+        _settings.Save();
+        SettingsMessage = value
+            ? "Web console will serve HTTPS only — restart the web console to apply. If the certificate fails to load at startup, plain HTTP stays on so the console stays reachable."
+            : "Web console will serve plain HTTP alongside HTTPS — restart the web console to apply.";
+        RefreshRemoteAccessStatus();
+    }
+
     partial void OnHttpsRedirectChanged(bool value)
     {
         _settings.WebHttpsRedirect = value;
@@ -1002,6 +1021,8 @@ public partial class MainViewModel : ObservableObject, IDisposable
                 _settings.WebTlsPfxPassword, out var cert, out var error))
         {
             var text = $"HTTPS ready on port {_settings.WebHttpsPort} — certificate expires {cert!.NotAfter:yyyy-MM-dd}.";
+            if (_settings.WebHttpsOnly)
+                text += " Plain HTTP is off (HTTPS only).";
             cert.Dispose();
             return text;
         }

@@ -139,6 +139,7 @@ public sealed class WebApp : IDisposable
     private TlsCertificateProvider? _tls;
     private int _httpsPort;
     private bool _httpsActive;
+    private bool _httpOff;
     private CancellationTokenSource? _cts;
     private string _statusMessage = "Web UI ready — monitoring started.";
     private readonly string _appVersion = FormatAppVersion();
@@ -218,7 +219,9 @@ public sealed class WebApp : IDisposable
         {
             // ResolvePort only guarantees the HTTP port is free — the HTTPS port is whatever
             // was configured, so name both rather than blaming the one that is probably fine.
-            var ports = _httpsActive ? $"port {_port} (HTTP) or {_httpsPort} (HTTPS)" : $"port {_port}";
+            var ports = _httpOff ? $"port {_httpsPort} (HTTPS)"
+                : _httpsActive ? $"port {_port} (HTTP) or {_httpsPort} (HTTPS)"
+                : $"port {_port}";
             throw new InvalidOperationException(
                 $"Failed to bind web UI on {ports}. Try another port with -w PORT " +
                 (_httpsActive ? "or --https-port PORT " : "") +
@@ -259,6 +262,10 @@ public sealed class WebApp : IDisposable
 
         var tlsError = ConfigureTls();
 
+        // HTTPS-only skips the plain-HTTP listener — but only when TLS actually came up.
+        // A certificate problem must degrade to HTTP with a warning, never to no console.
+        _httpOff = _settings.WebHttpsOnly && _httpsActive;
+
         builder.WebHost.ConfigureKestrel(options =>
         {
             // The request handler writes responses synchronously (Stream.Write / ReadToEnd).
@@ -267,7 +274,8 @@ public sealed class WebApp : IDisposable
             options.Limits.MaxRequestBodySize = 1 * 1024 * 1024;
             options.AddServerHeader = false;
 
-            options.Listen(bindAddress, _port);
+            if (!_httpOff)
+                options.Listen(bindAddress, _port);
 
             if (_httpsActive && _tls != null)
             {
@@ -289,6 +297,8 @@ public sealed class WebApp : IDisposable
 
         if (tlsError != null)
             Console.Error.WriteLine($"HTTPS disabled: {tlsError}");
+        if (_settings.WebHttpsOnly && !_httpOff)
+            Console.Error.WriteLine("HTTPS-only is set, but HTTPS is not running — serving plain HTTP so the console stays reachable.");
 
         return app;
     }
@@ -333,12 +343,27 @@ public sealed class WebApp : IDisposable
     {
         Console.WriteLine();
         var scope = _listeningLocalOnly ? "localhost only" : (_bindAll ? "all interfaces" : "localhost only");
-        Console.WriteLine($"  Listening on port {_port}  ({scope})");
-        Console.WriteLine($"  Local:   http://127.0.0.1:{_port}/");
-        if (_bindAll && !_listeningLocalOnly)
+        if (_httpOff)
         {
-            foreach (var ip in GetLanIpv4Addresses().Take(4))
-                Console.WriteLine($"  Network: http://{ip}:{_port}/");
+            // No HTTP listener at all, so the banner has to hand out working HTTPS URLs —
+            // the bare-IP ones get a certificate warning, but they connect encrypted.
+            Console.WriteLine($"  Listening on port {_httpsPort}  ({scope}) — HTTPS only, plain HTTP is off");
+            Console.WriteLine($"  Local:   https://127.0.0.1:{_httpsPort}/");
+            if (_bindAll && !_listeningLocalOnly)
+            {
+                foreach (var ip in GetLanIpv4Addresses().Take(4))
+                    Console.WriteLine($"  Network: https://{ip}:{_httpsPort}/");
+            }
+        }
+        else
+        {
+            Console.WriteLine($"  Listening on port {_port}  ({scope})");
+            Console.WriteLine($"  Local:   http://127.0.0.1:{_port}/");
+            if (_bindAll && !_listeningLocalOnly)
+            {
+                foreach (var ip in GetLanIpv4Addresses().Take(4))
+                    Console.WriteLine($"  Network: http://{ip}:{_port}/");
+            }
         }
 
         if (_httpsActive)
@@ -705,10 +730,15 @@ public sealed class WebApp : IDisposable
     private string HttpsStatusText()
     {
         if (_httpsActive)
-            return _tls?.Status ?? $"HTTPS: serving on port {_httpsPort}";
+        {
+            var status = _tls?.Status ?? $"HTTPS: serving on port {_httpsPort}";
+            return _httpOff ? $"{status} Plain HTTP is off — this console is HTTPS-only." : status;
+        }
         if (!_settings.WebHttpsEnabled)
             return "HTTPS: off — this page is served over plain HTTP.";
-        return "HTTPS: enabled in settings but not running — restart the web console.";
+        return _settings.WebHttpsOnly
+            ? "HTTPS: enabled in settings but not running — plain HTTP stays on so this page is reachable. Restart the web console."
+            : "HTTPS: enabled in settings but not running — restart the web console.";
     }
 
     // ── Certificate issuance ───────────────────────────────────────────────────
@@ -1207,6 +1237,15 @@ public sealed class WebApp : IDisposable
                                 ? "Hostname requests over plain HTTP will redirect to HTTPS."
                                 : "HTTP requests are served as-is (no HTTPS redirect).";
                             break;
+                        case "httpsOnly":
+                            if (on && !_settings.WebHttpsEnabled)
+                                return ActionResultDto.Fail(
+                                    "Switch HTTPS on first — turning off plain HTTP without it would leave no console at all.");
+                            _settings.WebHttpsOnly = on;
+                            label = on
+                                ? "Plain HTTP will be off (HTTPS only) — restart the web console to apply. If the certificate fails to load at startup, HTTP stays on so you aren't locked out."
+                                : "Plain HTTP will be served alongside HTTPS — restart the web console to apply.";
+                            break;
 
                         // --- DuckDNS (stored separately in duckdns.json, mode 0600) ---
                         case "duckDnsEnabled":
@@ -1644,6 +1683,7 @@ public sealed class WebApp : IDisposable
                 httpsActive = _httpsActive,
                 httpsPort = _settings.WebHttpsPort,
                 httpsRedirect = _settings.WebHttpsRedirect,
+                httpsOnly = _settings.WebHttpsOnly,
                 httpsStatus = HttpsStatusText(),
                 tlsCertPath = _settings.WebTlsCertPath,
                 tlsKeyPath = _settings.WebTlsKeyPath,
@@ -3790,6 +3830,7 @@ public sealed class WebApp : IDisposable
         ${row('Certificate (PEM fullchain or .pfx)', 'Filled in by Issue certificate; edit it if the certificate lives somewhere else.', txt('tlsCertPath', s.tlsCertPath || '', '/etc/networksentinel/fullchain.cer'))}
         ${row('Private key (PEM)', 'Full path to the private key. Leave empty when the certificate is a .pfx bundle.', txt('tlsKeyPath', s.tlsKeyPath || '', '/etc/networksentinel/privkey.key'))}
         ${row('Redirect HTTP to HTTPS', 'Requests that arrive by hostname get sent to the TLS port. Requests to a bare IP stay on HTTP — the certificate only covers the name.', sw('httpsRedirect', s.httpsRedirect))}
+        ${row('HTTPS only (turn off plain HTTP)', 'Skip the plain-HTTP listener entirely, so the master password can only cross the wire encrypted. Needs HTTPS on with a working certificate — if the certificate fails to load at startup, plain HTTP stays on so this console is not locked out. Takes effect when the web console restarts.', sw('httpsOnly', s.httpsOnly))}
         ${row('DuckDNS dynamic DNS', 'Keep a free duckdns.org hostname pointed at this machine so it stays reachable when your ISP changes your IP.', sw('duckDnsEnabled', s.duckDnsEnabled))}
         ${row('DuckDNS subdomain', 'Just the label — "myhost" for myhost.duckdns.org.', txt('duckDnsDomain', s.duckDnsDomain || '', 'myhost'))}
         ${row('DuckDNS token', 'Account token from duckdns.org. Stored owner-only on disk and never sent back to this page. ' + (s.duckDnsTokenSet ? 'A token is saved — replace the placeholder to change it, or empty the field to remove it.' : 'No token saved yet.'), txt('duckDnsToken', s.duckDnsTokenSet ? '••••••••' : '', 'paste token'))}

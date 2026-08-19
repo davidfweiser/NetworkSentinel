@@ -359,6 +359,8 @@ The first button in the web console's hero action row is a single **Sleep ⇄ Wa
 
 The console is served by **Kestrel**, so it terminates TLS itself (`HttpListener` cannot). HTTP and HTTPS are served side by side: the LAN keeps working on plain HTTP while requests that arrive **by hostname** are redirected to TLS — requests to a bare IP are left alone, since the certificate only covers the name and redirecting an IP would trade a working page for a certificate warning.
 
+Once HTTPS works, **Settings → Remote access → HTTPS only** turns the plain-HTTP listener off entirely, so the master password can never cross the wire in the clear — the strongest setting for a console reachable beyond localhost. Bare-IP visits then get a certificate warning but still connect encrypted. The switch is deliberately fail-open: it is honored only when the certificate actually loads at startup, so a broken or expired cert means the console falls back to plain HTTP (with a warning in the banner and on the settings page) instead of leaving you locked out.
+
 ```bash
 networksentinel -w --https \
     --tls-cert ~/.local/share/NetworkSentinel/tls/myhost.duckdns.org.fullchain.cer \
@@ -855,6 +857,7 @@ All three UIs write the same `~/.local/share/NetworkSentinel/settings.json`, so 
 | `WebTlsKeyPath` | `""` | PEM private key (leave empty for `.pfx`) |
 | `WebTlsPfxPassword` | `""` | Password for a `.pfx` / `.p12` |
 | `WebHttpsRedirect` | `true` | Redirect hostname requests to HTTPS (bare-IP requests stay on HTTP) |
+| `WebHttpsOnly` | `false` | Don't bind the plain-HTTP listener at all — HTTPS only. Honored only when the certificate loads at startup, so a broken cert falls back to HTTP instead of locking the console out |
 | `AcmeAccountEmail` | `""` | Address the Let's Encrypt account is registered against; first issuance only |
 | `WebhookUrl` | `""` | Push alerts to ntfy / Slack / Discord / generic JSON; empty disables |
 | `WebhookMinLevel` | `"Critical"` | Minimum severity that fires the webhook |

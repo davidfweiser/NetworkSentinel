@@ -1184,7 +1184,7 @@
                              Text="{Binding TlsKeyPath}" Watermark="…/tls/myhost.duckdns.org.key"/>
                   </Grid>
 
-                  <Grid ColumnDefinitions="*,Auto">
+                  <Grid ColumnDefinitions="*,Auto" Margin="0,0,0,14">
                     <StackPanel Margin="0,0,16,0">
                       <TextBlock Text="Redirect HTTP to HTTPS" FontWeight="Bold" FontSize="13"/>
                       <TextBlock Text="Requests that arrive by hostname get sent to the TLS port. Requests to a bare IP stay on HTTP, because the certificate only covers the name."
@@ -1193,6 +1193,17 @@
                     </StackPanel>
                     <CheckBox Grid.Column="1" VerticalAlignment="Center"
                               IsChecked="{Binding HttpsRedirect}"/>
+                  </Grid>
+
+                  <Grid ColumnDefinitions="*,Auto">
+                    <StackPanel Margin="0,0,16,0">
+                      <TextBlock Text="HTTPS only (turn off plain HTTP)" FontWeight="Bold" FontSize="13"/>
+                      <TextBlock Text="Skip the plain-HTTP listener entirely, so the master password can only cross the wire encrypted. Needs HTTPS on with a working certificate — if the certificate fails to load at startup, plain HTTP stays on so the console isn't locked out. Takes effect the next time the web console starts."
+                                 Foreground="{DynamicResource TextSecondaryBrush}" FontSize="11"
+                                 Margin="0,2,0,0" TextWrapping="Wrap"/>
+                    </StackPanel>
+                    <CheckBox Grid.Column="1" VerticalAlignment="Center"
+                              IsChecked="{Binding HttpsOnly}"/>
                   </Grid>
 
                   <TextBlock Text="Reaching this from outside your network means anyone who guesses the master password can change this machine's firewall. A VPN or Tailscale is safer than forwarding a port; if you do forward one, forward only the HTTPS port."
