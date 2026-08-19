@@ -2418,6 +2418,46 @@ public sealed class WebApp : IDisposable
     display: flex; justify-content: space-between; gap: 12px;
     color: var(--muted); font-size: .74rem; padding: 6px 2px 2px;
   }
+  /* DASHBOARD ROWS — a wide chart beside the one number that summarises it,
+     the pairing the desktop window uses. Under 900px the panel drops below the
+     chart rather than squeezing two unreadable columns onto a phone. */
+  .dash-row {
+    display: grid; grid-template-columns: 2fr 1fr; gap: 12px; align-items: stretch;
+  }
+  @media (max-width: 900px) { .dash-row { grid-template-columns: 1fr; } }
+  .side-panel {
+    background: var(--bg-panel); border: 1px solid var(--stroke);
+    border-radius: 12px; padding: 14px 16px;
+    display: flex; flex-direction: column; justify-content: center;
+  }
+  .side-panel.intensity {
+    align-items: center; text-align: center;
+    background: linear-gradient(150deg, rgba(59,200,180,.10), rgba(74,158,255,.05) 60%, transparent);
+  }
+  .side-panel .pulse {
+    width: 72px; height: 72px; border-radius: 50%; margin-bottom: 12px;
+    border: 2px solid var(--cyan); background: rgba(59,200,180,.15);
+    display: flex; align-items: center; justify-content: center;
+    font-weight: 700; font-size: .95rem; color: var(--cyan); letter-spacing: .04em;
+  }
+  /* Asleep must not read as LIVE — the number below it is then a stale count. */
+  .side-panel .pulse.idle {
+    border-color: var(--muted); color: var(--muted); background: rgba(255,255,255,.04);
+  }
+  .side-panel .side-title { font-weight: 650; }
+  .side-panel .side-sub { color: var(--text2); font-size: .78rem; }
+  .side-panel .side-kicker {
+    color: var(--muted); font-size: .68rem; font-weight: 700; letter-spacing: .06em;
+  }
+  .side-panel .side-month { font-size: .95rem; font-weight: 600; margin-bottom: 8px; }
+  .side-panel .big {
+    font-size: 1.75rem; font-weight: 700; font-variant-numeric: tabular-nums; line-height: 1.15;
+  }
+  .side-panel .big.danger { color: var(--danger); }
+  .side-panel .big.blue { color: var(--blue); }
+  .side-panel .big.cyan { color: var(--cyan); }
+  .side-panel .side-foot { font-size: .74rem; color: var(--text2); }
+  .side-panel .side-foot.dim { color: var(--muted); }
   .chip {
     display: inline-block; padding: 1px 8px; border-radius: 999px; margin-right: 4px;
     font-size: .72rem; font-weight: 600;
@@ -2707,12 +2747,37 @@ public sealed class WebApp : IDisposable
   <section id="tab-dashboard">
     <div class="cards" id="cards"></div>
     <h3 style="margin:18px 0 8px;font-size:.95rem;color:var(--text2)">Activity — last 5 minutes</h3>
-    <div class="chart-card" id="dash-chart"></div>
+    <div class="dash-row">
+      <div class="chart-card" id="dash-chart"></div>
+      <!-- The desktop's threat-intensity hero: the high/critical count on its own,
+           away from the four tiles it otherwise hides among. -->
+      <div class="side-panel intensity">
+        <div class="pulse" id="intensityPulse">LIVE</div>
+        <div class="side-title">Threat intensity</div>
+        <div class="big danger" id="intensityValue">0</div>
+        <div class="side-sub">high-severity signals</div>
+      </div>
+    </div>
     <h3 style="margin:18px 0 8px;font-size:.95rem;color:var(--text2)">
       Data flow <span class="muted" id="traffic-window" style="font-weight:400"></span>
     </h3>
-    <div class="chart-card" id="dash-traffic"></div>
-    <div class="toolbar" style="margin-top:10px">
+    <div class="dash-row">
+      <div class="chart-card" id="dash-traffic"></div>
+      <!-- The running month's totals, which the data-flow footer states in a
+           sentence too long to read at a glance. -->
+      <div class="side-panel">
+        <div class="side-kicker">THIS MONTH</div>
+        <div class="side-month" id="monthLabel">—</div>
+        <div class="side-sub">Data in</div>
+        <div class="big blue" id="monthIn">—</div>
+        <div class="side-sub" style="margin-top:6px">Data out</div>
+        <div class="big cyan" id="monthOut">—</div>
+        <div class="side-foot" style="margin-top:10px" id="monthTotal"></div>
+        <div class="side-foot dim" id="monthAvg"></div>
+      </div>
+    </div>
+    <h3 style="margin:18px 0 4px;font-size:.95rem;color:var(--text2)">Monthly data in and out</h3>
+    <div class="toolbar" style="margin-top:6px">
       <span class="muted" style="font-size:.85rem">Totals by</span>
       <select id="trafficRange">
         <option value="days">This month, by day</option>
@@ -3270,6 +3335,17 @@ public sealed class WebApp : IDisposable
     $('dash-traffic').innerHTML = trafficChartHtml(tr);
     $('traffic-window').textContent = tr.window ? '— ' + tr.window : '';
 
+    // The same five month fields the footer sentence uses, given room to be read.
+    // Em dashes rather than zeros while the meter is off: nothing was measured.
+    const metered = tr.enabled !== false;
+    $('monthLabel').textContent = tr.monthLabel || '—';
+    $('monthIn').textContent = metered ? (tr.monthIn || '—') : '—';
+    $('monthOut').textContent = metered ? (tr.monthOut || '—') : '—';
+    $('monthTotal').textContent = metered
+      ? (tr.monthTotal ? tr.monthTotal + ' total' : '')
+      : 'Traffic metering is off';
+    $('monthAvg').textContent = metered ? (tr.monthDailyAverage || '') : '';
+
     const useMonths = $('trafficRange').value === 'months';
     const buckets = (useMonths ? tr.months : tr.days) || [];
     $('dash-traffic-bars').innerHTML = trafficBarsHtml(buckets);
@@ -3570,6 +3646,18 @@ public sealed class WebApp : IDisposable
       </div>`).join('');
 
     $('dash-chart').innerHTML = chartHtml(state.activity || []);
+
+    // Threat intensity reads LIVE only while something is actually watching;
+    // asleep, the count below it is a leftover, not a measurement.
+    const watching = !!(state.settings && state.settings.isMonitoring);
+    const pulse = $('intensityPulse');
+    pulse.textContent = watching ? 'LIVE' : 'IDLE';
+    pulse.classList.toggle('idle', !watching);
+    pulse.title = watching
+      ? 'Monitoring — high and critical signals are being counted live'
+      : 'Asleep — this count is the last one measured';
+    $('intensityValue').textContent = s.highThreats ?? 0;
+
     renderTraffic();
 
     const threats = state.threats || [];

@@ -12,7 +12,7 @@ Three ways to run it:
 
 > **Host-based** intrusion detection and prevention. It detects on its own heuristics and, with Suricata attached (0.6.0), on signature/payload inspection — then enforces in the kernel via `nftables`. It is not an inline network appliance: it protects the machine it runs on, not a segment, and it does not sit in the forwarding path.
 
-Linux port of the original Windows WPF Network Sentinel. Platform layers use `/proc/net`, `ss`, conntrack netlink, `nftables`/`iptables` (elevated via **pkexec**), and XDG data paths. Version **0.7.6**.
+Linux port of the original Windows WPF Network Sentinel. Platform layers use `/proc/net`, `ss`, conntrack netlink, `nftables`/`iptables` (elevated via **pkexec**), and XDG data paths. Version **0.7.7**.
 
 ---
 
@@ -324,7 +324,7 @@ action row. Below ~900px the rail folds into a wrapping row above the content.
 
 | Tab | What you can do |
 |-----|-----------------|
-| **Dashboard** | Live counters, **5-minute activity chart** (connections + threat markers), data-flow charts, recent threats |
+| **Dashboard** | Live counters, **5-minute activity chart** (connections + threat markers) beside **Threat intensity**, data-flow charts beside the running month's totals, **Monthly data in and out**, recent threats |
 | **Live Connections / Break-in Attempts** | Live traffic with a **Block** button on every row |
 | **Remote Computers** | Remote peers; block / unblock by row or by typed IP |
 | **Open Ports** | Local listeners; one-click **Block port** |
@@ -332,6 +332,18 @@ action row. Below ~900px the rail folds into a wrapping row above the content.
 | **Firewall Config** (0.7.1, rebuilt 0.7.4) | The whole host firewall — UFW's rules, Network Sentinel's, and everyone else's — plus listening services and their firewall verdict; add / edit / delete any of them |
 | **Allowlist** | Add/remove trusted domains and IPs; refresh the feed |
 | **Settings** | Monitoring on/off, poll interval, geo lookups, auth-log and closed-port scan detection, the 0.4.0 detectors (threat intel, new-listener alerts, process reputation, ARP/gateway watch, startup-item watch, exfiltration threshold, honeypot ports), **kernel flow events**, **DNS hygiene** (with approved resolvers), **WireGuard peer monitoring** (with a live peer table), **Suricata signature ingestion** (EVE path, maximum severity, muted sids), **auto-block dry run**, **HTTPS + DuckDNS remote access** (including **Issue certificate**), webhook URL, auto-block + minimum severity + expiry, block direction (in/out), allowlist feed, **change master password**, **Remove all rules** |
+
+**The dashboard boxes the desktop had (0.7.7).** Two panels the desktop window
+carried and the console did not: **Threat intensity**, the high/critical count on
+its own beside the activity chart, and **This month**, the running month's data in
+and out beside the data-flow chart. Neither needed a new API field — the console
+was already sending all five month values and using them only in the footer
+sentence under the chart, which is too long to read at a glance. The console's
+pulse reads **IDLE** rather than LIVE while asleep, because the count beneath it
+is then the last one measured rather than a live one; the desktop has no sleep
+mode and so no equivalent. The monthly bar chart, which the console already drew
+unlabelled, gained the desktop's **Monthly data in and out** heading above its
+range dropdown. Below 900px each pair stacks instead of splitting the width.
 
 The navigation rail shows the running version (e.g. `v0.7.5`) — check it after an upgrade to confirm the new build is live. Since 0.7.2 the console notices this for you: a tab left open across an upgrade shows a banner naming both versions and offering a reload, because the page polls `/api/state` but never re-requests its own HTML, so the old UI would otherwise stay put and look like the upgrade never installed.
 
@@ -465,17 +477,17 @@ first. The build is self-contained — the server needs no .NET runtime.
 
 ```bash
 # build machine
-scp dist/networksentinel-0.7.6-linux-x64.install.sh user@server:
+scp dist/networksentinel-0.7.7-linux-x64.install.sh user@server:
 
 # server
-chmod +x networksentinel-0.7.6-linux-x64.install.sh
-sudo ./networksentinel-0.7.6-linux-x64.install.sh --web-service
+chmod +x networksentinel-0.7.7-linux-x64.install.sh
+sudo ./networksentinel-0.7.7-linux-x64.install.sh --web-service
 ```
 
 Confirm the installer is current before using root:
 
 ```bash
-./networksentinel-0.7.6-linux-x64.install.sh --help
+./networksentinel-0.7.7-linux-x64.install.sh --help
 # Should list: --web-service
 ```
 
@@ -525,8 +537,8 @@ sudo ./….install.sh --web-service --port 18765
 ./….install.sh --user --desktop-shortcut    # ~/.local + icon on the Desktop
 
 # classic tarball
-tar xzf networksentinel-0.7.6-linux-x64.tar.gz
-cd networksentinel-0.7.6-linux-x64
+tar xzf networksentinel-0.7.7-linux-x64.tar.gz
+cd networksentinel-0.7.7-linux-x64
 sudo ./install.sh --web-service
 ```
 
