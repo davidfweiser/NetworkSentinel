@@ -12,7 +12,7 @@ Three ways to run it:
 
 > **Host-based** intrusion detection and prevention. It detects on its own heuristics and, with Suricata attached (0.6.0), on signature/payload inspection — then enforces in the kernel via `nftables`. It is not an inline network appliance: it protects the machine it runs on, not a segment, and it does not sit in the forwarding path.
 
-Linux port of the original Windows WPF Network Sentinel. Platform layers use `/proc/net`, `ss`, conntrack netlink, `nftables`/`iptables` (elevated via **pkexec**), and XDG data paths. Version **0.7.3**.
+Linux port of the original Windows WPF Network Sentinel. Platform layers use `/proc/net`, `ss`, conntrack netlink, `nftables`/`iptables` (elevated via **pkexec**), and XDG data paths. Version **0.7.5**.
 
 ---
 
@@ -265,6 +265,10 @@ UFW's own helper chains (`ufw-before-*`, `ufw-track-*`, the logging chains) and 
 
 Every socket is listed with its **bind address**, so a service like NetBIOS shows its separate rows on `0.0.0.0`, the LAN address and the broadcast address rather than one collapsed entry — the same set `ss -tuln` prints. **New rule** on a row opens the editor with that socket's protocol and port already filled in (0.7.4), which is the point of listing them next to the rules: a rule here is written against a socket, and retyping the port out of a terminal is how one goes missing.
 
+**Both front-ends say the same thing (0.7.5).** The desktop window and the web console build the same three lines from the same fields, in the same order — summary, listening sockets, policy. The desktop gained the *Scanned HH:mm:ss, not live* stamp the console had, so a page read an hour ago says so rather than passing for current; the console gained the listening-socket count and how many of them are reachable from anywhere, which the desktop had; and the console's policy paragraph moved below the summary, where the desktop keeps it. The sentence describing what the listener table is, is now one sentence written once and shown in both.
+
+**Nothing is cut off (0.7.5).** The Firewall Config grids were the only ones in the app not trimming their cells, so a long rule label or an IPv6 range stopped mid-value with no ellipsis and no way to read the rest. Every cell trims now, and the columns whose values are routinely wider than any sensible column — label, addresses, created-by, process, bind address — carry the full value as a tooltip. Label and addresses share the leftover width rather than one of them being pinned narrow. The action column sized to its two buttons instead of the 150px it was pinned at, which had been slicing the rounded edge off **Delete**; and the rail title wraps rather than reading "Network Sentine".
+
 The listeners come from `ss`, which needs no privilege, so they are listed even when no firewall backend could be read at all — an unprivileged run, or a host with no firewall configured, still gets the inventory with a **No firewall** verdict against each row.
 
 **Writes follow the host.** Where UFW is active it owns the chains — it re-applies its rule set at boot and on `ufw reload`, so a rule written into nftables underneath it was invisible in `ufw status` and did not survive a reload, which looks exactly like a block quietly failing. So rules now go through `ufw allow` / `deny` where UFW is running, and into nftables (or iptables) where it is not. Installed-but-inactive does not count: enabling UFW can lock you out of SSH and that is never this app's decision to make.
@@ -329,7 +333,7 @@ action row. Below ~900px the rail folds into a wrapping row above the content.
 | **Allowlist** | Add/remove trusted domains and IPs; refresh the feed |
 | **Settings** | Monitoring on/off, poll interval, geo lookups, auth-log and closed-port scan detection, the 0.4.0 detectors (threat intel, new-listener alerts, process reputation, ARP/gateway watch, startup-item watch, exfiltration threshold, honeypot ports), **kernel flow events**, **DNS hygiene** (with approved resolvers), **WireGuard peer monitoring** (with a live peer table), **Suricata signature ingestion** (EVE path, maximum severity, muted sids), **auto-block dry run**, **HTTPS + DuckDNS remote access** (including **Issue certificate**), webhook URL, auto-block + minimum severity + expiry, block direction (in/out), allowlist feed, **change master password**, **Remove all rules** |
 
-The navigation rail shows the running version (e.g. `v0.7.3`) — check it after an upgrade to confirm the new build is live. Since 0.7.2 the console notices this for you: a tab left open across an upgrade shows a banner naming both versions and offering a reload, because the page polls `/api/state` but never re-requests its own HTML, so the old UI would otherwise stay put and look like the upgrade never installed.
+The navigation rail shows the running version (e.g. `v0.7.5`) — check it after an upgrade to confirm the new build is live. Since 0.7.2 the console notices this for you: a tab left open across an upgrade shows a banner naming both versions and offering a reload, because the page polls `/api/state` but never re-requests its own HTML, so the old UI would otherwise stay put and look like the upgrade never installed.
 
 ### Sleep / Wake
 
@@ -459,17 +463,17 @@ first. The build is self-contained — the server needs no .NET runtime.
 
 ```bash
 # build machine
-scp dist/networksentinel-0.7.3-linux-x64.install.sh user@server:
+scp dist/networksentinel-0.7.5-linux-x64.install.sh user@server:
 
 # server
-chmod +x networksentinel-0.7.3-linux-x64.install.sh
-sudo ./networksentinel-0.7.3-linux-x64.install.sh --web-service
+chmod +x networksentinel-0.7.5-linux-x64.install.sh
+sudo ./networksentinel-0.7.5-linux-x64.install.sh --web-service
 ```
 
 Confirm the installer is current before using root:
 
 ```bash
-./networksentinel-0.7.3-linux-x64.install.sh --help
+./networksentinel-0.7.5-linux-x64.install.sh --help
 # Should list: --web-service
 ```
 
@@ -519,8 +523,8 @@ sudo ./….install.sh --web-service --port 18765
 ./….install.sh --user --desktop-shortcut    # ~/.local + icon on the Desktop
 
 # classic tarball
-tar xzf networksentinel-0.7.3-linux-x64.tar.gz
-cd networksentinel-0.7.3-linux-x64
+tar xzf networksentinel-0.7.5-linux-x64.tar.gz
+cd networksentinel-0.7.5-linux-x64
 sudo ./install.sh --web-service
 ```
 
