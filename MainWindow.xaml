@@ -1233,6 +1233,13 @@
                                                                 ElementStyle="{StaticResource DataGridTextElementWide}"/>
                                             <DataGridTextColumn Header="Created by" Binding="{Binding OriginText}" Width="150"
                                                                 ElementStyle="{StaticResource DataGridTextElementWide}"/>
+                                            <!-- The binary or service the rule names, without which whole families
+                                                 of rules read as duplicates of one another: 21 Edge rules that
+                                                 differ only by EdgeWebView version, a Steam pair split across two
+                                                 cef builds. Trimmed from the left by ScopeText, so the tail that
+                                                 differs survives; the tooltip carries the whole path. -->
+                                            <DataGridTextColumn Header="Program" Binding="{Binding ScopeText}" Width="*" MinWidth="170"
+                                                                ElementStyle="{StaticResource DataGridTextElementScope}"/>
                                             <DataGridTextColumn Header="Profiles" Binding="{Binding ProfileScopeText}" Width="110"
                                                                 ElementStyle="{StaticResource DataGridTextElement}"/>
                                             <DataGridTextColumn Header="Copies" Binding="{Binding CopiesText}" Width="60"
@@ -1294,6 +1301,13 @@
                                                                 ElementStyle="{StaticResource DataGridTextElementWide}"/>
                                             <DataGridTextColumn Header="Created by" Binding="{Binding OriginText}" Width="150"
                                                                 ElementStyle="{StaticResource DataGridTextElementWide}"/>
+                                            <!-- The binary or service the rule names, without which whole families
+                                                 of rules read as duplicates of one another: 21 Edge rules that
+                                                 differ only by EdgeWebView version, a Steam pair split across two
+                                                 cef builds. Trimmed from the left by ScopeText, so the tail that
+                                                 differs survives; the tooltip carries the whole path. -->
+                                            <DataGridTextColumn Header="Program" Binding="{Binding ScopeText}" Width="*" MinWidth="170"
+                                                                ElementStyle="{StaticResource DataGridTextElementScope}"/>
                                             <DataGridTextColumn Header="Profiles" Binding="{Binding ProfileScopeText}" Width="110"
                                                                 ElementStyle="{StaticResource DataGridTextElement}"/>
                                             <DataGridTextColumn Header="Copies" Binding="{Binding CopiesText}" Width="60"

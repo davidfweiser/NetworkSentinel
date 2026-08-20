@@ -419,6 +419,17 @@
         <Setter Property="ToolTip" Value="{Binding Text, RelativeSource={RelativeSource Self}}"/>
     </Style>
 
+    <!--
+        The scope column, whose cell text is deliberately not the whole value: a
+        program path is trimmed from the left to keep the tail that tells two rules
+        apart (see FirewallRuleInfo.ScopeText). The tooltip therefore cannot come from
+        the cell's own Text the way the style above does it — it binds to the row, so
+        hovering gives the full path rather than the trimmed one.
+    -->
+    <Style x:Key="DataGridTextElementScope" TargetType="TextBlock" BasedOn="{StaticResource DataGridTextElement}">
+        <Setter Property="ToolTip" Value="{Binding ScopeDetailText}"/>
+    </Style>
+
     <Style TargetType="DataGridColumnHeader">
         <Setter Property="Background" Value="#0DFFFFFF"/>
         <Setter Property="Foreground" Value="{StaticResource TextSecondaryBrush}"/>
