@@ -92,23 +92,35 @@ public sealed class WebApp : IDisposable
     }
 
     /// <summary>
-    /// Stable identity for a scanned rule, so a Delete pressed in the browser acts on
-    /// the row that was displayed. Rule names are not unique on Windows — this host
-    /// holds 685 rules called "allow 9009" — so the key is the rule's whole shape,
-    /// and an ambiguous match is refused rather than guessed at.
+    /// The identity the browser hands back when a row's Edit or Delete is clicked, so
+    /// the click acts on the row that was displayed.
+    ///
+    /// Everything the fold in <see cref="HostFirewallScanner.Dedupe"/> keeps apart has
+    /// to appear here, or two rules that survive as separate rows share a key and
+    /// neither can be addressed. Shape alone did not manage that. Two rules can agree
+    /// on action, protocol, displayed port, sources and label and still be two rules:
+    /// adding the same Firewall Config rule twice is enough, which is what an operator
+    /// does after a delete appears to fail. Both rows then matched either row's key,
+    /// the lookup found two and refused, and from that point neither row could be
+    /// deleted or edited again — and the one remedy it suggested, giving them distinct
+    /// names, is done by editing them, through this same lookup.
+    ///
+    /// The name is what tells those rows apart, and it was already on the scanned rule:
+    /// <see cref="FirewallService.SaveCustomRule"/> mints "…-2" for a repeated label.
+    /// The raw port halves go in for the same reason the fold separates on them — an
+    /// inbound rule constrained on its local port and one constrained on its remote
+    /// port display the same range. Program and service stay in: one rule scoped to
+    /// svchost and one to System are two rules. The profile stays out, because the fold
+    /// no longer separates on it — it merges the profiles instead.
+    ///
+    /// Shape stays in the key as well, so a key still cannot follow a rule that was
+    /// edited into something else between the page rendering and the click arriving.
     /// </summary>
-    /// <summary>
-    /// A scanned rule's identity, as both front-ends address it. Everything the fold in
-    /// <see cref="HostFirewallScanner.Dedupe"/> keeps apart has to appear here: two rules
-    /// that survive as separate rows but share a key cannot be told apart by a list, and
-    /// a delete aimed at either is refused as ambiguous. Program and service are in for
-    /// exactly that reason — one rule scoped to svchost and one to System are two rules.
-    /// The profile is not, because the fold no longer separates on it.
-    /// </summary>
-    private static string ScannedRuleKey(FirewallRuleInfo r) => string.Join("|",
+    internal static string ScannedRuleKey(FirewallRuleInfo r) => string.Join("|",
         r.IsInbound ? "in" : "out", r.ActionText, r.ProtocolText,
         r.PortRangeText, r.AddressListText, r.LabelText, r.OriginText,
-        r.Program, r.Service);
+        r.Program, r.Service,
+        r.Name, r.LocalPortsRaw, r.RemotePortsRaw);
 
     private FirewallRuleInfo? FindScannedRule(string key, out string problem)
     {
@@ -118,12 +130,19 @@ public sealed class WebApp : IDisposable
             .Where(r => string.Equals(ScannedRuleKey(r), key, StringComparison.Ordinal))
             .ToList();
 
-        if (matches.Count == 1) return matches[0];
-        problem = matches.Count == 0
-            ? "That rule is no longer in the host firewall — the list has moved on. Rescan and try again."
-            : "Several rules on this host have exactly that shape, so it is not clear which one to remove. " +
-              "Give them distinct names, or remove it where it was created.";
-        return null;
+        if (matches.Count == 0)
+        {
+            problem = "That rule is no longer in the host firewall — the list has moved on. Rescan and try again.";
+            return null;
+        }
+
+        // Rows that agree on shape *and* on name, program, service and the raw port
+        // halves are the same rule as far as anything here can see — Windows lets the
+        // same rule be added over and over, and the scan folds exact duplicates into
+        // one row precisely because they cannot be told apart. Removing either is what
+        // was asked for, so take the first rather than refuse a delete that could never
+        // be made unambiguous.
+        return matches[0];
     }
 
     private readonly WebAuthStore _auth = new();
