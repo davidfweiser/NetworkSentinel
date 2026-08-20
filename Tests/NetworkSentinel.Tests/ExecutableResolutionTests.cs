@@ -58,6 +58,8 @@ public class ExecutableResolutionTests
     {
         // The Debian desktop case: the tool is installed, PATH does not name its
         // directory, and the app still has to find it.
+        if (OperatingSystem.IsWindows()) return;   // Unix modes are the thing under test
+
         var root = Path.Combine(Path.GetTempPath(), "ns-resolve-" + Guid.NewGuid().ToString("N"));
         Directory.CreateDirectory(root);
         try
@@ -78,6 +80,8 @@ public class ExecutableResolutionTests
     [Fact]
     public void AFileWithoutAnExecuteBitIsNotACommand()
     {
+        if (OperatingSystem.IsWindows()) return;   // Unix modes are the thing under test
+
         var path = Path.Combine(Path.GetTempPath(), "ns-plain-" + Guid.NewGuid().ToString("N"));
         File.WriteAllText(path, "not a program");
         try
