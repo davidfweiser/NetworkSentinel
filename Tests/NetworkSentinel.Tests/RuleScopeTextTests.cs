@@ -105,6 +105,42 @@ public class RuleScopeTextTests
         Assert.Equal("Service: Dnscache", rule.ScopeDetailText);
     }
 
+    /// <summary>
+    /// The cell trims anything wider than its column, and it trims from the right —
+    /// the opposite end from this one. A value that overflows is therefore trimmed
+    /// twice, and the second cut undoes the first: "cef.win64" and "cef.win7x64" both
+    /// end as "cef.win…" and the two rows collide again. Keeping the string inside a
+    /// width the column can hold is what stops that, so the bound is the invariant
+    /// worth pinning rather than the particular number.
+    /// </summary>
+    [Theory]
+    [InlineData(@"C:\Program Files (x86)\Microsoft\EdgeWebView\Application\151.0.4129.93\msedgewebview2.exe")]
+    [InlineData(@"C:\Program Files (x86)\Steam\bin\cef\cef.win7x64\steamwebhelper.exe")]
+    [InlineData(@"C:\users\david\programing\test\networksentinel\bin\package\windows-server-win-x64-selfcontained\networksentinel.exe")]
+    public void TheScopeNeverOutgrowsItsColumn(string program)
+    {
+        var scope = Rule(program).ScopeText;
+
+        Assert.True(scope.Length <= 34, $"'{scope}' is {scope.Length} chars and would be trimmed a second time.");
+    }
+
+    /// <summary>
+    /// The Steam pair specifically, since it is the one a second trim ruins: both
+    /// paths must still differ within the first characters a narrow column shows.
+    /// </summary>
+    [Fact]
+    public void TheSteamPair_DiffersEarlyEnoughToSurviveANarrowColumn()
+    {
+        var a = Rule(@"C:\Program Files (x86)\Steam\bin\cef\cef.win64\steamwebhelper.exe").ScopeText;
+        var b = Rule(@"C:\Program Files (x86)\Steam\bin\cef\cef.win7x64\steamwebhelper.exe").ScopeText;
+
+        // Compare only what a column roughly 20 characters wide would render.
+        var shownA = a[..Math.Min(20, a.Length)];
+        var shownB = b[..Math.Min(20, b.Length)];
+
+        Assert.NotEqual(shownA, shownB);
+    }
+
     /// <summary>A rule carrying both is described by both in the tooltip.</summary>
     [Fact]
     public void ARuleScopedToBoth_ReportsBoth()

@@ -1217,32 +1217,39 @@
                                     <DataGrid ItemsSource="{Binding InboundRules}" SelectedItem="{Binding SelectedInboundRule}"
                                               Style="{StaticResource ModernDataGrid}" AutoGenerateColumns="False">
                                         <DataGrid.Columns>
-                                            <!-- Label and the address list share the slack: a rule name and an
-                                                 IPv6 range are both long, and fixing either at 180px cut them in
-                                                 half. ElementStyle gives every cell the ellipsis-and-tooltip
-                                                 treatment, so a value too wide for its column is still readable. -->
-                                            <DataGridTextColumn Header="Label" Binding="{Binding LabelText}" Width="*" MinWidth="220"
+                                            <!-- Label, the address list and the program share the slack: all three
+                                                 are routinely long, and fixing any of them cut it in half.
+                                                 ElementStyle gives every cell the ellipsis-and-tooltip treatment,
+                                                 so a value too wide for its column is still readable.
+
+                                                 The fixed widths are sized to their own headers and nothing more.
+                                                 They were generous — 120px to hold "All ports", 90 to hold "UDP" —
+                                                 and that was affordable until the Program column arrived: the
+                                                 minimum this grid needs went past what a maximised window has at
+                                                 150% display scaling (1707px logical on a 2560px screen), so the
+                                                 grid squeezed every column instead and "Block" became "Bl…". -->
+                                            <DataGridTextColumn Header="Label" Binding="{Binding LabelText}" Width="*" MinWidth="200"
                                                                 ElementStyle="{StaticResource DataGridTextElementWide}"/>
-                                            <DataGridTextColumn Header="Action" Binding="{Binding ActionText}" Width="80"
+                                            <DataGridTextColumn Header="Action" Binding="{Binding ActionText}" Width="70"
                                                                 ElementStyle="{StaticResource DataGridTextElement}"/>
-                                            <DataGridTextColumn Header="Protocol" Binding="{Binding ProtocolText}" Width="90"
+                                            <DataGridTextColumn Header="Protocol" Binding="{Binding ProtocolText}" Width="80"
                                                                 ElementStyle="{StaticResource DataGridTextElement}"/>
-                                            <DataGridTextColumn Header="Port range" Binding="{Binding PortRangeText}" Width="120"
+                                            <DataGridTextColumn Header="Port range" Binding="{Binding PortRangeText}" Width="95"
                                                                 ElementStyle="{StaticResource DataGridTextElement}"/>
-                                            <DataGridTextColumn Header="Sources" Binding="{Binding AddressListText}" Width="*" MinWidth="200"
+                                            <DataGridTextColumn Header="Sources" Binding="{Binding AddressListText}" Width="*" MinWidth="170"
                                                                 ElementStyle="{StaticResource DataGridTextElementWide}"/>
-                                            <DataGridTextColumn Header="Created by" Binding="{Binding OriginText}" Width="150"
+                                            <DataGridTextColumn Header="Created by" Binding="{Binding OriginText}" Width="120"
                                                                 ElementStyle="{StaticResource DataGridTextElementWide}"/>
                                             <!-- The binary or service the rule names, without which whole families
                                                  of rules read as duplicates of one another: 21 Edge rules that
                                                  differ only by EdgeWebView version, a Steam pair split across two
                                                  cef builds. Trimmed from the left by ScopeText, so the tail that
                                                  differs survives; the tooltip carries the whole path. -->
-                                            <DataGridTextColumn Header="Program" Binding="{Binding ScopeText}" Width="*" MinWidth="170"
+                                            <DataGridTextColumn Header="Program" Binding="{Binding ScopeText}" Width="*" MinWidth="150"
                                                                 ElementStyle="{StaticResource DataGridTextElementScope}"/>
-                                            <DataGridTextColumn Header="Profiles" Binding="{Binding ProfileScopeText}" Width="110"
+                                            <DataGridTextColumn Header="Profiles" Binding="{Binding ProfileScopeText}" Width="100"
                                                                 ElementStyle="{StaticResource DataGridTextElement}"/>
-                                            <DataGridTextColumn Header="Copies" Binding="{Binding CopiesText}" Width="60"
+                                            <DataGridTextColumn Header="Copies" Binding="{Binding CopiesText}" Width="65"
                                                                 ElementStyle="{StaticResource DataGridTextElement}"/>
                                             <!-- Auto, not a pinned width: Edit and Delete are shown together here
                                                  (unlike the Block/Unblock pairs elsewhere, which swap), and two

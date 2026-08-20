@@ -1652,9 +1652,12 @@ public sealed class FirewallRuleInfo
     /// <summary>
     /// Longest scope string a column shows before it is trimmed. Wide enough for a
     /// version directory and an executable name, which is what tells two rules of the
-    /// same shape apart.
+    /// same shape apart, and no wider: a value longer than the column gets trimmed a
+    /// second time by the cell — from the right, undoing this one. Trimmed twice,
+    /// "cef.win64" and "cef.win7x64" both end up as "cef.win…" and the rows collide
+    /// again.
     /// </summary>
-    private const int ScopeTextMaxLength = 44;
+    private const int ScopeTextMaxLength = 34;
 
     /// <summary>
     /// What the rule is scoped to: the executable, or the Windows service, or "Any".
