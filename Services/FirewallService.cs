@@ -34,33 +34,118 @@ public sealed class FirewallService
 
     public AllowlistService? Allowlist { get; set; }
 
+    /// <summary>
+    /// True on the one platform whose firewall this service can drive. Everything
+    /// below — nftables, iptables, UFW, <c>geteuid</c>, pkexec — is Linux, and the
+    /// read path is /proc, so there is no privilege level on another OS that would
+    /// let a rule be written. Checked before the elevation probes so that a
+    /// Windows or macOS run is told what is actually wrong instead of being sent
+    /// to look for a sudo that would not help if it were there.
+    /// </summary>
+    public static bool PlatformSupported => OperatingSystem.IsLinux();
+
+    /// <summary>What to say instead of asking for a password the OS has no use for.</summary>
+    public const string UnsupportedPlatformText =
+        "Network Sentinel drives the Linux host firewall (UFW, nftables or iptables) and has no " +
+        "backend for this operating system, so no privilege level here can apply a rule — running " +
+        "it as Administrator or root would not change that. Run it on a Linux host. Under WSL2 it " +
+        "works, but the rules it writes belong to the Linux VM, not to Windows Defender Firewall.";
+
     /// <summary>True when euid is root (rare; GUI should not run as root on Wayland).</summary>
     public bool IsRoot => IsRootProcess();
 
     /// <summary>Static form, for the read path which has no instance to hand.</summary>
     internal static bool IsRootProcess()
     {
+        // The P/Invoke below binds to libc; calling it off Linux throws every time.
+        if (!PlatformSupported) return false;
         try { return geteuid() == 0; }
         catch { return false; }
     }
 
     /// <summary>True when firewall changes can be attempted (root or elevatable via pkexec/sudo).</summary>
-    public bool IsAdministrator => IsRoot || CanElevate;
+    public bool IsAdministrator => PlatformSupported && (IsRoot || CanElevate);
 
-    public bool CanElevate => CommandExists("pkexec") || CommandExists("sudo");
+    public bool CanElevate => PlatformSupported && (CommandExists("pkexec") || CommandExists("sudo"));
+
+    /// <summary>
+    /// True when a password can actually be collected for a rule the operator asked
+    /// for. Sudo on its own is not enough from a GUI or a systemd service: with no
+    /// pkexec, no cached credentials, no askpass helper and no terminal to prompt on,
+    /// there is nowhere to type the password, which is the case the old
+    /// "install pkexec or sudo" wording described as a missing sudo.
+    /// </summary>
+    public bool CanPromptForElevation =>
+        PlatformSupported &&
+        (IsRoot || CommandExists("pkexec") ||
+         (CommandExists("sudo") && (FindAskpassHelper() != null || HasTerminal())));
 
     public string PrivilegeText
     {
         get
         {
+            if (!PlatformSupported)
+                return UnsupportedPlatformText;
             if (IsRoot)
                 return "Running as root — firewall rules can be applied directly.";
             if (CommandExists("pkexec"))
                 return "Running as your user. Firewall changes will ask for your password (polkit/pkexec).";
+            if (CommandExists("sudo") && FindAskpassHelper() != null)
+                return "Running as your user. Firewall changes ask for your password through sudo's askpass dialog.";
             if (CommandExists("sudo"))
-                return "Running as your user. Firewall changes use sudo (may prompt for a password in a terminal).";
+                return "Running as your user with sudo but no password dialog. Firewall changes work only " +
+                       "from passwordless sudo or a terminal — install policykit-1 (pkexec), or grant this " +
+                       "user NOPASSWD sudo for ufw/nft/iptables.";
             return "No elevation helper found (install pkexec or sudo) — firewall rules cannot be applied.";
         }
+    }
+
+    /// <summary>
+    /// One sentence for a form that is about to write a rule: what applying will
+    /// actually ask for on this host. The editor used to state "asks for elevation
+    /// (pkexec or sudo)" unconditionally, which reads as a demand for sudo on the two
+    /// hosts where nothing is asked at all — already root, and passwordless sudo — and
+    /// promises a prompt on the one host that cannot raise one.
+    /// </summary>
+    public string ElevationNote
+    {
+        get
+        {
+            if (!PlatformSupported)
+                return UnsupportedPlatformText;
+            if (IsRoot)
+                return "Applying writes the rule directly — this process is already root.";
+            if (CommandExists("pkexec"))
+                return "Applying asks for your password (pkexec).";
+            if (CommandExists("sudo") && FindAskpassHelper() != null)
+                return "Applying asks for your password (sudo askpass dialog).";
+            if (CommandExists("sudo"))
+                return "Applying goes through sudo, which can only succeed here from passwordless sudo — " +
+                       "this session has no way to show a password prompt.";
+            return "Applying will fail: neither pkexec nor sudo is installed.";
+        }
+    }
+
+    /// <summary>
+    /// Why a write cannot even be attempted, naming the gap that is actually there:
+    /// an OS with no backend, no helper at all, or a helper with no way to ask for a
+    /// password. Every refusal in this class goes through here, so the operator is
+    /// never told to install something they already have.
+    /// </summary>
+    private FirewallOperationResult NoElevation(string action)
+    {
+        if (!PlatformSupported)
+            return FirewallOperationResult.Fail(UnsupportedPlatformText);
+
+        if (!CanElevate)
+            return FirewallOperationResult.Fail(
+                $"No elevation helper is installed, so Network Sentinel cannot {action}. " +
+                "Install policykit-1 (pkexec) for a password dialog, or sudo.");
+
+        return FirewallOperationResult.Fail(
+            $"Elevation is available but has no way to ask for a password, so Network Sentinel cannot {action}. " +
+            "Install policykit-1 (pkexec), or grant this user passwordless sudo for ufw/nft/iptables " +
+            "(see “Firewall elevation on a headless server” in the README).");
     }
 
     /// <summary>
@@ -83,7 +168,7 @@ public sealed class FirewallService
             return FirewallOperationResult.Fail($"Refusing to block allowlisted address {normalized} ({allowReason}).");
 
         if (!IsAdministrator)
-            return FirewallOperationResult.Fail("No way to elevate (need pkexec or sudo) to modify the host firewall.");
+            return NoElevation("modify the host firewall");
 
         EnsureBackendReady();
         var results = new List<string>();
@@ -114,7 +199,7 @@ public sealed class FirewallService
             return FirewallOperationResult.Fail(error);
 
         if (!IsAdministrator)
-            return FirewallOperationResult.Fail("No way to elevate (need pkexec or sudo) to modify the host firewall.");
+            return NoElevation("modify the host firewall");
 
         var inName = IpRuleName(normalized, true);
         var outName = IpRuleName(normalized, false);
@@ -137,7 +222,7 @@ public sealed class FirewallService
             return FirewallOperationResult.Fail("Protocol must be TCP or UDP.");
 
         if (!IsAdministrator)
-            return FirewallOperationResult.Fail("No way to elevate (need pkexec or sudo) to modify the host firewall.");
+            return NoElevation("modify the host firewall");
 
         EnsureBackendReady();
         var results = new List<string>();
@@ -166,7 +251,7 @@ public sealed class FirewallService
     {
         protocol = (protocol ?? "TCP").Trim().ToUpperInvariant();
         if (!IsAdministrator)
-            return FirewallOperationResult.Fail("No way to elevate (need pkexec or sudo) to modify the host firewall.");
+            return NoElevation("modify the host firewall");
 
         var r1 = RemoveRuleByName(PortRuleName(port, protocol, true));
         var r2 = RemoveRuleByName(PortRuleName(port, protocol, false));
@@ -184,7 +269,7 @@ public sealed class FirewallService
                 return FirewallOperationResult.Fail("Only Network Sentinel managed rules can be removed here.");
 
             if (!IsAdministrator)
-                return FirewallOperationResult.Fail("No way to elevate (need pkexec or sudo) to modify the host firewall.");
+                return NoElevation("modify the host firewall");
 
             var name = ruleName.Trim();
 
@@ -230,7 +315,7 @@ public sealed class FirewallService
     public FirewallOperationResult RemoveAllManagedRules(Func<FirewallRuleInfo, bool>? skip = null)
     {
         if (!IsAdministrator)
-            return FirewallOperationResult.Fail("No way to elevate (need pkexec or sudo) to modify the host firewall.");
+            return NoElevation("modify the host firewall");
 
         var rules = GetManagedRules().ToList();
         int removed = 0;
@@ -289,7 +374,7 @@ public sealed class FirewallService
             return FirewallOperationResult.Fail("Allowlist is not available.");
 
         if (!IsAdministrator)
-            return FirewallOperationResult.Fail("No way to elevate (need pkexec or sudo) to remove firewall rules.");
+            return NoElevation("remove firewall rules");
 
         var rules = GetManagedRules().Where(r => r.Kind == FirewallRuleKind.IpBlock).ToList();
         int removed = 0;
@@ -385,7 +470,7 @@ public sealed class FirewallService
             return FirewallOperationResult.Fail(error);
 
         if (!IsAdministrator)
-            return FirewallOperationResult.Fail("No way to elevate (need pkexec or sudo) to modify the host firewall.");
+            return NoElevation("modify the host firewall");
 
         if (!string.IsNullOrWhiteSpace(replaceName))
         {
@@ -547,7 +632,7 @@ public sealed class FirewallService
     public FirewallOperationResult DeleteHostRule(FirewallRuleInfo rule)
     {
         if (!IsAdministrator)
-            return FirewallOperationResult.Fail("No way to elevate (need pkexec or sudo) to modify the host firewall.");
+            return NoElevation("modify the host firewall");
 
         // One of ours: go through the ledger so its bookkeeping stays truthful.
         if (!rule.IsForeign || rule.Kind != FirewallRuleKind.Other)
@@ -639,7 +724,7 @@ public sealed class FirewallService
     public FirewallOperationResult EnableProbeLogging()
     {
         if (!IsAdministrator)
-            return FirewallOperationResult.Fail("No way to elevate (need pkexec or sudo) to modify the host firewall.");
+            return NoElevation("modify the host firewall");
 
         // Everything below runs in ONE elevated shell: creating the table/chains,
         // clearing any stale probe rule, and adding the new one. As separate
@@ -707,7 +792,7 @@ public sealed class FirewallService
     public FirewallOperationResult DisableProbeLogging()
     {
         if (!IsAdministrator)
-            return FirewallOperationResult.Fail("No way to elevate (need pkexec or sudo) to modify the host firewall.");
+            return NoElevation("modify the host firewall");
 
         // One prompt here too — the nft path otherwise costs a list plus a delete each.
         FirewallOperationResult r;
@@ -744,12 +829,14 @@ public sealed class FirewallService
     /// </summary>
     public FirewallOperationResult AuthorizeElevation()
     {
+        if (!PlatformSupported)
+            return FirewallOperationResult.Fail(UnsupportedPlatformText);
+
         if (IsRoot)
             return FirewallOperationResult.Ok("Already running as root.");
 
-        if (!CanElevate)
-            return FirewallOperationResult.Fail(
-                "No elevation helper found. Install policykit-1 (pkexec) or sudo.");
+        if (!CanPromptForElevation)
+            return NoElevation("apply firewall rules");
 
         // Touch a harmless privileged read — triggers polkit/sudo password once.
         var probe = BackendIsNft()
@@ -1039,52 +1126,81 @@ public sealed class FirewallService
     private static void InvalidateUfwProbe() => _ufwState = (false, DateTime.MinValue);
 
     /// <summary>
-    /// Cached <c>which</c> results. <see cref="IsAdministrator"/> probes for pkexec and
-    /// sudo, and it is now read per alert (see <see cref="PreventionService.DescribeEnforcement"/>)
-    /// as well as per block — a subprocess each time, for an answer that changes only when
-    /// someone installs an elevation helper. Short TTL rather than permanent, so installing
-    /// one mid-session is still picked up.
+    /// Where a firewall tool or an elevation helper is looked for. PATH first, then
+    /// the sbin directories — a desktop session on Debian and its derivatives leaves
+    /// those out of a normal user's PATH, and <c>nft</c>, <c>iptables</c> and
+    /// <c>ufw</c> all live there, so resolving against PATH alone finds <c>sudo</c>
+    /// but none of the binaries it would be asked to run.
     /// </summary>
-    private static readonly TimeSpan CommandProbeTtl = TimeSpan.FromSeconds(60);
-    private static readonly Dictionary<string, (bool Exists, DateTime CheckedUtc)> CommandProbes = new();
-
-    private static bool CommandExists(string name)
+    private static readonly string[] FallbackToolDirectories =
     {
-        lock (CommandProbes)
-        {
-            if (CommandProbes.TryGetValue(name, out var cached) &&
-                DateTime.UtcNow - cached.CheckedUtc < CommandProbeTtl)
-                return cached.Exists;
-        }
+        "/usr/local/sbin", "/usr/local/bin", "/usr/sbin", "/usr/bin", "/sbin", "/bin"
+    };
 
-        var exists = ProbeCommand(name);
+    /// <summary>
+    /// Whether a command is present. This used to shell out to <c>which</c>, which is
+    /// no longer installed by default on Fedora or Debian trixie: on those hosts every
+    /// probe answered "missing", so <see cref="IsAdministrator"/> reported no way to
+    /// elevate on a machine that had both pkexec and sudo, and the host scan reported
+    /// no firewall backend on a machine running UFW. Resolving in-process removes both
+    /// the dependency and a subprocess per probe.
+    /// </summary>
+    private static bool CommandExists(string name) => ResolveExecutable(name) != null;
 
-        lock (CommandProbes)
-            CommandProbes[name] = (exists, DateTime.UtcNow);
+    /// <summary>
+    /// Password dialogs <c>sudo -A</c> can drive, in the order the desktops that ship
+    /// them are likely to be running.
+    /// </summary>
+    private static readonly string[] AskpassCandidates =
+    {
+        "/usr/bin/ksshaskpass",
+        "/usr/libexec/openssh/gnome-ssh-askpass",
+        "/usr/lib/openssh/gnome-ssh-askpass",
+        "/usr/libexec/seahorse/ssh-askpass",
+        "/usr/bin/lxqt-openssh-askpass",
+        "/usr/lib/ssh/x11-ssh-askpass",
+        "/usr/bin/ssh-askpass"
+    };
 
-        return exists;
+    /// <summary>
+    /// A graphical password prompt for sudo, or null when there is none. This is the
+    /// path that makes a sudo-only host usable from the GUI: without pkexec, sudo has
+    /// nowhere to prompt — the GUI's stdin is not a terminal — so a rule the operator
+    /// had every right to add failed with a message telling them to install sudo.
+    /// </summary>
+    private static string? FindAskpassHelper()
+    {
+        if (!PlatformSupported) return null;
+
+        // A helper the operator configured is honoured wherever it is set: they chose
+        // it, and it may well be one that prompts without a display.
+        var configured = Environment.GetEnvironmentVariable("SUDO_ASKPASS");
+        if (!string.IsNullOrWhiteSpace(configured) && IsExecutableFile(configured))
+            return configured;
+
+        // The discovered ones are all graphical, so they are only worth trying where
+        // there is a display to draw on. Invoked without one they exit non-zero, and
+        // sudo reads that as a refused password.
+        if (string.IsNullOrEmpty(Environment.GetEnvironmentVariable("DISPLAY")) &&
+            string.IsNullOrEmpty(Environment.GetEnvironmentVariable("WAYLAND_DISPLAY")))
+            return null;
+
+        foreach (var candidate in AskpassCandidates)
+            if (IsExecutableFile(candidate))
+                return candidate;
+
+        return null;
     }
 
-    private static bool ProbeCommand(string name)
+    /// <summary>
+    /// Whether sudo could prompt on a terminal. A GUI started from a launcher has no
+    /// stdin to read a password from, so this is false there and the askpass path is
+    /// the only one left.
+    /// </summary>
+    private static bool HasTerminal()
     {
-        try
-        {
-            var psi = new ProcessStartInfo("which", name)
-            {
-                RedirectStandardOutput = true,
-                RedirectStandardError = true,
-                UseShellExecute = false,
-                CreateNoWindow = true
-            };
-            using var p = Process.Start(psi);
-            if (p == null) return false;
-            p.WaitForExit(3000);
-            return p.ExitCode == 0;
-        }
-        catch
-        {
-            return false;
-        }
+        try { return !Console.IsInputRedirected; }
+        catch { return false; }
     }
 
     /// <summary>
@@ -1093,7 +1209,10 @@ public sealed class FirewallService
     /// </summary>
     private static FirewallOperationResult RunPrivileged(string file, string args)
     {
-        if (geteuid() == 0)
+        if (!PlatformSupported)
+            return FirewallOperationResult.Fail(UnsupportedPlatformText);
+
+        if (IsRootProcess())
             return RunDirect(file, args);
 
         // Resolve absolute path so pkexec/sudo can find the binary in secure PATH.
@@ -1122,22 +1241,41 @@ public sealed class FirewallService
             if (cached.Success)
                 return cached;
 
-            // 3) Interactive sudo only if we have a TTY (rare for GUI)
-            if (!string.IsNullOrEmpty(Environment.GetEnvironmentVariable("SUDO_ASKPASS")) ||
-                !Console.IsInputRedirected)
+            // 3) sudo -A — a password dialog on a host that has sudo but no pkexec.
+            // A cancelled or wrong password comes back as sudo's own refusal, which is
+            // the answer; only a helper that would not run at all falls through.
+            var askpass = FindAskpassHelper();
+            if (askpass != null)
             {
-                var interactive = RunDirect("sudo", $"{Quote(resolved)} {args}", InteractiveProcessTimeoutMs);
-                if (interactive.Success)
-                    return interactive;
-                return interactive;
+                var prompted = RunDirect("sudo", $"-A {Quote(resolved)} {args}",
+                    InteractiveProcessTimeoutMs, askpass);
+                if (prompted.Success || !LooksLikeMissingHelper(prompted.Message))
+                    return prompted;
             }
 
-            return FirewallOperationResult.Fail(
-                "Need admin rights for firewall changes. Install policykit-1 (pkexec) for a password dialog, " +
-                "or configure passwordless sudo for nft/iptables. Do not start the GUI with plain sudo on Wayland.");
+            // 4) Interactive sudo only if we have a TTY (rare for GUI)
+            if (HasTerminal())
+                return RunDirect("sudo", $"{Quote(resolved)} {args}", InteractiveProcessTimeoutMs);
+
+            return FirewallOperationResult.Fail(NoPasswordPromptText(cached.Message));
         }
 
         return FirewallOperationResult.Fail("No elevation helper (pkexec/sudo) available.");
+    }
+
+    /// <summary>
+    /// The sudo-but-nowhere-to-type-the-password case, with sudo's own refusal kept
+    /// so a wrong sudoers entry is not reported as a missing package.
+    /// </summary>
+    private static string NoPasswordPromptText(string sudoMessage)
+    {
+        var text =
+            "Sudo is installed but has no way to ask for a password here: this window is not a terminal, " +
+            "no cached credentials are in force, and no pkexec or askpass dialog was found. Install " +
+            "policykit-1 (pkexec), or grant this user passwordless sudo for ufw/nft/iptables — see " +
+            "“Firewall elevation on a headless server” in the README. Do not start the GUI with plain " +
+            "sudo on Wayland.";
+        return string.IsNullOrWhiteSpace(sudoMessage) ? text : $"{text}\n\nsudo said: {sudoMessage.Trim()}";
     }
 
     /// <summary>
@@ -1150,7 +1288,10 @@ public sealed class FirewallService
     /// </summary>
     private static FirewallOperationResult RunPrivilegedBatch(string script)
     {
-        if (geteuid() == 0)
+        if (!PlatformSupported)
+            return FirewallOperationResult.Fail(UnsupportedPlatformText);
+
+        if (IsRootProcess())
             return RunDirectArgs("/bin/sh", new[] { "-c", script });
 
         if (CommandExists("pkexec"))
@@ -1166,9 +1307,19 @@ public sealed class FirewallService
             if (cached.Success)
                 return cached;
 
-            return FirewallOperationResult.Fail(
-                "Need admin rights for firewall changes. Install policykit-1 (pkexec) for a password dialog, " +
-                "or configure passwordless sudo for nft/iptables.");
+            var askpass = FindAskpassHelper();
+            if (askpass != null)
+            {
+                var prompted = RunDirectArgs("sudo", new[] { "-A", "/bin/sh", "-c", script },
+                    InteractiveProcessTimeoutMs, askpass);
+                if (prompted.Success || !LooksLikeMissingHelper(prompted.Message))
+                    return prompted;
+            }
+
+            if (HasTerminal())
+                return RunDirectArgs("sudo", new[] { "/bin/sh", "-c", script }, InteractiveProcessTimeoutMs);
+
+            return FirewallOperationResult.Fail(NoPasswordPromptText(cached.Message));
         }
 
         return FirewallOperationResult.Fail("No elevation helper (pkexec/sudo) available.");
@@ -1178,26 +1329,56 @@ public sealed class FirewallService
         => message.Contains("not found", StringComparison.OrdinalIgnoreCase)
            || message.Contains("No such file", StringComparison.OrdinalIgnoreCase);
 
-    private static string? ResolveExecutable(string name)
+    /// <summary>
+    /// Absolute path of a command, or null when it is not installed. Resolved by
+    /// walking PATH and then <see cref="FallbackToolDirectories"/> in this process —
+    /// see <see cref="CommandExists"/> for why <c>which</c> is no longer used.
+    /// </summary>
+    internal static string? ResolveExecutable(string name)
     {
         if (name.Contains('/')) return name;
+
+        foreach (var dir in ExecutableSearchPath())
+            if (IsExecutableFile(Path.Combine(dir, name)))
+                return Path.Combine(dir, name);
+
+        return null;
+    }
+
+    /// <summary>PATH, then the sbin fallbacks, each directory yielded once.</summary>
+    internal static IEnumerable<string> ExecutableSearchPath()
+    {
+        var seen = new HashSet<string>(StringComparer.Ordinal);
+
+        var path = Environment.GetEnvironmentVariable("PATH") ?? "";
+        foreach (var dir in path.Split(Path.PathSeparator, StringSplitOptions.RemoveEmptyEntries))
+            if (seen.Add(dir))
+                yield return dir;
+
+        foreach (var dir in FallbackToolDirectories)
+            if (seen.Add(dir))
+                yield return dir;
+    }
+
+    /// <summary>
+    /// A file that exists and carries an execute bit. The mode check matters: PATH
+    /// entries routinely hold same-named data files, and a directory named like the
+    /// tool would otherwise resolve as the tool.
+    /// </summary>
+    internal static bool IsExecutableFile(string path)
+    {
         try
         {
-            var psi = new ProcessStartInfo("which", name)
-            {
-                RedirectStandardOutput = true,
-                UseShellExecute = false,
-                CreateNoWindow = true
-            };
-            using var p = Process.Start(psi);
-            if (p == null) return null;
-            var path = p.StandardOutput.ReadToEnd().Trim();
-            p.WaitForExit(3000);
-            return p.ExitCode == 0 && !string.IsNullOrWhiteSpace(path) ? path : null;
+            if (!File.Exists(path)) return false;
+            if (OperatingSystem.IsWindows()) return true;   // no Unix mode to read
+
+            const UnixFileMode anyExecute =
+                UnixFileMode.UserExecute | UnixFileMode.GroupExecute | UnixFileMode.OtherExecute;
+            return (File.GetUnixFileMode(path) & anyExecute) != 0;
         }
         catch
         {
-            return null;
+            return false;
         }
     }
 
@@ -1212,7 +1393,7 @@ public sealed class FirewallService
 
     private const int ReadProcessTimeoutMs = 8_000;
 
-    /// <summary>Whether a read-only tool is on PATH. Shares the probe cache with the write path.</summary>
+    /// <summary>Whether a read-only tool is installed. Same resolution as the write path.</summary>
     internal static bool ReadCommandExists(string name) => CommandExists(name);
 
     /// <summary>
@@ -1290,25 +1471,34 @@ public sealed class FirewallService
     /// shell metacharacters in an argument survive verbatim. Required for the
     /// batched elevation path, where the payload is a shell script.
     /// </summary>
-    private static FirewallOperationResult RunDirectArgs(string file, string[] argv, int timeoutMs = DefaultProcessTimeoutMs)
+    private static FirewallOperationResult RunDirectArgs(string file, string[] argv, int timeoutMs = DefaultProcessTimeoutMs, string? askpass = null)
     {
         var psi = new ProcessStartInfo(file);
         foreach (var a in argv)
             psi.ArgumentList.Add(a);
-        return RunProcess(psi, file, timeoutMs);
+        return RunProcess(psi, file, timeoutMs, askpass);
     }
 
-    private static FirewallOperationResult RunDirect(string file, string args, int timeoutMs = DefaultProcessTimeoutMs)
+    private static FirewallOperationResult RunDirect(string file, string args, int timeoutMs = DefaultProcessTimeoutMs, string? askpass = null)
     {
         var psi = new ProcessStartInfo(file, args);
-        return RunProcess(psi, file, timeoutMs);
+        return RunProcess(psi, file, timeoutMs, askpass);
     }
 
-    private static FirewallOperationResult RunProcess(ProcessStartInfo psi, string file, int timeoutMs = DefaultProcessTimeoutMs)
+    /// <summary>Starts a process, drains both pipes, and turns its exit into a result.</summary>
+    /// <param name="askpass">
+    /// Password helper for a <c>sudo -A</c> call. Set in the child's environment rather
+    /// than exported into this process, so a helper chosen for one call cannot leak
+    /// into an unrelated subprocess.
+    /// </param>
+    private static FirewallOperationResult RunProcess(ProcessStartInfo psi, string file, int timeoutMs = DefaultProcessTimeoutMs, string? askpass = null)
     {
         try
         {
             psi.UseShellExecute = false;
+            // Only legal once UseShellExecute is false, which is why it follows it.
+            if (askpass != null)
+                psi.Environment["SUDO_ASKPASS"] = askpass;
             psi.RedirectStandardOutput = true;
             psi.RedirectStandardError = true;
             psi.CreateNoWindow = true;
@@ -1552,7 +1742,8 @@ public sealed class FirewallService
 
     private static bool CanElevateSilently()
     {
-        if (geteuid() == 0) return true;
+        if (!PlatformSupported) return false;
+        if (IsRootProcess()) return true;
         try
         {
             return CommandExists("sudo") && RunDirectArgs("sudo", new[] { "-n", "true" }).Success;

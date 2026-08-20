@@ -423,11 +423,12 @@ The token is stored in `~/.local/share/NetworkSentinel/duckdns.json` with mode `
 
 ## Requirements
 
-- **Linux** (kernel `/proc` networking; tested on Pop!_OS / Ubuntu-class systems)
+- **Linux only** (kernel `/proc` networking; tested on Pop!_OS / Ubuntu-class systems). There is no Windows or macOS build: the monitor reads `/proc/net` and conntrack netlink, and the firewall is `ufw`/`nft`/`iptables`. Under WSL2 it runs, but its rules belong to the Linux VM, not to Windows Defender Firewall
 - For **dev / `dotnet run`**: [.NET 8 SDK](https://dotnet.microsoft.com/download)
 - For **server package**: nothing on the target — self-contained binary (no .NET install)
 - Desktop libraries for Avalonia GUI (usual X11/Wayland desktop)
-- **policykit-1** (`pkexec`) recommended for firewall password prompts
+- **policykit-1** (`pkexec`) recommended for firewall password prompts. Failing that, the app drives an **askpass** dialog through `sudo -A` (`ssh-askpass`, `ksshaskpass`, `gnome-ssh-askpass`, or whatever `SUDO_ASKPASS` names), and failing that it needs passwordless sudo — see [Firewall elevation on a headless server](#firewall-elevation-on-a-headless-server-no-pkexec)
+- No `which` binary is needed: `sudo`, `pkexec`, `ufw`, `nft`, `iptables` and `ss` are resolved in-process against `PATH` plus `/usr/local/sbin`, `/usr/sbin` and `/sbin` — a desktop session's `PATH` omits the sbin directories on Debian and its derivatives
 - `ufw` when the host uses it — Firewall Config reads it and writes through it; the app never enables it for you (that can lock you out of SSH)
 - `nft` (nftables) or `iptables` for host firewall changes, and for reading the ruleset where UFW is not in use
 - `ss` (iproute2) for the exfiltration monitor and the Firewall Config listening-services table — present on essentially every distro; without it those report themselves unavailable
@@ -725,14 +726,14 @@ When you block an IP/port (or click **Authorize firewall**), only `nft`/`iptable
 
 ### Firewall elevation on a headless server (no pkexec)
 
-`pkexec` needs a graphical polkit session (D-Bus + auth agent), which doesn't exist for a `systemd`-run web service with no display. On a headless box, block/unblock and **Authorize firewall** will fail with *"Elevation failed... Need admin rights for firewall changes"* until you grant the service user **passwordless sudo scoped to just the firewall binaries**:
+`pkexec` needs a graphical polkit session (D-Bus + auth agent), which doesn't exist for a `systemd`-run web service with no display, and the `sudo -A` askpass fallback needs one to draw on. On a headless box, block/unblock and **Authorize firewall** will fail with *"Sudo is installed but has no way to ask for a password here"* until you grant the service user **passwordless sudo scoped to just the firewall binaries**:
 
 ```bash
 # 1. Confirm which user the service runs as
 systemctl show networksentinel-web -p User
 
 # 2. Find the exact binary paths (varies by distro)
-which ufw nft iptables ip6tables
+command -v ufw nft iptables ip6tables
 
 # 3. Add a scoped sudoers rule (replace YOUR_USER and the paths below)
 sudo visudo -f /etc/sudoers.d/networksentinel
@@ -1012,7 +1013,9 @@ On GNOME / Pop!_OS the indicator appears in the top bar (StatusNotifier / AppInd
 | `Unknown option: --web-service` | That flag is for the **installer**, and only in packages built after the web-service update. Rebuild with `./scripts/package.sh`, copy the new `*.install.sh`, and check `./….install.sh --help`. Or set up systemd [manually](#auto-start-on-boot-systemd). |
 | `XOpenDisplay failed` after `sudo` | Run **without** sudo. Use **Authorize firewall** / pkexec for rules only. Or use `--tui` / `-w`. |
 | Do I need `sudo` to launch? | **No.** Install with sudo if system-wide; run as your normal user. The web service also runs as your user. |
-| No password dialog for block | Install `policykit-1` (`pkexec`). |
+| No password dialog for block | Install `policykit-1` (`pkexec`). Without it the app falls back to `sudo -A` and needs an askpass helper (`ssh-askpass`, `ksshaskpass`, …) or `SUDO_ASKPASS` set. |
+| **“Needs sudo” when sudo is installed** | The elevation probe used to shell out to `which`, which Fedora 41+ and Debian trixie no longer install — every probe then answered “missing”. Fixed in current builds; on an older one, install `debianutils`/`which`. The other cause is sudo with nowhere to type the password: the message now says so and names what to install. |
+| **Windows says it needs administrator privileges** | Network Sentinel is Linux-only — it reads `/proc/net` and writes `ufw`/`nft`/`iptables`, none of which Windows has, so no privilege level there can apply a rule. Run it on a Linux host, or under WSL2 (where the rules belong to the Linux VM, not to Windows Defender Firewall). It now says that instead of asking to be elevated. |
 | `Elevation failed... Need admin rights` on a **headless server** | `pkexec` can't work without a display/polkit session. Grant the service user passwordless sudo for `nft`/`iptables` — see [Firewall elevation on a headless server](#firewall-elevation-on-a-headless-server-no-pkexec). |
 | `.NET location: Not found` | Use the **server installer** / self-contained package, or set `DOTNET_ROOT` / `PATH`. |
 | Process names missing | Expected for other users’ sockets without root; monitoring still works. |

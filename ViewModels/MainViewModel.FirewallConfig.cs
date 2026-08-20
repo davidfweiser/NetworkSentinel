@@ -216,7 +216,7 @@ public partial class MainViewModel
         RuleEditorNote =
             $"Writes a rule for {RuleProtocol} port {port}, which {DescribeListener(listener)} is listening on. " +
             "Sources is left empty (every address) — it matches the remote end, not the address the " +
-            "service is bound to. Applying asks for elevation (pkexec or sudo).";
+            "service is bound to. " + _firewall.ElevationNote;
     }
 
     private static string DescribeListener(HostListener listener)
@@ -294,7 +294,7 @@ public partial class MainViewModel
                   "Saving removes it there and writes these values as a new rule — " +
                   "UFW has no in-place edit, so this is what editing one means."
                 : "Replaces the loaded rule with these values.")
-            : "Writes a rule into this host's firewall. Applying asks for elevation (pkexec or sudo).";
+            : "Writes a rule into this host's firewall. " + _firewall.ElevationNote;
         RuleEditorError = "";
         IsRuleEditorOpen = true;
     }

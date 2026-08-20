@@ -226,6 +226,7 @@ public partial class MainViewModel : ObservableObject, IDisposable
         UpdateAutoBlockStatusText();
         RefreshFirewallRules();
         InitializeFirewallConfig();
+        NotifyUnsupportedPlatform();
         InitializeTraffic();
         _ = InitializeAllowlistAsync();
 
@@ -476,7 +477,9 @@ public partial class MainViewModel : ObservableObject, IDisposable
 
         if (!IsAdmin)
         {
-            AutoBlockStatusText = $"Auto-block is ON (≥ {AutoBlockMinLevel}), but no elevation helper (pkexec/sudo) was found.";
+            AutoBlockStatusText = FirewallService.PlatformSupported
+                ? $"Auto-block is ON (≥ {AutoBlockMinLevel}), but no elevation helper (pkexec/sudo) was found."
+                : $"Auto-block is ON (≥ {AutoBlockMinLevel}), but this OS has no firewall backend — nothing will be blocked.";
             return;
         }
 
@@ -501,7 +504,9 @@ public partial class MainViewModel : ObservableObject, IDisposable
         _prevention.Enabled = value;
         PersistSettings();
         if (value && !IsAdmin)
-            FirewallMessage = "Auto-block enabled, but no elevation helper found (install policykit-1 / pkexec).";
+            FirewallMessage = FirewallService.PlatformSupported
+                ? "Auto-block enabled, but no elevation helper found (install policykit-1 / pkexec)."
+                : FirewallService.UnsupportedPlatformText;
         else if (value)
             FirewallMessage = $"Auto-block enabled for {AutoBlockMinLevel}+ threats (password dialog may appear).";
         else
@@ -1629,8 +1634,60 @@ public partial class MainViewModel : ObservableObject, IDisposable
     /// </summary>
     private FirewallDirection ResolveDirection() => _prevention.ResolveDirection();
 
+    /// <summary>
+    /// Says once, on the way in, that this OS has no firewall backend. Without it the
+    /// operator finds out by adding a rule and being asked for an administrator
+    /// password that could not have helped — the app is a Linux port, and there is no
+    /// Windows or macOS side to elevate into.
+    ///
+    /// Only the banner is set here; the host scan started a moment earlier owns
+    /// <see cref="FirewallConfigMessage"/> and would overwrite it. The Firewall Config
+    /// page carries the same sentence in its policy line, from the scan's own
+    /// privilege note.
+    ///
+    /// Posted rather than awaited: the constructor runs while the window is still
+    /// being built, and a dialog has nothing to centre on until it exists.
+    /// </summary>
+    private void NotifyUnsupportedPlatform()
+    {
+        if (FirewallService.PlatformSupported) return;
+
+        FirewallMessage = FirewallService.UnsupportedPlatformText;
+
+        Dispatcher.UIThread.Post(
+            () => _ = DialogService.ShowWarningAsync(
+                FirewallService.UnsupportedPlatformText,
+                "Network Sentinel runs on Linux"),
+            DispatcherPriority.Background);
+    }
+
+    /// <summary>
+    /// Asks for the one authorization a firewall write needs — but only where asking
+    /// can lead anywhere. On an OS with no firewall backend, and on a host with no way
+    /// to collect a password, the dialog used to offer an authorization that could not
+    /// succeed; it now says what is actually missing instead.
+    /// </summary>
     private async Task PromptElevation()
     {
+        if (!FirewallService.PlatformSupported)
+        {
+            FirewallMessage = FirewallService.UnsupportedPlatformText;
+            await DialogService.ShowWarningAsync(
+                FirewallService.UnsupportedPlatformText,
+                "Not supported on this system");
+            return;
+        }
+
+        if (!_firewall.CanPromptForElevation)
+        {
+            FirewallMessage = _firewall.PrivilegeText;
+            await DialogService.ShowWarningAsync(
+                "Changing host firewall rules needs admin rights, and this session has no way to ask " +
+                "for your password.\n\n" + _firewall.PrivilegeText,
+                "Cannot ask for a password");
+            return;
+        }
+
         FirewallMessage = "Admin rights required for firewall changes (pkexec password dialog).";
         var answer = await DialogService.ConfirmAsync(
             "Changing host firewall rules needs admin rights.\n\n" +

@@ -16,6 +16,23 @@ internal static class Program
     [DllImport("libc", SetLastError = true)]
     private static extern int chown(string pathname, uint owner, uint group);
 
+    /// <summary>Why this OS cannot run it, in the words the GUI also uses.</summary>
+    private static string UnsupportedOsMessage() =>
+        $"""
+        Network Sentinel runs on Linux only.
+
+        It reads /proc/net and conntrack netlink, and writes rules through ufw,
+        nftables or iptables. On {RuntimeInformation.OSDescription} none of those
+        exist, so monitoring shows nothing and no firewall rule can be applied —
+        running it as Administrator or root does not change that.
+
+        Run it on a Linux host. Under WSL2 it works, but the rules it writes
+        belong to the Linux VM, not to Windows Defender Firewall.
+
+        To start the console modes anyway (they will not be able to do anything
+        useful):  NETWORKSENTINEL_ALLOW_UNSUPPORTED_OS=1
+        """;
+
     [STAThread]
     public static void Main(string[] args)
     {
@@ -32,6 +49,28 @@ internal static class Program
         {
             PrintUsage();
             return;
+        }
+
+        // The GUI, the TUI and the web console all read /proc/net and write
+        // nftables/iptables, so none of them has anything to show on another OS.
+        // Saying so up front is the difference between "this is a Linux program"
+        // and the firewall page's old answer, which was to ask for administrator
+        // rights that would not have helped.
+        //
+        // Only the console modes exit on it. The GUI is a WinExe with no console
+        // attached on Windows, so exiting here would look like the app failing to
+        // start at all; it carries the same sentence into the window instead (see
+        // MainViewModel's unsupported-platform notice).
+        if (!OperatingSystem.IsLinux() &&
+            string.IsNullOrEmpty(Environment.GetEnvironmentVariable("NETWORKSENTINEL_ALLOW_UNSUPPORTED_OS")))
+        {
+            Console.Error.WriteLine(UnsupportedOsMessage());
+            if (WantsTui(args) || WantsWeb(args, out _) ||
+                WantsSetMasterPassword(args) || WantsSetDuckDns(args))
+            {
+                Environment.Exit(2);
+                return;
+            }
         }
 
         if (WantsSetMasterPassword(args))

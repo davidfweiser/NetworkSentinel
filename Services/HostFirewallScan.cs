@@ -268,6 +268,8 @@ public sealed class HostFirewallScanner
 
     private string PrivilegeNote()
     {
+        if (!FirewallService.PlatformSupported)
+            return FirewallService.UnsupportedPlatformText;
         if (_firewall.IsRoot)
             return "Running as root — UFW, nftables and process names are all visible.";
         if (_firewall.CanElevate)
