@@ -12,7 +12,7 @@ Three ways to run it:
 
 > **Host-based** intrusion detection and prevention. It detects on its own heuristics and, with Suricata attached (0.6.0), on signature/payload inspection — then enforces in the kernel via `nftables`. It is not an inline network appliance: it protects the machine it runs on, not a segment, and it does not sit in the forwarding path.
 
-Linux port of the original Windows WPF Network Sentinel. Platform layers use `/proc/net`, `ss`, conntrack netlink, `nftables`/`iptables` (elevated via **pkexec**), and XDG data paths. Version **0.7.7**.
+Linux port of the original Windows WPF Network Sentinel. Platform layers use `/proc/net`, `ss`, conntrack netlink, `nftables`/`iptables` (elevated via **pkexec**), and XDG data paths. Version **0.7.8**.
 
 ---
 
@@ -478,17 +478,17 @@ first. The build is self-contained — the server needs no .NET runtime.
 
 ```bash
 # build machine
-scp dist/networksentinel-0.7.7-linux-x64.install.sh user@server:
+scp dist/networksentinel-0.7.8-linux-x64.install.sh user@server:
 
 # server
-chmod +x networksentinel-0.7.7-linux-x64.install.sh
-sudo ./networksentinel-0.7.7-linux-x64.install.sh --web-service
+chmod +x networksentinel-0.7.8-linux-x64.install.sh
+sudo ./networksentinel-0.7.8-linux-x64.install.sh --web-service
 ```
 
 Confirm the installer is current before using root:
 
 ```bash
-./networksentinel-0.7.7-linux-x64.install.sh --help
+./networksentinel-0.7.8-linux-x64.install.sh --help
 # Should list: --web-service
 ```
 
@@ -538,8 +538,8 @@ sudo ./….install.sh --web-service --port 18765
 ./….install.sh --user --desktop-shortcut    # ~/.local + icon on the Desktop
 
 # classic tarball
-tar xzf networksentinel-0.7.7-linux-x64.tar.gz
-cd networksentinel-0.7.7-linux-x64
+tar xzf networksentinel-0.7.8-linux-x64.tar.gz
+cd networksentinel-0.7.8-linux-x64
 sudo ./install.sh --web-service
 ```
 
@@ -660,7 +660,7 @@ If there is **no** `DISPLAY` / `WAYLAND_DISPLAY` (typical SSH session), the app 
 
 | Key | Action |
 |-----|--------|
-| `1`–`7` / `Tab` | Dashboard · Connections · Hosts · Threats · Ports · Firewall · **Allowlist** |
+| `1`–`8` / `Tab` | Dashboard · Connections · Hosts · Threats · Ports · Firewall · Allowlist · **Settings** |
 | `↑` `↓` / `j` `k` | Move selection |
 | `/` or `f` | Filter |
 | `p` | Pause / resume monitoring |
@@ -671,11 +671,41 @@ If there is **no** `DISPLAY` / `WAYLAND_DISPLAY` (typical SSH session), the app 
 | `n` / `+` | **Add domain or IP to allowlist** (never block) |
 | `d` | Remove selected allowlist Domain/IP (on Allowlist view) |
 | `g` | Restore good sites (unblock allowlisted IPs) |
-| `u` | Authorize firewall elevation (pkexec) |
+| `u` | Authorize firewall elevation (pkexec) — **also unlocks Settings** |
+| `Enter` | On **Settings**: flip a toggle, cycle a choice, or edit a value |
 | `c` | Clear threat alerts |
 | `r` | Refresh firewall · on Allowlist: refresh DNS/feed |
 | `h` / `F1` | Help |
 | `q` | Quit |
+
+#### Settings from the terminal (0.7.8)
+
+The TUI could watch and block but not configure: every setting meant reaching for
+the desktop window or the web console, neither of which exists on a headless box
+you only ever meet over SSH. **Settings** is the eighth view, and it carries the
+same catalogue the web console's Settings tab does — monitoring and poll interval,
+every detector and its thresholds, auto-block and its severity, direction, dry run
+and rule expiry, the webhook, and the whole remote-access group: HTTPS, port, TLS
+paths, redirect, HTTPS-only, DuckDNS, and Let's Encrypt issuance.
+
+**It is locked until you authorize.** The screen shows nothing — not even current
+values — until firewall elevation has been authorized this session with `u`, or the
+TUI is already running as root. One password, not two: the same authorization that
+lets the firewall be written unlocks the screen, because a settings page left open
+on an unattended terminal is the same exposure as a firewall left writable.
+
+**Enter is the only edit key.** It flips a toggle and cycles a choice in place;
+anything that has to be typed opens a prompt below the display, seeded with the
+current value. In that prompt **Enter alone keeps the value and `-` clears it** —
+on a terminal, a stray Return must not silently empty a webhook URL. A rejected
+value (a port out of range, a certificate path that does not exist) is reported in
+the footer and **nothing is written**, so a bad entry cannot leave the file half
+changed.
+
+Each change is pushed into the running service *and* saved, the way the web console
+applies them, so a detector switched on here starts working without a restart. The
+file is the same `settings.json` the desktop and web console read — but a console
+already running in another process keeps its in-memory copy until it restarts.
 
 ### Headless web UI (`-w`)
 
