@@ -1072,8 +1072,11 @@ public sealed class FirewallService
         var list = RunPrivileged(tool, $"-L {table} -n --line-numbers");
         if (!list.Success) return false;
 
+        // Whole comment, in iptables' own delimiters — see FindNftHandles for why a
+        // substring match deleted the neighbouring "…-2" rule as well.
+        var needle = $"/* {name} */";
         var lines = list.Message.Split('\n')
-            .Where(l => l.Contains(name, StringComparison.Ordinal))
+            .Where(l => l.Contains(needle, StringComparison.Ordinal))
             .Select(l => l.Trim().Split(' ', StringSplitOptions.RemoveEmptyEntries).FirstOrDefault())
             .Where(s => !string.IsNullOrEmpty(s) && int.TryParse(s, out _))
             .Select(s => int.Parse(s!))
@@ -1089,11 +1092,21 @@ public sealed class FirewallService
         return any;
     }
 
+    /// <summary>
+    /// Handles of the rules carrying exactly this comment.
+    ///
+    /// Matched whole, in nft's own quotes. A bare substring match also hit every rule
+    /// whose comment merely <em>starts</em> with this one, and SaveCustomRule mints
+    /// precisely that shape — a repeated label becomes "…-2" — so removing
+    /// "NetworkSentinel-Rule-SSH" silently took "NetworkSentinel-Rule-SSH-2" out of
+    /// the firewall with it, a rule on a different port that nobody had selected.
+    /// </summary>
     private static IEnumerable<string> FindNftHandles(string dump, string comment)
     {
+        var needle = $"comment \"{comment}\"";
         foreach (var line in dump.Split('\n'))
         {
-            if (!line.Contains(comment, StringComparison.Ordinal)) continue;
+            if (!line.Contains(needle, StringComparison.Ordinal)) continue;
             var m = Regex.Match(line, @"#\s*handle\s+(\d+)");
             if (m.Success)
                 yield return m.Groups[1].Value;

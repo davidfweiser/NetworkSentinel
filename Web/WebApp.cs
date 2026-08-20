@@ -92,9 +92,26 @@ public sealed class WebApp : IDisposable
     /// two UFW rules can both be called allow-inbound-ssh — so the key is the rule's
     /// whole shape, and an ambiguous match is refused rather than guessed at.
     /// </summary>
-    private static string ScannedRuleKey(FirewallRuleInfo r) => string.Join("|",
+    /// <summary>
+    /// The identity the browser hands back when a row's Edit or Delete is clicked.
+    ///
+    /// Shape is not an identity. Two rules can share action, protocol, port range,
+    /// sources and label and still be two separate rules in the kernel — adding the
+    /// same rule twice is all it takes, and the page lists both. On a shape-only key
+    /// both rows then matched every key, the lookup found two and refused with
+    /// "Several rules on this host have exactly that shape", and neither row could
+    /// ever be deleted. The only remedy it offered — give them distinct labels — is
+    /// done by editing them, which goes through this same lookup.
+    ///
+    /// Name and nftables handle are what actually tell two such rows apart:
+    /// SaveCustomRule mints "…-2" for a repeated label, and the kernel numbers every
+    /// rule it holds. The shape stays in the key as well, so a key can still only
+    /// ever match a rule that looks the way it did when the page was rendered.
+    /// </summary>
+    internal static string ScannedRuleKey(FirewallRuleInfo r) => string.Join("|",
         r.IsInbound ? "in" : "out", r.ActionText, r.ProtocolText,
-        r.PortRangeText, r.AddressListText, r.LabelText, r.Origin);
+        r.PortRangeText, r.AddressListText, r.LabelText, r.Origin,
+        r.Name, r.Handle, r.Table, r.Chain);
 
     private FirewallRuleInfo? FindScannedRule(string key, out string problem)
     {
@@ -104,12 +121,18 @@ public sealed class WebApp : IDisposable
             .Where(r => string.Equals(ScannedRuleKey(r), key, StringComparison.Ordinal))
             .ToList();
 
-        if (matches.Count == 1) return matches[0];
-        problem = matches.Count == 0
-            ? "That rule is no longer in the host firewall — the list has moved on. Refresh and try again."
-            : "Several rules on this host have exactly that shape, so it is not clear which one to remove. " +
-              "Give them distinct labels, or remove it where it was created.";
-        return null;
+        if (matches.Count == 0)
+        {
+            problem = "That rule is no longer in the host firewall — the list has moved on. Refresh and try again.";
+            return null;
+        }
+
+        // Rows that agree on shape *and* on name, handle, table and chain are the
+        // same rule as far as anything here can see — a host can hold two identical
+        // UFW rules, and neither carries a handle to tell it from the other.
+        // Removing either is what was asked for, so take the first rather than
+        // refuse a delete that could never be made unambiguous.
+        return matches[0];
     }
     private readonly WebAuthStore _auth = new();
     private readonly AppSettings _settings;
