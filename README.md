@@ -10,9 +10,19 @@ Three ways to run it (same idea as the Linux build):
 | **Terminal UI (`--tui`)** | Server Core, RDP console, SSH-style workflows |
 | **Headless web UI (`-w`)** | Browser dashboard on a server (master-password protected) |
 
-> Awareness / monitoring tooling — not a full IDS/IPS replacement. Version **0.7.5**.
+> Awareness / monitoring tooling — not a full IDS/IPS replacement. Version **0.7.7**.
 
 ---
+
+## What's new in 0.7.7
+
+Two ways the master password and the peer IPs this app watches used to leave the machine in the clear, closed — and the dashboard boxes the desktop window has always had, given to the web console.
+
+| Area | What changed |
+|------|--------------|
+| **HTTPS only** | **Settings → Remote access → HTTPS only** turns the plain-HTTP listener off entirely, rather than merely redirecting to TLS. Redirecting still means the password crosses the wire in the clear when a browser reaches the console by bare IP, because a redirect on a name-only certificate would trade a working page for a warning — with no HTTP listener bound there is nothing left to reach that way. Deliberately fail-open: honored only when HTTPS is on *and* the certificate loads at startup, so a broken or expired cert falls back to plain HTTP with a warning in the console banner and on the settings page instead of locking you out. Turning it on needs HTTPS already on, in the desktop app and the web console alike; the listen banner then hands out `https://` URLs, and a bind failure names only the port actually bound. |
+| **Both geo endpoints are HTTPS** | The primary lookup (`ipwho.is`) was already TLS, but any failure — a rate limit, an outage — fell back to `http://ip-api.com`, broadcasting every public peer IP this app observes in cleartext and letting anyone on the path forge the country/city/ISP strings that land in threat alerts and webhooks. ip-api.com sells TLS only on its paid tier, so the fallback moves to `ipapi.co`, which is free over HTTPS. The parser takes both the full payload and the abbreviated one, and treats the documented `{"error": true}` body as a failure; anything unexpected degrades to the same *lookup unavailable* cache entry and 10-minute cooldown as before. |
+| **The console's two dashboard boxes** | The desktop pairs each chart with the one number that summarises it — **Threat intensity** beside the activity chart, **This month**'s data in and out beside the data flow — and the web console paired them with nothing. Both panels are ported, so the two front-ends say the same thing on the page people actually leave open. Neither needed a new API field: all five month values were already being sent and spent on the footer sentence under the chart, which states the month's whole story in a line too long to read at a glance. The console's pulse reads **IDLE** rather than LIVE while asleep, because the count beneath it is then the last one measured; the desktop has no sleep mode and so no equivalent. With metering off the month box shows em dashes rather than zeros, because nothing was measured. The monthly bar chart, drawn unlabelled until now, gained the desktop's **Monthly data in and out** heading above its range dropdown. Below 900px — the same breakpoint the navigation rail folds at — each pair stacks instead of splitting a phone's width between two unreadable columns. |
 
 ## What's new in 0.7.5
 
@@ -521,11 +531,11 @@ Self-contained by default — the server does **not** need the .NET SDK or a com
 
 ```powershell
 # Copy the .install.cmd to the server, then run it (UAC prompt if not elevated):
-.\NetworkSentinel-windows-server-x64-0.7.5.install.cmd
+.\NetworkSentinel-windows-server-x64-0.7.7.install.cmd
 # optional port:
-.\NetworkSentinel-windows-server-x64-0.7.5.install.cmd -Port 18765
+.\NetworkSentinel-windows-server-x64-0.7.7.install.cmd -Port 18765
 # unpack without installing:
-.\NetworkSentinel-windows-server-x64-0.7.5.install.cmd --extract-only
+.\NetworkSentinel-windows-server-x64-0.7.7.install.cmd --extract-only
 ```
 
 The one-file installer is a `.cmd`, not a `.ps1`: `cmd.exe` stops reading the script at `exit /b`, so the ZIP appended to it is never parsed. PowerShell tokenizes an entire `-File` script before running any of it, and the cost on appended binary is quadratic (16 MB ≈ 5½ minutes) before it fails to parse at all — so the shell-style "payload after exit" trick only works with a `cmd` entry point.
@@ -587,7 +597,7 @@ No URL ACL is reserved. That was an `HttpListener` requirement; Kestrel binds th
 
 #### Upgrades and uninstall
 
-Re-running the installer **upgrades in place**: it stops the running task, replaces the binaries, and restarts. `%ProgramData%\NetworkSentinel` is both the install folder and the data directory, so the installer removes **only the files the package ships** — the master password hash, settings, allowlist, logs, host history, threat log, `duckdns.json`, `tls\`, and `acme\` all survive. The web console's navigation rail shows the running version (e.g. `v0.7.5`) — check it after an upgrade to confirm the new build is live.
+Re-running the installer **upgrades in place**: it stops the running task, replaces the binaries, and restarts. `%ProgramData%\NetworkSentinel` is both the install folder and the data directory, so the installer removes **only the files the package ships** — the master password hash, settings, allowlist, logs, host history, threat log, `duckdns.json`, `tls\`, and `acme\` all survive. The web console's navigation rail shows the running version (e.g. `v0.7.7`) — check it after an upgrade to confirm the new build is live.
 
 Uninstall keeps that same data by default so a reinstall picks up where you left off:
 
