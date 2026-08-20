@@ -606,7 +606,7 @@ The console is laid out like the desktop window (0.7.4), because they are the sa
 
 | Tab | What you can do |
 |-----|-----------------|
-| **Dashboard** | Live counters, **5-minute activity chart** (connections + threat markers), **data-flow charts** (live in/out throughput, this month's totals, paired bars per day or per month), recent threats |
+| **Dashboard** | Live counters, **5-minute activity chart** (connections + threat markers) beside **Threat intensity**, **data-flow charts** (live in/out throughput, paired bars per day or per month) beside the running month's totals, **Monthly data in and out**, recent threats |
 | **Live Connections / Break-in Attempts** | Live traffic with a **Block** button on every row |
 | **Remote Computers** | Remote peers; block / unblock by row or by typed IP |
 | **Open Ports** | Local listeners; one-click **Block port** |
@@ -715,6 +715,8 @@ The app starts **without** forcing UAC (so TUI/web work on servers). Desktop ins
 The console is served by **Kestrel** rather than `HttpListener`. On Windows `HttpListener` *can* do TLS, but only against a certificate imported into the machine store and bound to the port with `netsh http add sslcert` — per-port, admin-only, and redone at every renewal. Kestrel reads the PEM or `.pfx` straight off disk, which is exactly what an ACME renewal rewrites. It also removes the `netsh http add urlacl` reservation that binding to all interfaces used to need, so the console no longer falls back to localhost-only when it isn't elevated.
 
 HTTP and HTTPS are served side by side: the LAN keeps working on plain HTTP while requests that arrive **by hostname** are redirected to TLS — requests to a bare IP are left alone, since the certificate only covers the name and redirecting an IP would trade a working page for a certificate warning.
+
+Once HTTPS works, **Settings → Remote access → HTTPS only** (0.7.7) turns the plain-HTTP listener off entirely, so the master password can never cross the wire in the clear — the strongest setting for a console reachable beyond localhost. Bare-IP visits then get a certificate warning but still connect encrypted. The switch is deliberately fail-open: it is honored only when the certificate actually loads at startup, so a broken or expired cert means the console falls back to plain HTTP (with a warning in the banner and on the settings page) instead of leaving you locked out. The setting is `"WebHttpsOnly": true` in `%ProgramData%\NetworkSentinel\settings.json`; like the other endpoint settings it is read when the console starts, so restart it to apply.
 
 ```powershell
 .\NetworkSentinel.exe -w --https `
@@ -948,7 +950,7 @@ The token is written to `duckdns.json`, not `settings.json`; the GUI, TUI, and w
 
 - This is an **awareness console**, not a substitute for enterprise IDS, EDR, or carefully tuned host firewall policy.
 - Scan/brute-force heuristics count **new inbound connections to ports this PC is listening on** — long-lived sessions and ordinary outbound client traffic are never treated as probing. The only outbound rule is the beacon detector, which requires a regular cadence to an uncommon port on a public IP.
-- Public IP geolocation uses the free `ipwho.is` endpoint over **HTTPS**, falling back to `ip-api.com` (plain HTTP) only if that fails. Both are rate-limited and best-effort. Toggle lookups off in **Settings** (desktop app or web console), or set `"GeoLookupEnabled": false` in `%ProgramData%\NetworkSentinel\settings.json`; reverse DNS still runs. LAN/private addresses are labeled as local.
+- Public IP geolocation uses the free `ipwho.is` endpoint, falling back to `ipapi.co` only if that fails — **both over HTTPS** (0.7.7), so the peer IPs this app observes never cross the wire in cleartext (the fallback was previously plain-HTTP `ip-api.com`). Both are rate-limited and best-effort. Toggle lookups off in **Settings** (desktop app or web console), or set `"GeoLookupEnabled": false` in `%ProgramData%\NetworkSentinel\settings.json`; reverse DNS still runs. LAN/private addresses are labeled as local.
 - **Failed-logon detection** subscribes to the Windows Security event log (4625 / 4771), which requires Administrator or membership in the local **Event Log Readers** group. Without it the app keeps running and shows why under **Settings → Failed-logon monitoring**; set `"AuthLogMonitorEnabled": false` to turn the feature off. The web service runs as SYSTEM, so it always has access.
 - **Closed-port scan detection** is off by default because it turns on Windows Firewall **dropped-packet logging** (a firewall setting, not a rule — nothing extra is blocked or allowed). Enable it under **Settings → Closed-port scan detection** while elevated, or set `"ProbeLogEnabled": true`. The watcher tails `%windir%\System32\LogFiles\Firewall\pfirewall.log` (readable by Administrators/SYSTEM), counts pure SYNs only, and the toggle turns the logging back off.
 - **Monitor poll interval** (desktop **Settings**, default 1.2 s, `"MonitorPollMs"`) is also the activity-chart sample rate, so a slower interval widens the window the chart covers rather than thinning it.
