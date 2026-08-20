@@ -10,9 +10,19 @@ Three ways to run it (same idea as the Linux build):
 | **Terminal UI (`--tui`)** | Server Core, RDP console, SSH-style workflows |
 | **Headless web UI (`-w`)** | Browser dashboard on a server (master-password protected) |
 
-> Awareness / monitoring tooling — not a full IDS/IPS replacement. Version **0.7.7**.
+> Awareness / monitoring tooling — not a full IDS/IPS replacement. Version **0.7.9**.
 
 ---
+
+## What's new in 0.7.9
+
+The terminal can configure the app now, not just watch it — and a rule you added twice can be deleted again. The number skips 0.7.8 to stay level with the Linux line, where these shipped as two releases.
+
+| Area | What changed |
+|------|--------------|
+| **Settings from the terminal** | The TUI could watch and block but not configure: every setting meant reaching for the desktop window or the web console, neither of which is at hand on a server you only ever meet over a remote session. **Settings** is the eighth view (`8`), carrying the same catalogue the web console's Settings tab does — monitoring and poll interval, every detector and its thresholds, auto-block with its severity, direction, dry run and rule expiry, the webhook, and the whole remote-access group: HTTPS, port, TLS paths, redirect, HTTPS-only, DuckDNS, and Let's Encrypt issuance. Two rows go further than the console: Suricata's severity ceiling and its muted signature list, which no front-end here exposed before — hand-editing `settings.json` was the only way to change them. See [Settings from the terminal](#settings-from-the-terminal-079). |
+| **A rule added twice can be deleted** | The web console names the row a **Delete** or an **Edit** meant by a key built from the rule's shape — direction, action, protocol, ports, sources, label, origin. Two rules can share every one of those and still be two rules: adding the same Firewall Config rule twice is enough, and the app names the second one `…-2` while both keep the label you typed. Either row's key then matched both, the lookup found two and refused with *"Several rules on this host have exactly that shape"*, and from that point neither row could be deleted or edited again — the one remedy it suggested, giving them distinct names, being something you do by editing them. The rule's name and its raw local/remote port constraints now go into the key, which makes it a superset of the fields the duplicate-fold groups on, so every row the list shows can be addressed. Rows that still agree on all of it are indistinguishable — Windows lets the same rule be added over and over — so the lookup takes the first rather than refuse a delete that could never be made unambiguous. |
+| **Keys keep up with the cursor** | Drawing and reading the keyboard shared one 200ms tick in the TUI, so at most five keys a second were retired and the rest sat in the terminal buffer — holding an arrow down moved the cursor long after you let go. Input is polled ten times per draw and every key waiting is handled per pass, so a press lands within ~20ms and forces an immediate redraw, while an idle screen still refreshes on the slow tick. |
 
 ## What's new in 0.7.7
 
@@ -531,11 +541,11 @@ Self-contained by default — the server does **not** need the .NET SDK or a com
 
 ```powershell
 # Copy the .install.cmd to the server, then run it (UAC prompt if not elevated):
-.\NetworkSentinel-windows-server-x64-0.7.7.install.cmd
+.\NetworkSentinel-windows-server-x64-0.7.9.install.cmd
 # optional port:
-.\NetworkSentinel-windows-server-x64-0.7.7.install.cmd -Port 18765
+.\NetworkSentinel-windows-server-x64-0.7.9.install.cmd -Port 18765
 # unpack without installing:
-.\NetworkSentinel-windows-server-x64-0.7.7.install.cmd --extract-only
+.\NetworkSentinel-windows-server-x64-0.7.9.install.cmd --extract-only
 ```
 
 The one-file installer is a `.cmd`, not a `.ps1`: `cmd.exe` stops reading the script at `exit /b`, so the ZIP appended to it is never parsed. PowerShell tokenizes an entire `-File` script before running any of it, and the cost on appended binary is quadratic (16 MB ≈ 5½ minutes) before it fails to parse at all — so the shell-style "payload after exit" trick only works with a `cmd` entry point.
@@ -597,7 +607,7 @@ No URL ACL is reserved. That was an `HttpListener` requirement; Kestrel binds th
 
 #### Upgrades and uninstall
 
-Re-running the installer **upgrades in place**: it stops the running task, replaces the binaries, and restarts. `%ProgramData%\NetworkSentinel` is both the install folder and the data directory, so the installer removes **only the files the package ships** — the master password hash, settings, allowlist, logs, host history, threat log, `duckdns.json`, `tls\`, and `acme\` all survive. The web console's navigation rail shows the running version (e.g. `v0.7.7`) — check it after an upgrade to confirm the new build is live.
+Re-running the installer **upgrades in place**: it stops the running task, replaces the binaries, and restarts. `%ProgramData%\NetworkSentinel` is both the install folder and the data directory, so the installer removes **only the files the package ships** — the master password hash, settings, allowlist, logs, host history, threat log, `duckdns.json`, `tls\`, and `acme\` all survive. The web console's navigation rail shows the running version (e.g. `v0.7.9`) — check it after an upgrade to confirm the new build is live.
 
 Uninstall keeps that same data by default so a reinstall picks up where you left off:
 
@@ -709,7 +719,7 @@ Publish (framework-dependent — target needs the Desktop **and** ASP.NET Core 8
 dotnet publish -c Release -r win-x64 --self-contained false
 ```
 
-The app starts **without** forcing UAC (so TUI/web work on servers). Desktop install shortcuts are still marked **Run as administrator**. TUI key **`u`** and the web **Authorize** button relaunch elevated via UAC when firewall changes need it. The web scheduled-task installer runs as **SYSTEM** (already elevated).
+The app starts **without** forcing UAC (so TUI/web work on servers). Desktop install shortcuts are still marked **Run as administrator**. TUI key **`u`** and the web **Authorize** button relaunch elevated via UAC when firewall changes need it; the elevated TUI window is also where the [Settings view](#settings-from-the-terminal-079) is available. The web scheduled-task installer runs as **SYSTEM** (already elevated).
 
 ### Web UI security
 - First browser visit **creates a master password** (min. 8 characters)
@@ -851,6 +861,50 @@ schtasks /Run /TN "NetworkSentinel-Web"
 | **Firewall & Block** | Manual IP/port rules, auto-block toggle, managed rule list |
 | **Settings** | Monitor poll interval, geo lookups, failed-logon monitoring, closed-port scan detection, **remote access (HTTPS + DuckDNS)**, allowlist feed, data folder |
 
+### Settings from the terminal (0.7.9)
+
+The TUI (`--tui`) could watch and block but not configure: every setting meant
+reaching for the desktop window or the web console, neither of which is at hand on
+a Server Core box or an RDP console you only ever meet remotely. **Settings** is the
+eighth view — press `8` — and it carries the same catalogue the web console's
+Settings tab does: monitoring and poll interval, every detector and its thresholds,
+auto-block and its severity, direction, dry run and rule expiry, the webhook, and
+the whole remote-access group — HTTPS, port, TLS paths, redirect, HTTPS-only,
+DuckDNS, and Let's Encrypt issuance.
+
+**It is locked unless the TUI is elevated.** The screen shows nothing — not even
+current values — to an unelevated run: it writes the same `settings.json` the
+desktop and web console read, and that is not something to leave open on a terminal
+somebody walked away from. Press `u` to relaunch through UAC; **Settings opens in
+that elevated window**, and the process you pressed it in stays locked, which is
+right — it is the one that could not have applied the change anyway. Starting
+Network Sentinel elevated skips the extra step.
+
+**Enter is the only edit key.** It flips a toggle and cycles a choice in place;
+anything that has to be typed opens a prompt below the display, seeded with the
+current value. In that prompt **Enter alone keeps the value and `-` clears it** — on
+a terminal, a stray Return must not silently empty a webhook URL. A rejected value
+(a port out of range, a certificate path that does not exist) is reported in the
+footer and **nothing is written**, so a bad entry cannot leave the file half changed.
+
+Each change is pushed into the running service *and* saved, the way the web console
+applies them, so a detector switched on here starts working without a restart. The
+file is the same `%ProgramData%\NetworkSentinel\settings.json` the desktop and web
+console read — but a console already running in another process keeps its in-memory
+copy until it restarts.
+
+Two rows go beyond what the web console offers: **Suricata max severity** and
+**Muted Suricata signatures**. Both are settings the monitor already applies, and no
+front-end on this platform exposed them — until now, hand-editing `settings.json`
+was the only way to change them.
+
+| Key | Action (Settings view) |
+|-----|------------------------|
+| `8` | Open Settings (`9` / `h` / `F1` is now Help) |
+| `↑` `↓` / `j` `k` | Move between rows |
+| `Enter` | Flip a toggle, cycle a choice, or open the edit prompt |
+| `u` | Relaunch as Administrator — Settings opens in the new window |
+
 ### Remote access from the desktop Settings
 
 **Settings → Remote access (web console)** configures HTTPS and DuckDNS without touching a config file or the command line:
@@ -949,6 +1003,7 @@ The token is written to `duckdns.json`, not `settings.json`; the GUI, TUI, and w
 | `scripts/issue-duckdns-cert.ps1` | Let's Encrypt DNS-01 issuance via Posh-ACME + renewal scheduled task |
 | `scripts/diagnose-ipsec.ps1` | Read-only triage for a site-to-site tunnel that won't come up |
 | `Tui/TuiApp.cs` | Terminal UI (Spectre.Console) |
+| `Tui/TuiSettings.cs` | The TUI Settings catalogue — one list of editable settings, applied and saved the way the web console applies them |
 | `MainWindow.xaml` | Dashboard UI |
 | `Themes/` | Colors and control styles |
 | `Controls/Sparkline.cs` | Live activity chart |
