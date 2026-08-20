@@ -1133,7 +1133,10 @@ public sealed class HostFirewallScanner
         Chain = rule.Chain,
         Family = rule.Family,
         IsForeign = rule.IsForeign,
-        Verdict = verdict ?? rule.Verdict
+        Verdict = verdict ?? rule.Verdict,
+        // Carried, not dropped: the comment is what re-attribution matched on, and a
+        // clone that loses it cannot be matched again.
+        Comment = rule.Comment
     };
 
     // ── Small shared helpers ─────────────────────────────────────────────

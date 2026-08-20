@@ -36,7 +36,7 @@ public class UfwWriterTests
 
         Assert.Equal(new[]
         {
-            "--force", "allow", "in", "proto", "tcp", "from", "any",
+            "allow", "in", "proto", "tcp", "from", "any",
             "to", "any", "port", "22", "comment", "allow-inbound-ssh"
         }, Assert.Single(commands));
     }
@@ -57,7 +57,7 @@ public class UfwWriterTests
             Spec(direction: FirewallRuleSpecs.DirectionOutbound, protocol: "UDP", ports: "53", label: "allow-outbound-dns"));
 
         var argv = Assert.Single(commands);
-        Assert.Equal("out", argv[2]);
+        Assert.Equal("out", argv[1]);   // [verb, side, …]
         Assert.Contains("udp", argv);
     }
 
@@ -120,7 +120,7 @@ public class UfwWriterTests
 
         Assert.Equal(new[]
         {
-            "--force", "delete", "in", "proto", "tcp", "from", "any", "to", "any", "port", "22"
+            "--force", "delete", "allow", "in", "proto", "tcp", "from", "any", "to", "any", "port", "22"
         }, Assert.Single(commands));
     }
 
@@ -207,5 +207,48 @@ Status: active
         var target = HostFirewallScanner.ParseUfwStatusLine("22/tcp  DENY IN  Anywhere")!;
 
         Assert.Empty(UfwWriter.MatchNumbers(target, rows));
+    }
+
+    /// <summary>
+    /// UFW takes <c>--force</c> only on enable, disable, reset and delete. An add
+    /// carrying it is answered with "ERROR: Invalid syntax", so every rule written
+    /// on a UFW host was rejected — the Firewall Config page could add nothing at all.
+    /// </summary>
+    [Fact]
+    public void AddCommands_DoNotPassForce()
+    {
+        foreach (var argv in UfwWriter.BuildAddCommands(Spec(ports: "22", label: "allow-inbound-ssh")))
+        {
+            Assert.DoesNotContain("--force", argv);
+            Assert.True(argv[0] is "allow" or "deny", $"argv must start at the verb, got '{argv[0]}'");
+        }
+    }
+
+    /// <summary>
+    /// <c>ufw delete</c> wants the rule spelled the way it was added, verb included.
+    /// Dropping the verb produced <c>ufw --force delete in proto tcp …</c>, which UFW
+    /// rejects — so the fallback delete never removed a rule.
+    /// </summary>
+    [Fact]
+    public void DeleteCommands_KeepTheVerbAfterDelete()
+    {
+        foreach (var argv in UfwWriter.BuildDeleteCommands(Spec(ports: "22", label: "allow-inbound-ssh")))
+        {
+            Assert.Equal("--force", argv[0]);
+            Assert.Equal("delete", argv[1]);
+            Assert.True(argv[2] is "allow" or "deny", $"delete must name the verb, got '{argv[2]}'");
+        }
+    }
+
+    /// <summary>A deny rule round-trips as a deny delete, not an allow delete.</summary>
+    [Fact]
+    public void DeleteCommands_CarryTheOriginalVerb()
+    {
+        var argv = Assert.Single(UfwWriter.BuildDeleteCommands(
+            Spec(action: FirewallRuleSpecs.ActionBlock, ports: "23", label: "block-inbound-telnet")));
+
+        Assert.Equal(
+            new[] { "--force", "delete", "deny", "in", "proto", "tcp", "from", "any", "to", "any", "port", "23" },
+            argv);
     }
 }

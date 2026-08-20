@@ -29,6 +29,13 @@ public static class UfwWriter
     /// The commands that create one rule. A spec with several addresses or
     /// several port tokens becomes several UFW rules, because UFW takes one
     /// source and one port per invocation.
+    ///
+    /// The argv starts at the verb. <c>--force</c> is deliberately absent: UFW
+    /// accepts it only on <c>enable</c>, <c>disable</c>, <c>reset</c> and
+    /// <c>delete</c>, and answers "ERROR: Invalid syntax" to
+    /// <c>ufw --force allow …</c> — which is what every rule this app added on a
+    /// UFW host used to be. Adding a rule never prompts, so there is nothing for
+    /// it to force.
     /// </summary>
     public static IReadOnlyList<string[]> BuildAddCommands(FirewallRuleSpec spec)
     {
@@ -47,7 +54,7 @@ public static class UfwWriter
         if (protocol == "icmp")
         {
             foreach (var source in sources)
-                commands.Add(Finish(new List<string> { "--force", verb, side, "proto", "icmp", "from", source }, normalized.Label));
+                commands.Add(Finish(new List<string> { verb, side, "proto", "icmp", "from", source }, normalized.Label));
             return commands;
         }
 
@@ -56,7 +63,7 @@ public static class UfwWriter
         {
             foreach (var port in portTokens)
             {
-                var argv = new List<string> { "--force", verb, side };
+                var argv = new List<string> { verb, side };
 
                 // Protocol "Any" is left off entirely: UFW then covers tcp and udp,
                 // which is what "any protocol on this port" means.
@@ -85,17 +92,23 @@ public static class UfwWriter
     }
 
     /// <summary>
-    /// Fallback delete: the add command with the verb swapped for
-    /// <c>delete</c> and the comment dropped. Used when the numbered listing
-    /// could not be read; UFW matches the rule by its shape.
+    /// Fallback delete: <c>delete</c> in front of the whole add command, with the
+    /// comment dropped. Used when the numbered listing could not be read; UFW
+    /// matches the rule by its shape.
+    ///
+    /// The verb goes back in, not out. <c>ufw delete</c> takes the rule it is
+    /// deleting spelled the way it was added, verb included; the old form dropped
+    /// it along with <c>--force</c> and produced <c>ufw --force delete in proto tcp
+    /// …</c>, which UFW rejects as invalid syntax — so this fallback never once
+    /// deleted anything.
     /// </summary>
     public static IReadOnlyList<string[]> BuildDeleteCommands(FirewallRuleSpec spec)
     {
         var commands = new List<string[]>();
         foreach (var add in BuildAddCommands(spec))
         {
-            // add = ["--force", verb, side, …, "comment", label]
-            var body = add.Skip(2).ToList();
+            // add = [verb, side, …, "comment", label]
+            var body = add.ToList();
             var comment = body.IndexOf("comment");
             if (comment >= 0) body = body.Take(comment).ToList();
             commands.Add(new[] { "--force", "delete" }.Concat(body).ToArray());

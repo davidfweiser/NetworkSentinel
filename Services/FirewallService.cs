@@ -298,7 +298,7 @@ public sealed class FirewallService
             }
 
             if (removed.Count == 0)
-                return FirewallOperationResult.Fail(firstError ?? $"No rule named \"{name}\".");
+                return FirewallOperationResult.Fail(firstError ?? AlreadyGoneText(name));
 
             return FirewallOperationResult.Ok(removed.Count > 1
                 ? $"Removed inbound + outbound rules ({removed[0]} and its pair)."
@@ -649,6 +649,13 @@ public sealed class FirewallService
 
         if (rule.Handle.Length > 0 && BackendIsNft())
         {
+            // The handle is read back out of a kernel dump, so it is checked rather
+            // than trusted: everything after it is interpolated into a shell line.
+            if (!long.TryParse(rule.Handle, NumberStyles.None, CultureInfo.InvariantCulture, out _))
+                return FirewallOperationResult.Fail(
+                    $"“{rule.LabelText}” carries an unreadable nftables handle (“{rule.Handle}”), so it cannot be " +
+                    "deleted by handle. Rescan and try again.");
+
             var family = rule.Family.ToLowerInvariant() switch
             {
                 "ipv4" or "ip" => "ip",
@@ -660,7 +667,13 @@ public sealed class FirewallService
             var table = rule.Table.Length > 0 ? rule.Table : "filter";
             var chain = rule.Chain.Length > 0 ? rule.Chain : (rule.IsInbound ? "input" : "output");
 
-            var r = RunPrivileged("nft", $"delete rule {family} {Sh(table)} {Sh(chain)} handle {Sh(rule.Handle)}");
+            // Sh() is POSIX shell quoting, so the command has to reach a shell. Handed
+            // to RunPrivileged — which execs nft directly — the quotes arrived as part
+            // of the table and chain names, and nft answered "syntax error, unexpected
+            // junk" to every delete of a rule this app had not written itself.
+            var nft = ResolveExecutable("nft") ?? "nft";
+            var r = RunPrivilegedBatch(
+                $"{Sh(nft)} delete rule {family} {Sh(table)} {Sh(chain)} handle {rule.Handle}");
             return r.Success
                 ? FirewallOperationResult.Ok($"Removed “{rule.LabelText}” from nftables.")
                 : FirewallOperationResult.Fail($"nftables refused the delete: {r.Message}");
@@ -973,6 +986,18 @@ public sealed class FirewallService
         return applied;
     }
 
+    /// <summary>
+    /// Wording for a rule that is not there to remove. One managed rule can hold
+    /// several kernel fragments — a multi-port range, or protocol Any splitting into
+    /// TCP and UDP — and the host scan lists one row per fragment. Removing the first
+    /// row takes them all, so a click on a sibling row from the same listing arrives
+    /// after the rule is already gone. That is the requested end state, not a fault,
+    /// and reporting it as "No rule named …" read as delete being broken.
+    /// </summary>
+    private static string AlreadyGoneText(string name) =>
+        $"“{name}” is no longer in the firewall — it was already removed, most likely " +
+        "together with another row of the same rule.";
+
     private FirewallOperationResult RemoveRuleByName(string name)
     {
         bool removed = false;
@@ -1027,7 +1052,7 @@ public sealed class FirewallService
 
         return removed || hadLedger
             ? FirewallOperationResult.Ok($"Removed “{name}”.")
-            : FirewallOperationResult.Fail($"No rule named “{name}”.");
+            : FirewallOperationResult.Fail(AlreadyGoneText(name));
     }
 
     /// <summary>
