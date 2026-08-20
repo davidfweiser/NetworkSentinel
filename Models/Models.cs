@@ -55,6 +55,7 @@ public sealed class NetworkConnection : INotifyPropertyChanged
     private string _processName = "—";
     private string _remoteHostName = "";
     private string _geoSummary = "Looking up…";
+    private string _loopbackPeer = "";
 
     private TcpConnectionState _state;
 
@@ -107,11 +108,38 @@ public sealed class NetworkConnection : INotifyPropertyChanged
         set { if (_geoSummary != value) { _geoSummary = value; OnPropertyChanged(); } }
     }
 
+    /// <summary>
+    /// Process on the far end of a local socket, when this row is the surviving half of
+    /// a folded pair (see <see cref="Services.LoopbackPairs"/>). Empty on every other
+    /// row, and cleared again when the far end goes away — these objects live across
+    /// polls, so a stale peer would outlast the connection that justified it.
+    /// </summary>
+    public string LoopbackPeer
+    {
+        get => _loopbackPeer;
+        set
+        {
+            if (_loopbackPeer == value) return;
+            _loopbackPeer = value;
+            OnPropertyChanged();
+            OnPropertyChanged(nameof(DisplayRemote));
+        }
+    }
+
     public string StateText => State.ToString();
     public string DisplayLocal => $"{LocalAddress}:{LocalPort}";
-    public string DisplayRemote => string.IsNullOrWhiteSpace(RemoteHostName)
-        ? $"{RemoteAddress}:{RemotePort}"
-        : $"{RemoteHostName} ({RemoteAddress}:{RemotePort})";
+
+    /// <summary>
+    /// The far end, named as usefully as it can be. A folded local pair names the peer
+    /// process, which beats the hostname here: reverse-resolving 127.0.0.1 returns
+    /// whatever the hosts file maps it to — "kubernetes.docker.internal" on a machine
+    /// running Docker Desktop — which says nothing about who is actually on the socket.
+    /// </summary>
+    public string DisplayRemote => !string.IsNullOrWhiteSpace(LoopbackPeer)
+        ? $"{LoopbackPeer} ({RemoteAddress}:{RemotePort})"
+        : string.IsNullOrWhiteSpace(RemoteHostName)
+            ? $"{RemoteAddress}:{RemotePort}"
+            : $"{RemoteHostName} ({RemoteAddress}:{RemotePort})";
 
     public bool IsInboundEstablished =>
         State == TcpConnectionState.Established &&

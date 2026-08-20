@@ -955,7 +955,9 @@ public sealed class TuiApp : IDisposable
 
     private IReadOnlyList<NetworkConnection> FilterConnections()
     {
-        var source = _monitor.Connections;
+        // Folded before filtering, for the same reason the desktop does it there: the
+        // peer process the fold attaches should be searchable.
+        var source = LoopbackPairs.Collapse(_monitor.Connections);
         if (string.IsNullOrWhiteSpace(_filter)) return source;
         var q = _filter.Trim();
         return source.Where(c =>

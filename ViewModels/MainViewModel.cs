@@ -518,6 +518,10 @@ public partial class MainViewModel : ObservableObject, IDisposable
 
     private IEnumerable<NetworkConnection> FilterConnections(IReadOnlyList<NetworkConnection> source)
     {
+        // Folded before filtering, so the peer process the fold attaches is searchable
+        // and the count the user filters against is the count they can see.
+        source = LoopbackPairs.Collapse(source);
+
         if (string.IsNullOrWhiteSpace(SearchText)) return source;
         var q = SearchText.Trim();
         return source.Where(c =>
