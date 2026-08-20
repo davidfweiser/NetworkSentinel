@@ -1736,7 +1736,9 @@ public sealed class WebApp : IDisposable
                 isMonitoring = stats.IsMonitoring
             },
             allowlistStatus = _allowlist.StatusText,
-            connections = _monitor.Connections.Take(250).Select(c => new
+            // Folded before the cap, not after: 250 conversations is a more useful
+            // budget than 250 rows half of which are the other end of the other half.
+            connections = LoopbackPairs.Collapse(_monitor.Connections).Take(250).Select(c => new
             {
                 protocol = c.Protocol,
                 local = c.DisplayLocal,
@@ -1876,6 +1878,12 @@ public sealed class WebApp : IDisposable
                 ports = r.PortRangeText,
                 addresses = r.AddressListText,
                 origin = r.OriginText,
+                // The binary or service the rule names. Without it whole families of
+                // rules render as duplicates of one another — see ScopeText. `scope` is
+                // trimmed to a column width, `scopeDetail` is the whole path for the
+                // cell's title attribute.
+                scope = r.ScopeText,
+                scopeDetail = r.ScopeDetailText,
                 expiry = r.ExpiryText
             }),
             listeners = scan.Listeners.Select(l => new
@@ -3540,7 +3548,7 @@ public sealed class WebApp : IDisposable
     $('listenerCount').textContent = `(${listeners.length})`;
 
     const rows = (list, addrHeader) => table(
-      ['Label', 'Action', 'Protocol', 'Port range', addrHeader, 'Created by', 'Copies', ''],
+      ['Label', 'Action', 'Protocol', 'Port range', addrHeader, 'Created by', 'Program', 'Copies', ''],
       list.map(r => `<tr>
         <td class="mono">${esc(r.label)}${r.profileScope
           ? `<div class="muted" style="font-size:.8em">${esc(r.profileScope)} profile only</div>` : ''}</td>
@@ -3549,6 +3557,9 @@ public sealed class WebApp : IDisposable
         <td class="mono">${esc(r.ports)}</td>
         <td class="mono">${esc(r.addresses)}</td>
         <td class="muted">${esc(r.origin)}</td>
+        <!-- Trimmed from the left server-side, so the tail that tells two otherwise
+             identical rules apart survives; the title carries the whole path. -->
+        <td class="mono muted" title="${esc(r.scopeDetail || '')}">${esc(r.scope || '')}</td>
         <td class="muted">${r.copies > 1 ? '×' + esc(r.copies) : ''}</td>
         <td class="row-actions">${r.isProtected
           ? '<span class="muted" title="The allow rule that lets your browser reach this console">console</span>'

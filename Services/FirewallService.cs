@@ -1649,6 +1649,84 @@ public sealed class FirewallRuleInfo
         }
     }
 
+    /// <summary>
+    /// Longest scope string a column shows before it is trimmed. Wide enough for a
+    /// version directory and an executable name, which is what tells two rules of the
+    /// same shape apart, and no wider: a value longer than the column gets trimmed a
+    /// second time by the cell — from the right, undoing this one. Trimmed twice,
+    /// "cef.win64" and "cef.win7x64" both end up as "cef.win…" and the rows collide
+    /// again.
+    /// </summary>
+    private const int ScopeTextMaxLength = 34;
+
+    /// <summary>
+    /// What the rule is scoped to: the executable, or the Windows service, or "Any".
+    ///
+    /// This is the field that decides whether two rows are the same rule, and it was
+    /// the one nothing displayed. A host carries whole families of rules identical in
+    /// every column the table did show — same name, action, protocol, ports, addresses
+    /// and origin — that are separate rules only because they name different binaries:
+    /// 21 <c>Microsoft Edge (mDNS-In)</c> rules, one per retained EdgeWebView version,
+    /// and a <c>Steam Web Helper</c> pair split across cef.win64 and cef.win7x64. They
+    /// read as duplicates of one another, and there was nothing on screen to say
+    /// otherwise.
+    ///
+    /// Trimmed from the <em>left</em>, not the right. Paths that collide share a long
+    /// prefix and differ at the tail, so trimming the usual way keeps precisely the
+    /// half that is the same on every row and drops the half that tells them apart.
+    /// <see cref="ScopeDetailText"/> carries the whole value for the tooltip, because
+    /// no column width disambiguates every case — two build outputs under different
+    /// configurations still agree on their last two segments.
+    /// </summary>
+    public string ScopeText
+    {
+        get
+        {
+            var program = CleanScopeValue(Program);
+            if (program.Length > 0) return TrimFromLeft(program, ScopeTextMaxLength);
+
+            var service = CleanScopeValue(Service);
+            if (service.Length > 0) return TrimFromLeft(service, ScopeTextMaxLength);
+
+            return "Any";
+        }
+    }
+
+    /// <summary>The whole scope, for the tooltip that sits behind <see cref="ScopeText"/>.</summary>
+    public string ScopeDetailText
+    {
+        get
+        {
+            var program = CleanScopeValue(Program);
+            var service = CleanScopeValue(Service);
+
+            if (program.Length > 0 && service.Length > 0)
+                return $"Program: {program}\nService: {service}";
+            if (program.Length > 0)
+                return program;
+            if (service.Length > 0)
+                return $"Service: {service}";
+
+            return "Applies to any program or service.";
+        }
+    }
+
+    /// <summary>
+    /// netsh prints an unconstrained scope as "Any" or "*", both of which mean the rule
+    /// names no binary at all — not that a program called "Any" is being matched.
+    /// </summary>
+    private static string CleanScopeValue(string? value)
+    {
+        var text = (value ?? "").Trim();
+        if (text.Length == 0) return "";
+        if (text.Equals("Any", StringComparison.OrdinalIgnoreCase) || text == "*") return "";
+        return text;
+    }
+
+    /// <summary>Keeps the tail — the part that differs — and marks the cut with an ellipsis.</summary>
+    private static string TrimFromLeft(string value, int max)
+        => value.Length <= max ? value : "…" + value[^(max - 1)..];
+
     public bool IsExpired => ExpiresUtc.HasValue && ExpiresUtc.Value <= DateTime.UtcNow;
 
     public string ExpiryText => ExpiresUtc.HasValue
