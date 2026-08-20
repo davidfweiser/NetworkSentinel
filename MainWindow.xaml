@@ -1428,7 +1428,7 @@
                                             </Grid.ColumnDefinitions>
                                             <StackPanel Margin="0,0,16,0">
                                                 <TextBlock Text="Geo lookups" FontWeight="Bold" FontSize="13"/>
-                                                <TextBlock Text="Resolve country and city for remote IPs (ipwho.is over HTTPS, ip-api.com fallback). Reverse DNS still runs when this is off."
+                                                <TextBlock Text="Resolve country and city for remote IPs (ipwho.is, ipapi.co fallback — both over HTTPS). Reverse DNS still runs when this is off."
                                                            Foreground="{StaticResource TextSecondaryBrush}" FontSize="11"
                                                            Margin="0,2,0,0" TextWrapping="Wrap"/>
                                             </StackPanel>
@@ -1886,7 +1886,7 @@
                                                      Text="{Binding TlsKeyPath, UpdateSourceTrigger=LostFocus}"/>
                                         </Grid>
 
-                                        <Grid>
+                                        <Grid Margin="0,0,0,14">
                                             <Grid.ColumnDefinitions>
                                                 <ColumnDefinition Width="*"/>
                                                 <ColumnDefinition Width="Auto"/>
@@ -1900,6 +1900,22 @@
                                             <CheckBox Grid.Column="1" VerticalAlignment="Center"
                                                       Style="{StaticResource ModernCheckBox}"
                                                       IsChecked="{Binding HttpsRedirect}"/>
+                                        </Grid>
+
+                                        <Grid>
+                                            <Grid.ColumnDefinitions>
+                                                <ColumnDefinition Width="*"/>
+                                                <ColumnDefinition Width="Auto"/>
+                                            </Grid.ColumnDefinitions>
+                                            <StackPanel Margin="0,0,16,0">
+                                                <TextBlock Text="HTTPS only (turn off plain HTTP)" FontWeight="Bold" FontSize="13"/>
+                                                <TextBlock Text="Skip the plain-HTTP listener entirely, so the master password can only cross the wire encrypted. Needs HTTPS on with a working certificate — if the certificate fails to load at startup, plain HTTP stays on so the console isn't locked out. Takes effect the next time the web console starts."
+                                                           Foreground="{StaticResource TextSecondaryBrush}" FontSize="11"
+                                                           Margin="0,2,0,0" TextWrapping="Wrap"/>
+                                            </StackPanel>
+                                            <CheckBox Grid.Column="1" VerticalAlignment="Center"
+                                                      Style="{StaticResource ModernCheckBox}"
+                                                      IsChecked="{Binding HttpsOnly}"/>
                                         </Grid>
 
                                         <TextBlock Text="Reaching this from outside your network means anyone who guesses the master password can change this machine's firewall. A VPN or Tailscale is safer than forwarding a port; if you do forward one, forward only the HTTPS port."

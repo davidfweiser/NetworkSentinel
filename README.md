@@ -10,9 +10,29 @@ Three ways to run it (same idea as the Linux build):
 | **Terminal UI (`--tui`)** | Server Core, RDP console, SSH-style workflows |
 | **Headless web UI (`-w`)** | Browser dashboard on a server (master-password protected) |
 
-> Awareness / monitoring tooling — not a full IDS/IPS replacement. Version **0.7.5**.
+> Awareness / monitoring tooling — not a full IDS/IPS replacement. Version **0.7.9**.
 
 ---
+
+## What's new in 0.7.9
+
+The terminal can configure the app now, not just watch it — and a rule you added twice can be deleted again. The number skips 0.7.8 to stay level with the Linux line, where these shipped as two releases.
+
+| Area | What changed |
+|------|--------------|
+| **Settings from the terminal** | The TUI could watch and block but not configure: every setting meant reaching for the desktop window or the web console, neither of which is at hand on a server you only ever meet over a remote session. **Settings** is the eighth view (`8`), carrying the same catalogue the web console's Settings tab does — monitoring and poll interval, every detector and its thresholds, auto-block with its severity, direction, dry run and rule expiry, the webhook, and the whole remote-access group: HTTPS, port, TLS paths, redirect, HTTPS-only, DuckDNS, and Let's Encrypt issuance. Two rows go further than the console: Suricata's severity ceiling and its muted signature list, which no front-end here exposed before — hand-editing `settings.json` was the only way to change them. See [Settings from the terminal](#settings-from-the-terminal-079). |
+| **A rule added twice can be deleted** | The web console names the row a **Delete** or an **Edit** meant by a key built from the rule's shape — direction, action, protocol, ports, sources, label, origin. Two rules can share every one of those and still be two rules: adding the same Firewall Config rule twice is enough, and the app names the second one `…-2` while both keep the label you typed. Either row's key then matched both, the lookup found two and refused with *"Several rules on this host have exactly that shape"*, and from that point neither row could be deleted or edited again — the one remedy it suggested, giving them distinct names, being something you do by editing them. The rule's name and its raw local/remote port constraints now go into the key, which makes it a superset of the fields the duplicate-fold groups on, so every row the list shows can be addressed. Rows that still agree on all of it are indistinguishable — Windows lets the same rule be added over and over — so the lookup takes the first rather than refuse a delete that could never be made unambiguous. |
+| **Keys keep up with the cursor** | Drawing and reading the keyboard shared one 200ms tick in the TUI, so at most five keys a second were retired and the rest sat in the terminal buffer — holding an arrow down moved the cursor long after you let go. Input is polled ten times per draw and every key waiting is handled per pass, so a press lands within ~20ms and forces an immediate redraw, while an idle screen still refreshes on the slow tick. |
+
+## What's new in 0.7.7
+
+Two ways the master password and the peer IPs this app watches used to leave the machine in the clear, closed — and the dashboard boxes the desktop window has always had, given to the web console.
+
+| Area | What changed |
+|------|--------------|
+| **HTTPS only** | **Settings → Remote access → HTTPS only** turns the plain-HTTP listener off entirely, rather than merely redirecting to TLS. Redirecting still means the password crosses the wire in the clear when a browser reaches the console by bare IP, because a redirect on a name-only certificate would trade a working page for a warning — with no HTTP listener bound there is nothing left to reach that way. Deliberately fail-open: honored only when HTTPS is on *and* the certificate loads at startup, so a broken or expired cert falls back to plain HTTP with a warning in the console banner and on the settings page instead of locking you out. Turning it on needs HTTPS already on, in the desktop app and the web console alike; the listen banner then hands out `https://` URLs, and a bind failure names only the port actually bound. |
+| **Both geo endpoints are HTTPS** | The primary lookup (`ipwho.is`) was already TLS, but any failure — a rate limit, an outage — fell back to `http://ip-api.com`, broadcasting every public peer IP this app observes in cleartext and letting anyone on the path forge the country/city/ISP strings that land in threat alerts and webhooks. ip-api.com sells TLS only on its paid tier, so the fallback moves to `ipapi.co`, which is free over HTTPS. The parser takes both the full payload and the abbreviated one, and treats the documented `{"error": true}` body as a failure; anything unexpected degrades to the same *lookup unavailable* cache entry and 10-minute cooldown as before. |
+| **The console's two dashboard boxes** | The desktop pairs each chart with the one number that summarises it — **Threat intensity** beside the activity chart, **This month**'s data in and out beside the data flow — and the web console paired them with nothing. Both panels are ported, so the two front-ends say the same thing on the page people actually leave open. Neither needed a new API field: all five month values were already being sent and spent on the footer sentence under the chart, which states the month's whole story in a line too long to read at a glance. The console's pulse reads **IDLE** rather than LIVE while asleep, because the count beneath it is then the last one measured; the desktop has no sleep mode and so no equivalent. With metering off the month box shows em dashes rather than zeros, because nothing was measured. The monthly bar chart, drawn unlabelled until now, gained the desktop's **Monthly data in and out** heading above its range dropdown. Below 900px — the same breakpoint the navigation rail folds at — each pair stacks instead of splitting a phone's width between two unreadable columns. |
 
 ## What's new in 0.7.5
 
@@ -521,11 +541,11 @@ Self-contained by default — the server does **not** need the .NET SDK or a com
 
 ```powershell
 # Copy the .install.cmd to the server, then run it (UAC prompt if not elevated):
-.\NetworkSentinel-windows-server-x64-0.7.5.install.cmd
+.\NetworkSentinel-windows-server-x64-0.7.9.install.cmd
 # optional port:
-.\NetworkSentinel-windows-server-x64-0.7.5.install.cmd -Port 18765
+.\NetworkSentinel-windows-server-x64-0.7.9.install.cmd -Port 18765
 # unpack without installing:
-.\NetworkSentinel-windows-server-x64-0.7.5.install.cmd --extract-only
+.\NetworkSentinel-windows-server-x64-0.7.9.install.cmd --extract-only
 ```
 
 The one-file installer is a `.cmd`, not a `.ps1`: `cmd.exe` stops reading the script at `exit /b`, so the ZIP appended to it is never parsed. PowerShell tokenizes an entire `-File` script before running any of it, and the cost on appended binary is quadratic (16 MB ≈ 5½ minutes) before it fails to parse at all — so the shell-style "payload after exit" trick only works with a `cmd` entry point.
@@ -587,7 +607,7 @@ No URL ACL is reserved. That was an `HttpListener` requirement; Kestrel binds th
 
 #### Upgrades and uninstall
 
-Re-running the installer **upgrades in place**: it stops the running task, replaces the binaries, and restarts. `%ProgramData%\NetworkSentinel` is both the install folder and the data directory, so the installer removes **only the files the package ships** — the master password hash, settings, allowlist, logs, host history, threat log, `duckdns.json`, `tls\`, and `acme\` all survive. The web console's navigation rail shows the running version (e.g. `v0.7.5`) — check it after an upgrade to confirm the new build is live.
+Re-running the installer **upgrades in place**: it stops the running task, replaces the binaries, and restarts. `%ProgramData%\NetworkSentinel` is both the install folder and the data directory, so the installer removes **only the files the package ships** — the master password hash, settings, allowlist, logs, host history, threat log, `duckdns.json`, `tls\`, and `acme\` all survive. The web console's navigation rail shows the running version (e.g. `v0.7.9`) — check it after an upgrade to confirm the new build is live.
 
 Uninstall keeps that same data by default so a reinstall picks up where you left off:
 
@@ -606,7 +626,7 @@ The console is laid out like the desktop window (0.7.4), because they are the sa
 
 | Tab | What you can do |
 |-----|-----------------|
-| **Dashboard** | Live counters, **5-minute activity chart** (connections + threat markers), **data-flow charts** (live in/out throughput, this month's totals, paired bars per day or per month), recent threats |
+| **Dashboard** | Live counters, **5-minute activity chart** (connections + threat markers) beside **Threat intensity**, **data-flow charts** (live in/out throughput, paired bars per day or per month) beside the running month's totals, **Monthly data in and out**, recent threats |
 | **Live Connections / Break-in Attempts** | Live traffic with a **Block** button on every row |
 | **Remote Computers** | Remote peers; block / unblock by row or by typed IP |
 | **Open Ports** | Local listeners; one-click **Block port** |
@@ -699,7 +719,7 @@ Publish (framework-dependent — target needs the Desktop **and** ASP.NET Core 8
 dotnet publish -c Release -r win-x64 --self-contained false
 ```
 
-The app starts **without** forcing UAC (so TUI/web work on servers). Desktop install shortcuts are still marked **Run as administrator**. TUI key **`u`** and the web **Authorize** button relaunch elevated via UAC when firewall changes need it. The web scheduled-task installer runs as **SYSTEM** (already elevated).
+The app starts **without** forcing UAC (so TUI/web work on servers). Desktop install shortcuts are still marked **Run as administrator**. TUI key **`u`** and the web **Authorize** button relaunch elevated via UAC when firewall changes need it; the elevated TUI window is also where the [Settings view](#settings-from-the-terminal-079) is available. The web scheduled-task installer runs as **SYSTEM** (already elevated).
 
 ### Web UI security
 - First browser visit **creates a master password** (min. 8 characters)
@@ -715,6 +735,8 @@ The app starts **without** forcing UAC (so TUI/web work on servers). Desktop ins
 The console is served by **Kestrel** rather than `HttpListener`. On Windows `HttpListener` *can* do TLS, but only against a certificate imported into the machine store and bound to the port with `netsh http add sslcert` — per-port, admin-only, and redone at every renewal. Kestrel reads the PEM or `.pfx` straight off disk, which is exactly what an ACME renewal rewrites. It also removes the `netsh http add urlacl` reservation that binding to all interfaces used to need, so the console no longer falls back to localhost-only when it isn't elevated.
 
 HTTP and HTTPS are served side by side: the LAN keeps working on plain HTTP while requests that arrive **by hostname** are redirected to TLS — requests to a bare IP are left alone, since the certificate only covers the name and redirecting an IP would trade a working page for a certificate warning.
+
+Once HTTPS works, **Settings → Remote access → HTTPS only** (0.7.7) turns the plain-HTTP listener off entirely, so the master password can never cross the wire in the clear — the strongest setting for a console reachable beyond localhost. Bare-IP visits then get a certificate warning but still connect encrypted. The switch is deliberately fail-open: it is honored only when the certificate actually loads at startup, so a broken or expired cert means the console falls back to plain HTTP (with a warning in the banner and on the settings page) instead of leaving you locked out. The setting is `"WebHttpsOnly": true` in `%ProgramData%\NetworkSentinel\settings.json`; like the other endpoint settings it is read when the console starts, so restart it to apply.
 
 ```powershell
 .\NetworkSentinel.exe -w --https `
@@ -839,6 +861,50 @@ schtasks /Run /TN "NetworkSentinel-Web"
 | **Firewall & Block** | Manual IP/port rules, auto-block toggle, managed rule list |
 | **Settings** | Monitor poll interval, geo lookups, failed-logon monitoring, closed-port scan detection, **remote access (HTTPS + DuckDNS)**, allowlist feed, data folder |
 
+### Settings from the terminal (0.7.9)
+
+The TUI (`--tui`) could watch and block but not configure: every setting meant
+reaching for the desktop window or the web console, neither of which is at hand on
+a Server Core box or an RDP console you only ever meet remotely. **Settings** is the
+eighth view — press `8` — and it carries the same catalogue the web console's
+Settings tab does: monitoring and poll interval, every detector and its thresholds,
+auto-block and its severity, direction, dry run and rule expiry, the webhook, and
+the whole remote-access group — HTTPS, port, TLS paths, redirect, HTTPS-only,
+DuckDNS, and Let's Encrypt issuance.
+
+**It is locked unless the TUI is elevated.** The screen shows nothing — not even
+current values — to an unelevated run: it writes the same `settings.json` the
+desktop and web console read, and that is not something to leave open on a terminal
+somebody walked away from. Press `u` to relaunch through UAC; **Settings opens in
+that elevated window**, and the process you pressed it in stays locked, which is
+right — it is the one that could not have applied the change anyway. Starting
+Network Sentinel elevated skips the extra step.
+
+**Enter is the only edit key.** It flips a toggle and cycles a choice in place;
+anything that has to be typed opens a prompt below the display, seeded with the
+current value. In that prompt **Enter alone keeps the value and `-` clears it** — on
+a terminal, a stray Return must not silently empty a webhook URL. A rejected value
+(a port out of range, a certificate path that does not exist) is reported in the
+footer and **nothing is written**, so a bad entry cannot leave the file half changed.
+
+Each change is pushed into the running service *and* saved, the way the web console
+applies them, so a detector switched on here starts working without a restart. The
+file is the same `%ProgramData%\NetworkSentinel\settings.json` the desktop and web
+console read — but a console already running in another process keeps its in-memory
+copy until it restarts.
+
+Two rows go beyond what the web console offers: **Suricata max severity** and
+**Muted Suricata signatures**. Both are settings the monitor already applies, and no
+front-end on this platform exposed them — until now, hand-editing `settings.json`
+was the only way to change them.
+
+| Key | Action (Settings view) |
+|-----|------------------------|
+| `8` | Open Settings (`9` / `h` / `F1` is now Help) |
+| `↑` `↓` / `j` `k` | Move between rows |
+| `Enter` | Flip a toggle, cycle a choice, or open the edit prompt |
+| `u` | Relaunch as Administrator — Settings opens in the new window |
+
 ### Remote access from the desktop Settings
 
 **Settings → Remote access (web console)** configures HTTPS and DuckDNS without touching a config file or the command line:
@@ -937,6 +1003,7 @@ The token is written to `duckdns.json`, not `settings.json`; the GUI, TUI, and w
 | `scripts/issue-duckdns-cert.ps1` | Let's Encrypt DNS-01 issuance via Posh-ACME + renewal scheduled task |
 | `scripts/diagnose-ipsec.ps1` | Read-only triage for a site-to-site tunnel that won't come up |
 | `Tui/TuiApp.cs` | Terminal UI (Spectre.Console) |
+| `Tui/TuiSettings.cs` | The TUI Settings catalogue — one list of editable settings, applied and saved the way the web console applies them |
 | `MainWindow.xaml` | Dashboard UI |
 | `Themes/` | Colors and control styles |
 | `Controls/Sparkline.cs` | Live activity chart |
@@ -948,7 +1015,7 @@ The token is written to `duckdns.json`, not `settings.json`; the GUI, TUI, and w
 
 - This is an **awareness console**, not a substitute for enterprise IDS, EDR, or carefully tuned host firewall policy.
 - Scan/brute-force heuristics count **new inbound connections to ports this PC is listening on** — long-lived sessions and ordinary outbound client traffic are never treated as probing. The only outbound rule is the beacon detector, which requires a regular cadence to an uncommon port on a public IP.
-- Public IP geolocation uses the free `ipwho.is` endpoint over **HTTPS**, falling back to `ip-api.com` (plain HTTP) only if that fails. Both are rate-limited and best-effort. Toggle lookups off in **Settings** (desktop app or web console), or set `"GeoLookupEnabled": false` in `%ProgramData%\NetworkSentinel\settings.json`; reverse DNS still runs. LAN/private addresses are labeled as local.
+- Public IP geolocation uses the free `ipwho.is` endpoint, falling back to `ipapi.co` only if that fails — **both over HTTPS** (0.7.7), so the peer IPs this app observes never cross the wire in cleartext (the fallback was previously plain-HTTP `ip-api.com`). Both are rate-limited and best-effort. Toggle lookups off in **Settings** (desktop app or web console), or set `"GeoLookupEnabled": false` in `%ProgramData%\NetworkSentinel\settings.json`; reverse DNS still runs. LAN/private addresses are labeled as local.
 - **Failed-logon detection** subscribes to the Windows Security event log (4625 / 4771), which requires Administrator or membership in the local **Event Log Readers** group. Without it the app keeps running and shows why under **Settings → Failed-logon monitoring**; set `"AuthLogMonitorEnabled": false` to turn the feature off. The web service runs as SYSTEM, so it always has access.
 - **Closed-port scan detection** is off by default because it turns on Windows Firewall **dropped-packet logging** (a firewall setting, not a rule — nothing extra is blocked or allowed). Enable it under **Settings → Closed-port scan detection** while elevated, or set `"ProbeLogEnabled": true`. The watcher tails `%windir%\System32\LogFiles\Firewall\pfirewall.log` (readable by Administrators/SYSTEM), counts pure SYNs only, and the toggle turns the logging back off.
 - **Monitor poll interval** (desktop **Settings**, default 1.2 s, `"MonitorPollMs"`) is also the activity-chart sample rate, so a slower interval widens the window the chart covers rather than thinning it.
