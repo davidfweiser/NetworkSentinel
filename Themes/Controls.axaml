@@ -83,10 +83,10 @@
     <Setter Property="Foreground" Value="{DynamicResource TextSecondaryBrush}"/>
     <Setter Property="Background" Value="Transparent"/>
     <Setter Property="Padding" Value="14,12"/>
-    <!-- Half the old 13.5/12.5: the rail carried the same weight as the page
-         headings once the window scale went up, which made the navigation read
-         as the loudest thing on screen rather than the quietest. -->
-    <Setter Property="FontSize" Value="6.75"/>
+    <!-- Half the old 13.5/12.5, then a third back up. Halving alone was right at
+         175% and unreadable at the 100% the text-size setting now offers; this
+         holds up across the range. -->
+    <Setter Property="FontSize" Value="9"/>
     <Setter Property="FontWeight" Value="SemiBold"/>
     <Setter Property="Margin" Value="0,3"/>
   </Style>
@@ -100,9 +100,28 @@
        so the sidebar reads as a hierarchy rather than a longer flat list. -->
   <Style Selector="RadioButton.nav.sub">
     <Setter Property="Padding" Value="30,9"/>
-    <Setter Property="FontSize" Value="6.25"/>
+    <Setter Property="FontSize" Value="8.33"/>
     <Setter Property="FontWeight" Value="Normal"/>
     <Setter Property="Margin" Value="0,0,0,3"/>
+  </Style>
+
+  <!-- The ring and its dot are the RadioButton template's, sized for a 13.5px label.
+       Halving the label left the rail reading as large circles beside small text, so
+       the ellipses come down to match. All three parts move together: OuterEllipse is
+       the unchecked ring, CheckOuterEllipse the checked one, and CheckGlyph the dot —
+       leave any of them at the template size and the bullet changes size when it is
+       selected. -->
+  <Style Selector="RadioButton.nav /template/ Ellipse#OuterEllipse">
+    <Setter Property="Width" Value="13.5"/>
+    <Setter Property="Height" Value="13.5"/>
+  </Style>
+  <Style Selector="RadioButton.nav /template/ Ellipse#CheckOuterEllipse">
+    <Setter Property="Width" Value="13.5"/>
+    <Setter Property="Height" Value="13.5"/>
+  </Style>
+  <Style Selector="RadioButton.nav /template/ Ellipse#CheckGlyph">
+    <Setter Property="Width" Value="6.75"/>
+    <Setter Property="Height" Value="6.75"/>
   </Style>
 
   <Style Selector="DataGrid">
