@@ -276,6 +276,9 @@ public sealed class HostFirewallScanner
         // The reads and the writes are two different questions, and the note used to
         // answer only the first. A console that lists every rule but cannot change any
         // of them reads as working right up until Save, so say which it is.
+        if (FirewallService.HasDirectKernelAccess())
+            return "Running unprivileged with CAP_NET_ADMIN — nftables is read and written directly, with no " +
+                   "elevation. UFW still refuses this user, because it tests the uid rather than the capability.";
         if (FirewallService.CanElevateSilently())
             return "Running unprivileged with passwordless sudo for the firewall binaries — rules are read " +
                    "and written through sudo -n, with no prompt.";

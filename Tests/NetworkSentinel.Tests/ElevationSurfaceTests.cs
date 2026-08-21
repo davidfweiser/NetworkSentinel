@@ -136,6 +136,94 @@ public class ElevationSurfaceTests
             WithSurface(surface, () => Assert.True(new FirewallService().CanApplyRules));
     }
 
+    // ── The capability path ─────────────────────────────────────────────
+
+    [Fact]
+    public void HeadlessHelp_OffersTheCapabilityBeforeTheSudoersGrant()
+    {
+        var help = FirewallService.HeadlessElevationHelp();
+
+        Assert.Contains("AmbientCapabilities=CAP_NET_ADMIN", help);
+        Assert.Contains(FirewallService.SudoersGrantText(), help);
+
+        // Order is the point: CAP_NET_ADMIN is the right to configure networking,
+        // where NOPASSWD for nft is `nft -f` on any file as root — the whole machine.
+        Assert.True(help.IndexOf("AmbientCapabilities") < help.IndexOf("NOPASSWD"),
+            "the smaller grant should be offered first");
+    }
+
+    [Fact]
+    public void CapabilityCommands_EditTheUnitAndRestartIt()
+    {
+        var commands = FirewallService.CapabilityInstallCommands();
+
+        Assert.Contains("systemctl edit", commands);
+        Assert.Contains("AmbientCapabilities=CAP_NET_ADMIN", commands);
+        Assert.Contains("systemctl restart networksentinel-web", commands);
+
+        // Pinning the bounding set would silently drop CAP_NET_BIND_SERVICE for an
+        // operator who later serves TLS on a port below 1024.
+        Assert.DoesNotContain("CapabilityBoundingSet", commands);
+    }
+
+    [Fact]
+    public void DirectKernelAccess_ImpliesRulesCanBeAppliedOnEverySurface()
+    {
+        if (!FirewallService.HasDirectKernelAccess()) return;
+
+        foreach (var surface in new[] { FirewallUiSurface.Desktop, FirewallUiSurface.Terminal, FirewallUiSurface.Web })
+            WithSurface(surface, () => Assert.True(new FirewallService().CanApplyRules));
+    }
+
+    [Fact]
+    public void DirectKernelAccess_CountsAsSilentElevationSoSweepsRun()
+    {
+        // Auto-block expiry only sweeps where a rule can be removed without asking.
+        // A held capability asks for nothing, so it has to satisfy that gate — before
+        // 0.7.10 it did not, and timed blocks on such a host became permanent.
+        if (FirewallService.HasDirectKernelAccess())
+            Assert.True(FirewallService.CanElevateSilently());
+    }
+
+    [Fact]
+    public void UnitFile_GrantsTheCapabilityItDocuments()
+    {
+        var unit = TestEnv.RepoFile("scripts/systemd/networksentinel-web.service");
+        if (unit == null) return;
+
+        var text = File.ReadAllText(unit);
+        Assert.Contains("AmbientCapabilities=CAP_NET_ADMIN", text);
+
+        // Live, not just described in the comment above it.
+        Assert.Contains("\nAmbientCapabilities=CAP_NET_ADMIN", text.Replace("\r\n", "\n"));
+    }
+
+    [Theory]
+    // The batch is built from shell-quoted argv, so this is the shape that actually
+    // reaches the matcher — a quoted absolute path, not a bare command.
+    [InlineData("'/usr/sbin/ufw' '--force' 'delete' '3'", true)]
+    [InlineData("'/usr/sbin/ufw' 'deny' '22' && '/usr/sbin/ufw' 'deny' '80'", true)]
+    [InlineData("ufw --force delete 3", true)]
+    [InlineData("'/usr/sbin/nft' 'delete' 'rule' 'inet' 'networksentinel' 'input' 'handle' '7'", false)]
+    [InlineData("'/usr/sbin/iptables' '-D' 'INPUT' '2'", false)]
+    public void UfwBatches_StayOnTheElevationPath(string script, bool expected)
+    {
+        // ufw opens with getuid() != 0, so a capability-endowed user is refused no
+        // matter what capabilities are held. Missing one of these would run it as a
+        // non-root uid and get "You need to be root to run this script" instead of
+        // falling back to sudo.
+        Assert.Equal(expected, FirewallService.MentionsUfw(script));
+    }
+
+    [Fact]
+    public void UfwGuard_DoesNotFireOnALabelThatMerelyContainsUfw()
+    {
+        // A rule named "block-ufw-bypass" is not a call to ufw; diverting its batch
+        // would cost the direct path for no reason.
+        Assert.False(FirewallService.MentionsUfw(
+            "'/usr/sbin/nft' 'add' 'rule' 'comment' '\"NetworkSentinel-Rule-block-ufw-bypass\"'"));
+    }
+
     [Fact]
     public void ElevationProbe_CanBeInvalidatedSoAFreshGrantIsSeen()
     {

@@ -14,8 +14,23 @@ ExecStart=REPLACE_BINDIR/networksentinel -w ${WEB_PORT}
 Restart=on-failure
 RestartSec=5
 TimeoutStopSec=20
-# Connection tables come from /proc; firewall elevation uses pkexec/sudo when needed.
 PrivateTmp=true
+
+# Connection tables come from /proc, but writing a rule needs CAP_NET_ADMIN, and a
+# headless service has no way to obtain it on demand: pkexec needs a polkit session
+# and sudo needs somewhere to ask for a password, neither of which exists here. So
+# the unit is given the one capability nftables asks for, rather than the console
+# being read-only until someone grants NOPASSWD sudo for nft — a strictly larger
+# grant, since `nft -f` on any file as root is the whole machine.
+#
+# The service still runs as an unprivileged user. Comment this out to make the web
+# console read-only for firewall changes; monitoring is unaffected either way.
+# Hosts that write rules through UFW need the sudoers route instead — UFW tests the
+# uid, not the capability. See "Firewall elevation on a headless server" in the README.
+#
+# CapabilityBoundingSet is deliberately not pinned: a TLS port below 1024 needs
+# CAP_NET_BIND_SERVICE added here too, and a pinned set would drop it silently.
+AmbientCapabilities=CAP_NET_ADMIN
 
 # Allow writing settings / master-password hash for this user.
 ReadWritePaths=REPLACE_DATA_DIR

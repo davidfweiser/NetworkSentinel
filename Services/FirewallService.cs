@@ -162,12 +162,23 @@ public sealed class FirewallService
     /// </summary>
     public static string HeadlessElevationHelp(bool asBlock = true)
     {
-        var steps = SudoersInstallCommands();
+        var text =
+            $"{HeadlessElevationLead}\n\n{CapabilityInstallCommands()}\n\n" +
+            $"{HeadlessElevationAlternative}\n\n{SudoersInstallCommands()}\n\n{HeadlessElevationTail}";
 
-        return asBlock
-            ? $"{HeadlessElevationLead}\n\n{steps}\n\n{HeadlessElevationTail}"
-            : $"{HeadlessElevationLead} {steps.Replace("\n", "  ")} {HeadlessElevationTail}";
+        return asBlock ? text : text.Replace("\n\n", "  ").Replace("\n", "  ");
     }
+
+    /// <summary>
+    /// Give the unit the one capability nftables asks for. This is the first remedy
+    /// offered because it is the smaller grant: <c>CAP_NET_ADMIN</c> is the right to
+    /// configure networking, where a NOPASSWD entry for <c>nft</c> is the right to run
+    /// <c>nft -f</c> on any file as root, which is the whole machine.
+    /// </summary>
+    public static string CapabilityInstallCommands()
+        => "sudo systemctl edit --full networksentinel-web\n" +
+           "#   under [Service], add:  AmbientCapabilities=CAP_NET_ADMIN\n" +
+           "sudo systemctl restart networksentinel-web";
 
     /// <summary>
     /// The four commands on their own, so a front-end that can lay out a code block
@@ -180,7 +191,11 @@ public sealed class FirewallService
            "sudo systemctl restart networksentinel-web";
 
     public const string HeadlessElevationLead =
-        "Give this user passwordless sudo for the firewall binaries, from a shell on the host:";
+        "Grant the service the one capability nftables needs \u2014 no password, and nothing runs as root:";
+
+    public const string HeadlessElevationAlternative =
+        "Or, on a host that writes rules through UFW (which checks the uid, not the capability), " +
+        "give this user passwordless sudo for the firewall binaries instead:";
 
     public const string HeadlessElevationTail =
         "Then use Rescan to re-check \u2014 see \u201cFirewall elevation on a headless server\u201d in the README.";
@@ -205,6 +220,9 @@ public sealed class FirewallService
                 return UnsupportedPlatformText;
             if (IsRoot)
                 return "Running as root — firewall rules can be applied directly.";
+            if (HasDirectKernelAccess())
+                return "Running as your user with CAP_NET_ADMIN — rules are written straight to the kernel, " +
+                       "with no elevation and no prompt.";
             if (CanElevateSilently())
                 return "Running as your user with passwordless sudo for the firewall binaries — rules apply " +
                        "without a prompt.";
@@ -242,6 +260,8 @@ public sealed class FirewallService
                 return UnsupportedPlatformText;
             if (IsRoot)
                 return "Applying writes the rule directly — this process is already root.";
+            if (HasDirectKernelAccess())
+                return "Applying writes the rule directly — this process holds CAP_NET_ADMIN.";
             if (CanElevateSilently())
                 return "Applying writes the rule through passwordless sudo — nothing is asked for.";
             if (Surface == FirewallUiSurface.Web)
@@ -992,6 +1012,10 @@ public sealed class FirewallService
             return FirewallOperationResult.Ok("Already running as root.");
 
         InvalidateElevationProbe();
+        if (HasDirectKernelAccess())
+            return FirewallOperationResult.Ok(
+                "Nothing to authorize — this process holds CAP_NET_ADMIN, so rules are written straight to " +
+                "the kernel without elevating.");
         if (CanElevateSilently())
             return FirewallOperationResult.Ok(
                 "Nothing to authorize — this user already has passwordless sudo for the firewall binaries, " +
@@ -1407,6 +1431,13 @@ public sealed class FirewallService
         // Resolve absolute path so pkexec/sudo can find the binary in secure PATH.
         var resolved = ResolveExecutable(file) ?? file;
 
+        // Nothing to elevate to: the capability is already held, and the command will
+        // do exactly what it would do under sudo. Returned whichever way it goes — a
+        // failure here is the kernel rejecting the rule, not a missing privilege, and
+        // retrying it under sudo would only apply it twice or blame the wrong thing.
+        if (HonoursCapabilities(resolved) && HasDirectKernelAccess())
+            return RunDirect(resolved, args);
+
         // Background sweeps take the cached-sudo path only — no dialogs.
         if (_silentElevationOnly)
         {
@@ -1491,6 +1522,13 @@ public sealed class FirewallService
         if (IsRootProcess())
             return RunDirectArgs("/bin/sh", new[] { "-c", script });
 
+        // The whole point of the batch is one password for the sequence. With the
+        // capability held there is no password to ask for, so the shell runs as us and
+        // every nft/iptables it spawns inherits the right to write. A script that calls
+        // ufw is excluded: ufw tests the uid, not the capability.
+        if (HasDirectKernelAccess() && !MentionsUfw(script))
+            return RunDirectArgs("/bin/sh", new[] { "-c", script });
+
         if (CommandExists("pkexec"))
         {
             var r = RunDirectArgs("pkexec", new[] { "/bin/sh", "-c", script }, InteractiveProcessTimeoutMs);
@@ -1521,6 +1559,19 @@ public sealed class FirewallService
 
         return FirewallOperationResult.Fail("No elevation helper (pkexec/sudo) available.");
     }
+
+    /// <summary>
+    /// Whether a batch script calls UFW, which refuses a capability-endowed user and
+    /// so has to stay on the elevation path.
+    ///
+    /// Matched as a bare token rather than as a command at the head of a line: the
+    /// batch is assembled from <see cref="Sh"/>-quoted argv, so the binary arrives as
+    /// <c>'/usr/sbin/ufw'</c> — quoted, mid-string, and invisible to a pattern that
+    /// expects a command to follow whitespace. Erring towards a match only costs a
+    /// batch the direct path; missing one runs ufw as a non-root uid, which it refuses.
+    /// </summary>
+    internal static bool MentionsUfw(string script)
+        => Regex.IsMatch(script, @"(?<![\w.-])ufw(?![\w.-])");
 
     private static bool LooksLikeMissingHelper(string message)
         => message.Contains("not found", StringComparison.OrdinalIgnoreCase)
@@ -1954,6 +2005,10 @@ public sealed class FirewallService
     {
         if (!PlatformSupported) return false;
         if (IsRootProcess()) return true;
+
+        // A held capability is silent by definition — nothing is asked for.
+        if (HasDirectKernelAccess()) return true;
+
         if (!CommandExists("sudo")) return false;
 
         var now = Environment.TickCount64;
@@ -1982,8 +2037,79 @@ public sealed class FirewallService
     public static void InvalidateElevationProbe()
     {
         lock (SilentProbeLock)
+        {
             _silentProbeStampMs = 0;
+            _directProbeStampMs = 0;
+        }
     }
+
+    /// <summary>
+    /// Whether this process can drive the kernel's firewall without elevating at all.
+    ///
+    /// A systemd unit given <c>AmbientCapabilities=CAP_NET_ADMIN</c> runs as an
+    /// ordinary user and still has every right nftables asks for, and the ambient set
+    /// survives <c>execve</c>, so the <c>nft</c> it spawns has it too. The read path
+    /// has always benefited from this by accident — it tries the bare command before
+    /// reaching for sudo — which is why such a host lists its whole ruleset happily
+    /// and then refuses every write: the write path went straight to pkexec/sudo the
+    /// moment it saw a non-root euid, and never tried the thing that would have worked.
+    ///
+    /// Probed rather than read out of <c>/proc/self/status</c>: what matters is whether
+    /// a <em>child</em> keeps the capability, which depends on the ambient set, on file
+    /// capabilities, and on which of the two granted it. Running the read settles all
+    /// of that at once and is exactly the operation the writes will need.
+    /// </summary>
+    internal static bool HasDirectKernelAccess()
+    {
+        if (!PlatformSupported) return false;
+        if (IsRootProcess()) return true;
+
+        var now = Environment.TickCount64;
+        lock (SilentProbeLock)
+        {
+            if (_directProbeStampMs != 0 &&
+                now - _directProbeStampMs < (_directProbeResult ? SilentProbeOkTtlMs : SilentProbeFailTtlMs))
+                return _directProbeResult;
+        }
+
+        var result = ProbeDirectKernelAccess();
+
+        lock (SilentProbeLock)
+        {
+            _directProbeResult = result;
+            _directProbeStampMs = Environment.TickCount64;
+        }
+        return result;
+    }
+
+    private static bool ProbeDirectKernelAccess()
+    {
+        try
+        {
+            // Listing is refused with EPERM for a user without the capability and
+            // succeeds for one with it, so it separates the two hosts without writing
+            // anything. `nft list tables` is the cheapest form; iptables answers for a
+            // host with no nft binary.
+            if (CommandExists("nft"))
+                return RunDirectArgs("nft", new[] { "list", "tables" }).Success;
+            if (CommandExists("iptables"))
+                return RunDirectArgs("iptables", new[] { "-S", "-t", "filter" }).Success;
+        }
+        catch
+        {
+            // Treated as "no direct access" — the callers all fall back to elevating.
+        }
+        return false;
+    }
+
+    /// <summary>
+    /// Whether a tool honours capabilities at all. UFW is a Python script that opens
+    /// with a <c>getuid() != 0</c> test, so it refuses a capability-endowed user out of
+    /// hand — running it directly only produces "You need to be root to run this
+    /// script", which is what the host scan has been reporting all along.
+    /// </summary>
+    private static bool HonoursCapabilities(string tool)
+        => !Path.GetFileName(tool).Equals("ufw", StringComparison.OrdinalIgnoreCase);
 
     private static bool ProbeSilentSudo()
     {
@@ -2013,6 +2139,8 @@ public sealed class FirewallService
     private static readonly object SilentProbeLock = new();
     private static bool _silentProbeResult;
     private static long _silentProbeStampMs;
+    private static bool _directProbeResult;
+    private static long _directProbeStampMs;
 
     /// <summary>A grant that works is stable; re-checking it often buys nothing.</summary>
     private const int SilentProbeOkTtlMs = 60_000;

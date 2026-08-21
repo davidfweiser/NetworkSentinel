@@ -1862,8 +1862,12 @@ public sealed class WebApp : IDisposable
                 // host with no passwordless sudo can never apply a rule and the page
                 // has no business offering an editor that will always fail.
                 canWriteRules = _firewall.CanApplyRules,
+                // Two remedies, capability first — see FirewallService for why that
+                // order. Blank when writes already work, so the page has nothing to draw.
                 elevationLead = _firewall.CanApplyRules ? "" : FirewallService.HeadlessElevationLead,
-                elevationCommands = _firewall.CanApplyRules ? "" : FirewallService.SudoersInstallCommands(),
+                elevationCapCommands = _firewall.CanApplyRules ? "" : FirewallService.CapabilityInstallCommands(),
+                elevationAlternative = _firewall.CanApplyRules ? "" : FirewallService.HeadlessElevationAlternative,
+                elevationSudoCommands = _firewall.CanApplyRules ? "" : FirewallService.SudoersInstallCommands(),
                 elevationTail = _firewall.CanApplyRules ? "" : FirewallService.HeadlessElevationTail,
                 rulesSummary = hostScan.RulesSummary,
                 backendsSeen = hostScan.BackendsSeen,
@@ -2909,7 +2913,9 @@ public sealed class WebApp : IDisposable
     <div id="fwCfgElevation" class="elev-banner hidden">
       <strong>Read-only — rules cannot be changed from here</strong>
       <p id="fwCfgElevationLead"></p>
-      <pre id="fwCfgElevationCmds"></pre>
+      <pre id="fwCfgElevationCap"></pre>
+      <p id="fwCfgElevationAlt"></p>
+      <pre id="fwCfgElevationSudo"></pre>
       <p class="tail" id="fwCfgElevationTail"></p>
     </div>
     <!-- Summary, then listeners, then policy — the same three lines in the same
@@ -3508,7 +3514,9 @@ public sealed class WebApp : IDisposable
     $('fwCfgElevation').classList.toggle('hidden', !readOnly);
     if (readOnly) {
       $('fwCfgElevationLead').textContent = fw.elevationLead || '';
-      $('fwCfgElevationCmds').textContent = fw.elevationCommands || '';
+      $('fwCfgElevationCap').textContent = fw.elevationCapCommands || '';
+      $('fwCfgElevationAlt').textContent = fw.elevationAlternative || '';
+      $('fwCfgElevationSudo').textContent = fw.elevationSudoCommands || '';
       $('fwCfgElevationTail').textContent = fw.elevationTail || '';
       if (!$('ruleEditor').classList.contains('hidden')) closeRuleEditor();
     }

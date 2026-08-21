@@ -502,11 +502,11 @@ What you get:
 **Two things to settle before the console faces a network.** Neither is a bug, and
 both look like one the first time you hit them:
 
-1. **`pkexec` cannot work under systemd.** It needs a graphical polkit session, which
-   a headless service does not have, so *Block*, *Unblock*, *Authorize firewall* and
-   every Firewall Config write are unavailable until the service user has passwordless
-   sudo scoped to `nft`/`iptables`. The console marks itself **read-only** and prints
-   the `sudoers` line to paste — see
+1. **`pkexec` cannot work under systemd.** It needs a graphical polkit session, which a
+   headless service does not have, so the service has to already hold the right to
+   write. The shipped unit grants `AmbientCapabilities=CAP_NET_ADMIN`, which covers
+   nftables; UFW hosts need scoped passwordless sudo instead. Where neither is in
+   force the console marks itself **read-only** and prints both remedies — see
    [Firewall elevation on a headless server](#firewall-elevation-on-a-headless-server-no-pkexec).
 2. **The unit serves plain HTTP.** `ExecStart` is `networksentinel -w ${WEB_PORT}`, so a
    master password typed into a routable server crosses the wire in the clear. Put it
@@ -757,9 +757,32 @@ When you block an IP/port (or click **Authorize firewall**), only `nft`/`iptable
 
 ### Firewall elevation on a headless server (no pkexec)
 
-`pkexec` needs a graphical polkit session (D-Bus + auth agent), which doesn't exist for a `systemd`-run web service with no display, and the `sudo -A` askpass fallback needs one to draw on. There is no third option: a browser cannot answer a password prompt raised on the server. Until the service user has **passwordless sudo scoped to just the firewall binaries**, the console can read the whole ruleset and change none of it.
+`pkexec` needs a graphical polkit session (D-Bus + auth agent), which doesn't exist for a `systemd`-run web service with no display, and the `sudo -A` askpass fallback needs one to draw on. A browser cannot answer a password prompt raised on the server, so *asking* is off the table entirely — the service has to already hold the right to write.
 
-From **0.7.10** it says so up front rather than at the first failed write. Firewall Config carries a **Read-only** notice with the exact `sudoers` line for *this* host — the user the service actually runs as, and the binaries at the paths they are actually installed at — and Add/Edit/Delete are disabled while it is showing. Paste the commands, then press **Rescan the host firewall** (or **Authorize firewall**, which on the web console re-checks rather than prompting) and the notice clears. To do it by hand:
+Two ways to give it one.
+
+### The capability (default from 0.7.10)
+
+Writing an nftables rule needs exactly one capability, `CAP_NET_ADMIN`, and systemd can hand it to an otherwise unprivileged unit:
+
+```ini
+[Service]
+AmbientCapabilities=CAP_NET_ADMIN
+```
+
+The shipped `networksentinel-web.service` sets this, so a fresh install can write rules with no password anywhere and nothing running as root. Comment it out to make the console read-only for firewall changes; monitoring is unaffected. On an existing install, `sudo systemctl edit --full networksentinel-web`, add the line, and restart.
+
+It is also the *smaller* grant. `NOPASSWD: /usr/sbin/nft` is the right to run `nft -f` on any file as root, which is the whole machine; `CAP_NET_ADMIN` is the right to configure networking.
+
+The capability is ambient, so it survives `execve` and the `nft` the app spawns keeps it. **UFW does not benefit** — it is a Python script that opens with a `getuid() != 0` test, so it refuses a capability-endowed user and reports *"You need to be root to run this script"* no matter what capabilities are held. A host whose rules are managed by UFW needs the sudoers route below.
+
+> If your console lists the host's rules happily but fails every write, this is almost certainly the shape you are in: `nft` reads succeed because the app tries the bare command before elevating, and before 0.7.10 the *write* path went straight to pkexec/sudo the moment it saw a non-root euid — so it never tried the thing that would have worked. Upgrading is the whole fix; no host change is needed.
+
+### Scoped passwordless sudo
+
+For UFW hosts, or where a capability on the unit is not wanted, grant the service user **passwordless sudo scoped to just the firewall binaries**.
+
+From **0.7.10** the console tells you which it needs rather than failing at the first write. Firewall Config carries a **Read-only** notice with both remedies and the exact `sudoers` line for *this* host — the user the service actually runs as, and the binaries at the paths they are actually installed at — and Add/Edit/Delete are disabled while it is showing. Apply either fix, then press **Rescan the host firewall** (or **Authorize firewall**, which on the web console re-checks rather than prompting) and the notice clears. To do it by hand:
 
 ```bash
 # 1. Confirm which user the service runs as
@@ -781,7 +804,7 @@ sudo systemctl restart networksentinel-web  # retry block/unblock afterwards
 
 This keeps the service itself running as your unprivileged user for everything else, and only elevates the firewall binaries — the headless equivalent of the pkexec prompt the desktop GUI uses.
 
-The same grant is what lets **auto-block expiry** run. Timed blocks are swept by a background timer that will not raise a password prompt in anyone's face, so it only sweeps when sudo answers without asking. Before 0.7.10 it tested that with `sudo -n true`, which a *scoped* grant correctly refuses — `true` is not on the NOPASSWD list — so on a host set up exactly as above the sweep never ran and temporary blocks quietly became permanent. It now probes with the firewall binaries themselves, so the line above covers it.
+Either grant is also what lets **auto-block expiry** run. Timed blocks are swept by a background timer that will not raise a password prompt in anyone's face, so it only sweeps when the rule can be removed without asking. Before 0.7.10 it tested that with `sudo -n true`, which a *scoped* grant correctly refuses — `true` is not on the NOPASSWD list — and which a capability host has no use for either, so on both of the setups documented here the sweep never ran and temporary blocks quietly became permanent. It now probes with the firewall binaries themselves and recognises a held capability, so either route covers it.
 
 Include `ufw` where the host uses it (0.7.4). The same grant does double duty: Firewall Config's *reads* (`ufw status verbose`, `nft -j list ruleset`, `iptables -S`) go through `sudo -n`, so without this rule the page lists only what is world-readable, and the writes go through `ufw` rather than `nft`. Drop `ufw` from the line on a host that does not run it — sudoers should not name binaries that are not there.
 
