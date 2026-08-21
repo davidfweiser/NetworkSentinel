@@ -12,7 +12,7 @@ Three ways to run it:
 
 > **Host-based** intrusion detection and prevention. It detects on its own heuristics and, with Suricata attached (0.6.0), on signature/payload inspection — then enforces in the kernel via `nftables`. It is not an inline network appliance: it protects the machine it runs on, not a segment, and it does not sit in the forwarding path.
 
-Linux port of the original Windows WPF Network Sentinel. Platform layers use `/proc/net`, `ss`, conntrack netlink, `nftables`/`iptables` (elevated via **pkexec**), and XDG data paths. Version **0.7.9**.
+Linux port of the original Windows WPF Network Sentinel. Platform layers use `/proc/net`, `ss`, conntrack netlink, `nftables`/`iptables` (elevated via **pkexec**), and XDG data paths. Version **0.7.10**.
 
 ---
 
@@ -480,17 +480,17 @@ first. The build is self-contained — the server needs no .NET runtime.
 
 ```bash
 # build machine
-scp dist/networksentinel-0.7.9-linux-x64.install.sh user@server:
+scp dist/networksentinel-0.7.10-linux-x64.install.sh user@server:
 
 # server
-chmod +x networksentinel-0.7.9-linux-x64.install.sh
-sudo ./networksentinel-0.7.9-linux-x64.install.sh --web-service
+chmod +x networksentinel-0.7.10-linux-x64.install.sh
+sudo ./networksentinel-0.7.10-linux-x64.install.sh --web-service
 ```
 
 Confirm the installer is current before using root:
 
 ```bash
-./networksentinel-0.7.9-linux-x64.install.sh --help
+./networksentinel-0.7.10-linux-x64.install.sh --help
 # Should list: --web-service
 ```
 
@@ -540,8 +540,8 @@ sudo ./….install.sh --web-service --port 18765
 ./….install.sh --user --desktop-shortcut    # ~/.local + icon on the Desktop
 
 # classic tarball
-tar xzf networksentinel-0.7.9-linux-x64.tar.gz
-cd networksentinel-0.7.9-linux-x64
+tar xzf networksentinel-0.7.10-linux-x64.tar.gz
+cd networksentinel-0.7.10-linux-x64
 sudo ./install.sh --web-service
 ```
 
