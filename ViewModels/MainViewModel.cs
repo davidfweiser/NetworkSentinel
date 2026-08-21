@@ -1,4 +1,5 @@
 using System.Collections.ObjectModel;
+using System.Linq;
 using System.Diagnostics;
 using System.IO;
 using System.Reflection;
@@ -65,6 +66,13 @@ public partial class MainViewModel : ObservableObject, IDisposable
     [ObservableProperty] private bool _allowlistUseRemoteFeed = true;
     [ObservableProperty] private bool _criticalAlertsEnabled = true;
     [ObservableProperty] private string _selectedMonitorPoll = "1.2 seconds (default)";
+    [ObservableProperty] private string _selectedUiScale = "175% — 4K (default)";
+
+    /// <summary>
+    /// The multiplier the window applies. Kept beside the label so the view has a number
+    /// to scale by without parsing display text.
+    /// </summary>
+    [ObservableProperty] private double _uiScale = AppSettings.DefaultUiScale;
     [ObservableProperty] private string _authLogStatusText = "";
     [ObservableProperty] private string _probeLogStatusText = "";
     [ObservableProperty] private string _settingsMessage = "";
@@ -151,6 +159,20 @@ public partial class MainViewModel : ObservableObject, IDisposable
         nameof(ThreatLevel.High),
         nameof(ThreatLevel.Critical)
     };
+    /// <summary>
+    /// Text size for the GUI, as a percentage the label carries so the value can be read
+    /// back off it. The hints name the panel each step suits, because the setting exists
+    /// for screens the session does not scale for and "175%" alone does not say which.
+    /// </summary>
+    public ObservableCollection<string> UiScaleOptions { get; } = new()
+    {
+        "100% — unscaled",
+        "125% — 1080p",
+        "150% — 1440p",
+        "175% — 4K (default)",
+        "200% — 4K, larger",
+        "250% — largest"
+    };
     public ObservableCollection<string> AutoBlockExpiryOptions { get; } = new()
     {
         "Never (permanent)",
@@ -187,6 +209,8 @@ public partial class MainViewModel : ObservableObject, IDisposable
         _trafficMeterEnabled = _settings.TrafficMeterEnabled;
         _criticalAlertsEnabled = _settings.CriticalAlertsEnabled;
         _selectedMonitorPoll = PollMsToLabel(_settings.MonitorPollMs);
+        _uiScale = _settings.GetUiScale();
+        _selectedUiScale = ScaleValueToLabel(_uiScale);
         _threatIntelEnabled = _settings.ThreatIntelEnabled;
         _processReputationEnabled = _settings.ProcessReputationEnabled;
         _newListenerAlertsEnabled = _settings.NewListenerAlertsEnabled;
@@ -716,6 +740,15 @@ public partial class MainViewModel : ObservableObject, IDisposable
         SettingsMessage = $"Monitor poll interval: {value}";
     }
 
+    partial void OnSelectedUiScaleChanged(string value)
+    {
+        var scale = ScaleLabelToValue(value);
+        UiScale = scale;
+        _settings.UiScale = scale;
+        _settings.Save();
+        SettingsMessage = $"Text size: {value}";
+    }
+
     partial void OnThreatIntelEnabledChanged(bool value)
     {
         _monitor.ThreatIntelEnabled = value;
@@ -1131,6 +1164,34 @@ public partial class MainViewModel : ObservableObject, IDisposable
         "10 seconds" => 10_000,
         _ => NetworkMonitorService.DefaultPollIntervalMs
     };
+
+    /// <summary>
+    /// The percentage the label opens with, so the option list stays the single place the
+    /// steps are written down — adding one there needs no change here.
+    /// </summary>
+    private static double ScaleLabelToValue(string? label)
+    {
+        var digits = new string((label ?? string.Empty).TakeWhile(char.IsDigit).ToArray());
+        return int.TryParse(digits, out var percent)
+            ? Math.Clamp(percent / 100.0, AppSettings.MinUiScale, AppSettings.MaxUiScale)
+            : AppSettings.DefaultUiScale;
+    }
+
+    /// <summary>
+    /// Nearest listed step, so a settings.json hand-edited to something between them still
+    /// selects an entry instead of leaving the box blank.
+    /// </summary>
+    private string ScaleValueToLabel(double scale)
+    {
+        var best = UiScaleOptions[0];
+        var bestGap = double.MaxValue;
+        foreach (var option in UiScaleOptions)
+        {
+            var gap = Math.Abs(ScaleLabelToValue(option) - scale);
+            if (gap < bestGap) { bestGap = gap; best = option; }
+        }
+        return best;
+    }
 
     private static string PollMsToLabel(int ms) => ms switch
     {

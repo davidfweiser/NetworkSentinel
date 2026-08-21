@@ -25,12 +25,11 @@
 
        LayoutTransformControl scales during layout, not just at paint, so children
        measure against the scaled size and wrapping, trimming and scrolling all stay
-       correct. Change the ScaleTransform to taste: 1.0 is the original sizing, 1.5 is
-       a middle setting; the value is a plain multiplier on every dimension. -->
-  <LayoutTransformControl>
-    <LayoutTransformControl.LayoutTransform>
-      <ScaleTransform ScaleX="1.75" ScaleY="1.75"/>
-    </LayoutTransformControl.LayoutTransform>
+       correct. The multiplier is Settings -> Display -> Text size, persisted as
+       UiScale and applied by the code-behind, which is where the transform is set:
+       a ScaleTransform is not a StyledElement, so it inherits no DataContext and
+       cannot carry a binding of its own. -->
+  <LayoutTransformControl x:Name="UiScaler">
 
   <Grid Margin="18">
     <Grid.ColumnDefinitions>
@@ -928,6 +927,27 @@
         <Grid IsVisible="{Binding ShowSettings}" RowDefinitions="*,Auto">
           <ScrollViewer>
             <StackPanel Spacing="14">
+              <Border Classes="card">
+                <StackPanel>
+                  <TextBlock Text="Display" FontWeight="Bold" FontSize="15"/>
+                  <TextBlock Text="How this window is drawn on this screen."
+                             Foreground="{DynamicResource TextSecondaryBrush}" FontSize="12"
+                             Margin="0,4,0,14" TextWrapping="Wrap"/>
+
+                  <Grid ColumnDefinitions="*,Auto" Margin="0,0,0,14">
+                    <StackPanel Margin="0,0,16,0">
+                      <TextBlock Text="Text size" FontWeight="Bold" FontSize="13"/>
+                      <TextBlock Text="Scales the whole window — text, tables, charts and spacing together — so nothing is left clipped by text that outgrew it. Pick the step that suits the screen: a 4K panel whose desktop session does not scale needs one, a 1080p screen usually does not. Applies straight away."
+                                 Foreground="{DynamicResource TextSecondaryBrush}" FontSize="11"
+                                 Margin="0,2,0,0" TextWrapping="Wrap"/>
+                    </StackPanel>
+                    <ComboBox Grid.Column="1" Width="205" VerticalAlignment="Center"
+                              ItemsSource="{Binding UiScaleOptions}"
+                              SelectedItem="{Binding SelectedUiScale}"/>
+                  </Grid>
+                </StackPanel>
+              </Border>
+
               <Border Classes="card">
                 <StackPanel>
                   <TextBlock Text="Monitoring" FontWeight="Bold" FontSize="15"/>
