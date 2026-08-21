@@ -360,6 +360,14 @@ EOF
   if [[ "$MODE" == "user" ]]; then
     sed -i '/^User=/d;/^Group=/d' "$unit_dst"
     sed -i 's/WantedBy=multi-user.target/WantedBy=default.target/' "$unit_dst"
+    # AmbientCapabilities too: a `systemd --user` manager is itself unprivileged, so
+    # it cannot hand out CAP_NET_ADMIN. Left in place the unit does not merely run
+    # without the capability — it refuses to start at all, exiting 218/CAPABILITIES
+    # before the app is executed, which reads as "the web console is broken" rather
+    # than "the web console cannot write rules". Dropping the line gets the console
+    # up in the read-only-firewall mode it already knows how to explain; a user
+    # install that must write rules needs the sudoers route from the README.
+    sed -i '/^AmbientCapabilities=/d' "$unit_dst"
   fi
 
   # Ensure service user can write data dir
