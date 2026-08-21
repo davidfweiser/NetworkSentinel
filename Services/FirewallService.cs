@@ -11,6 +11,25 @@ using NetworkSentinel.Models;
 namespace NetworkSentinel.Services;
 
 /// <summary>
+/// Which front-end is driving <see cref="FirewallService"/>. The only thing it
+/// decides is where a password could be typed: a desktop session can raise a polkit
+/// dialog, a terminal can prompt on its own TTY, and the web console can do neither —
+/// the operator is in a browser, and any prompt would have to appear on a server they
+/// are not sitting at.
+/// </summary>
+public enum FirewallUiSurface
+{
+    /// <summary>The Avalonia GUI — pkexec or an askpass dialog can prompt.</summary>
+    Desktop,
+
+    /// <summary>The TUI over SSH or a console — sudo can prompt on the TTY.</summary>
+    Terminal,
+
+    /// <summary>The headless web console — nothing can prompt.</summary>
+    Web
+}
+
+/// <summary>
 /// Manages host firewall rules owned by Network Sentinel on Linux via nftables
 /// (preferred) or iptables. The GUI always runs as the normal user; privileged
 /// commands are elevated per-call with pkexec/sudo so Wayland/X11 never has to
@@ -69,6 +88,104 @@ public sealed class FirewallService
     public bool CanElevate => PlatformSupported && (CommandExists("pkexec") || CommandExists("sudo"));
 
     /// <summary>
+    /// Which front-end is running. Set once at startup by <c>Program</c>; the default
+    /// suits the GUI, which is the one process that does not set it.
+    /// </summary>
+    public static FirewallUiSurface Surface { get; set; } = FirewallUiSurface.Desktop;
+
+    /// <summary>
+    /// The binaries a rule write ever has to run as root, and therefore the ones a
+    /// scoped sudoers grant has to name. Also what the silent-elevation probe asks for
+    /// a version of — see <see cref="ProbeSilentSudo"/>.
+    /// </summary>
+    internal static readonly string[] PrivilegedTools = { "ufw", "nft", "iptables", "ip6tables" };
+
+    /// <summary>True when there is a display for pkexec or an askpass helper to draw on.</summary>
+    private static bool HasGraphicalSession()
+        => !string.IsNullOrEmpty(Environment.GetEnvironmentVariable("DISPLAY")) ||
+           !string.IsNullOrEmpty(Environment.GetEnvironmentVariable("WAYLAND_DISPLAY"));
+
+    /// <summary>
+    /// Whether a password prompt could actually reach the operator who is asking.
+    /// <see cref="CanPromptForElevation"/> answers a weaker question — which helpers
+    /// are installed — and overstates it twice over: pkexec needs a live polkit agent
+    /// to talk to, and a browser is not where a prompt raised on the server appears.
+    /// </summary>
+    private static bool CanPromptOnThisSurface()
+    {
+        if (!PlatformSupported) return false;
+        if (Surface == FirewallUiSurface.Web) return false;
+        if (CommandExists("pkexec") && (HasGraphicalSession() || HasTerminal())) return true;
+        return CommandExists("sudo") && (FindAskpassHelper() != null || HasTerminal());
+    }
+
+    /// <summary>
+    /// True when a rule written now would actually reach the kernel: this process is
+    /// root, or sudo runs the firewall binaries without asking, or there is somewhere
+    /// on this surface to type a password.
+    ///
+    /// <see cref="IsAdministrator"/> only reports that some elevation helper exists, so
+    /// on a headless web console it is true on a host where every single write fails.
+    /// That is how an operator came to open the rule editor, fill it in, and learn only
+    /// at Save that the console had never been able to write anything.
+    /// </summary>
+    public bool CanApplyRules
+        => PlatformSupported && (IsRoot || CanElevateSilently() || CanPromptOnThisSurface());
+
+    /// <summary>
+    /// The sudoers grant that makes writes work where nothing can prompt, built for
+    /// this host: the user the process is actually running as, and the firewall
+    /// binaries that are actually installed, at the paths they are installed at. The
+    /// README's line is a template with placeholders; this one can be pasted as it
+    /// stands, which matters most on the surface that cannot show a prompt anyway.
+    /// </summary>
+    public static string SudoersGrantText()
+    {
+        var tools = PrivilegedTools
+            .Select(ResolveExecutable)
+            .Where(path => path != null)
+            .ToArray();
+
+        // Naming a binary that is not installed makes visudo reject the whole file, so
+        // an empty resolve falls back to the conventional paths rather than to nothing.
+        var list = tools.Length > 0
+            ? string.Join(", ", tools)
+            : "/usr/sbin/nft, /usr/sbin/iptables";
+
+        return $"{Environment.UserName} ALL=(root) NOPASSWD: {list}";
+    }
+
+    /// <summary>
+    /// What to do about a host that cannot prompt, as commands to run rather than a
+    /// section to go and find. <paramref name="asBlock"/> keeps the newlines for a
+    /// console or a preformatted block; the flowed form is for a one-line status.
+    /// </summary>
+    public static string HeadlessElevationHelp(bool asBlock = true)
+    {
+        var steps = SudoersInstallCommands();
+
+        return asBlock
+            ? $"{HeadlessElevationLead}\n\n{steps}\n\n{HeadlessElevationTail}"
+            : $"{HeadlessElevationLead} {steps.Replace("\n", "  ")} {HeadlessElevationTail}";
+    }
+
+    /// <summary>
+    /// The four commands on their own, so a front-end that can lay out a code block
+    /// does not have to pick them back out of the prose.
+    /// </summary>
+    public static string SudoersInstallCommands()
+        => $"echo '{SudoersGrantText()}' | sudo tee /etc/sudoers.d/networksentinel\n" +
+           "sudo chmod 0440 /etc/sudoers.d/networksentinel\n" +
+           "sudo visudo -c\n" +
+           "sudo systemctl restart networksentinel-web";
+
+    public const string HeadlessElevationLead =
+        "Give this user passwordless sudo for the firewall binaries, from a shell on the host:";
+
+    public const string HeadlessElevationTail =
+        "Then use Rescan to re-check \u2014 see \u201cFirewall elevation on a headless server\u201d in the README.";
+
+    /// <summary>
     /// True when a password can actually be collected for a rule the operator asked
     /// for. Sudo on its own is not enough from a GUI or a systemd service: with no
     /// pkexec, no cached credentials, no askpass helper and no terminal to prompt on,
@@ -88,6 +205,16 @@ public sealed class FirewallService
                 return UnsupportedPlatformText;
             if (IsRoot)
                 return "Running as root — firewall rules can be applied directly.";
+            if (CanElevateSilently())
+                return "Running as your user with passwordless sudo for the firewall binaries — rules apply " +
+                       "without a prompt.";
+
+            // Past here nothing can be written without asking for a password, so the
+            // question is only whether this surface has anywhere to ask.
+            if (Surface == FirewallUiSurface.Web)
+                return "Running as your user with no passwordless sudo, so the console cannot write rules: " +
+                       "a password prompt would have to appear on the server, not in this browser. " +
+                       HeadlessElevationHelp(asBlock: false);
             if (CommandExists("pkexec"))
                 return "Running as your user. Firewall changes will ask for your password (polkit/pkexec).";
             if (CommandExists("sudo") && FindAskpassHelper() != null)
@@ -115,6 +242,11 @@ public sealed class FirewallService
                 return UnsupportedPlatformText;
             if (IsRoot)
                 return "Applying writes the rule directly — this process is already root.";
+            if (CanElevateSilently())
+                return "Applying writes the rule through passwordless sudo — nothing is asked for.";
+            if (Surface == FirewallUiSurface.Web)
+                return "Applying will fail: this console has no passwordless sudo, and a password prompt " +
+                       "cannot be shown in a browser. " + HeadlessElevationHelp(asBlock: false);
             if (CommandExists("pkexec"))
                 return "Applying asks for your password (pkexec).";
             if (CommandExists("sudo") && FindAskpassHelper() != null)
@@ -141,6 +273,12 @@ public sealed class FirewallService
             return FirewallOperationResult.Fail(
                 $"No elevation helper is installed, so Network Sentinel cannot {action}. " +
                 "Install policykit-1 (pkexec) for a password dialog, or sudo.");
+
+        if (Surface == FirewallUiSurface.Web)
+            return FirewallOperationResult.Fail(
+                $"This user has no passwordless sudo, so the web console cannot {action}: the password " +
+                "prompt would have to appear on the server, not in your browser.\n\n" +
+                HeadlessElevationHelp());
 
         return FirewallOperationResult.Fail(
             $"Elevation is available but has no way to ask for a password, so Network Sentinel cannot {action}. " +
@@ -839,6 +977,11 @@ public sealed class FirewallService
     /// <summary>
     /// Pre-authorize elevation with a no-op privileged command so the first real
     /// block does not surprise the user. Does NOT relaunch the GUI as root.
+    ///
+    /// On the web console there is no prompt to raise, so the button does the other
+    /// useful thing instead: it re-checks whether sudo will run the firewall binaries
+    /// now. That is what an operator who has just written the sudoers file wants, and
+    /// re-checking is the only way to answer it without waiting out the probe cache.
     /// </summary>
     public FirewallOperationResult AuthorizeElevation()
     {
@@ -848,7 +991,13 @@ public sealed class FirewallService
         if (IsRoot)
             return FirewallOperationResult.Ok("Already running as root.");
 
-        if (!CanPromptForElevation)
+        InvalidateElevationProbe();
+        if (CanElevateSilently())
+            return FirewallOperationResult.Ok(
+                "Nothing to authorize — this user already has passwordless sudo for the firewall binaries, " +
+                "so rules apply without a prompt.");
+
+        if (!CanApplyRules)
             return NoElevation("apply firewall rules");
 
         // Touch a harmless privileged read — triggers polkit/sudo password once.
@@ -860,10 +1009,12 @@ public sealed class FirewallService
             return FirewallOperationResult.Ok(
                 "Authorization OK. Firewall changes can proceed (you may be prompted again after a while).");
 
-        return FirewallOperationResult.Fail(
-            "Elevation failed or was cancelled. " + probe.Message +
-            "\n\nDo not run the whole app with sudo on Wayland — that breaks the display " +
-            "(XOpenDisplay). Run as your user and let pkexec prompt for password.");
+        var tail = Surface == FirewallUiSurface.Web
+            ? $"\n\n{HeadlessElevationHelp()}"
+            : "\n\nDo not run the whole app with sudo on Wayland — that breaks the display " +
+              "(XOpenDisplay). Run as your user and let pkexec prompt for password.";
+
+        return FirewallOperationResult.Fail("Elevation failed or was cancelled. " + probe.Message + tail);
     }
 
     [Obsolete("GUI must not restart as root on Wayland. Use AuthorizeElevation() instead.")]
@@ -1307,12 +1458,20 @@ public sealed class FirewallService
     /// </summary>
     private static string NoPasswordPromptText(string sudoMessage)
     {
-        var text =
-            "Sudo is installed but has no way to ask for a password here: this window is not a terminal, " +
-            "no cached credentials are in force, and no pkexec or askpass dialog was found. Install " +
-            "policykit-1 (pkexec), or grant this user passwordless sudo for ufw/nft/iptables — see " +
-            "“Firewall elevation on a headless server” in the README. Do not start the GUI with plain " +
-            "sudo on Wayland.";
+        // The desktop wording named a window, a Wayland session and a GUI started with
+        // sudo. Read in a browser on a phone, pointed at a systemd service, not one of
+        // those three is a thing the operator has — so the web console gets the advice
+        // that fits it, with the grant already filled in for this host.
+        var text = Surface == FirewallUiSurface.Web
+            ? "The web console cannot write firewall rules: sudo is installed but wants a password, and " +
+              "there is nowhere to ask for one — no terminal, no cached credentials, and no desktop on " +
+              "the server for pkexec or an askpass dialog to draw on. A browser cannot answer a prompt " +
+              $"raised on the host.\n\n{HeadlessElevationHelp()}"
+            : "Sudo is installed but has no way to ask for a password here: this window is not a terminal, " +
+              "no cached credentials are in force, and no pkexec or askpass dialog was found. Install " +
+              "policykit-1 (pkexec), or grant this user passwordless sudo for ufw/nft/iptables — see " +
+              "“Firewall elevation on a headless server” in the README. Do not start the GUI with plain " +
+              "sudo on Wayland.";
         return string.IsNullOrWhiteSpace(sudoMessage) ? text : $"{text}\n\nsudo said: {sudoMessage.Trim()}";
     }
 
@@ -1778,19 +1937,92 @@ public sealed class FirewallService
         }
     }
 
-    private static bool CanElevateSilently()
+    /// <summary>
+    /// Whether sudo will run a firewall command without asking for anything.
+    ///
+    /// This used to probe with <c>sudo -n true</c>, which answers no on exactly the
+    /// host the README tells operators to build: a grant scoped to <c>nft</c>,
+    /// <c>ufw</c> and <c>iptables</c> does not cover <c>true</c>. Auto-block expiry and
+    /// ledger reconciliation both gate on this, so on a correctly configured headless
+    /// server the expiry sweep quietly never ran and temporary blocks became permanent.
+    ///
+    /// The answer is cached because a failed <c>sudo -n</c> is written to the auth log,
+    /// which this very application watches for break-in attempts; a probe on every
+    /// snapshot would have Network Sentinel reporting on itself.
+    /// </summary>
+    internal static bool CanElevateSilently()
     {
         if (!PlatformSupported) return false;
         if (IsRootProcess()) return true;
+        if (!CommandExists("sudo")) return false;
+
+        var now = Environment.TickCount64;
+        lock (SilentProbeLock)
+        {
+            if (_silentProbeStampMs != 0 &&
+                now - _silentProbeStampMs < (_silentProbeResult ? SilentProbeOkTtlMs : SilentProbeFailTtlMs))
+                return _silentProbeResult;
+        }
+
+        var result = ProbeSilentSudo();
+
+        lock (SilentProbeLock)
+        {
+            _silentProbeResult = result;
+            _silentProbeStampMs = Environment.TickCount64;
+        }
+        return result;
+    }
+
+    /// <summary>
+    /// Forgets the cached <see cref="CanElevateSilently"/> answer, so an operator who
+    /// has just written the sudoers file sees the change on the next Rescan instead of
+    /// waiting out the cache.
+    /// </summary>
+    public static void InvalidateElevationProbe()
+    {
+        lock (SilentProbeLock)
+            _silentProbeStampMs = 0;
+    }
+
+    private static bool ProbeSilentSudo()
+    {
         try
         {
-            return CommandExists("sudo") && RunDirectArgs("sudo", new[] { "-n", "true" }).Success;
+            // A blanket NOPASSWD grant answers here and costs one process.
+            if (RunDirectArgs("sudo", new[] { "-n", "true" }).Success)
+                return true;
+
+            // A scoped grant does not, so ask the tools it does name for their version:
+            // harmless, and it goes through the same sudoers line the writes will.
+            foreach (var tool in PrivilegedTools)
+            {
+                var resolved = ResolveExecutable(tool);
+                if (resolved == null) continue;
+                if (RunDirectArgs("sudo", new[] { "-n", resolved, "--version" }).Success)
+                    return true;
+            }
         }
         catch
         {
-            return false;
+            // Treated as "cannot elevate silently" — the callers are all best-effort.
         }
+        return false;
     }
+
+    private static readonly object SilentProbeLock = new();
+    private static bool _silentProbeResult;
+    private static long _silentProbeStampMs;
+
+    /// <summary>A grant that works is stable; re-checking it often buys nothing.</summary>
+    private const int SilentProbeOkTtlMs = 60_000;
+
+    /// <summary>
+    /// A grant that is missing is the case an operator is actively fixing, but every
+    /// probe leaves a line in the auth log, so it is re-checked less often than it is
+    /// asked about and <see cref="InvalidateElevationProbe"/> covers the impatient.
+    /// </summary>
+    private const int SilentProbeFailTtlMs = 300_000;
 
     /// <summary>
     /// Set for the duration of the expiry sweep on the sweeping thread: makes

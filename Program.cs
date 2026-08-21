@@ -3,6 +3,7 @@ using System.IO;
 using System.Linq;
 using System.Runtime.InteropServices;
 using Avalonia;
+using NetworkSentinel.Services;
 using NetworkSentinel.Tui;
 using NetworkSentinel.Web;
 
@@ -164,6 +165,9 @@ internal static class Program
 
     private static void RunTui()
     {
+        // Decides where a sudo password could be asked for: on a TTY here, in a polkit
+        // dialog on the desktop, and nowhere at all under the web console.
+        FirewallService.Surface = FirewallUiSurface.Terminal;
         try
         {
             using var app = new TuiApp();
@@ -179,6 +183,7 @@ internal static class Program
 
     private static void RunWeb(int? port, WebTlsOptions? tls)
     {
+        FirewallService.Surface = FirewallUiSurface.Web;
         try
         {
             using var app = new WebApp(port, bindAll: true, tlsOverrides: tls);

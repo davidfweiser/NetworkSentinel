@@ -272,9 +272,19 @@ public sealed class HostFirewallScanner
             return FirewallService.UnsupportedPlatformText;
         if (_firewall.IsRoot)
             return "Running as root — UFW, nftables and process names are all visible.";
+
+        // The reads and the writes are two different questions, and the note used to
+        // answer only the first. A console that lists every rule but cannot change any
+        // of them reads as working right up until Save, so say which it is.
+        if (FirewallService.CanElevateSilently())
+            return "Running unprivileged with passwordless sudo for the firewall binaries — rules are read " +
+                   "and written through sudo -n, with no prompt.";
         if (_firewall.CanElevate)
             return "Running unprivileged. Rules that need root are read through sudo -n where that is allowed; " +
-                   "run the app elevated if the list looks short.";
+                   "run the app elevated if the list looks short. " +
+                   (_firewall.CanApplyRules
+                       ? "Writing a rule asks for your password."
+                       : "Writing a rule is not possible here until this user has passwordless sudo.");
         return "Running unprivileged with no pkexec or sudo. Only world-readable rules are listed.";
     }
 

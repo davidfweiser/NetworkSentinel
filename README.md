@@ -12,7 +12,7 @@ Three ways to run it:
 
 > **Host-based** intrusion detection and prevention. It detects on its own heuristics and, with Suricata attached (0.6.0), on signature/payload inspection — then enforces in the kernel via `nftables`. It is not an inline network appliance: it protects the machine it runs on, not a segment, and it does not sit in the forwarding path.
 
-Linux port of the original Windows WPF Network Sentinel. Platform layers use `/proc/net`, `ss`, conntrack netlink, `nftables`/`iptables` (elevated via **pkexec**), and XDG data paths. Version **0.7.9**.
+Linux port of the original Windows WPF Network Sentinel. Platform layers use `/proc/net`, `ss`, conntrack netlink, `nftables`/`iptables` (elevated via **pkexec**), and XDG data paths. Version **0.7.10**.
 
 ---
 
@@ -478,17 +478,17 @@ first. The build is self-contained — the server needs no .NET runtime.
 
 ```bash
 # build machine
-scp dist/networksentinel-0.7.9-linux-x64.install.sh user@server:
+scp dist/networksentinel-0.7.10-linux-x64.install.sh user@server:
 
 # server
-chmod +x networksentinel-0.7.9-linux-x64.install.sh
-sudo ./networksentinel-0.7.9-linux-x64.install.sh --web-service
+chmod +x networksentinel-0.7.10-linux-x64.install.sh
+sudo ./networksentinel-0.7.10-linux-x64.install.sh --web-service
 ```
 
 Confirm the installer is current before using root:
 
 ```bash
-./networksentinel-0.7.9-linux-x64.install.sh --help
+./networksentinel-0.7.10-linux-x64.install.sh --help
 # Should list: --web-service
 ```
 
@@ -503,9 +503,10 @@ What you get:
 both look like one the first time you hit them:
 
 1. **`pkexec` cannot work under systemd.** It needs a graphical polkit session, which
-   a headless service does not have, so *Block*, *Unblock* and *Authorize firewall*
-   fail with *"Need admin rights for firewall changes"* until the service user has
-   passwordless sudo scoped to `nft`/`iptables` — see
+   a headless service does not have, so *Block*, *Unblock*, *Authorize firewall* and
+   every Firewall Config write are unavailable until the service user has passwordless
+   sudo scoped to `nft`/`iptables`. The console marks itself **read-only** and prints
+   the `sudoers` line to paste — see
    [Firewall elevation on a headless server](#firewall-elevation-on-a-headless-server-no-pkexec).
 2. **The unit serves plain HTTP.** `ExecStart` is `networksentinel -w ${WEB_PORT}`, so a
    master password typed into a routable server crosses the wire in the clear. Put it
@@ -538,8 +539,8 @@ sudo ./….install.sh --web-service --port 18765
 ./….install.sh --user --desktop-shortcut    # ~/.local + icon on the Desktop
 
 # classic tarball
-tar xzf networksentinel-0.7.9-linux-x64.tar.gz
-cd networksentinel-0.7.9-linux-x64
+tar xzf networksentinel-0.7.10-linux-x64.tar.gz
+cd networksentinel-0.7.10-linux-x64
 sudo ./install.sh --web-service
 ```
 
@@ -756,7 +757,9 @@ When you block an IP/port (or click **Authorize firewall**), only `nft`/`iptable
 
 ### Firewall elevation on a headless server (no pkexec)
 
-`pkexec` needs a graphical polkit session (D-Bus + auth agent), which doesn't exist for a `systemd`-run web service with no display, and the `sudo -A` askpass fallback needs one to draw on. On a headless box, block/unblock and **Authorize firewall** will fail with *"Sudo is installed but has no way to ask for a password here"* until you grant the service user **passwordless sudo scoped to just the firewall binaries**:
+`pkexec` needs a graphical polkit session (D-Bus + auth agent), which doesn't exist for a `systemd`-run web service with no display, and the `sudo -A` askpass fallback needs one to draw on. There is no third option: a browser cannot answer a password prompt raised on the server. Until the service user has **passwordless sudo scoped to just the firewall binaries**, the console can read the whole ruleset and change none of it.
+
+From **0.7.10** it says so up front rather than at the first failed write. Firewall Config carries a **Read-only** notice with the exact `sudoers` line for *this* host — the user the service actually runs as, and the binaries at the paths they are actually installed at — and Add/Edit/Delete are disabled while it is showing. Paste the commands, then press **Rescan the host firewall** (or **Authorize firewall**, which on the web console re-checks rather than prompting) and the notice clears. To do it by hand:
 
 ```bash
 # 1. Confirm which user the service runs as
@@ -777,6 +780,8 @@ sudo systemctl restart networksentinel-web  # retry block/unblock afterwards
 ```
 
 This keeps the service itself running as your unprivileged user for everything else, and only elevates the firewall binaries — the headless equivalent of the pkexec prompt the desktop GUI uses.
+
+The same grant is what lets **auto-block expiry** run. Timed blocks are swept by a background timer that will not raise a password prompt in anyone's face, so it only sweeps when sudo answers without asking. Before 0.7.10 it tested that with `sudo -n true`, which a *scoped* grant correctly refuses — `true` is not on the NOPASSWD list — so on a host set up exactly as above the sweep never ran and temporary blocks quietly became permanent. It now probes with the firewall binaries themselves, so the line above covers it.
 
 Include `ufw` where the host uses it (0.7.4). The same grant does double duty: Firewall Config's *reads* (`ufw status verbose`, `nft -j list ruleset`, `iptables -S`) go through `sudo -n`, so without this rule the page lists only what is world-readable, and the writes go through `ufw` rather than `nft`. Drop `ufw` from the line on a host that does not run it — sudoers should not name binaries that are not there.
 
