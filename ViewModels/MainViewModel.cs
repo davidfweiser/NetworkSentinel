@@ -66,6 +66,13 @@ public partial class MainViewModel : ObservableObject, IDisposable
     [ObservableProperty] private bool _allowlistUseRemoteFeed = true;
     [ObservableProperty] private bool _criticalAlertsEnabled = true;
     [ObservableProperty] private string _selectedMonitorPoll = "1.2 seconds (default)";
+    [ObservableProperty] private string _selectedUiScale = "100% — matches Windows (default)";
+
+    /// <summary>
+    /// The multiplier the window applies. Kept beside the label so the view has a number
+    /// to scale by without parsing display text.
+    /// </summary>
+    [ObservableProperty] private double _uiScale = AppSettings.DefaultUiScale;
     [ObservableProperty] private string _authLogStatusText = "";
     [ObservableProperty] private string _probeLogStatusText = "";
     [ObservableProperty] private string _settingsMessage = "";
@@ -151,6 +158,21 @@ public partial class MainViewModel : ObservableObject, IDisposable
         "5 seconds",
         "10 seconds"
     };
+    /// <summary>
+    /// Text size for the GUI, as a percentage the label carries so the value can be read
+    /// back off it. This multiplies the scaling Windows has already applied for the
+    /// monitor's DPI, so the default step is the one that adds nothing — the hints say so,
+    /// because "125%" alone reads like a display setting rather than something on top of one.
+    /// </summary>
+    public ObservableCollection<string> UiScaleOptions { get; } = new()
+    {
+        "100% — matches Windows (default)",
+        "125% — a little larger",
+        "150% — larger",
+        "175% — much larger",
+        "200% — very large",
+        "250% — largest"
+    };
     public ObservableCollection<string> AutoBlockLevelOptions { get; } = new()
     {
         nameof(ThreatLevel.Medium),
@@ -193,6 +215,8 @@ public partial class MainViewModel : ObservableObject, IDisposable
         _trafficMeterEnabled = _settings.TrafficMeterEnabled;
         _criticalAlertsEnabled = _settings.CriticalAlertsEnabled;
         _selectedMonitorPoll = PollMsToLabel(_settings.MonitorPollMs);
+        _uiScale = _settings.GetUiScale();
+        _selectedUiScale = ScaleValueToLabel(_uiScale);
         _threatIntelEnabled = _settings.ThreatIntelEnabled;
         _processReputationEnabled = _settings.ProcessReputationEnabled;
         _newListenerAlertsEnabled = _settings.NewListenerAlertsEnabled;
@@ -692,6 +716,15 @@ public partial class MainViewModel : ObservableObject, IDisposable
         _settings.AllowlistUseRemoteFeed = value;
         _settings.Save();
         SettingsMessage = $"Allowlist remote feed: {(value ? "on" : "off")}";
+    }
+
+    partial void OnSelectedUiScaleChanged(string value)
+    {
+        var scale = ScaleLabelToValue(value);
+        UiScale = scale;
+        _settings.UiScale = scale;
+        _settings.Save();
+        SettingsMessage = $"Text size: {value}";
     }
 
     partial void OnSelectedMonitorPollChanged(string value)
@@ -1241,6 +1274,36 @@ public partial class MainViewModel : ObservableObject, IDisposable
         10_000 => "10 seconds",
         _ => "1.2 seconds (default)"
     };
+
+    /// <summary>
+    /// The percentage the label opens with, so the option list stays the single place the
+    /// steps are written down — adding one there needs no change here.
+    /// </summary>
+    private static double ScaleLabelToValue(string? label)
+    {
+        var digits = new string((label ?? string.Empty).TakeWhile(char.IsDigit).ToArray());
+        return int.TryParse(digits, out var percent)
+            ? Math.Clamp(percent / 100.0, AppSettings.MinUiScale, AppSettings.MaxUiScale)
+            : AppSettings.DefaultUiScale;
+    }
+
+    /// <summary>
+    /// Nearest listed step, so a settings.json hand-edited to something between them still
+    /// selects an entry instead of leaving the box blank.
+    /// </summary>
+    private string ScaleValueToLabel(double scale)
+    {
+        var best = UiScaleOptions[0];
+        var bestGap = double.MaxValue;
+        foreach (var option in UiScaleOptions)
+        {
+            var gap = Math.Abs(ScaleLabelToValue(option) - scale);
+            if (gap >= bestGap) continue;
+            bestGap = gap;
+            best = option;
+        }
+        return best;
+    }
 
     [RelayCommand]
     private void ToggleMonitoring()

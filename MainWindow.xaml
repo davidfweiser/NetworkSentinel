@@ -62,7 +62,24 @@
             </Ellipse.Fill>
         </Ellipse>
 
+        <!-- UI scale — Settings → Display → Text size, persisted as UiScale.
+             LayoutTransform scales during measure, not just at paint, so children lay
+             out against the scaled size and wrapping, trimming, scrolling and the table
+             columns all stay correct; a RenderTransform here would magnify a layout
+             built for the old size and clip it.
+
+             Bound rather than set from the code-behind: a ScaleTransform is a Freezable,
+             and WPF gives it an inheritance context from the FrameworkElement property
+             it is set on, so it resolves the DataContext and the choice lands without a
+             restart. (The Avalonia build has to do this from code-behind — its
+             ScaleTransform is not a StyledElement and can carry no binding at all.)
+
+             Only the content scales. The ambient glow ellipses behind it are sized to
+             the window, not to the layout, and scaling them would just push them off it. -->
         <Grid Margin="18">
+            <Grid.LayoutTransform>
+                <ScaleTransform ScaleX="{Binding UiScale}" ScaleY="{Binding UiScale}"/>
+            </Grid.LayoutTransform>
             <Grid.ColumnDefinitions>
                 <ColumnDefinition Width="230" MinWidth="200" MaxWidth="280"/>
                 <ColumnDefinition Width="*"/>
@@ -171,6 +188,12 @@
                         </Border>
                     </StackPanel>
 
+                    <!-- The nav list is the DockPanel's fill child, and neither a DockPanel
+                         nor the Border around it clips, so when the rail is shorter than its
+                         items the list drew straight over the STATUS block docked above it.
+                         Reachable already with a short enough window, and certain once the
+                         text-size setting is turned up. It scrolls now. -->
+                    <ScrollViewer HorizontalScrollBarVisibility="Disabled" VerticalScrollBarVisibility="Auto">
                     <StackPanel>
                         <TextBlock Text="NAVIGATION" FontSize="10" FontWeight="Bold"
                                    Foreground="{StaticResource TextMutedBrush}" Margin="8,0,0,8"/>
@@ -201,6 +224,7 @@
                                      IsChecked="{Binding ShowSettings, Mode=OneWay}"
                                      Command="{Binding NavigateCommand}" CommandParameter="Settings"/>
                     </StackPanel>
+                    </ScrollViewer>
                 </DockPanel>
             </Border>
 
@@ -1401,6 +1425,32 @@
 
                         <ScrollViewer VerticalScrollBarVisibility="Auto">
                             <StackPanel>
+                                <Border Style="{StaticResource Card}" Margin="0,0,0,14">
+                                    <StackPanel>
+                                        <TextBlock Text="Display" FontWeight="Bold" FontSize="15"/>
+                                        <TextBlock Text="How this window is drawn on this screen."
+                                                   Foreground="{StaticResource TextSecondaryBrush}" FontSize="12"
+                                                   Margin="0,4,0,14" TextWrapping="Wrap"/>
+
+                                        <Grid Margin="0,0,0,14">
+                                            <Grid.ColumnDefinitions>
+                                                <ColumnDefinition Width="*"/>
+                                                <ColumnDefinition Width="Auto"/>
+                                            </Grid.ColumnDefinitions>
+                                            <StackPanel Margin="0,0,16,0">
+                                                <TextBlock Text="Text size" FontWeight="Bold" FontSize="13"/>
+                                                <TextBlock Text="Scales the whole window — text, tables, charts and spacing together — so nothing is left clipped by text that outgrew it. This is on top of the scaling Windows already applies for the display, so 100% is the size the screen asks for; turn it up only if you want this window larger than the rest of the desktop. Applies straight away."
+                                                           Foreground="{StaticResource TextSecondaryBrush}" FontSize="11"
+                                                           Margin="0,2,0,0" TextWrapping="Wrap"/>
+                                            </StackPanel>
+                                            <ComboBox Grid.Column="1" Width="205" VerticalAlignment="Center"
+                                                      Style="{StaticResource ModernComboBox}"
+                                                      ItemsSource="{Binding UiScaleOptions}"
+                                                      SelectedItem="{Binding SelectedUiScale}"/>
+                                        </Grid>
+                                    </StackPanel>
+                                </Border>
+
                                 <Border Style="{StaticResource Card}" Margin="0,0,0,14">
                                     <StackPanel>
                                         <TextBlock Text="Monitoring" FontWeight="Bold" FontSize="15"/>
