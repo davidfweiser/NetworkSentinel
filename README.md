@@ -10,9 +10,20 @@ Three ways to run it (same idea as the Linux build):
 | **Terminal UI (`--tui`)** | Server Core, RDP console, SSH-style workflows |
 | **Headless web UI (`-w`)** | Browser dashboard on a server (master-password protected) |
 
-> Awareness / monitoring tooling — not a full IDS/IPS replacement. Version **0.7.9**.
+> Awareness / monitoring tooling — not a full IDS/IPS replacement. Version **0.7.13**.
 
 ---
+
+## What's new in 0.7.13
+
+The window can be drawn at whatever size suits the screen, and the web console stops offering an editor it cannot honour. The number jumps from 0.7.9 to stay level with the Linux line, where these shipped as four releases.
+
+| Area | What changed |
+|------|--------------|
+| **Choose the text size** | Every size in the desktop window is an absolute device-independent pixel, so the only thing setting how large it draws was whatever Windows scales the display by. **Settings → Display → Text size** is a second multiplier on top of that, in six steps from 100% to 250%, applied straight away without a restart. It scales the whole window — text, tables, charts and spacing together — rather than the font sizes alone, so nothing is left clipped by text that outgrew the column holding it. Unlike the Linux build, which defaults to 175% because a desktop session that does not scale leaves it rendering 9px labels on a 4K panel, this one **defaults to 100%**: `app.manifest` declares PerMonitorV2, so Windows has already told the app the monitor's scale factor and applied it. Turn it up only to make this window larger than the rest of the desktop. Read through a clamp of 1.0–2.5, so a hand-edited `settings.json` cannot draw one stat tile across the screen with the Settings page that would undo it somewhere off the bottom right. |
+| **The navigation rail scrolls** | The rail is the sidebar's fill child, and neither the DockPanel nor the card around it clips, so when the window was shorter than the list of entries the navigation drew straight over the STATUS block beneath it. Reachable already with a short enough window and certain once the text size goes up, so the list scrolls now. |
+| **Firewall Config says it is read-only, before the form** | The web console decided whether to offer **Add**, **Edit** and **Delete** without asking whether a write could land, so a console that is not running elevated drew the whole editor, accepted a rule and refused it at Save — with a message naming “Run as Admin”, which is not a thing anyone has in a browser pointed at a service. The page now carries a read-only notice with the commands that fix it for this host, and disables the buttons behind it, so the failure arrives before the form rather than after it. `CanApplyRules` is the gate, and `FirewallService.Surface` says which front-end is asking: the desktop and the TUI keep their UAC advice, and the console — the one surface where a consent dialog would be raised on a server nobody is sitting at — gets commands it can paste. |
+| **Firewall Config looks like the desktop page** | The two front-ends were already the same product carrying the same columns, but not the same page. Each section is a card now — the desktop's 18px radius and padding — with its name, a line of context, and that section's action pinned to the right of the same row, so **Add an Inbound Rule** sits on the list it adds to instead of in a shared strip above everything. Column headers take the desktop's sentence case, the zebra banding gives way to the flat card and its horizontal rules, and Delete becomes the solid danger gradient rather than an outline. The rail draws the same selection bar the desktop rail does. |
 
 ## What's new in 0.7.9
 
@@ -545,11 +556,11 @@ Self-contained by default — the server does **not** need the .NET SDK or a com
 
 ```powershell
 # Copy the .install.cmd to the server, then run it (UAC prompt if not elevated):
-.\NetworkSentinel-windows-server-x64-0.7.9.install.cmd
+.\NetworkSentinel-windows-server-x64-0.7.13.install.cmd
 # optional port:
-.\NetworkSentinel-windows-server-x64-0.7.9.install.cmd -Port 18765
+.\NetworkSentinel-windows-server-x64-0.7.13.install.cmd -Port 18765
 # unpack without installing:
-.\NetworkSentinel-windows-server-x64-0.7.9.install.cmd --extract-only
+.\NetworkSentinel-windows-server-x64-0.7.13.install.cmd --extract-only
 ```
 
 The one-file installer is a `.cmd`, not a `.ps1`: `cmd.exe` stops reading the script at `exit /b`, so the ZIP appended to it is never parsed. PowerShell tokenizes an entire `-File` script before running any of it, and the cost on appended binary is quadratic (16 MB ≈ 5½ minutes) before it fails to parse at all — so the shell-style "payload after exit" trick only works with a `cmd` entry point.
@@ -611,7 +622,7 @@ No URL ACL is reserved. That was an `HttpListener` requirement; Kestrel binds th
 
 #### Upgrades and uninstall
 
-Re-running the installer **upgrades in place**: it stops the running task, replaces the binaries, and restarts. `%ProgramData%\NetworkSentinel` is both the install folder and the data directory, so the installer removes **only the files the package ships** — the master password hash, settings, allowlist, logs, host history, threat log, `duckdns.json`, `tls\`, and `acme\` all survive. The web console's navigation rail shows the running version (e.g. `v0.7.9`) — check it after an upgrade to confirm the new build is live.
+Re-running the installer **upgrades in place**: it stops the running task, replaces the binaries, and restarts. `%ProgramData%\NetworkSentinel` is both the install folder and the data directory, so the installer removes **only the files the package ships** — the master password hash, settings, allowlist, logs, host history, threat log, `duckdns.json`, `tls\`, and `acme\` all survive. The web console's navigation rail shows the running version (e.g. `v0.7.13`) — check it after an upgrade to confirm the new build is live.
 
 Uninstall keeps that same data by default so a reinstall picks up where you left off:
 
@@ -863,7 +874,7 @@ schtasks /Run /TN "NetworkSentinel-Web"
 | **Break-in Attempts** | Heuristic alerts with origin and method |
 | **Open Ports** | Listening TCP/UDP; optional inbound port block |
 | **Firewall & Block** | Manual IP/port rules, auto-block toggle, managed rule list |
-| **Settings** | Monitor poll interval, geo lookups, failed-logon monitoring, closed-port scan detection, **remote access (HTTPS + DuckDNS)**, allowlist feed, data folder |
+| **Settings** | **Text size** (how large this window draws), monitor poll interval, geo lookups, failed-logon monitoring, closed-port scan detection, **remote access (HTTPS + DuckDNS)**, allowlist feed, data folder |
 
 ### Settings from the terminal (0.7.9)
 
