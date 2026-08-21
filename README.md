@@ -265,7 +265,7 @@ UFW's own helper chains (`ufw-before-*`, `ufw-track-*`, the logging chains) and 
 
 Every socket is listed with its **bind address**, so a service like NetBIOS shows its separate rows on `0.0.0.0`, the LAN address and the broadcast address rather than one collapsed entry — the same set `ss -tuln` prints. **New rule** on a row opens the editor with that socket's protocol and port already filled in (0.7.4), which is the point of listing them next to the rules: a rule here is written against a socket, and retyping the port out of a terminal is how one goes missing.
 
-**Both front-ends say the same thing (0.7.5).** The desktop window and the web console build the same three lines from the same fields, in the same order — summary, listening sockets, policy. The desktop gained the *Scanned HH:mm:ss, not live* stamp the console had, so a page read an hour ago says so rather than passing for current; the console gained the listening-socket count and how many of them are reachable from anywhere, which the desktop had; and the console's policy paragraph moved below the summary, where the desktop keeps it. The sentence describing what the listener table is, is now one sentence written once and shown in both.
+**Both front-ends say the same thing (0.7.5).** The desktop window and the web console build the same three lines from the same fields, in the same order — summary, listening sockets, policy. The desktop gained the *Scanned HH:mm:ss, not live* stamp the console had, so a page read an hour ago says so rather than passing for current; the console gained the listening-socket count and how many of them are reachable from anywhere, which the desktop had; and the console's policy paragraph moved below the summary, where the desktop keeps it. The sentence describing what the listener table is, is now one sentence written once and shown in both. Since 0.7.12 the console's page is also *shaped* like the desktop's rather than only worded like it — see [Web console layout](#web-console-layout).
 
 **Nothing is cut off (0.7.5).** The Firewall Config grids were the only ones in the app not trimming their cells, so a long rule label or an IPv6 range stopped mid-value with no ellipsis and no way to read the rest. Every cell trims now, and the columns whose values are routinely wider than any sensible column — label, addresses, created-by, process, bind address — carry the full value as a tooltip. Label and addresses share the leftover width rather than one of them being pinned narrow. The action column sized to its two buttons instead of the 150px it was pinned at, which had been slicing the rounded edge off **Delete**; and the rail title wraps rather than reading "Network Sentine".
 
@@ -321,6 +321,21 @@ and Allowlist indented under **Firewall & Block**, Help under **Settings** — w
 the same hero header the desktop carries: clock, **Network Defense Console**, the
 `high/critical · blocked · auto-block` subtitle from the same three numbers, and the
 action row. Below ~900px the rail folds into a wrapping row above the content.
+
+**And drawn like it too (0.7.12).** Matching the shape left the two still looking
+unrelated, so the console's styling is now taken from the values in the desktop's
+`Themes/Controls.axaml` — radii, paddings, the danger gradient — rather than
+approximated by eye. They are still two stylesheets in two languages and can drift
+if only one is edited; the point is that where they agree today, they agree on a
+number someone can look up. Rail entries draw the ring and
+dot of the RadioButton they have always been, with the selected one filled. A list
+is a card at the desktop's 18px radius, carrying its name, a line of context under
+it, and that section's action on the right of the same row — so **Add an Inbound
+Rule** sits on the list it adds to instead of in a strip above everything. Column
+headers are sentence case as the grid draws them, not uppercase; the zebra banding
+is gone for the flat card and horizontal rules the desktop uses; and row buttons are
+the desktop's mini-ghost and mini-danger, which makes **Delete** the solid danger
+gradient rather than an outline.
 
 ### Web console tabs
 
