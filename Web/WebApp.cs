@@ -1514,9 +1514,8 @@ public sealed class WebApp : IDisposable
                     if (guard != null)
                         return ActionResultDto.Fail(guard);
 
-                    if (!_firewall.IsAdministrator)
-                        return ActionResultDto.Fail(
-                            "Cannot write rules — the web service must run as Administrator (or as SYSTEM, which the installed service does).");
+                    if (!_firewall.CanApplyRules)
+                        return ActionResultDto.Fail(CannotWriteText("write rules"));
 
                     var replace = string.IsNullOrWhiteSpace(req.Replace)
                         ? null
@@ -1561,8 +1560,8 @@ public sealed class WebApp : IDisposable
                 {
                     var key = (req.Key ?? "").Trim();
                     if (key.Length == 0) return ActionResultDto.Fail("Rule identity required.");
-                    if (!_firewall.IsAdministrator)
-                        return ActionResultDto.Fail("Cannot remove rules — run Network Sentinel elevated (Admin / service as SYSTEM).");
+                    if (!_firewall.CanApplyRules)
+                        return ActionResultDto.Fail(CannotWriteText("remove rules"));
 
                     var target = FindScannedRule(key, out var problem);
                     if (target == null) return ActionResultDto.Fail(problem);
@@ -1598,8 +1597,8 @@ public sealed class WebApp : IDisposable
                         return ActionResultDto.Fail("Rule name required.");
                     if (IsOwnWebRule(name))
                         return ActionResultDto.Fail(SelfRuleRefusal(name));
-                    if (!_firewall.IsAdministrator)
-                        return ActionResultDto.Fail("Cannot remove rules — run Network Sentinel elevated (Admin / service as SYSTEM).");
+                    if (!_firewall.CanApplyRules)
+                        return ActionResultDto.Fail(CannotWriteText("remove rules"));
 
                     // netsh-only delete; never HNetCfg COM (MTA AccessViolation kills the host).
                     FirewallOperationResult r;
@@ -1853,6 +1852,14 @@ public sealed class WebApp : IDisposable
                 defaultOutbound = scan.DefaultOutbound,
                 description = scan.Description,
                 privilegeNote = scan.PrivilegeNote,
+                // Whether Save and Delete can land at all, decided here rather than
+                // discovered at the write: netsh either has an elevated token or it does
+                // not, and nothing the browser sends can supply one, so a console without
+                // it has no business offering an editor that will always fail.
+                canWriteRules = _firewall.CanApplyRules,
+                elevationLead = _firewall.CanApplyRules ? "" : FirewallService.HeadlessElevationLead,
+                elevationCommands = _firewall.CanApplyRules ? "" : FirewallService.ElevationInstallCommands(),
+                elevationTail = _firewall.CanApplyRules ? "" : FirewallService.HeadlessElevationTail,
                 rulesSummary = scan.RulesSummary,
                 profiles = scan.ProfilesSeen,
                 disabledRules = scan.DisabledRules,
@@ -2010,6 +2017,17 @@ public sealed class WebApp : IDisposable
         => $"\"{name}\" is the allow rule that lets your browser reach this console — " +
            "removing it from here would instantly cut off this page (it looks like a crash). " +
            "To remove web access, use the desktop app or run uninstall-web-service.ps1 on the server.";
+
+    /// <summary>
+    /// Why a write cannot be attempted from here, with the fix already written out for
+    /// this host. The old wording named the fix — run as Administrator, or as SYSTEM —
+    /// without saying how to get there from a browser, which is the only place this
+    /// message is ever read.
+    /// </summary>
+    private static string CannotWriteText(string action)
+        => $"Cannot {action}: this console is not running elevated, and nothing typed in a browser " +
+           "can supply an elevated token — UAC would have to be approved on the server itself." +
+           $"\n\n{FirewallService.HeadlessElevationHelp()}";
 
     /// <summary>
     /// Why a Firewall Config rule cannot be written from this console, or null when
@@ -2249,6 +2267,8 @@ public sealed class WebApp : IDisposable
     --sev-high: #fa7340;
     --sev-critical: #f24059;
     --success: #4dd18c;
+    --danger-grad: linear-gradient(90deg, #ff5d78, #fa7340);
+    --accent-grad: linear-gradient(135deg, #3bc8b4, #4a9eff);
     --font: "Segoe UI", system-ui, -apple-system, sans-serif;
     --mono: ui-monospace, "Cascadia Code", "SF Mono", Menlo, monospace;
   }
@@ -2290,11 +2310,23 @@ public sealed class WebApp : IDisposable
   nav { display: flex; flex-direction: column; overflow-y: auto; min-height: 0; }
   .nav-cap { font-size: .62rem; font-weight: 700; letter-spacing: .09em; color: var(--muted); margin: 0 0 8px 8px; }
   nav button {
-    appearance: none; display: block; width: 100%; text-align: left;
-    background: transparent; border: 1px solid transparent; border-radius: 10px;
+    appearance: none; display: flex; align-items: center; gap: 12px;
+    width: 100%; text-align: left;
+    background: transparent; border: 1px solid transparent; border-radius: 12px;
     color: var(--text2); font: inherit; font-size: .84rem; font-weight: 600;
     padding: 11px 14px; margin: 3px 0; cursor: pointer; transition: .15s ease;
   }
+  /* The selection bar the desktop rail draws: a 4x18 cyan rounded block in a well
+     to the left of the label, transparent until the entry is current. Not the
+     ring-and-dot the Linux console uses — that build's rail is a stock RadioButton,
+     where this one is a custom template, and the console should match the desktop
+     it ships beside rather than the other product's. */
+  nav button::before {
+    content: ''; flex: none; width: 4px; height: 18px; border-radius: 2px;
+    background: transparent; transition: .15s ease;
+  }
+  nav button:hover::before { background: rgba(255,255,255,.18); }
+  nav button.active::before { background: var(--cyan); }
   nav button:hover { background: rgba(255,255,255,.05); color: var(--text); }
   nav button.active { background: rgba(74,158,255,.15); color: var(--text); }
   /* Submenu entry: indented under its parent and a shade quieter, so the rail
@@ -2337,25 +2369,33 @@ public sealed class WebApp : IDisposable
   .hero h1 { margin: 2px 0 0; font-size: 1.4rem; font-weight: 700; }
   .hero .lead { color: var(--text2); font-size: .8rem; margin: 4px 0 10px; }
   .actions { display: flex; flex-wrap: wrap; gap: 8px; }
-  .actions button, .row-actions button, .toolbar button {
-    appearance: none; border: 1px solid var(--stroke); background: var(--bg-card);
-    color: var(--text2); border-radius: 8px; padding: 7px 12px; cursor: pointer;
-    font: inherit; font-size: .82rem; transition: .15s ease;
+  .actions button, .toolbar button, .panel-head button {
+    appearance: none; border: 1px solid var(--stroke); background: rgba(255,255,255,.10);
+    color: var(--text); border-radius: 12px; padding: 8px 12px; cursor: pointer;
+    font: inherit; font-size: .82rem; font-weight: 600; transition: .15s ease;
   }
-  .actions button:hover, .row-actions button:hover, .toolbar button:hover {
+  /* Row buttons are the desktop's mini-ghost / mini-danger: smaller, 10px radius,
+     and a shared minimum width so an Edit and a Delete line up down the column. */
+  .row-actions button {
+    appearance: none; border: 1px solid var(--stroke); background: rgba(255,255,255,.10);
+    color: var(--text); border-radius: 10px; padding: 6px 10px; min-width: 72px;
+    cursor: pointer; font: inherit; font-size: .78rem; transition: .15s ease;
+  }
+  .actions button:hover, .row-actions button:hover, .toolbar button:hover,
+  .panel-head button:hover {
     background: var(--bg-hover); color: var(--text); border-color: var(--stroke-strong);
   }
   .actions button.primary {
-    color: var(--bg-deep); font-weight: 600;
-    background: linear-gradient(135deg, var(--cyan), var(--blue));
+    color: var(--bg-deep); font-weight: 700;
+    background: var(--accent-grad);
     border: none;
   }
   .actions button.danger { border-color: rgba(255,93,120,.4); color: #ffa8b6; }
   /* Same emphasis inside a toolbar — the Firewall Config editor's save button is
      the one press that writes a firewall rule, so it should not look like Cancel. */
   .toolbar button.primary {
-    color: var(--bg-deep); font-weight: 600;
-    background: linear-gradient(135deg, var(--cyan), var(--blue));
+    color: var(--bg-deep); font-weight: 700;
+    background: var(--accent-grad);
     border: none;
   }
   /* Wake reads as the one thing worth pressing while the console is asleep. */
@@ -2395,14 +2435,54 @@ public sealed class WebApp : IDisposable
   }
   .status.err { border-color: rgba(255,93,120,.45); color: #ffa8b6; }
   .status.good { border-color: rgba(77,209,140,.4); color: #a6e6c4; }
+  /* Firewall Config's read-only notice. Amber, not red: the page is working, it
+     just cannot write, and the commands that fix it are right there. */
+  .elev-banner {
+    margin: 0 0 14px; padding: 12px 16px; border-radius: 10px;
+    background: rgba(245,185,59,.08); border: 1px solid rgba(245,185,59,.45);
+    color: #f6d089; font-size: .85rem;
+  }
+  .elev-banner strong {
+    display: block; color: var(--amber); letter-spacing: .04em;
+    text-transform: uppercase; font-size: .74rem; margin-bottom: 6px;
+  }
+  .elev-banner p { margin: 0 0 8px; }
+  .elev-banner pre {
+    margin: 0 0 8px; padding: 10px 12px; border-radius: 8px; overflow-x: auto;
+    background: rgba(0,0,0,.28); color: var(--text2);
+    font-family: var(--mono); font-size: .78rem;
+    white-space: pre; user-select: all;
+  }
+  .elev-banner .tail { margin: 0; opacity: .85; }
   .cards {
     display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
     gap: 10px; margin-bottom: 16px;
   }
   .card {
     background: var(--bg-card); border: 1px solid var(--stroke);
-    border-radius: 12px; padding: 14px 16px;
+    border-radius: 18px; padding: 14px 16px;
   }
+
+  /* A titled card holding a table, matching the desktop's Border.Card (18px
+     radius, 18px padding) and its header: name, a line of context under it, and
+     the action for that section pinned to the right of the same row. */
+  .panel {
+    background: var(--bg-card); border: 1px solid var(--stroke);
+    border-radius: 18px; padding: 18px; margin-bottom: 14px;
+  }
+  .panel-head {
+    display: flex; align-items: flex-start; gap: 12px; margin-bottom: 12px;
+  }
+  .panel-head .grow { flex: 1; min-width: 0; }
+  .panel-head button { flex: none; }
+  .panel-head h3 { margin: 0; font-size: .95rem; font-weight: 700; color: var(--text); }
+  .panel-sub { margin: 3px 0 0; color: var(--text2); font-size: .8rem; line-height: 1.45; }
+  .panel-sub.thin { color: var(--muted); }
+  /* Inside a panel the table is the card's contents, not its own object — the
+     desktop DataGrid is transparent over the card for the same reason. */
+  .panel table { background: transparent; border: none; border-radius: 0; }
+  .panel td.row-actions { background: var(--bg-card); }
+  .panel th { background: #222631; }
   .card .label { color: var(--muted); font-size: .75rem; text-transform: uppercase; letter-spacing: .06em; }
   .card .value { font-size: 1.55rem; font-weight: 650; margin-top: 4px; font-variant-numeric: tabular-nums; }
   .card .value.cyan { color: var(--cyan); }
@@ -2413,8 +2493,8 @@ public sealed class WebApp : IDisposable
     margin-bottom: 12px;
   }
   .toolbar input, .toolbar select, .modal input {
-    background: var(--bg-deep); border: 1px solid var(--stroke); color: var(--text);
-    border-radius: 8px; padding: 8px 12px; font: inherit; font-size: .88rem;
+    background: rgba(255,255,255,.05); border: 1px solid var(--stroke); color: var(--text);
+    border-radius: 12px; padding: 10px 12px; font: inherit; font-size: .88rem;
     min-width: 180px;
   }
   .toolbar input:focus, .modal input:focus { outline: 1px solid var(--blue); }
@@ -2423,13 +2503,16 @@ public sealed class WebApp : IDisposable
     background: var(--bg-panel); border: 1px solid var(--stroke); border-radius: 12px;
     overflow: hidden;
   }
-  th, td { text-align: left; padding: 9px 12px; border-bottom: 1px solid var(--stroke); vertical-align: top; }
+  th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid rgba(255,255,255,.08); vertical-align: top; }
+  /* Sentence case and the DataGridColumnHeader weight, not the old uppercase
+     letter-spaced caption. The fill is an opaque colour rather than a translucent
+     tint: header cells are sticky to the top of a scrolling table and, for the last
+     one, to the right edge, so rows would read straight through a tint. */
   th {
-    color: var(--muted); font-weight: 600; font-size: .72rem;
-    text-transform: uppercase; letter-spacing: .05em; background: #12161f;
+    color: var(--text2); font-weight: 600; font-size: .78rem;
+    background: #1c2027;
     position: sticky; top: 0;
   }
-  tbody tr:nth-child(even) td { background: rgba(255,255,255,.02); }
   tr:hover td { background: rgba(24,36,63,.55); }
   tr:last-child td { border-bottom: none; }
   [data-scroll] { scrollbar-width: thin; scrollbar-color: rgba(124,249,255,.25) transparent; }
@@ -2440,13 +2523,13 @@ public sealed class WebApp : IDisposable
   /* Keep the actions column visible when wide tables scroll horizontally. */
   td.row-actions {
     position: sticky; right: 0; background: var(--bg-panel);
-    white-space: nowrap; box-shadow: -10px 0 12px -10px rgba(0,0,0,.7);
+    text-align: right; white-space: nowrap;
+    box-shadow: -10px 0 12px -10px rgba(0,0,0,.7);
   }
   table:has(td.row-actions) th:last-child {
     position: sticky; right: 0; z-index: 2;
     box-shadow: -10px 0 12px -10px rgba(0,0,0,.7);
   }
-  tbody tr:nth-child(even) td.row-actions { background: #141922; }
   tr:hover td.row-actions { background: var(--bg-hover); }
   /* IPs, ports, and timestamps must never break mid-value — wide tables
      scroll horizontally instead (the actions column stays pinned). */
@@ -2506,16 +2589,16 @@ public sealed class WebApp : IDisposable
     background: rgba(74,158,255,.16); color: #a8cfff; border: 1px solid rgba(74,158,255,.25);
   }
   .row-actions button.rm, .toolbar button.rm, button.rm-lg {
-    border-color: rgba(255,93,120,.4); color: #ffa8b6;
+    background: var(--danger-grad); border: none; color: #fff; font-weight: 600;
   }
   .row-actions button.rm:hover, .toolbar button.rm:hover, button.rm-lg:hover {
-    background: rgba(255,93,120,.12); border-color: rgba(255,93,120,.65); color: #ffd0d8;
+    background: var(--danger-grad); color: #fff; filter: brightness(1.12);
   }
   .row-actions button:disabled { opacity: .55; cursor: wait; }
   button.rm-lg {
-    appearance: none; font: inherit; font-size: .85rem; cursor: pointer;
-    padding: 8px 14px; border-radius: 8px; background: var(--bg-card);
-    border: 1px solid rgba(255,93,120,.4); transition: .15s ease; flex-shrink: 0;
+    appearance: none; font: inherit; font-size: .85rem; font-weight: 600; cursor: pointer;
+    padding: 8px 14px; border-radius: 12px; background: var(--danger-grad);
+    border: none; color: #fff; transition: .15s ease; flex-shrink: 0;
   }
   .setting-row {
     display: flex; align-items: center; justify-content: space-between; gap: 16px;
@@ -2876,15 +2959,28 @@ public sealed class WebApp : IDisposable
 
   <section id="tab-fwconfig" class="hidden">
     <div class="toolbar">
-      <button id="btnAddInbound">Add an Inbound Rule</button>
-      <button id="btnAddOutbound">Add an Outbound Rule</button>
       <button id="btnRefreshFwCfg">Rescan the host firewall</button>
+    </div>
+    <!-- Shown only when a write cannot land. The console reads the whole ruleset
+         without elevation and can still have no way to change any of it, and until
+         now nothing said so until Save had already failed. -->
+    <div id="fwCfgElevation" class="elev-banner hidden">
+      <strong>Read-only — rules cannot be changed from here</strong>
+      <p id="fwCfgElevationLead"></p>
+      <pre id="fwCfgElevationCmds"></pre>
+      <p class="tail" id="fwCfgElevationTail"></p>
     </div>
     <!-- Summary, then listeners, then policy — the same three lines in the same
          order as the desktop page's header card. -->
-    <p class="muted" id="fwCfgSummary" style="margin:0 0 6px;font-size:.85rem"></p>
-    <p class="muted" id="fwCfgListeners" style="margin:0 0 6px;font-size:.85rem"></p>
-    <p class="muted" id="fwCfgPolicy" style="margin:0 0 10px;font-size:.85rem"></p>
+    <div class="panel">
+      <div class="panel-head">
+        <div class="grow">
+          <h3>Host firewall</h3>
+          <p class="panel-sub" id="fwCfgSummary"></p>
+          <p class="panel-sub thin" id="fwCfgPolicy"></p>
+        </div>
+      </div>
+    </div>
 
     <div id="ruleEditor" class="settings-group hidden" style="margin-bottom:14px">
       <h3 id="ruleEditorTitle" style="margin:0 0 4px;font-size:.95rem">Add an Inbound Rule</h3>
@@ -2912,15 +3008,38 @@ public sealed class WebApp : IDisposable
       </div>
     </div>
 
-    <h3 style="margin:14px 0 8px;font-size:.95rem;color:var(--text2)">Inbound rules <span class="muted" id="inboundCount"></span></h3>
-    <div id="tbl-fwconfig-in"></div>
-    <h3 style="margin:18px 0 8px;font-size:.95rem;color:var(--text2)">Outbound rules <span class="muted" id="outboundCount"></span></h3>
-    <div id="tbl-fwconfig-out"></div>
+    <div class="panel">
+      <div class="panel-head">
+        <div class="grow">
+          <h3>Inbound rules</h3>
+          <p class="panel-sub" id="inboundCount"></p>
+        </div>
+        <button id="btnAddInbound">Add an Inbound Rule</button>
+      </div>
+      <div id="tbl-fwconfig-in"></div>
+    </div>
+    <div class="panel">
+      <div class="panel-head">
+        <div class="grow">
+          <h3>Outbound rules</h3>
+          <p class="panel-sub" id="outboundCount"></p>
+        </div>
+        <button id="btnAddOutbound">Add an Outbound Rule</button>
+      </div>
+      <div id="tbl-fwconfig-out"></div>
+    </div>
     <!-- A rule list alone does not answer "is this port actually reachable" —
          the listeners and the rules above them together do. -->
-    <h3 style="margin:18px 0 8px;font-size:.95rem;color:var(--text2)">Listening services <span class="muted" id="listenerCount"></span></h3>
-    <p class="muted" id="listenHint" style="margin:0 0 10px;font-size:.85rem"></p>
-    <div id="tbl-fwconfig-listeners"></div>
+    <div class="panel">
+      <div class="panel-head">
+        <div class="grow">
+          <h3>Listening services</h3>
+          <p class="panel-sub" id="fwCfgListeners"></p>
+          <p class="panel-sub thin" id="listenHint"></p>
+        </div>
+      </div>
+      <div id="tbl-fwconfig-listeners"></div>
+    </div>
   </section>
 
   <section id="tab-allowlist" class="hidden">
@@ -3481,7 +3600,6 @@ public sealed class WebApp : IDisposable
     $('fwCfgPolicy').textContent = '';
     $('inboundCount').textContent = '';
     $('outboundCount').textContent = '';
-    $('listenerCount').textContent = '';
     $('listenHint').textContent = '';
     const cell = `<div class="empty${isError ? ' blocked' : ''}">${esc(message)}</div>`;
     $('tbl-fwconfig-in').innerHTML = cell;
@@ -3543,9 +3661,27 @@ public sealed class WebApp : IDisposable
       ? 'No listening sockets were readable.'
       : `${listeners.length} listening socket${listeners.length === 1 ? '' : 's'} · ` +
         `${openCount} reachable from anywhere`;
-    $('inboundCount').textContent = `(${inbound.length})`;
-    $('outboundCount').textContent = `(${outbound.length})`;
-    $('listenerCount').textContent = `(${listeners.length})`;
+    const plural = (n, one) => `${n} ${one}${n === 1 ? '' : 's'}`;
+    $('inboundCount').textContent = plural(inbound.length, 'inbound rule');
+    $('outboundCount').textContent = plural(outbound.length, 'outbound rule');
+
+    // A host this console can read but not write. Say so once at the top, and stop
+    // offering buttons whose only outcome is the same failure — an editor that
+    // accepts a rule and refuses it at Save is worse than no editor at all.
+    const readOnly = fw.canWriteRules === false;
+    const noWriteTitle = 'This console is not running elevated, so it cannot change firewall rules.';
+    const banner = $('fwCfgElevation');
+    banner.classList.toggle('hidden', !readOnly);
+    if (readOnly) {
+      $('fwCfgElevationLead').textContent = fw.elevationLead || '';
+      $('fwCfgElevationCmds').textContent = fw.elevationCommands || '';
+      $('fwCfgElevationTail').textContent = fw.elevationTail || '';
+    }
+    for (const id of ['btnAddInbound', 'btnAddOutbound']) {
+      const b = $(id);
+      b.disabled = readOnly;
+      b.title = readOnly ? noWriteTitle : '';
+    }
 
     const rows = (list, addrHeader) => table(
       ['Label', 'Action', 'Protocol', 'Port range', addrHeader, 'Created by', 'Program', 'Copies', ''],
@@ -3563,8 +3699,11 @@ public sealed class WebApp : IDisposable
         <td class="muted">${r.copies > 1 ? '×' + esc(r.copies) : ''}</td>
         <td class="row-actions">${r.isProtected
           ? '<span class="muted" title="The allow rule that lets your browser reach this console">console</span>'
-          : `<button data-editrule="${esc(r.key)}">Edit</button> ` +
-            `<button data-delrule="${esc(r.key)}">Delete</button>`}</td>
+          : readOnly
+            ? `<button disabled title="${esc(noWriteTitle)}">Edit</button> ` +
+              `<button class="rm" disabled title="${esc(noWriteTitle)}">Delete</button>`
+            : `<button data-editrule="${esc(r.key)}">Edit</button> ` +
+              `<button class="rm" data-delrule="${esc(r.key)}">Delete</button>`}</td>
       </tr>`).join('')
     );
 
@@ -3575,9 +3714,10 @@ public sealed class WebApp : IDisposable
     // them. Without this you read `netstat -ano` in a terminal and retype the port,
     // which is how ports and bind addresses go missing from the rule set.
     // Same two lines the GUI's Listening services card carries, in the same order:
-    // the count and reachability, then what the table is.
+    // the count and reachability, then what the table is. The first is now the card's
+    // own subtitle (fwCfgListeners, set above), so this says only what the table is —
+    // folding them together read as one long sentence.
     $('listenHint').textContent =
-      ($('fwCfgListeners').textContent ? $('fwCfgListeners').textContent + ' — ' : '') +
       'The same set “netstat -ano” prints, with what the inbound rules above do to each one. ' +
       '“New rule” fills the form above in with that socket\'s protocol and port.';
     $('tbl-fwconfig-listeners').innerHTML = table(

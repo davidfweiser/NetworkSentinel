@@ -183,6 +183,32 @@ public sealed class AppSettings
     /// </summary>
     public string AcmeAccountEmail { get; set; } = "";
 
+    /// <summary>
+    /// Multiplier the desktop window's content is drawn at, on top of whatever Windows
+    /// is already scaling by. Read through <see cref="GetUiScale"/>, which clamps — a
+    /// hand-edited 12 here would draw one stat tile across the screen with no way back
+    /// to the setting that did it.
+    ///
+    /// Defaults to 1.0, unlike the Linux build's 1.75. That number exists because a
+    /// desktop session which does not scale leaves Avalonia rendering 9px labels on a
+    /// 4K panel; app.manifest declares PerMonitorV2, so WPF is told the monitor's scale
+    /// factor and has already applied it. This multiplies whatever Windows chose, so a
+    /// default above 1.0 would compound with it — 175% here on a 150% display renders
+    /// at ~260%. It is a preference knob, not a fix for an unreadable window.
+    /// GUI only: the TUI is sized by the terminal and the web console by the browser.
+    /// </summary>
+    public double UiScale { get; set; } = DefaultUiScale;
+
+    /// <summary>Windows already scales by monitor DPI, so the default adds nothing to it.</summary>
+    public const double DefaultUiScale = 1.0;
+
+    public const double MinUiScale = 1.0;
+    public const double MaxUiScale = 2.5;
+
+    /// <summary>UiScale, clamped, with a non-finite or out-of-range value falling back to the default.</summary>
+    public double GetUiScale()
+        => double.IsFinite(UiScale) ? Math.Clamp(UiScale, MinUiScale, MaxUiScale) : DefaultUiScale;
+
     /// <summary>POST alerts to this webhook URL (ntfy / Slack / Discord / generic JSON). Empty = off.</summary>
     public string WebhookUrl { get; set; } = "";
 
