@@ -10,6 +10,25 @@ using NetworkSentinel.Models;
 namespace NetworkSentinel.Services;
 
 /// <summary>
+/// Which front-end is driving <see cref="FirewallService"/>. The only thing it decides
+/// is what can be said about a missing privilege: a desktop session or a terminal can
+/// relaunch through UAC and have someone there to approve it, and the web console can
+/// do neither — the operator is in a browser, and a consent dialog raised on the server
+/// would appear on a desktop nobody is sitting at.
+/// </summary>
+public enum FirewallUiSurface
+{
+    /// <summary>The WPF GUI — UAC can prompt on this desktop.</summary>
+    Desktop,
+
+    /// <summary>The TUI on a console — UAC can prompt on the session it was launched from.</summary>
+    Terminal,
+
+    /// <summary>The headless web console — nothing can prompt.</summary>
+    Web
+}
+
+/// <summary>
 /// Manages Windows Defender Firewall rules owned by Network Sentinel.
 /// Requires administrator privileges to add/remove rules.
 /// </summary>
@@ -53,17 +72,94 @@ public sealed class FirewallService
     /// <summary>Windows has no separate root; true when elevated (matches Linux API for TUI/Web).</summary>
     public bool IsRoot => IsAdministrator;
 
+    /// <summary>
+    /// Which front-end is running. Set once at startup by <c>Program</c>; the default
+    /// suits the GUI, which is the one process that does not set it.
+    /// </summary>
+    public static FirewallUiSurface Surface { get; set; } = FirewallUiSurface.Desktop;
+
+    /// <summary>
+    /// True when a rule written now would actually reach the firewall.
+    ///
+    /// On Windows this is exactly <see cref="IsAdministrator"/>: netsh either has the
+    /// elevated token or it does not, and there is no in-process way to acquire one.
+    /// It exists as its own name because the front-ends ask this question rather than
+    /// "am I an administrator", and because the Linux build's answer is genuinely a
+    /// different one — there, elevation helpers can be installed but unable to prompt.
+    /// Keeping the name identical is what lets the shared web and TUI code port across.
+    /// </summary>
+    public bool CanApplyRules => IsAdministrator;
+
     public string PrivilegeText => IsAdministrator
         ? "Running as Administrator — firewall rules can be applied."
-        : "Not elevated — use “Run as Admin” / authorize (UAC) to add or remove firewall rules.";
+        : Surface == FirewallUiSurface.Web
+            ? "Not elevated, so the console cannot write rules: a UAC prompt would have to be approved " +
+              "on the server, not in this browser. " + HeadlessElevationHelp(asBlock: false)
+            : "Not elevated — use “Run as Admin” / authorize (UAC) to add or remove firewall rules.";
+
+    /// <summary>
+    /// What to do about a console that cannot write, as commands to run rather than a
+    /// section to go and find. <paramref name="asBlock"/> keeps the newlines for a
+    /// preformatted block; the flowed form is for a one-line status.
+    /// </summary>
+    public static string HeadlessElevationHelp(bool asBlock = true)
+        => asBlock
+            ? $"{HeadlessElevationLead}\n\n{ElevationInstallCommands()}\n\n{HeadlessElevationTail}"
+            : $"{HeadlessElevationLead} {ElevationInstallCommands().Replace("\n", "  ")} {HeadlessElevationTail}";
+
+    /// <summary>
+    /// The commands on their own, so a front-end that can lay out a code block does not
+    /// have to pick them back out of the prose. Re-registering the scheduled task is the
+    /// supported fix: it runs as SYSTEM at boot, which is elevated without anyone
+    /// approving anything. Starting the console by hand from an elevated prompt is the
+    /// same privilege without the persistence, so it is offered second.
+    /// </summary>
+    public static string ElevationInstallCommands()
+    {
+        var exe = ProcessImagePath() ?? "NetworkSentinel.exe";
+        return "powershell -ExecutionPolicy Bypass -File scripts\\install-web-service.ps1\n" +
+               "schtasks /Run /TN \"NetworkSentinel-Web\"\n" +
+               $"# or, from an elevated prompt:  \"{exe}\" -w";
+    }
+
+    /// <summary>Full path of the running image, so the pasted line points at this install.</summary>
+    private static string? ProcessImagePath()
+    {
+        try
+        {
+            return Environment.ProcessPath;
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    public const string HeadlessElevationLead =
+        "Run the console with an elevated token. The installed scheduled task already does — " +
+        "it runs as SYSTEM at boot — so registering and starting it is the fix:";
+
+    public const string HeadlessElevationTail =
+        "Then use Rescan to re-check — see “Headless web console” in the README.";
 
     /// <summary>
     /// TUI/Web “Authorize” action. On Windows this relaunches the process elevated (UAC).
+    ///
+    /// Except from the web console, where relaunching is the wrong move twice over: the
+    /// consent dialog would be raised on the server's desktop with nobody at it, and a
+    /// success would tear down the very process serving the page that asked. There it
+    /// reports what has to be done on the host instead.
     /// </summary>
     public FirewallOperationResult AuthorizeElevation()
     {
         if (IsAdministrator)
             return FirewallOperationResult.Ok("Already running as Administrator. Firewall rules can be applied.");
+
+        if (Surface == FirewallUiSurface.Web)
+            return FirewallOperationResult.Fail(
+                "The web console cannot elevate itself: approving UAC would mean sitting at the server, " +
+                "and restarting this process would drop the connection serving this page.\n\n" +
+                HeadlessElevationHelp());
 
         try
         {

@@ -1,6 +1,7 @@
 using System.IO;
 using System.Runtime.InteropServices;
 using System.Windows;
+using NetworkSentinel.Services;
 using NetworkSentinel.Tui;
 using NetworkSentinel.Web;
 
@@ -98,6 +99,10 @@ internal static class Program
 
     private static void RunTui()
     {
+        // Decides what can be said about a missing privilege: UAC can be approved from
+        // the session that launched a TUI or the GUI, and from nowhere at all under the
+        // web console.
+        FirewallService.Surface = FirewallUiSurface.Terminal;
         try
         {
             using var app = new TuiApp();
@@ -393,6 +398,7 @@ internal static class Program
 
     private static void RunWeb(int? port, WebTlsOptions? tls)
     {
+        FirewallService.Surface = FirewallUiSurface.Web;
         try
         {
             using var app = new WebApp(port, bindAll: true, tlsOverrides: tls);

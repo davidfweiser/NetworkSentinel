@@ -239,10 +239,16 @@ public sealed class HostFirewallScanner
             profileText += "The active profile blocks all inbound connections, including ones an allow " +
                            "rule would admit, so no inbound rule below is in force.  ";
 
-        return profileText + (_firewall.IsAdministrator
-            ? "Running as Administrator — rules can be written as well as read."
-            : "Reading the firewall needs no elevation, so this is the whole rule set; writing or " +
-              "deleting a rule needs “Run as Admin”.");
+        if (_firewall.IsAdministrator)
+            return profileText + "Running as Administrator — rules can be written as well as read.";
+
+        // The reads and the writes are two different questions, and “Run as Admin” only
+        // answers the second one on a surface that has a window to run. In a browser
+        // pointed at a service there is nothing to right-click.
+        return profileText + "Reading the firewall needs no elevation, so this is the whole rule set; " +
+            (FirewallService.Surface == FirewallUiSurface.Web
+                ? "writing or deleting a rule is not possible here until the console runs elevated."
+                : "writing or deleting a rule needs “Run as Admin”.");
     }
 
     // ── Profiles ─────────────────────────────────────────────────────────
