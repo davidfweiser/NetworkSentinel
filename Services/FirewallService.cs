@@ -505,9 +505,12 @@ public sealed class FirewallService
 
         UpsertLedger(rule);
 
-        return FirewallOperationResult.Ok(string.IsNullOrWhiteSpace(replaceName)
+        // Where the rule landed only needs saying when it is not where the operator
+        // will go looking for it — see OutsideUfwNote.
+        var where = viaUfw ? "" : OutsideUfwNote();
+        return FirewallOperationResult.Ok((string.IsNullOrWhiteSpace(replaceName)
             ? $"Added rule “{normalized.Label}”."
-            : $"Saved rule “{normalized.Label}”.");
+            : $"Saved rule “{normalized.Label}”.") + where);
     }
 
     /// <summary>
@@ -1144,6 +1147,20 @@ public sealed class FirewallService
     /// Installed-but-inactive does not count. Enabling UFW can lock an operator
     /// out of SSH, and that decision is never ours to make; with UFW off, the
     /// nftables path below is still the live firewall.
+    ///
+    /// The probe must answer without a password dialog — it runs on the write
+    /// path, and prompting twice for one rule is what
+    /// <see cref="RunPrivilegedBatch"/> exists to avoid. But `ufw status` needs
+    /// root: run as the desktop user it prints "You need to be root to run this
+    /// script" to stderr and exits 1, which the old probe read as "UFW is not
+    /// active". On the ordinary Ubuntu desktop — UFW enabled, no passwordless
+    /// sudo — that sent every rule into nftables while UFW owned the firewall.
+    /// The rule was applied and reported added, and was then absent from
+    /// `ufw status numbered`, which reads exactly like the write having failed.
+    ///
+    /// So a refused read falls back to <see cref="UfwEnabledFlag"/> rather than
+    /// to "inactive". That file is not a guess at UFW's state: it is the same
+    /// flag `ufw status` itself reports, and it is world-readable.
     /// </summary>
     internal static bool BackendIsUfw()
     {
@@ -1153,11 +1170,79 @@ public sealed class FirewallService
         if (CommandExists("ufw"))
         {
             var status = ReadCommand("ufw", "status");
-            active = status.Ok && status.StdOut.Contains("Status: active", StringComparison.OrdinalIgnoreCase);
+            active = status.Ok && status.StdOut.Trim().Length > 0
+                ? status.StdOut.Contains("Status: active", StringComparison.OrdinalIgnoreCase)
+                : UfwEnabledFlag() == true;
         }
 
         _ufwState = (active, DateTime.UtcNow);
         return active;
+    }
+
+    /// <summary>UFW's own configuration file, mode 0644 on Debian and its derivatives.</summary>
+    private const string UfwConfigFile = "/etc/ufw/ufw.conf";
+
+    private static readonly Regex UfwEnabledSetting = new(
+        @"^[ \t]*ENABLED[ \t]*=[ \t]*""?(?<value>[A-Za-z]+)""?[ \t\r]*$",
+        RegexOptions.Multiline | RegexOptions.IgnoreCase | RegexOptions.Compiled);
+
+    /// <summary>
+    /// UFW's enabled flag as ufw.conf holds it: true, false, or null when the file
+    /// is missing, unreadable or says nothing about it. Used only when `ufw status`
+    /// could not be run — where it can, its answer wins.
+    /// </summary>
+    private static bool? UfwEnabledFlag()
+    {
+        try
+        {
+            return File.Exists(UfwConfigFile) ? ParseUfwEnabledFlag(File.ReadAllText(UfwConfigFile)) : null;
+        }
+        catch (IOException) { return null; }
+        catch (UnauthorizedAccessException) { return null; }
+    }
+
+    /// <summary>
+    /// Reads ENABLED out of ufw.conf the way UFW's own loader does: shell-style
+    /// KEY=value, last assignment wins, commented-out lines ignored. Anything
+    /// other than yes/no is not an answer — ufw.conf is edited by hand often
+    /// enough that a typo must not be read as a decision either way.
+    /// </summary>
+    internal static bool? ParseUfwEnabledFlag(string? text)
+    {
+        if (string.IsNullOrEmpty(text)) return null;
+
+        bool? flag = null;
+        foreach (Match match in UfwEnabledSetting.Matches(text))
+        {
+            var value = match.Groups["value"].Value;
+            if (value.Equals("yes", StringComparison.OrdinalIgnoreCase)) flag = true;
+            else if (value.Equals("no", StringComparison.OrdinalIgnoreCase)) flag = false;
+        }
+        return flag;
+    }
+
+    /// <summary>
+    /// Said after a rule goes into nftables on a host that has UFW installed. The
+    /// rule is in force, but it is not UFW's, so `ufw status` will not list it —
+    /// and an operator who checks there sees nothing and concludes the write
+    /// failed. Which of the three reasons it was is worth saying: only one of them
+    /// is something they chose.
+    /// </summary>
+    private static string OutsideUfwNote()
+    {
+        if (!CommandExists("ufw")) return "";
+
+        return UfwEnabledFlag() switch
+        {
+            false => " UFW is installed but switched off, so the rule went into nftables — " +
+                     "“ufw status” will not list it.",
+            true => " UFW’s configuration says it is enabled but “ufw status” reported it inactive, " +
+                    "so the rule went into nftables — “ufw status” will not list it. " +
+                    "Run “sudo ufw status” to see which of the two is stale.",
+            null => " UFW is installed and its state could not be read, so the rule went into nftables — " +
+                    "“ufw status” will not list it. Grant this user passwordless sudo for ufw " +
+                    "(see “Firewall elevation on a headless server” in the README) to have UFW own the rules."
+        };
     }
 
     /// <summary>Forgets the cached UFW probe — called after a write, which can flip it.</summary>
