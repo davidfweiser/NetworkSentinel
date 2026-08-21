@@ -83,7 +83,10 @@
     <Setter Property="Foreground" Value="{DynamicResource TextSecondaryBrush}"/>
     <Setter Property="Background" Value="Transparent"/>
     <Setter Property="Padding" Value="14,12"/>
-    <Setter Property="FontSize" Value="13.5"/>
+    <!-- Half the old 13.5/12.5: the rail carried the same weight as the page
+         headings once the window scale went up, which made the navigation read
+         as the loudest thing on screen rather than the quietest. -->
+    <Setter Property="FontSize" Value="6.75"/>
     <Setter Property="FontWeight" Value="SemiBold"/>
     <Setter Property="Margin" Value="0,3"/>
   </Style>
@@ -97,7 +100,7 @@
        so the sidebar reads as a hierarchy rather than a longer flat list. -->
   <Style Selector="RadioButton.nav.sub">
     <Setter Property="Padding" Value="30,9"/>
-    <Setter Property="FontSize" Value="12.5"/>
+    <Setter Property="FontSize" Value="6.25"/>
     <Setter Property="FontWeight" Value="Normal"/>
     <Setter Property="Margin" Value="0,0,0,3"/>
   </Style>

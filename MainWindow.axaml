@@ -5,8 +5,8 @@
         x:Class="NetworkSentinel.MainWindow"
         Title="{Binding WindowTitle}"
         Icon="/Assets/icon.png"
-        Width="1320" Height="860"
-        MinWidth="980" MinHeight="720"
+        Width="2000" Height="1300"
+        MinWidth="1100" MinHeight="760"
         WindowStartupLocation="CenterScreen"
         Background="{DynamicResource BgDeepBrush}"
         FontFamily="{DynamicResource AppFont}"
@@ -15,6 +15,22 @@
   <Window.DataContext>
     <vm:MainViewModel/>
   </Window.DataContext>
+
+  <!-- UI scale. Every font size in this file is an absolute device-independent
+       pixel, so on a 4K panel the desktop session does not scale, the window opens
+       2000px wide and an 11px label is genuinely unreadable. Scaling here rather
+       than doubling 194 FontSize literals: the literals are only half the problem —
+       the column widths, paddings and the icon well are all fixed too, so text
+       alone would grow into a clipped layout rather than a bigger one.
+
+       LayoutTransformControl scales during layout, not just at paint, so children
+       measure against the scaled size and wrapping, trimming and scrolling all stay
+       correct. Change the ScaleTransform to taste: 1.0 is the original sizing, 1.5 is
+       a middle setting; the value is a plain multiplier on every dimension. -->
+  <LayoutTransformControl>
+    <LayoutTransformControl.LayoutTransform>
+      <ScaleTransform ScaleX="1.75" ScaleY="1.75"/>
+    </LayoutTransformControl.LayoutTransform>
 
   <Grid Margin="18">
     <Grid.ColumnDefinitions>
@@ -68,6 +84,7 @@
           </Border>
         </StackPanel>
 
+        <ScrollViewer HorizontalScrollBarVisibility="Disabled" VerticalScrollBarVisibility="Auto">
         <StackPanel>
           <TextBlock Text="NAVIGATION" FontSize="10" FontWeight="Bold"
                      Foreground="{DynamicResource TextMutedBrush}" Margin="8,0,0,8"/>
@@ -97,6 +114,7 @@
                        IsChecked="{Binding ShowSettings, Mode=OneWay}"
                        Command="{Binding NavigateCommand}" CommandParameter="Settings"/>
         </StackPanel>
+        </ScrollViewer>
       </DockPanel>
     </Border>
 
@@ -135,7 +153,7 @@
           <Grid ColumnDefinitions="*,*,*,*,*" Margin="0,0,0,14">
             <Border Classes="stat" Margin="0,0,8,0">
               <StackPanel>
-                <TextBlock Text="LISTENING PORTS" FontSize="9" FontWeight="Bold" Foreground="{DynamicResource TextMutedBrush}"/>
+                <TextBlock Text="LISTENING PORTS" FontSize="9" FontWeight="Bold" Foreground="{DynamicResource TextMutedBrush}" TextTrimming="CharacterEllipsis"/>
                 <TextBlock Text="{Binding Stats.ListeningPorts}" FontSize="26" FontWeight="Bold" Margin="0,4,0,0"
                            Foreground="{DynamicResource SuccessBrush}"/>
                 <TextBlock Text="TCP + UDP open" Foreground="{DynamicResource TextSecondaryBrush}" FontSize="10"/>
@@ -143,7 +161,7 @@
             </Border>
             <Border Classes="stat" Grid.Column="1" Margin="0,0,8,0">
               <StackPanel>
-                <TextBlock Text="ACTIVE SESSIONS" FontSize="9" FontWeight="Bold" Foreground="{DynamicResource TextMutedBrush}"/>
+                <TextBlock Text="ACTIVE SESSIONS" FontSize="9" FontWeight="Bold" Foreground="{DynamicResource TextMutedBrush}" TextTrimming="CharacterEllipsis"/>
                 <TextBlock Text="{Binding Stats.ActiveConnections}" FontSize="26" FontWeight="Bold" Margin="0,4,0,0"
                            Foreground="{DynamicResource AccentBlueBrush}"/>
                 <TextBlock Text="TCP connections" Foreground="{DynamicResource TextSecondaryBrush}" FontSize="10"/>
@@ -151,7 +169,7 @@
             </Border>
             <Border Classes="stat" Grid.Column="2" Margin="0,0,8,0">
               <StackPanel>
-                <TextBlock Text="REMOTE COMPUTERS" FontSize="9" FontWeight="Bold" Foreground="{DynamicResource TextMutedBrush}"/>
+                <TextBlock Text="REMOTE COMPUTERS" FontSize="9" FontWeight="Bold" Foreground="{DynamicResource TextMutedBrush}" TextTrimming="CharacterEllipsis"/>
                 <TextBlock Text="{Binding Stats.RemoteHosts}" FontSize="26" FontWeight="Bold" Margin="0,4,0,0"
                            Foreground="{DynamicResource AccentCyanBrush}"/>
                 <TextBlock Text="Peers tracked" Foreground="{DynamicResource TextSecondaryBrush}" FontSize="10"/>
@@ -159,7 +177,7 @@
             </Border>
             <Border Classes="stat" Grid.Column="3" Margin="0,0,8,0">
               <StackPanel>
-                <TextBlock Text="THREAT EVENTS" FontSize="9" FontWeight="Bold" Foreground="{DynamicResource TextMutedBrush}"/>
+                <TextBlock Text="THREAT EVENTS" FontSize="9" FontWeight="Bold" Foreground="{DynamicResource TextMutedBrush}" TextTrimming="CharacterEllipsis"/>
                 <TextBlock Text="{Binding Stats.ThreatsToday}" FontSize="26" FontWeight="Bold" Margin="0,4,0,0"
                            Foreground="{DynamicResource AccentAmberBrush}"/>
                 <TextBlock Text="Heuristic alerts" Foreground="{DynamicResource TextSecondaryBrush}" FontSize="10"/>
@@ -167,7 +185,7 @@
             </Border>
             <Border Classes="stat" Grid.Column="4">
               <StackPanel>
-                <TextBlock Text="HIGH / CRITICAL" FontSize="9" FontWeight="Bold" Foreground="{DynamicResource TextMutedBrush}"/>
+                <TextBlock Text="HIGH / CRITICAL" FontSize="9" FontWeight="Bold" Foreground="{DynamicResource TextMutedBrush}" TextTrimming="CharacterEllipsis"/>
                 <TextBlock Text="{Binding Stats.HighThreats}" FontSize="26" FontWeight="Bold" Margin="0,4,0,0"
                            Foreground="{DynamicResource DangerBrush}"/>
                 <TextBlock Text="Needs attention" Foreground="{DynamicResource TextSecondaryBrush}" FontSize="10"/>
@@ -1287,4 +1305,5 @@
       </Grid>
     </Grid>
   </Grid>
+  </LayoutTransformControl>
 </Window>
