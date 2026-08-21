@@ -13,7 +13,7 @@
     <RootNamespace>NetworkSentinel</RootNamespace>
     <Product>Network Sentinel</Product>
     <Description>Linux-native network port monitor and intrusion awareness console</Description>
-    <Version>0.7.12</Version>
+    <Version>0.7.13</Version>
     <!-- The test project lives in a subfolder; keep it out of the app's implicit compile glob. -->
     <DefaultItemExcludes>$(DefaultItemExcludes);Tests/**</DefaultItemExcludes>
   </PropertyGroup>

@@ -12,7 +12,7 @@ Three ways to run it:
 
 > **Host-based** intrusion detection and prevention. It detects on its own heuristics and, with Suricata attached (0.6.0), on signature/payload inspection — then enforces in the kernel via `nftables`. It is not an inline network appliance: it protects the machine it runs on, not a segment, and it does not sit in the forwarding path.
 
-Linux port of the original Windows WPF Network Sentinel. Platform layers use `/proc/net`, `ss`, conntrack netlink, `nftables`/`iptables` (elevated via **pkexec**), and XDG data paths. Version **0.7.12**.
+Linux port of the original Windows WPF Network Sentinel. Platform layers use `/proc/net`, `ss`, conntrack netlink, `nftables`/`iptables` (elevated via **pkexec**), and XDG data paths. Version **0.7.13**.
 
 ---
 
@@ -427,7 +427,7 @@ The token is stored in `~/.local/share/NetworkSentinel/duckdns.json` with mode `
 - For **dev / `dotnet run`**: [.NET 8 SDK](https://dotnet.microsoft.com/download)
 - For **server package**: nothing on the target — self-contained binary (no .NET install)
 - Desktop libraries for Avalonia GUI (usual X11/Wayland desktop)
-- **UI scale (0.7.12).** Every size in the GUI is an absolute device-independent pixel, so on a 4K panel whose session does not scale, the window opened ~2000px wide with 11px labels. The window content is now drawn through a `LayoutTransformControl` at **1.75×**. It scales during layout rather than at paint, so wrapping, trimming and the table columns all stay correct. To change it, edit the `ScaleTransform` at the top of `MainWindow.axaml` — `1.0` is the pre-0.7.12 sizing, `1.5` a middle setting
+- **Text size (0.7.12, a setting in 0.7.13).** Every size in the GUI is an absolute device-independent pixel, so on a 4K panel whose desktop session does not scale, the window opened ~2000px wide with 11px labels. The content is drawn through a `LayoutTransformControl`, which scales during layout rather than at paint, so wrapping, trimming and the table columns all stay correct — the window gets bigger rather than clipped. Choose the step under **Settings → Display → Text size**: 100% is the original sizing, 175% the default (sized for an unscaled 4K panel), up to 250%. It applies straight away and persists as `UiScale` in `settings.json`, clamped to 1.0–2.5 on read. GUI only — the TUI is sized by the terminal and the web console by the browser
 - **policykit-1** (`pkexec`) recommended for firewall password prompts. Failing that, the app drives an **askpass** dialog through `sudo -A` (`ssh-askpass`, `ksshaskpass`, `gnome-ssh-askpass`, or whatever `SUDO_ASKPASS` names), and failing that it needs passwordless sudo — see [Firewall elevation on a headless server](#firewall-elevation-on-a-headless-server-no-pkexec)
 - No `which` binary is needed: `sudo`, `pkexec`, `ufw`, `nft`, `iptables` and `ss` are resolved in-process against `PATH` plus `/usr/local/sbin`, `/usr/sbin` and `/sbin` — a desktop session's `PATH` omits the sbin directories on Debian and its derivatives
 - `ufw` when the host uses it — Firewall Config reads it and writes through it; the app never enables it for you (that can lock you out of SSH)
@@ -479,17 +479,17 @@ first. The build is self-contained — the server needs no .NET runtime.
 
 ```bash
 # build machine
-scp dist/networksentinel-0.7.12-linux-x64.install.sh user@server:
+scp dist/networksentinel-0.7.13-linux-x64.install.sh user@server:
 
 # server
-chmod +x networksentinel-0.7.12-linux-x64.install.sh
-sudo ./networksentinel-0.7.12-linux-x64.install.sh --web-service
+chmod +x networksentinel-0.7.13-linux-x64.install.sh
+sudo ./networksentinel-0.7.13-linux-x64.install.sh --web-service
 ```
 
 Confirm the installer is current before using root:
 
 ```bash
-./networksentinel-0.7.12-linux-x64.install.sh --help
+./networksentinel-0.7.13-linux-x64.install.sh --help
 # Should list: --web-service
 ```
 
@@ -541,8 +541,8 @@ sudo ./….install.sh --web-service --port 18765
 ./….install.sh --user --desktop-shortcut    # ~/.local + icon on the Desktop
 
 # classic tarball
-tar xzf networksentinel-0.7.12-linux-x64.tar.gz
-cd networksentinel-0.7.12-linux-x64
+tar xzf networksentinel-0.7.13-linux-x64.tar.gz
+cd networksentinel-0.7.13-linux-x64
 sudo ./install.sh --web-service
 ```
 
