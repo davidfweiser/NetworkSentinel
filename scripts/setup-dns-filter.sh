@@ -584,18 +584,31 @@ run systemctl restart AdGuardHome
 # Verify it actually came up before anything is pointed at it. Switching the host's
 # resolver to a service that failed to start is how you lose a remote box.
 if [[ "$DRY_RUN" != "1" ]]; then
+  # "active" is not enough on its own. With Restart=always, a daemon that dies on a
+  # port collision spends its life being restarted, and `is-active` polled once a
+  # second can land in the window between spawn and exit and call that success. The
+  # admin port is the honest test: nothing else on this node serves it, and AdGuard
+  # only reaches it after every DNS listener has bound.
+  AGH_SERVING=0
   for _ in $(seq 1 20); do
     sleep 1
-    systemctl is-active --quiet AdGuardHome && break
+    if curl -fsS --max-time 2 -o /dev/null "http://${TUNNEL_IP}:${UI_PORT}/" 2>/dev/null; then
+      AGH_SERVING=1
+      break
+    fi
   done
-  if ! systemctl is-active --quiet AdGuardHome; then
+  if [[ "$AGH_SERVING" != "1" ]]; then
     say ""
     journalctl -u AdGuardHome -n 30 --no-pager || true
-    die "AdGuard Home did not start — nothing else has been changed, your DNS is untouched"
+    say ""
+    die "AdGuard Home is not serving ${TUNNEL_IP}:${UI_PORT} — see the log above; nothing else has been changed, your DNS is untouched"
   fi
-  info "service is running"
+  info "service is running and serving ${TUNNEL_IP}:${UI_PORT}"
 
-  # A real query through the new resolver, before the host depends on it.
+  # A real query through the new resolver, before the host depends on it. This runs
+  # after the admin-port check for a reason: on a node where something else already
+  # answers on 53, a query to the tunnel address is answered by *that*, and this test
+  # passed against a resolver the script had not installed.
   if command -v dig >/dev/null 2>&1; then
     dig +short +timeout=5 @"${TUNNEL_IP}" example.com >/dev/null 2>&1 \
       || die "the resolver is up but did not answer a query — leaving your DNS untouched"
