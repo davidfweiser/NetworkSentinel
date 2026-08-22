@@ -154,4 +154,17 @@ public class DnsFilterServiceTests
         Assert.Null(service.ProtectionEnabled);
         Assert.Contains("not configured", service.Status);
     }
+
+    /// <summary>
+    /// AdGuard Home compares the Content-Type header instead of parsing it, so the
+    /// "; charset=utf-8" that StringContent adds by default earns a 415 — with the
+    /// resolver reachable and the credentials accepted, which is the hardest kind of
+    /// failure to place. Exactly "application/json", or the switch does nothing.
+    /// </summary>
+    [Fact]
+    public void JsonBody_SendsNoCharsetParameter()
+    {
+        using var content = DnsFilterService.JsonBody("{\"enabled\":true}");
+        Assert.Equal("application/json", content.Headers.ContentType?.ToString());
+    }
 }

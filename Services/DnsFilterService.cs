@@ -246,7 +246,7 @@ public sealed class DnsFilterService : IDisposable
             {
                 using var request = new HttpRequestMessage(HttpMethod.Post, url + path)
                 {
-                    Content = new StringContent(body, Encoding.UTF8, "application/json")
+                    Content = JsonBody(body)
                 };
                 Authorize(request);
                 using var response = await _http.SendAsync(request, ct).ConfigureAwait(false);
@@ -305,6 +305,23 @@ public sealed class DnsFilterService : IDisposable
 
     public (bool Ok, string Message) SetProtection(bool enabled)
         => Task.Run(() => SetProtectionAsync(enabled)).GetAwaiter().GetResult();
+
+    /// <summary>
+    /// A JSON body whose Content-Type is exactly <c>application/json</c>.
+    ///
+    /// StringContent's (string, Encoding, string) constructor appends
+    /// <c>; charset=utf-8</c>, and AdGuard Home compares the header rather than
+    /// parsing it: the request is refused with 415 before it reaches the handler.
+    /// The switch then failed against a resolver that was running, reachable and
+    /// authenticated — the one case where every other check says everything is fine.
+    /// The body is still UTF-8; only the parameter is dropped.
+    /// </summary>
+    public static StringContent JsonBody(string json)
+    {
+        var content = new StringContent(json, Encoding.UTF8);
+        content.Headers.ContentType = new MediaTypeHeaderValue("application/json");
+        return content;
+    }
 
     private void Authorize(HttpRequestMessage request)
     {
