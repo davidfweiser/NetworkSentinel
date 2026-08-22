@@ -462,7 +462,8 @@ gradient rather than an outline.
 | **Firewall & Block** | Managed rules grouped as In/Out pairs; manual IP and port blocking; **Restore allowlisted** |
 | **Firewall Config** (0.7.1, rebuilt 0.7.4) | The whole host firewall — UFW's rules, Network Sentinel's, and everyone else's — plus listening services and their firewall verdict; add / edit / delete any of them |
 | **Allowlist** | Add/remove trusted domains and IPs; refresh the feed |
-| **Settings** | Monitoring on/off, poll interval, geo lookups, auth-log and closed-port scan detection, the 0.4.0 detectors (threat intel, new-listener alerts, process reputation, ARP/gateway watch, startup-item watch, exfiltration threshold, honeypot ports), **kernel flow events**, **DNS hygiene** (with approved resolvers), **DNS filtering on/off**, **WireGuard peer monitoring** (with a live peer table), **Suricata signature ingestion** (EVE path, maximum severity, muted sids), **auto-block dry run**, **HTTPS + DuckDNS remote access** (including **Issue certificate**), webhook URL, auto-block + minimum severity + expiry, block direction (in/out), allowlist feed, **change master password**, **Remove all rules** |
+| **Blocked Sites** (0.7.16) | What the filtering resolver refused — name, client, reason and rule, newest first. Present only while a resolver is configured; read on arrival and on **Refresh**, never on the live poll |
+| **Settings** | Monitoring on/off, poll interval, geo lookups, auth-log and closed-port scan detection, the 0.4.0 detectors (threat intel, new-listener alerts, process reputation, ARP/gateway watch, startup-item watch, exfiltration threshold, honeypot ports), **kernel flow events**, **DNS hygiene** (with approved resolvers), **DNS filtering** (on/off, resolver address, and the user and password to reach it), **WireGuard peer monitoring** (with a live peer table), **Suricata signature ingestion** (EVE path, maximum severity, muted sids), **auto-block dry run**, **HTTPS + DuckDNS remote access** (including **Issue certificate**), webhook URL, auto-block + minimum severity + expiry, block direction (in/out), allowlist feed, **change master password**, **Remove all rules** |
 
 **The dashboard boxes the desktop had (0.7.7).** Two panels the desktop window
 carried and the console did not: **Threat intensity**, the high/critical count on
@@ -1017,6 +1018,7 @@ Two things the installer handles that a plain `cp` does not:
 | **Break-in Attempts** | Heuristic alerts with origin and method |
 | **Open Ports** | Listening TCP/UDP; optional inbound port block |
 | **Firewall & Block** | Manual IP/port rules, auto-block, managed rule list, and the **allowlist** panel (domains/IPs that are never blocked) |
+| **Blocked Sites** (0.7.16) | Names the filtering resolver refused, with the client that asked and the rule that matched. The rail item appears only while a resolver is configured |
 | **Settings** | Monitoring · Intrusion detection · Alerting & auto-block · Allowlist · Data — every toggle described below |
 
 The GUI **Settings** view groups the same options the web console exposes:
@@ -1025,6 +1027,7 @@ The GUI **Settings** view groups the same options the web console exposes:
 |-------|---------|
 | **Monitoring** | Live monitoring on/off, poll interval, geo lookups, auth-log monitoring, closed-port scan detection, Critical desktop notifications |
 | **Intrusion detection** | Threat-intel blocklists, new-listener alerts, process reputation, ARP/gateway watch, startup-item watch, exfiltration threshold (MB / 10 min), honeypot decoy ports |
+| **DNS filtering** | Filtering on/off, the resolver's admin address, and the user and password to reach it (0.7.15) — see [DNS filtering](#setting-up-the-filtering-resolver--scriptssetup-dns-filtersh-0715) |
 | **Remote access (web console)** | DuckDNS subdomain + token, HTTPS on/off and TLS port, certificate and key paths, HTTP→HTTPS redirect, **Update now** |
 | **Alerting & auto-block** | Webhook URL, auto-block expiry |
 | **Allowlist** | Remote allowlist feed |
@@ -1162,6 +1165,8 @@ All three UIs write the same `~/.local/share/NetworkSentinel/settings.json`, so 
 | `Services/CertIssuanceService.cs` | Runs the issuance script for the Settings **Issue certificate** button |
 | `Services/LoginThrottle.cs` | Per-IP lockout for the console's password endpoints |
 | `Services/WireGuardEndpointGuard.cs` / `IpsecEndpointGuard.cs` | Tunnel endpoints that must never be auto-blocked |
+| `Services/DnsFilterService.cs` | The filtering resolver's switch and its blocked-query log |
+| `scripts/setup-dns-filter.sh` | Installs AdGuard Home as the resolver for tunnel clients; `--uninstall` reverses it |
 | `scripts/issue-duckdns-cert.sh` | Let's Encrypt DNS-01 issuance for a duckdns.org name |
 | `scripts/diagnose-ipsec.sh` | Read-only triage for a site-to-site tunnel that won't come up |
 | `Web/WebAuthStore.cs` | Master password hash + session tokens |
