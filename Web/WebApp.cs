@@ -158,6 +158,9 @@ public sealed class WebApp : IDisposable
     /// </summary>
     private readonly TrafficMeterService _traffic;
 
+    /// <summary>The switch for the filtering resolver installed by scripts\setup-dns-filter.ps1.</summary>
+    private readonly DnsFilterService _dnsFilter;
+
     /// <summary>Stand-in shown in the settings page where a DuckDNS token is stored but must not be sent.</summary>
     private const string TokenPlaceholder = "••••••••";
 
@@ -191,6 +194,7 @@ public sealed class WebApp : IDisposable
         _allowlist = _core.Allowlist;
         _prevention = _core.Prevention;
         _traffic = _core.Traffic;
+        _dnsFilter = _core.DnsFilter;
         // TLS flags touch only Web* settings, which nothing in the core graph reads,
         // so applying them after construction is safe.
         ApplyTlsOverrides(tlsOverrides);
@@ -674,6 +678,33 @@ public sealed class WebApp : IDisposable
         {
             var force = req.Query["rescan"].ToString() is "1" or "true";
             WriteJson(res, 200, BuildHostFirewall(force));
+            return;
+        }
+
+        // Its own route rather than a field on /api/state: the query log is the busiest
+        // thing AdGuard serves, and the dashboard poll runs every couple of seconds
+        // against a resolver every tunnel client depends on. This is read when the view
+        // is opened and when refresh is pressed, and not otherwise.
+        if (req.Method == "GET" && path == "/api/dns-blocked")
+        {
+            var limit = 100;
+            if (int.TryParse(req.Query["limit"], out var requested))
+                limit = requested;
+
+            var (ok, message, entries) = _dnsFilter.GetBlockedAsync(limit).GetAwaiter().GetResult();
+            WriteJson(res, 200, new
+            {
+                ok,
+                message,
+                entries = entries.Select(e => new
+                {
+                    time = e.TimeText,
+                    domain = e.Domain,
+                    client = e.Client,
+                    reason = e.Reason,
+                    rule = e.Rule
+                }).ToArray()
+            });
             return;
         }
 
@@ -1182,9 +1213,65 @@ public sealed class WebApp : IDisposable
                             _settings.WireGuardPeerMbPer10Min = peerMb;
                             _monitor.WireGuardPeerMbPer10Min = peerMb;
                             label = peerMb == 0
-                                ? "Per-peer transfer alerts off — a VPN user streaming video legitimately moves gigabytes."
-                                : $"Alert when one WireGuard peer receives more than {peerMb} MB in 10 minutes.";
+                                ? "Per-peer transfer notices off — a VPN user streaming video legitimately moves gigabytes."
+                                : $"Note it when one WireGuard peer receives more than {peerMb} MB in 10 minutes.";
                             break;
+                        case "dnsFilterEnabled":
+                        {
+                            // Deliberately never runs setup, which the desktop switch does.
+                            // Installing a resolver needs Administrator consent at the
+                            // machine's own desktop, and an HTTP request is the last thing
+                            // that should be able to ask for it. Same reason this console
+                            // does not write firewall rules: it says what it cannot do.
+                            if (!_dnsFilter.Configured)
+                                return ActionResultDto.Fail(
+                                    "No filtering resolver is set up, and the web console cannot install one. "
+                                    + "Turn the switch on in the desktop app, or run "
+                                    + DnsFilterService.SetupCommandHint()
+                                    + " from an elevated prompt on that machine.");
+
+                            // The one control here that stops a connection being attempted
+                            // at all, so a failure must be reported, not silently swallowed.
+                            var (dnsOk, dnsMessage) = _dnsFilter.SetProtection(on);
+                            if (!dnsOk) return ActionResultDto.Fail(dnsMessage);
+                            label = dnsMessage;
+                            break;
+                        }
+                        case "dnsFilterUrl":
+                        {
+                            var normalised = DnsFilterService.NormalizeBaseUrl(raw);
+                            if (!string.IsNullOrWhiteSpace(raw) && normalised.Length == 0)
+                                return ActionResultDto.Fail("Enter the resolver's admin address, e.g. 10.8.0.1:3000 or http://10.8.0.1:3000.");
+                            _settings.DnsFilterUrl = normalised;
+                            _dnsFilter.Configure(normalised, _settings.DnsFilterUsername, _settings.DnsFilterPassword);
+                            label = normalised.Length == 0
+                                ? "DNS filter resolver cleared — the switch has nothing to control."
+                                : $"DNS filter resolver: {normalised} ({_dnsFilter.Status})";
+                            break;
+                        }
+                        case "dnsFilterUsername":
+                        {
+                            _settings.DnsFilterUsername = raw.Trim();
+                            _dnsFilter.Configure(_settings.DnsFilterUrl, _settings.DnsFilterUsername, _settings.DnsFilterPassword);
+                            label = _settings.DnsFilterUsername.Length == 0
+                                ? "DNS filter user cleared — the resolver is assumed to need no login."
+                                : $"DNS filter user: {_settings.DnsFilterUsername} ({_dnsFilter.Status})";
+                            break;
+                        }
+                        case "dnsFilterPassword":
+                        {
+                            // Same placeholder contract as the DuckDNS token: the page never
+                            // receives the stored value, so echoing the bullets back means
+                            // "unchanged" and an empty field means "remove it".
+                            if (raw == TokenPlaceholder)
+                                return ActionResultDto.Success(_dnsFilter.Status);
+                            _settings.DnsFilterPassword = raw;
+                            _dnsFilter.Configure(_settings.DnsFilterUrl, _settings.DnsFilterUsername, _settings.DnsFilterPassword);
+                            label = raw.Length == 0
+                                ? "DNS filter password cleared."
+                                : $"DNS filter password saved ({_dnsFilter.Status})";
+                            break;
+                        }
                         case "dnsHygieneEnabled":
                             _monitor.DnsHygieneEnabled = on;
                             _settings.DnsHygieneEnabled = on;
@@ -1702,6 +1789,14 @@ public sealed class WebApp : IDisposable
                 dnsHygieneEnabled = _settings.DnsHygieneEnabled,
                 dnsApprovedResolvers = _settings.DnsApprovedResolvers,
                 dnsHygieneStatus = _monitor.DnsHygieneStatus,
+                dnsFilterEnabled = DnsFilterOn(),
+                // Drives the nav item: the blocked-sites view is meaningless without
+                // a resolver, so it is not offered until one is configured.
+                dnsFilterConfigured = _dnsFilter.Configured,
+                dnsFilterUrl = _settings.DnsFilterUrl,
+                dnsFilterUsername = _settings.DnsFilterUsername,
+                dnsFilterPasswordSet = _settings.DnsFilterPassword.Length > 0,
+                dnsFilterStatus = DnsFilterStatusText(),
                 webhookUrl = _settings.WebhookUrl,
                 webhookStatus = _monitor.WebhookStatus,
                 autoBlockExpiryMinutes = _settings.AutoBlockExpiryMinutes,
@@ -1972,6 +2067,23 @@ public sealed class WebApp : IDisposable
     /// reported here — but only once it has something to say. A host with no IPSec would
     /// otherwise carry a permanent line about a protocol it does not run.
     /// </summary>
+    /// <summary>
+    /// Live state, refreshed in the background. Unknown renders as off in the switch
+    /// itself — the status line beside it is what distinguishes "unreachable" from
+    /// "deliberately off", because those need different action from the operator.
+    /// </summary>
+    private bool DnsFilterOn()
+    {
+        _dnsFilter.EnsureFresh();
+        return _dnsFilter.ProtectionEnabled == true;
+    }
+
+    private string DnsFilterStatusText()
+    {
+        _dnsFilter.EnsureFresh();
+        return _dnsFilter.Status;
+    }
+
     private string WireGuardStatusText()
     {
         var monitor = _settings.WireGuardMonitorEnabled
@@ -2818,6 +2930,7 @@ public sealed class WebApp : IDisposable
     <button data-tab="firewall">Firewall &amp; Block</button>
     <button data-tab="fwconfig" class="sub" title="Add, edit and delete inbound and outbound rules">Firewall Config</button>
     <button data-tab="allowlist" class="sub" title="Domains and IPs that are never blocked">Allowlist</button>
+    <button data-tab="dnsblocked" id="navDnsBlocked" class="hidden" title="Names the filtering resolver refused">Blocked Sites</button>
     <button data-tab="settings">Settings</button>
     <button data-tab="help" class="sub">Help</button>
   </nav>
@@ -3053,6 +3166,21 @@ public sealed class WebApp : IDisposable
     <div id="tbl-allowlist"></div>
   </section>
 
+  <section id="tab-dnsblocked" class="hidden">
+    <div class="toolbar">
+      <button id="btnRefreshBlocked">Refresh</button>
+      <select id="blockedLimit">
+        <option value="50">Last 50</option>
+        <option value="100" selected>Last 100</option>
+        <option value="250">Last 250</option>
+        <option value="500">Last 500</option>
+      </select>
+    </div>
+    <p class="muted" id="blockedStatus" style="margin:0 0 10px;font-size:.85rem">Loading&hellip;</p>
+    <p class="muted" style="margin:0 0 10px;font-size:.85rem">Names your filtering resolver refused, newest first. This is a name-based block: a client that dials a hard-coded address never asks, so it never appears here.</p>
+    <div id="tbl-dnsblocked"></div>
+  </section>
+
   <section id="tab-settings" class="hidden">
     <div id="settingsPanel"></div>
     <div class="settings-group">
@@ -3187,6 +3315,28 @@ public sealed class WebApp : IDisposable
     </table></div>`;
   }
 
+  async function loadBlockedSites() {
+    const limit = ($('blockedLimit') || {}).value || 100;
+    $('blockedStatus').textContent = 'Reading the resolver…';
+    try {
+      const res = await fetch('/api/dns-blocked?limit=' + encodeURIComponent(limit),
+        { cache: 'no-store', credentials: 'same-origin' });
+      const data = await res.json();
+      $('blockedStatus').textContent = data.message || '';
+      const rows = (data.entries || []).map(e => `<tr>
+        <td>${esc(e.time || '')}</td>
+        <td>${esc(e.domain || '')}</td>
+        <td>${esc(e.client || '')}</td>
+        <td>${esc(e.reason || '')}</td>
+        <td class="mono">${esc(e.rule || '')}</td>
+      </tr>`).join('');
+      $('tbl-dnsblocked').innerHTML = table(['Time', 'Name', 'Client', 'Why', 'Rule'], rows);
+    } catch (e) {
+      $('blockedStatus').textContent = 'Could not read the resolver: ' + (e.message || e);
+      $('tbl-dnsblocked').innerHTML = '';
+    }
+  }
+
   async function ensureAuth() {
     try {
       const res = await fetch('/api/auth/status', { cache: 'no-store', credentials: 'same-origin' });
@@ -3214,7 +3364,8 @@ public sealed class WebApp : IDisposable
   function isFrozenTab() {
     // Firewall Config joins them: a redraw mid-edit would wipe the form, and the
     // rule tables are something you read and act on rather than watch.
-    return tab === 'allowlist' || tab === 'firewall' || tab === 'settings' || tab === 'fwconfig';
+    return tab === 'allowlist' || tab === 'firewall' || tab === 'settings' || tab === 'fwconfig'
+        || tab === 'dnsblocked';
   }
 
   function getRefreshMs() {
@@ -3861,6 +4012,11 @@ public sealed class WebApp : IDisposable
     updateCriticalAlerts();
     const forceLists = !!opts.forceLists;
     $('ver').textContent = 'v' + (state.version || '?');
+    // The blocked-sites view has nothing to show without a resolver, so the nav item
+    // appears only once one is configured — and takes itself away again if it is cleared.
+    const dnsOn = !!(state.settings && state.settings.dnsFilterConfigured);
+    $('navDnsBlocked').classList.toggle('hidden', !dnsOn);
+    if (!dnsOn && tab === 'dnsblocked') showTab('dashboard');
     $('clock').textContent = state.clock || '';
     checkForUpgrade();
     // Don't overwrite a recent action result (add/remove/block) with the generic status.
@@ -4160,10 +4316,17 @@ public sealed class WebApp : IDisposable
         ${row('DNS hygiene','Watch how names get resolved: plaintext queries leaving the machine, encrypted DNS silently falling back, queries to resolvers you did not approve, and allowlisted domains resolving into unfamiliar networks — the shape of a poisoning attack aimed at the never-block list. Needs kernel flow events. ' + (s.dnsHygieneStatus || ''), sw('dnsHygieneEnabled', s.dnsHygieneEnabled))}
         ${row('Approved resolvers', 'Comma-separated resolver IPs this host is meant to use. Queries anywhere else are flagged, and 443 traffic to these addresses is recognised as DoH — without them, DoH is indistinguishable from ordinary web traffic.', txt('dnsApprovedResolvers', s.dnsApprovedResolvers || '', '1.1.1.1, 9.9.9.9'))}
       </div>
+      <div class="settings-group"><h3>DNS filtering</h3>
+        <div class="settings-note">The only control here that can stop a connection before it is attempted. Everything else acts on a flow that already exists — and on a VPN gateway a client's forwarded traffic never becomes a tracked connection at all, so nothing else on this page can block where a client goes. This switches <em>filtering</em>, not the resolver: turning it off leaves DNS answering normally but unfiltered, so no client loses name resolution. <strong>Setting a resolver up is not something this console can do</strong> — it needs Administrator consent at that machine's own desktop. Turn the switch on in the desktop app, or run scripts\setup-dns-filter.ps1 from an elevated prompt there.</div>
+        ${row('DNS filtering', 'Refuse known malware, phishing and tracking names at the resolver, before anything connects. ' + (s.dnsFilterStatus || ''), sw('dnsFilterEnabled', s.dnsFilterEnabled))}
+        ${row('Filtering resolver', 'Admin API of the filtering resolver on this node. Setup fills this in; clear it to leave the switch unconfigured.', txt('dnsFilterUrl', s.dnsFilterUrl || '', 'http://10.8.0.1:3000'))}
+        ${row('Resolver user', 'Admin user for that API — "admin" for an AdGuard Home setup installed. Leave empty if the resolver needs no login.', txt('dnsFilterUsername', s.dnsFilterUsername || '', 'admin'))}
+        ${row('Resolver password', 'Password for that user. Stored on the server and never sent back to this page. ' + (s.dnsFilterPasswordSet ? 'A password is saved — replace the placeholder to change it, or empty the field to remove it.' : 'No password saved yet.'), txt('dnsFilterPassword', s.dnsFilterPasswordSet ? '••••••••' : '', 'resolver admin password'))}
+      </div>
       <div class="settings-group"><h3>VPN (WireGuard)</h3>
         <div class="settings-note">WireGuard uses one unconnected UDP socket, so its peers never appear as connections and nothing else on this page can see them. This reads WireGuard's own state via wg.exe instead. Needs Administrator. Only public keys are read — the interface private key and peer preshared keys are discarded at parse time and never stored, logged, or sent here.</div>
         ${row('WireGuard peer monitoring', 'Watch peers for new keys, endpoint moves, and removals. ' + (s.wireGuardStatus || ''), sw('wireGuardMonitorEnabled', s.wireGuardMonitorEnabled))}
-        ${row('Per-peer transfer alert (MB / 10 min)', 'Alert when this much data is sent to a single peer within 10 minutes. 0 disables it — a VPN user streaming video legitimately moves gigabytes. Forwarded tunnel traffic has no local socket, so this is the only place it is counted.', txt('wireGuardPeerMbPer10Min', s.wireGuardPeerMbPer10Min ?? 0, '0'))}
+        ${row('Per-peer transfer notice (MB / 10 min)', 'Note it when this much data is sent to a single peer within 10 minutes. Recorded as an observation, not a threat — volume through a tunnel is the tunnel working, and a VPN user streaming video legitimately moves gigabytes. 0 disables it. Forwarded tunnel traffic has no local socket, so this is the only place it is counted.', txt('wireGuardPeerMbPer10Min', s.wireGuardPeerMbPer10Min ?? 0, '0'))}
         ${wgPeerTable(s.wireGuardPeers)}
       </div>
       <div class="settings-group"><h3>Alerting</h3>
@@ -4204,14 +4367,14 @@ public sealed class WebApp : IDisposable
       </div>`;
   }
 
-  document.getElementById('nav').addEventListener('click', (e) => {
-    const btn = e.target.closest('button[data-tab]');
-    if (!btn) return;
-    tab = btn.dataset.tab;
+  function showTab(name) {
+    tab = name;
     document.querySelectorAll('nav button').forEach(b => b.classList.toggle('active', b.dataset.tab === tab));
     document.querySelectorAll('main > section').forEach(sec => {
       sec.classList.toggle('hidden', sec.id !== 'tab-' + tab);
     });
+    // Read from the resolver on arrival — this list is not part of the state poll.
+    if (tab === 'dnsblocked') loadBlockedSites();
     // Freeze live poll on allowlist/firewall so lists stay readable.
     if (isFrozenTab()) {
       stopPolling();
@@ -4222,7 +4385,16 @@ public sealed class WebApp : IDisposable
     // The host firewall rides on its own endpoint, so opening the tab is what
     // fetches it — the first time, and whenever a write has invalidated it.
     if (tab === 'fwconfig' && !hostScan) loadHostFirewall(false);
+  }
+
+  document.getElementById('nav').addEventListener('click', (e) => {
+    const btn = e.target.closest('button[data-tab]');
+    if (!btn) return;
+    showTab(btn.dataset.tab);
   });
+
+  $('btnRefreshBlocked').onclick = () => loadBlockedSites();
+  $('blockedLimit').onchange = () => loadBlockedSites();
 
   $('btnSleep').onclick = () => toggleSleep();
   $('btnWakeBanner').onclick = () => toggleSleep(false);

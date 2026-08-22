@@ -220,6 +220,11 @@
                                      IsChecked="{Binding ShowFirewallConfig, Mode=OneWay}"
                                      Command="{Binding NavigateCommand}" CommandParameter="FirewallConfig"
                                      ToolTip="Add, edit and delete inbound and outbound rules"/>
+                        <RadioButton Content="Blocked Sites" Style="{StaticResource SubNavButton}"
+                                     Visibility="{Binding DnsFilterConfigured, Converter={StaticResource BoolToVis}}"
+                                     IsChecked="{Binding ShowDnsBlocked, Mode=OneWay}"
+                                     Command="{Binding NavigateCommand}" CommandParameter="DnsBlocked"
+                                     ToolTip="Names the filtering resolver refused"/>
                         <RadioButton Content="Settings" Style="{StaticResource NavButton}"
                                      IsChecked="{Binding ShowSettings, Mode=OneWay}"
                                      Command="{Binding NavigateCommand}" CommandParameter="Settings"/>
@@ -826,6 +831,34 @@
                                             </DataTemplate>
                                         </DataGridTemplateColumn.CellTemplate>
                                     </DataGridTemplateColumn>
+                                </DataGrid.Columns>
+                            </DataGrid>
+                        </DockPanel>
+                    </Border>
+
+                    <!-- BLOCKED SITES -->
+                    <Border Visibility="{Binding ShowDnsBlocked, Converter={StaticResource BoolToVis}}" Style="{StaticResource Card}">
+                        <DockPanel>
+                            <StackPanel DockPanel.Dock="Top" Margin="0,0,0,12">
+                                <TextBlock Text="Names your filtering resolver refused" FontWeight="Bold" FontSize="15"/>
+                                <TextBlock Text="Newest first, read from the resolver's own query log when you open this page. This is a name-based block: a client that dials a hard-coded address never asks, so it never appears here — that half is what the threat-intel feeds and the prevention engine cover."
+                                           Foreground="{StaticResource TextSecondaryBrush}" FontSize="12"
+                                           Margin="0,4,0,0" TextWrapping="Wrap"/>
+                                <StackPanel Orientation="Horizontal" Margin="0,10,0,0">
+                                    <Button Content="Refresh" Style="{StaticResource GhostButton}"
+                                            Command="{Binding RefreshBlockedSitesCommand}"/>
+                                    <TextBlock Text="{Binding BlockedSitesStatus}" VerticalAlignment="Center"
+                                               Margin="12,0,0,0" FontSize="12"
+                                               Foreground="{StaticResource TextMutedBrush}"/>
+                                </StackPanel>
+                            </StackPanel>
+                            <DataGrid ItemsSource="{Binding BlockedSites}" Style="{StaticResource ModernDataGrid}">
+                                <DataGrid.Columns>
+                                    <DataGridTextColumn ElementStyle="{StaticResource DataGridTextElement}" Header="Time" Binding="{Binding TimeText}" Width="90"/>
+                                    <DataGridTextColumn ElementStyle="{StaticResource DataGridTextElement}" Header="Name" Binding="{Binding Domain}" Width="280"/>
+                                    <DataGridTextColumn ElementStyle="{StaticResource DataGridTextElement}" Header="Client" Binding="{Binding Client}" Width="140"/>
+                                    <DataGridTextColumn ElementStyle="{StaticResource DataGridTextElement}" Header="Why" Binding="{Binding Reason}" Width="140"/>
+                                    <DataGridTextColumn ElementStyle="{StaticResource DataGridTextElement}" Header="Rule" Binding="{Binding Rule}" Width="*"/>
                                 </DataGrid.Columns>
                             </DataGrid>
                         </DockPanel>
@@ -1824,6 +1857,86 @@
                                             <CheckBox Grid.Column="2" VerticalAlignment="Center"
                                                       Style="{StaticResource ModernCheckBox}"
                                                       IsChecked="{Binding DnsHygieneEnabled}"/>
+                                        </Grid>
+                                    </StackPanel>
+                                </Border>
+
+                                <Border Style="{StaticResource Card}" Margin="0,0,0,14">
+                                    <StackPanel>
+                                        <TextBlock Text="DNS filtering" FontWeight="Bold" FontSize="15"/>
+                                        <TextBlock Text="The only control here that stops a connection before it is attempted. Everything else acts on a flow that already exists — and a VPN client&apos;s forwarded traffic never becomes a tracked connection at all, so nothing else on this page can block where a client goes. Turning the switch on with no resolver installed offers to set one up; Windows will ask for Administrator consent."
+                                                   Foreground="{StaticResource TextSecondaryBrush}" FontSize="12"
+                                                   Margin="0,4,0,10" TextWrapping="Wrap"/>
+                                        <TextBlock Text="{Binding DnsFilterStatus}" FontSize="11"
+                                                   Foreground="{StaticResource TextMutedBrush}"
+                                                   Margin="0,0,0,14" TextWrapping="Wrap"/>
+
+                                        <Grid Margin="0,0,0,14">
+                                            <Grid.ColumnDefinitions>
+                                                <ColumnDefinition Width="*"/>
+                                                <ColumnDefinition Width="Auto"/>
+                                            </Grid.ColumnDefinitions>
+                                            <StackPanel Margin="0,0,16,0">
+                                                <TextBlock Text="Filter names at the resolver" FontWeight="Bold" FontSize="13"/>
+                                                <TextBlock Text="Refuse known malware, phishing and tracking names before anything connects. This switches filtering, not the resolver: turning it off leaves DNS answering normally but unfiltered, so no client loses name resolution."
+                                                           Foreground="{StaticResource TextSecondaryBrush}" FontSize="11"
+                                                           Margin="0,2,0,0" TextWrapping="Wrap"/>
+                                            </StackPanel>
+                                            <CheckBox Grid.Column="1" VerticalAlignment="Center"
+                                                      Style="{StaticResource ModernCheckBox}"
+                                                      IsEnabled="{Binding DnsFilterSetupRunning, Converter={StaticResource InvertBool}}"
+                                                      IsChecked="{Binding DnsFilterEnabled}"/>
+                                        </Grid>
+
+                                        <Grid Margin="0,0,0,14">
+                                            <Grid.ColumnDefinitions>
+                                                <ColumnDefinition Width="*"/>
+                                                <ColumnDefinition Width="Auto"/>
+                                            </Grid.ColumnDefinitions>
+                                            <StackPanel Margin="0,0,16,0">
+                                                <TextBlock Text="Filtering resolver" FontWeight="Bold" FontSize="13"/>
+                                                <TextBlock Text="Admin API of the filtering resolver on this node. Setup fills this in; clear it to leave the switch unconfigured. Point it at an AdGuard Home you installed yourself if you would rather not use setup."
+                                                           Foreground="{StaticResource TextSecondaryBrush}" FontSize="11"
+                                                           Margin="0,2,0,0" TextWrapping="Wrap"/>
+                                            </StackPanel>
+                                            <TextBox Grid.Column="1" Width="200" VerticalAlignment="Center"
+                                                     Style="{StaticResource ModernTextBox}"
+                                                     Text="{Binding DnsFilterUrl, UpdateSourceTrigger=LostFocus}"/>
+                                        </Grid>
+
+                                        <Grid Margin="0,0,0,14">
+                                            <Grid.ColumnDefinitions>
+                                                <ColumnDefinition Width="*"/>
+                                                <ColumnDefinition Width="Auto"/>
+                                            </Grid.ColumnDefinitions>
+                                            <StackPanel Margin="0,0,16,0">
+                                                <TextBlock Text="Resolver user" FontWeight="Bold" FontSize="13"/>
+                                                <TextBlock Text="Admin user for that API — &quot;admin&quot; for an AdGuard Home setup installed. Leave empty if the resolver needs no login."
+                                                           Foreground="{StaticResource TextSecondaryBrush}" FontSize="11"
+                                                           Margin="0,2,0,0" TextWrapping="Wrap"/>
+                                            </StackPanel>
+                                            <TextBox Grid.Column="1" Width="200" VerticalAlignment="Center"
+                                                     Style="{StaticResource ModernTextBox}"
+                                                     Text="{Binding DnsFilterUsername, UpdateSourceTrigger=LostFocus}"/>
+                                        </Grid>
+
+                                        <Grid Margin="0,0,0,14">
+                                            <Grid.ColumnDefinitions>
+                                                <ColumnDefinition Width="*"/>
+                                                <ColumnDefinition Width="Auto"/>
+                                            </Grid.ColumnDefinitions>
+                                            <StackPanel Margin="0,0,16,0">
+                                                <TextBlock Text="Resolver password" FontWeight="Bold" FontSize="13"/>
+                                                <TextBlock Text="Password for that user. Without it the switch cannot authenticate and reports that the resolver rejected the credentials."
+                                                           Foreground="{StaticResource TextSecondaryBrush}" FontSize="11"
+                                                           Margin="0,2,0,0" TextWrapping="Wrap"/>
+                                            </StackPanel>
+                                            <!-- PasswordBox for the same reason as the DuckDNS token: WPF has no
+                                                 PasswordChar on TextBox, and Password is deliberately not bindable,
+                                                 so it is synced in code-behind. Setup writes into it too. -->
+                                            <PasswordBox Grid.Column="1" Width="200" VerticalAlignment="Center"
+                                                         x:Name="DnsFilterPasswordBox" PasswordChar="●"
+                                                         PasswordChanged="OnDnsFilterPasswordChanged"/>
                                         </Grid>
                                     </StackPanel>
                                 </Border>

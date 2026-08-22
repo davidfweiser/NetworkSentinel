@@ -79,6 +79,7 @@ internal sealed class TuiSettings
     private readonly FirewallService _firewall;
     private readonly AllowlistService _allowlist;
     private readonly TrafficMeterService _traffic;
+    private readonly DnsFilterService _dnsFilter;
 
     /// <summary>Own instance, exactly as the desktop view-model keeps one: DuckDNS
     /// lives in its own admins-only file next to the settings, not in AppSettings.</summary>
@@ -92,6 +93,7 @@ internal sealed class TuiSettings
         _firewall = core.Firewall;
         _allowlist = core.Allowlist;
         _traffic = core.Traffic;
+        _dnsFilter = core.DnsFilter;
         Items = BuildCatalogue();
     }
 
@@ -348,6 +350,75 @@ internal sealed class TuiSettings
                         : $"Approved resolvers: {normalised}";
                 }, "comma-separated IPs, empty to clear"),
 
+            Toggle(detection, "DNS filtering", "Refuse malware and phishing names at the resolver, before anything connects.",
+                () =>
+                {
+                    // Read back from the resolver rather than from settings.json: anyone can
+                    // flip protection in AdGuard's own UI, and a switch that says "on" while
+                    // nothing is filtered is worse than no switch at all.
+                    _dnsFilter.EnsureFresh();
+                    return _dnsFilter.ProtectionEnabled == true;
+                },
+                on =>
+                {
+                    // Deliberately does NOT run setup, which the desktop switch does. The
+                    // installer needs Administrator, and consent is a prompt on the machine's
+                    // own desktop — which is exactly what nobody is looking at when the TUI is
+                    // being driven over SSH or a remote session. Naming the command beats
+                    // opening a window on a screen at the other end of the country.
+                    if (!_dnsFilter.Configured)
+                        throw new SettingRejectedException(
+                            "No filtering resolver is set up. Run "
+                            + DnsFilterService.SetupCommandHint()
+                            + " from an elevated prompt on this machine, then set the resolver address below.");
+
+                    var (ok, message) = _dnsFilter.SetProtection(on);
+                    if (!ok) throw new SettingRejectedException(message);
+                    return message;
+                }),
+
+            Value(detection, "DNS filter resolver", "Admin API of the filtering resolver, e.g. http://10.8.0.1:3000.",
+                SettingKind.Text,
+                () => _settings.DnsFilterUrl.Length == 0 ? "(not configured)" : _settings.DnsFilterUrl,
+                raw =>
+                {
+                    var normalised = DnsFilterService.NormalizeBaseUrl(raw);
+                    if (raw.Trim().Length > 0 && normalised.Length == 0)
+                        throw new SettingRejectedException(
+                            "Enter the resolver's admin address, e.g. 10.8.0.1:3000 or http://10.8.0.1:3000.");
+                    _settings.DnsFilterUrl = normalised;
+                    _dnsFilter.Configure(normalised, _settings.DnsFilterUsername, _settings.DnsFilterPassword);
+                    return normalised.Length == 0
+                        ? "DNS filter resolver cleared — the switch has nothing to control."
+                        : $"DNS filter resolver: {normalised} ({_dnsFilter.Status})";
+                }, "host:port, empty to clear"),
+
+            Value(detection, "DNS filter user", "Admin user for that API — \"admin\" for a resolver the setup script installed.",
+                SettingKind.Text,
+                () => _settings.DnsFilterUsername.Length == 0 ? "(no login)" : _settings.DnsFilterUsername,
+                raw =>
+                {
+                    _settings.DnsFilterUsername = raw.Trim();
+                    _dnsFilter.Configure(_settings.DnsFilterUrl, _settings.DnsFilterUsername, _settings.DnsFilterPassword);
+                    return _settings.DnsFilterUsername.Length == 0
+                        ? "DNS filter user cleared — the resolver is assumed to need no login."
+                        : $"DNS filter user: {_settings.DnsFilterUsername} ({_dnsFilter.Status})";
+                }, "user name, empty to clear"),
+
+            // Never shown back, for the same reason as the DuckDNS token: the prompt is
+            // the only place a credential is typed.
+            Value(detection, "DNS filter password", "Stored in settings.json and never displayed again.",
+                SettingKind.Text,
+                () => _settings.DnsFilterPassword.Length > 0 ? "(stored)" : "(not set)",
+                raw =>
+                {
+                    _settings.DnsFilterPassword = raw;
+                    _dnsFilter.Configure(_settings.DnsFilterUrl, _settings.DnsFilterUsername, _settings.DnsFilterPassword);
+                    return raw.Length == 0
+                        ? "DNS filter password cleared."
+                        : $"DNS filter password saved ({_dnsFilter.Status})";
+                }, "password, empty to clear"),
+
             Toggle(detection, "WireGuard peer monitoring", "Per-peer handshake and transfer accounting.",
                 () => _settings.WireGuardMonitorEnabled,
                 on =>
@@ -357,7 +428,7 @@ internal sealed class TuiSettings
                     return on ? $"WireGuard peers: on ({_monitor.WireGuardStatus})" : "WireGuard peer monitoring: off";
                 }),
 
-            Value(detection, "Per-peer transfer alert", "Megabytes per peer per 10 minutes. 0 turns the alert off.",
+            Value(detection, "Per-peer transfer notice", "Megabytes per peer per 10 minutes, noted rather than raised as a threat. 0 turns it off.",
                 SettingKind.Number,
                 () => _settings.WireGuardPeerMbPer10Min == 0 ? "off" : $"{_settings.WireGuardPeerMbPer10Min} MB / 10 min",
                 raw =>
@@ -366,8 +437,8 @@ internal sealed class TuiSettings
                     _monitor.WireGuardPeerMbPer10Min = mb;
                     _settings.WireGuardPeerMbPer10Min = mb;
                     return mb == 0
-                        ? "Per-peer transfer alerts off — a VPN user streaming video legitimately moves gigabytes."
-                        : $"Alert when one WireGuard peer receives more than {mb} MB in 10 minutes.";
+                        ? "Per-peer transfer notices off — a VPN user streaming video legitimately moves gigabytes."
+                        : $"Note it when one WireGuard peer receives more than {mb} MB in 10 minutes.";
                 }, "MB per 10 minutes, 0 to disable"),
 
             Toggle(detection, "Suricata ingestion", "Read Suricata's EVE JSON and raise its alerts as threats.",

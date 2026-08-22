@@ -122,6 +122,15 @@ if (Test-Path $certSrc) {
     Copy-Item $certSrc (Join-Path $stage "issue-duckdns-cert.ps1") -Force
 }
 
+# Same arrangement for the DNS filter: DnsFilterSetup.ScriptPath looks beside the
+# binary first, and the Settings switch runs whatever it finds there. Left out of the
+# package, the switch can only report that it has nothing to run - on a server, which
+# is the machine this matters on.
+$dnsFilterSrc = Join-Path $PSScriptRoot "setup-dns-filter.ps1"
+if (Test-Path $dnsFilterSrc) {
+    Copy-Item $dnsFilterSrc (Join-Path $stage "setup-dns-filter.ps1") -Force
+}
+
 # Double-click friendly launcher inside the zip
 $cmdLauncher = @"
 @echo off

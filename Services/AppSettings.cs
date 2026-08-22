@@ -125,6 +125,32 @@ public sealed class AppSettings
     /// </summary>
     public string DnsApprovedResolvers { get; set; } = "";
 
+    /// <summary>
+    /// Address of the filtering resolver's admin API — the AdGuard Home that
+    /// <c>scripts/setup-dns-filter.ps1</c> installs, e.g. <c>http://10.8.0.1:3000</c>.
+    /// Empty means no resolver is under this app's control, which is what the DNS
+    /// filtering switch offers to fix rather than pretending to work. Setup fills
+    /// this in; nothing else writes it except the operator typing an address.
+    /// </summary>
+    public string DnsFilterUrl { get; set; } = "";
+
+    /// <summary>Admin user for the filtering resolver's API. Empty means it needs no auth.</summary>
+    public string DnsFilterUsername { get; set; } = "";
+
+    /// <summary>
+    /// Admin password for the filtering resolver's API. Kept here for the same reason
+    /// the DuckDNS token and the TLS key password are: the switch cannot work without
+    /// being able to authenticate.
+    ///
+    /// Note the storage is not owner-only, as it is on the sibling POSIX build.
+    /// <see cref="AppPaths"/> grants BUILTIN\Users Modify on %ProgramData%\NetworkSentinel
+    /// so the desktop GUI, the TUI and the SYSTEM web service share one state, which
+    /// means any local user can read this file. That is already true of every other
+    /// secret here; it is written down because a resolver admin password is worth
+    /// knowing that about.
+    /// </summary>
+    public string DnsFilterPassword { get; set; } = "";
+
     /// <summary>Ingest Suricata's EVE JSON alerts as threat events (payload inspection / signatures).</summary>
     public bool SuricataEnabled { get; set; }
 

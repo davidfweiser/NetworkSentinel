@@ -10,9 +10,24 @@ Three ways to run it (same idea as the Linux build):
 | **Terminal UI (`--tui`)** | Server Core, RDP console, SSH-style workflows |
 | **Headless web UI (`-w`)** | Browser dashboard on a server (master-password protected) |
 
-> Awareness / monitoring tooling — not a full IDS/IPS replacement. Version **0.7.13**.
+> Awareness / monitoring tooling — not a full IDS/IPS replacement. Version **0.7.16**.
 
 ---
+
+## What's new in 0.7.16
+
+The first control here that can stop a connection before it is attempted — and a VPN alert that was calling ordinary tunnel use an attack. The number jumps from 0.7.13 to stay level with the Linux line, where this shipped as two releases: the filter and the WireGuard demotion as 0.7.15, Blocked Sites as 0.7.16. Neither line has a 0.7.14.
+
+| Area | What changed |
+|------|--------------|
+| **DNS filtering** | Everything else in this app acts on a flow that already exists: the prevention engine writes a rule for an address the socket tables have already seen. On a VPN gateway a client's forwarded traffic never becomes a tracked connection at all, so **nothing here could block where a client goes**. A resolver refuses to answer, so the client learns no address and dials nothing. **Settings → DNS filtering** is that switch, over an AdGuard Home on this node's tunnel address. See [DNS filtering](#dns-filtering). |
+| **The switch is the setup** | Unlike the Linux build, where an administrator runs a shell script first and the switch only means anything afterwards, here **turning the switch on is what installs it**. With no resolver present the switch names everything it would change — a Windows service, port 53, firewall rules, this host's own resolver — and only proceeds if you accept, with Windows asking again for Administrator consent. The script is still shipped and still runnable by hand (`scripts\setup-dns-filter.ps1`, with `-Uninstall`), for anyone who would rather read it first. |
+| **Blocked Sites** | A new view, in the desktop app and the web console, listing the names the resolver actually refused: time, name, client, why, and the rule that did it. Read when you open it and when you press Refresh — never on the dashboard poll, because the query log is the busiest thing AdGuard serves and every tunnel client depends on that resolver answering. The rail item appears only once a resolver is configured. |
+| **The switch reports the resolver, not itself** | Filtering state is read back from AdGuard rather than mirrored into `settings.json`. Anyone can flip protection in AdGuard's own UI, and a switch that says "on" while nothing is filtered is worse than no switch. "Cannot reach it" stays distinct from "deliberately off" — those need opposite responses. And it switches *filtering*, not the resolver: turning it off leaves DNS answering normally, so no client loses name resolution. |
+| **Per-peer transfer is a note, not a threat** | Bytes to a WireGuard peer were filed as a **High** `DataExfiltration`. All that counter sees is encrypted volume, so a client pulling a backup looks exactly like a leak — and filing it as exfiltration aimed a threat at the peer's *endpoint*, the one address the prevention engine must never block and the reason `WireGuardEndpointGuard` exists. It is now an **Info** `VpnPeerChange` that says how much moved, at the figure you asked to hear about. |
+| **An upgrade stops moving the web console** | `install-web-service.ps1` registered the scheduled task with the default port every time, so a console on any other port vanished from the address that was bookmarked — and reinstalling the previous version wrote the same default again. The port is now read back from the installed task and kept; `-Port` still wins, and the banner says which happened. A port you *do* move away from has its stale firewall rule removed. |
+
+Seventeen more tests arrive with the setup handoff, and the resolver's own API is covered by the parse and wire suites ported from the Linux build — **345 total**.
 
 ## What's new in 0.7.13
 
@@ -302,13 +317,13 @@ This reads WireGuard's own state (`wg show all dump`, via the `wg.exe` that Wire
 | **New peer** | High | A peer entry grants standing access to your network. If you didn't add it, someone with Administrator rights edited the WireGuard config |
 | **Endpoint moved** | Low | Roaming between wifi and cellular is ordinary WireGuard behaviour — the value is the geo lookup patched into the alert's origin. The same key appearing from another country is not roaming |
 | **Peer removed** | Low | Expected after revoking access; unexpected means the config changed underneath you |
-| **Per-peer transfer** | High | Optional (0 = off). Forwarded tunnel traffic has no local socket, so the exfiltration monitor cannot see it — this is the only place it is counted |
+| **Per-peer transfer** | Info | Optional (0 = off). An accounting note, not a finding: volume through a tunnel is the tunnel working. Forwarded tunnel traffic has no local socket, so the exfiltration monitor cannot see it — this is the only place it is counted |
 
 - The first run adopts the existing peer list silently; the baseline persists in `wireguard-peers.json`, so a restart doesn't re-alert on peers you already know. Endpoint addresses are kept separately in `wireguard-endpoints.json` — see [tunnel endpoints are never auto-blocked](#tunnel-endpoints-are-never-auto-blocked).
 - **Key material never leaves the parser.** `wg show ... dump` prints the interface *private* key and each peer's *preshared* key. Both are dropped at parse time — they are never stored, logged, shown in the console, written to the baseline file, or sent to a webhook. Only public keys are used.
 - The web console shows a live peer table under **Settings → VPN (WireGuard)**: peer key (hover for the full key), interface, endpoint, allowed IPs, last handshake, and Rx/Tx. It is **read-only by design** — revoking a peer is a WireGuard configuration change, not something a monitoring console should do behind your back.
 - Needs **Administrator**; `wg.exe` cannot read the WireGuard service's device state otherwise. Without it the setting explains why rather than failing quietly.
-- Per-peer transfer alerting is **off by default**: a VPN user streaming video legitimately moves gigabytes, so any threshold low enough to catch a slow leak would fire constantly on normal use.
+- Per-peer transfer noting is **off by default**, and informational when on: a VPN user streaming video legitimately moves gigabytes, so any threshold low enough to catch a slow leak would fire constantly on normal use. What comes out is a volume notice at the figure you picked, not a judgement that the traffic was wrong. Until 0.7.16 it was a **High** `DataExfiltration`, which also pointed a threat at the peer's endpoint — the one address that must never be auto-blocked.
 
 #### Tunnel endpoints are never auto-blocked
 
@@ -391,7 +406,57 @@ Flows come from the ETW flow event source, so this covers traffic the socket tab
 
 > **The arrangement to aim for.** Windows 11 and Server 2022 can encrypt DNS themselves — `netsh dns add encryption server=<resolver> dohtemplate=<url>`, then set the adapter to DoH. Queries to a local address are never flagged, because a local resolver forwarding upstream over DoT/DoH is the wanted design: you keep full visibility here while the network sees nothing. Pointing everything straight at an external DoH endpoint hides your queries from your ISP *and* from this program — and from Suricata's DNS rules.
 
-Network Sentinel does not configure your resolver. Getting that wrong costs name resolution for the host and every VPN client at the same time, possibly while you are remote and depending on that tunnel to fix it. Detection and enforcement are what this program is for.
+Detection is what this section is for. Doing something about it is the next one.
+
+### DNS filtering
+
+Every other control in this app acts on a flow that **already exists**. The prevention engine writes a firewall rule for an address the socket tables have already reported, which means the connection was made first. On a VPN gateway it is worse than that: a client's forwarded traffic never becomes a tracked connection at all, so nothing described above can block **where a client goes**.
+
+A resolver can. It refuses to answer, the client learns no address, and nothing is dialled. That is the only control here that stops a connection *before* it is attempted.
+
+**Settings → DNS filtering** is that switch, over an [AdGuard Home](https://adguard.com/en/adguard-home/overview.html) running on this node's tunnel address:
+
+```
+host + tunnel clients -> AdGuard Home (this node) -> [DoT] -> upstream
+```
+
+Queries never leave the node in the clear, and because the resolver is local you keep full visibility while the network sees nothing — the arrangement the section above asks for.
+
+#### Turning it on installs it
+
+**This is the one place the feature is turned on.** Flip the switch with no resolver present and it names everything it is about to change before anything happens:
+
+- download AdGuard Home and register it as a Windows service
+- bind its admin UI to this node's tunnel address (port 3000)
+- serve DNS on port 53 to tunnel clients only
+- add Windows Firewall rules for both
+- point this machine's own resolver at it
+
+Accept and Windows asks again for Administrator consent; decline either and nothing is changed and the switch goes back to off. Everything replaced is backed up first, and `-Uninstall` puts it back — including this host's original resolver settings, because a machine left pointing at a resolver that no longer exists loses name resolution entirely.
+
+The download is verified against AdGuard's published `checksums.txt` before it is unpacked; a hash that differs stops the install, and a *missing* line is reported as the packaging change it probably is rather than as tampering.
+
+This differs from the Linux build on purpose. There, `setup-dns-filter.sh` is run by hand and the switch only means anything afterwards. The script is still here and still runnable directly — `powershell -ExecutionPolicy Bypass -File .\scripts\setup-dns-filter.ps1`, with `-DryRun`, `-Uninstall`, `-TunnelAddress`, `-Upstream`, `-StrayDns` and `-NoFirewall` — for a headless server, or for reading before running.
+
+**Only the desktop switch installs.** The TUI and the web console change filtering on a resolver that already exists, and otherwise name the command instead of running it. Installing needs Administrator consent at that machine's own desktop, which is exactly what is not there when the console is being driven over the network — the same reason the console says it cannot write firewall rules rather than offering an editor that fails at Save.
+
+#### What the switch actually switches
+
+Filtering, not the resolver. Stopping the service would take DNS away from every tunnel client at once — an outage, not "filtering off". Switching protection off leaves the resolver answering normally but unfiltered, which is what AdGuard's own **Disable protection** does and the only reading that cannot strand a client.
+
+The state shown is **read back from AdGuard**, not from `settings.json`. Anyone can flip protection in AdGuard's own UI, and a switch that claims "on" while nothing is being filtered is worse than no switch — the same reason the auto-block status comes from the engine rather than the settings. "Cannot reach the resolver" stays distinct from "deliberately off": they need opposite responses from whoever is reading.
+
+#### Blocked Sites
+
+A view in the desktop app and the web console listing what the resolver refused, newest first: time, name, client, why, and the rule. It is read when you open it and when you press **Refresh**, never on the dashboard poll — the query log is the busiest thing AdGuard serves, and every tunnel client depends on that resolver answering. The rail item appears only once a resolver is configured, and takes itself away if you clear it.
+
+#### The gap this leaves
+
+**It blocks by name.** Malware that dials a hard-coded IP makes no DNS query and passes straight through — which is exactly the case the threat-intel feeds and the prevention engine catch. Neither half covers the other; keep both on.
+
+Two Windows-specific limits are worth knowing. The Linux build can DNAT a client's hard-coded `8.8.8.8` back to the local resolver, so filtering holds even for a client that ignores the pushed setting. Windows Firewall has no DNAT and `netsh portproxy` is TCP-only, so **that mode is not offered here** rather than half-implemented; `-StrayDns Block` fails such a client's DNS instead of silently letting it bypass the filter. And whether that block reaches RRAS-*forwarded* client traffic depends on your routing setup — verify it with a client rather than assuming.
+
+Finally: the resolver's admin password is stored in `settings.json`, which on Windows lives in `%ProgramData%\NetworkSentinel` with `BUILTIN\Users` granted Modify so the desktop app, the TUI and the SYSTEM web service share one state. Any local user can read it. That is already true of the DuckDNS token and the TLS key password; it is written down here because a resolver admin password is worth knowing it about.
 
 ### Remote alerting (webhook)
 Set **Settings → Webhook URL** to push Critical threats off the machine — the payload adapts automatically: **ntfy** (plain text + `Title`/`Priority` headers), **Slack** (`{"text": …}`), **Discord** (`{"content": …}`), anything else gets a generic JSON document. Per-source/type cooldown stops a burst from flooding the channel.
@@ -648,7 +713,7 @@ The console is laid out like the desktop window (0.7.4), because they are the sa
 | **Firewall & Block** | Managed rules grouped as In/Out pairs; manual IP and port blocking; **Restore allowlisted** |
 | **Firewall Config** (rebuilt 0.7.4) | The whole host firewall — Windows' own rules, Network Sentinel's, and everyone else's — plus listening services and their firewall verdict; add / edit / delete any of them |
 | **Allowlist** | Add/remove trusted domains and IPs; refresh the feed |
-| **Settings** | Monitoring on/off, page refresh speed, geo lookups, failed-logon monitoring, closed-port scan detection, the intrusion detectors (threat intel, new-listener, process reputation, ARP watch, startup-item watch, exfiltration, honeypot), **kernel flow events**, **DNS hygiene** (with approved resolvers), **WireGuard peer monitoring**, **Suricata signature ingestion** (EVE path), **auto-block dry run**, **HTTPS + DuckDNS remote access** (including **Issue certificate**), webhook alerts, auto-block + minimum severity + expiry, block direction (in/out), allowlist feed, **change master password**, **Remove all rules** |
+| **Settings** | Monitoring on/off, page refresh speed, geo lookups, failed-logon monitoring, closed-port scan detection, the intrusion detectors (threat intel, new-listener, process reputation, ARP watch, startup-item watch, exfiltration, honeypot), **kernel flow events**, **DNS hygiene** (with approved resolvers), **DNS filtering** (resolver address, user and password), **WireGuard peer monitoring**, **Suricata signature ingestion** (EVE path), **auto-block dry run**, **HTTPS + DuckDNS remote access** (including **Issue certificate**), webhook alerts, auto-block + minimum severity + expiry, block direction (in/out), allowlist feed, **change master password**, **Remove all rules** |
 
 The console protects itself: it refuses to remove its own firewall access rule, block its own port, or write a Firewall Config rule that would do the same (doing so would cut off your browser mid-request and look exactly like a crash).
 
@@ -998,6 +1063,9 @@ The token is written to `duckdns.json`, not `settings.json`; the GUI, TUI, and w
 | `Services/WireGuardEndpointGuard.cs` / `IpsecEndpointGuard.cs` | Tunnel endpoints that must never be auto-blocked |
 | `Services/TrafficMeterService.cs` | Adapter byte-counter sampling + daily history behind the data-flow charts |
 | `Services/DnsHygieneMonitor.cs` | Plaintext/encrypted DNS, unapproved resolvers, allowlist resolution drift |
+| `Services/DnsFilterService.cs` | The DNS filtering switch: AdGuard Home's status, protection and query log |
+| `Services/DnsFilterSetup.cs` | Runs `setup-dns-filter.ps1` elevated for the switch, and reads back what it built |
+| `scripts/setup-dns-filter.ps1` | Installs AdGuard Home as the filtering resolver for this node's tunnel clients; `-Uninstall` reverses it |
 | `Services/HostHistoryStore.cs` | Persistent host + listener baseline, threat log |
 | `Services/WebhookNotifier.cs` | ntfy / Slack / Discord / generic JSON alerts, each carrying the block verdict |
 | `Services/DesktopNotifier.cs` | Critical Windows toasts, blocked-or-not in the title |
