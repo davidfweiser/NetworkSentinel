@@ -1,3 +1,4 @@
+using System;
 using System.IO;
 using System.Net.Http;
 using System.Net.Http.Headers;
@@ -99,7 +100,24 @@ public sealed class DnsFilterService : IDisposable
         if (uri.Scheme is not ("http" or "https")) return "";
         if (uri.Host.Length == 0) return "";
 
-        var port = uri.IsDefaultPort && !raw!.Contains(':') ? 3000 : uri.Port;
+        // Whether a port was typed cannot be answered by looking for a colon in the
+        // whole string — "http://10.8.0.1" has one, in the scheme. That read every
+        // scheme-qualified address without a port as port 80, so the switch pointed
+        // at nothing and reported only that the resolver could not be reached. Ask
+        // the authority instead, past any IPv6 brackets.
+        // Read the text, not the parsed Uri: Uri fills in a default port either way,
+        // so it cannot say whether one was typed — which is the only question here.
+        var afterScheme = text[(text.IndexOf("://", StringComparison.Ordinal) + 3)..];
+        var pathStart = afterScheme.IndexOfAny(new[] { '/', '?', '#' });
+        var authority = pathStart >= 0 ? afterScheme[..pathStart] : afterScheme;
+        var portGiven = authority.LastIndexOf(':') > authority.LastIndexOf(']');
+
+        // No port typed: http means the resolver's own admin UI, which is where the
+        // setup script puts it. https means something is proxying it, and the proxy's
+        // default port is the sensible reading.
+        var port = portGiven
+            ? uri.Port
+            : uri.Scheme == "https" ? 443 : 3000;
         return $"{uri.Scheme}://{uri.Host}:{port}";
     }
 

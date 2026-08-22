@@ -22,6 +22,16 @@ public class DnsFilterServiceTests
     [InlineData("http://10.8.0.1:3000/", "http://10.8.0.1:3000")]
     [InlineData("  http://10.8.0.1:3000  ", "http://10.8.0.1:3000")]
     [InlineData("https://dns.example.org:8443", "https://dns.example.org:8443")]
+    // A scheme with no port: the colon in "http://" must not be read as a port having
+    // been given, which is what sent this to port 80 and made the switch unreachable.
+    [InlineData("http://10.8.0.1", "http://10.8.0.1:3000")]
+    [InlineData("http://10.8.0.1/", "http://10.8.0.1:3000")]
+    // https without a port means a proxy in front, where 443 is the sensible reading.
+    [InlineData("https://dns.example.org", "https://dns.example.org:443")]
+    // An explicit port always wins, including one that equals the scheme default.
+    [InlineData("http://10.8.0.1:80", "http://10.8.0.1:80")]
+    [InlineData("http://[fd00::1]:3000", "http://[fd00::1]:3000")]
+    [InlineData("http://[fd00::1]", "http://[fd00::1]:3000")]
     public void KnownForms_NormalizeToAnOrigin(string raw, string expected)
     {
         Assert.Equal(expected, DnsFilterService.NormalizeBaseUrl(raw));
