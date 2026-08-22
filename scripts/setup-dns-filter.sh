@@ -299,8 +299,12 @@ if [[ -x "$AGH_BIN" ]]; then
   info "already installed at ${AGH_BIN} — reusing the binary"
 else
   if [[ "$AGH_VERSION" == "latest" ]]; then
-    AGH_VERSION="$(curl -fsSL https://api.github.com/repos/AdguardTeam/AdGuardHome/releases/latest \
-      | grep -m1 '"tag_name"' | cut -d'"' -f4 || true)"
+    # Read the body first: piping curl into `grep -m1` makes grep exit on the first
+    # match and close the pipe, so curl dies of EPIPE and prints "curl: (23) Failure
+    # writing output to destination" — an alarming line for a step that in fact
+    # succeeded, printed right where a real download error would appear.
+    AGH_RELEASE_JSON="$(curl -fsSL https://api.github.com/repos/AdguardTeam/AdGuardHome/releases/latest || true)"
+    AGH_VERSION="$(grep -m1 '"tag_name"' <<<"$AGH_RELEASE_JSON" | cut -d'"' -f4 || true)"
     [[ -n "$AGH_VERSION" ]] || die "could not determine the latest AdGuard Home release — pass --version"
   fi
   info "version: ${AGH_VERSION}"
@@ -317,8 +321,22 @@ else
   # Verify before unpacking. A resolver is the single most valuable thing on this
   # box to tamper with — it decides where every client goes.
   if [[ "$DRY_RUN" != "1" ]]; then
-    ( cd "$TMP" && grep " ${TARBALL}\$" checksums.txt | sha256sum -c - ) \
-      || die "checksum mismatch on ${TARBALL} — refusing to install"
+    # The release file lists names as "./AdGuardHome_linux_amd64.tar.gz", so a pattern
+    # anchored on a leading space selects no line at all; sha256sum then read an empty
+    # list, said so, and this script reported it as a checksum *mismatch* — the one
+    # verdict that means the download was tampered with. Compare the basename instead
+    # of pattern-matching the line, and keep the two failures apart: no line for this
+    # file is a packaging change, a differing hash is a reason to stop.
+    expected="$(awk -v want="$TARBALL" '
+      { name = $NF
+        sub(/^\.\//, "", name)
+        sub(/^\*/, "", name)
+        if (name == want) { print $1; exit } }' "${TMP}/checksums.txt")"
+    [[ -n "$expected" ]] \
+      || die "checksums.txt has no line for ${TARBALL} — refusing to install"
+    actual="$(sha256sum "${TMP}/${TARBALL}" | cut -d' ' -f1)"
+    [[ "$expected" == "$actual" ]] \
+      || die "checksum mismatch on ${TARBALL}: expected ${expected}, got ${actual} — refusing to install"
     info "sha256 verified"
   fi
 
