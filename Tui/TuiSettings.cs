@@ -342,7 +342,7 @@ internal sealed class TuiSettings
                     return on ? $"WireGuard peers: on ({_monitor.WireGuardStatus})" : "WireGuard peer monitoring: off";
                 }),
 
-            Value(detection, "Per-peer transfer alert", "Megabytes per peer per 10 minutes. 0 turns the alert off.",
+            Value(detection, "Per-peer transfer notice", "Megabytes per peer per 10 minutes, noted rather than raised as a threat. 0 turns it off.",
                 SettingKind.Number,
                 () => _settings.WireGuardPeerMbPer10Min == 0 ? "off" : $"{_settings.WireGuardPeerMbPer10Min} MB / 10 min",
                 raw =>
@@ -350,7 +350,7 @@ internal sealed class TuiSettings
                     var mb = RequireInt(raw, 0, int.MaxValue, "Enter 0 to disable, or a positive number of megabytes.");
                     _monitor.WireGuardPeerMbPer10Min = mb;
                     _settings.WireGuardPeerMbPer10Min = mb;
-                    return mb == 0 ? "Per-peer transfer alerts off" : $"Per-peer transfer alert threshold: {mb} MB / 10 min";
+                    return mb == 0 ? "Per-peer transfer notices off" : $"Per-peer transfer notice at {mb} MB / 10 min";
                 }, "MB per 10 minutes, 0 to disable"),
 
             Toggle(detection, "Suricata ingestion", "Read Suricata's EVE JSON and raise its alerts as threats.",

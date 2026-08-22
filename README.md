@@ -131,13 +131,17 @@ This reads WireGuard's own state (`wg show all dump`) instead:
 | **New peer** | High | A peer entry grants standing access to your network. If you didn't add it, someone with root edited the WireGuard config |
 | **Endpoint moved** | Low | Roaming between wifi and cellular is ordinary WireGuard behaviour — the value is the geo lookup patched into the alert's origin. The same key appearing from another country is not roaming |
 | **Peer removed** | Low | Expected after revoking access; unexpected means the config changed underneath you |
-| **Per-peer transfer** | High | Optional (0 = off). Forwarded tunnel traffic has no local socket, so the exfiltration monitor cannot see it — this is the only place it is counted |
+| **Per-peer transfer** | Info | Optional (0 = off). Forwarded tunnel traffic has no local socket, so the exfiltration monitor cannot see it — this is the only place it is counted. Counted, not accused: volume through a tunnel is the tunnel working |
 
 - The first run adopts the existing peer list silently; the baseline persists in `wireguard-peers.json`, so a restart doesn't re-alert on peers you already know.
 - **Key material never leaves the parser.** `wg show ... dump` prints the interface *private* key and each peer's *preshared* key. Both are dropped at parse time — they are never stored, logged, shown in the console, written to the baseline file, or sent to a webhook. Only public keys are used.
 - The peer table in **Settings → VPN (WireGuard)** is read-only by design. Revoking a peer is `wg set <iface> peer <key> remove` — a WireGuard configuration change, not something a monitoring console should do behind your back.
 - Needs **root** (`CAP_NET_ADMIN`); `wg show` cannot read device state otherwise. Without it the setting explains why rather than failing quietly.
-- Per-peer transfer alerting is **off by default**: a VPN user streaming video legitimately moves gigabytes, so any threshold low enough to catch a slow leak would fire constantly on normal use.
+- Per-peer transfer notices are **off by default, and informational when on**: a VPN user streaming video legitimately
+  moves gigabytes, so any threshold low enough to catch a slow leak would fire constantly on normal use. Through 0.7.13
+  a peer crossing the threshold raised a **High Data Exfiltration** threat, which was wrong twice over — the counter sees
+  encrypted volume and nothing of what is inside, and the threat carried the peer's *endpoint* as its source address, the
+  one address [that must never be blocked](#tunnel-endpoints-are-never-auto-blocked).
 
 #### Tunnel endpoints are never auto-blocked
 

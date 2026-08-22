@@ -1141,8 +1141,8 @@ public sealed class WebApp : IDisposable
                             _monitor.WireGuardPeerMbPer10Min = wgMb;
                             _settings.WireGuardPeerMbPer10Min = wgMb;
                             label = wgMb == 0
-                                ? "Per-peer transfer alerts off"
-                                : $"Per-peer transfer alert threshold: {wgMb} MB / 10 min";
+                                ? "Per-peer transfer notices off"
+                                : $"Per-peer transfer notice at {wgMb} MB / 10 min";
                             break;
                         case "suricataEnabled":
                             _monitor.SuricataEnabled = on;
@@ -4069,7 +4069,7 @@ public sealed class WebApp : IDisposable
       <div class="settings-group"><h3>VPN (WireGuard)</h3>
         <div class="settings-note">WireGuard uses one unconnected UDP socket, so its peers never appear as connections and nothing else on this page can see them. This reads WireGuard's own state instead. Needs root. Only public keys are read — the interface private key and peer preshared keys are discarded and never stored.</div>
         ${row('WireGuard peer monitoring', 'Watch peers for new keys, endpoint moves, and removals. ' + (s.wireGuardStatus || ''), sw('wireGuardMonitorEnabled', s.wireGuardMonitorEnabled))}
-        ${row('Per-peer transfer alert (MB / 10 min)', 'Alert when this much data is sent to a single peer within 10 minutes. 0 disables it — a VPN user streaming video legitimately moves gigabytes. Forwarded tunnel traffic has no local socket, so this is the only place it is counted.', txt('wireGuardPeerMbPer10Min', s.wireGuardPeerMbPer10Min ?? 0, '0'))}
+        ${row('Per-peer transfer notice (MB / 10 min)', 'Note it when this much data is sent to a single peer within 10 minutes. Recorded as an observation, not a threat — volume through a tunnel is the tunnel working, and a VPN user streaming video legitimately moves gigabytes. 0 disables it. Forwarded tunnel traffic has no local socket, so this is the only place it is counted.', txt('wireGuardPeerMbPer10Min', s.wireGuardPeerMbPer10Min ?? 0, '0'))}
         ${wgPeerTable(s.wireGuardPeers)}
       </div>
       <div class="settings-group"><h3>Signatures (Suricata)</h3>
