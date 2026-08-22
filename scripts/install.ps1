@@ -107,6 +107,15 @@ if (Test-Path $CertScript) {
     Copy-Item $CertScript (Join-Path $InstallDir "issue-duckdns-cert.ps1") -Force
 }
 
+# Same arrangement for the DNS filter, which DnsFilterSetup.ScriptPath finds the same
+# way. Settings -> DNS filtering runs whatever is beside the binary, so without this
+# the switch can only report that it has nothing to run - on the desktop, which is the
+# one front-end that is allowed to install a resolver at all.
+$DnsFilterScript = Join-Path $PSScriptRoot "setup-dns-filter.ps1"
+if (Test-Path $DnsFilterScript) {
+    Copy-Item $DnsFilterScript (Join-Path $InstallDir "setup-dns-filter.ps1") -Force
+}
+
 # Prefer standalone .ico for shortcuts; fall back to the exe (embedded app icon).
 $IconPath = $InstalledExe
 $RootIcon = Join-Path $Root "Assets\icon.ico"
