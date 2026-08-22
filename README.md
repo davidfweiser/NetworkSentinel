@@ -170,6 +170,35 @@ The status line beside the switch distinguishes three states, because they need 
 
 "Cannot tell" is deliberately never rendered as "off". A resolver that has stopped answering is a different problem from one that has been told to stop filtering, and reporting the first as the second sends you looking for a setting when the service is simply down.
 
+#### When the switch turns itself back off
+
+The switch reverts whenever the resolver refuses the change, and the message beside it names the reason. All four of these were found on one host in one sitting, and three of them were bugs here rather than anything wrong with the setup:
+
+| Message | Cause | Fix |
+|---------|-------|-----|
+| `DNS filtering is not configured` | No resolver address. Usually the console was **running** while the setup script wrote `settings.json`: the app rewrites that file on exit, over what the script put there | Stop the console before running the script, or type the address into the panel afterwards |
+| `could not be reached` | Nothing is listening at that address. Either the resolver is down, or the address is wrong — including `http://10.8.0.1` **without a port**, which through 0.7.14 was read as port 80 because the parse looked for a colon in the whole string and found the one in `http://` (fixed in 0.7.15) | `sudo ss -lntup \| grep :3000`, then correct the field |
+| `the resolver rejected the credentials` | AdGuard has a password and the app has none, or the wrong one | The **Resolver user** / **Resolver password** fields — `admin` plus the password set during setup |
+| `the resolver answered 415` | Fixed in 0.7.15. The request went out as `application/json; charset=utf-8`, and AdGuard compares that header rather than parsing it, so it was refused before reaching the handler — with the resolver running, reachable and authenticated | Upgrade; nothing to configure |
+
+**If the resolver will not start at all**, the usual reason is that something already owns port 53 — on a VPN gateway, very often a `dnsmasq` the tunnel's own setup installed. AdGuard binds its UDP sockets first, collides on TCP, exits 1, and with `Restart=always` becomes a crash loop rather than a visible failure, so the only symptom anywhere is *could not be reached*:
+
+```bash
+sudo journalctl -u AdGuardHome -n 30 --no-pager   # "bind: address already in use"
+sudo ss -lntp | grep ':53'                        # names the holder
+```
+
+From 0.7.15 the setup script checks this **before installing anything** and stops with the holder's name and process, rather than leaving a crash loop to be found later. It also verifies the resolver by its **admin port** rather than by `systemctl is-active`: a daemon being restarted every ten seconds reads as *active* if the check lands in the window between spawn and exit, and the `dig` test that followed was answered by the resolver already on 53 — a test the wrong daemon can pass.
+
+Replacing a `dnsmasq` that was serving your clients is usually right: AdGuard binds the same addresses, so nothing on the client side changes. Carry over anything `dnsmasq` was doing besides forwarding, though — split-horizon lines especially, since they fail silently:
+
+```
+server=/localdomain/192.168.0.1          # dnsmasq
+[/localdomain/]192.168.0.1               # the same thing in AdGuard's upstream list
+```
+
+Check for `dhcp-range`/`dhcp-host` first — if it is also your DHCP server, do not disable it; give AdGuard a different DNS port instead.
+
 The one manual step it cannot do for you is pointing clients at it — `DNS = <tunnel-ip>` under `[Interface]` in each WireGuard client config, or `rightdns=` for strongSwan. Nothing is filtered until you do. The script prints the exact line and the two `dig` commands that verify it.
 
 > **This blocks by name, and that is a real limit.** Malware that dials a hard-coded IP makes no DNS query and passes straight through; a phishing domain registered an hour ago is on no list yet. Name filtering and the IP-based threat-intel feeds cover different halves of the problem, which is why both are on by default.
