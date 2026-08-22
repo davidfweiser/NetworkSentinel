@@ -14,6 +14,7 @@ public partial class MainViewModel : ObservableObject, IDisposable
 {
     /// <summary>Owns and wires the shared service graph (see <see cref="SentinelCore"/>).</summary>
     private readonly SentinelCore _core = new();
+    private readonly DnsFilterService _dnsFilter;
     private readonly NetworkMonitorService _monitor;
     private readonly FirewallService _firewall;
     private readonly AllowlistService _allowlist;
@@ -195,6 +196,7 @@ public partial class MainViewModel : ObservableObject, IDisposable
         _firewall = _core.Firewall;
         _allowlist = _core.Allowlist;
         _prevention = _core.Prevention;
+        _dnsFilter = _core.DnsFilter;
         _autoBlockEnabled = _settings.AutoBlockEnabled;
         _autoBlockMinLevel = _settings.AutoBlockMinLevel;
         if (!AutoBlockLevelOptions.Contains(_autoBlockMinLevel))
@@ -233,6 +235,10 @@ public partial class MainViewModel : ObservableObject, IDisposable
         _wireGuardPeerMbText = _settings.WireGuardPeerMbPer10Min.ToString();
         _dnsHygieneEnabled = _settings.DnsHygieneEnabled;
         _dnsApprovedResolversText = _settings.DnsApprovedResolvers;
+        _dnsFilterUrl = _settings.DnsFilterUrl;
+        _dnsFilterConfigured = _settings.DnsFilterUrl.Length > 0;
+        _dnsFilterUsername = _settings.DnsFilterUsername;
+        _dnsFilterPassword = _settings.DnsFilterPassword;
         _webhookUrl = _settings.WebhookUrl;
         _selectedAutoBlockExpiry = ExpiryMinutesToLabel(_settings.AutoBlockExpiryMinutes);
 
@@ -622,6 +628,7 @@ public partial class MainViewModel : ObservableObject, IDisposable
         ShowFirewall = SelectedNav == "Firewall";
         ShowFirewallConfig = SelectedNav == "FirewallConfig";
         ShowSettings = SelectedNav == "Settings";
+        ShowDnsBlocked = SelectedNav == "DnsBlocked";
 
         if (ShowFirewall)
             RefreshFirewallRules();
@@ -632,6 +639,10 @@ public partial class MainViewModel : ObservableObject, IDisposable
             _ = RefreshFirewallConfigAsync();
         if (ShowSettings)
             RefreshMonitorStatusText();
+        // Read on arrival rather than on the poll: this is the resolver's query log,
+        // and every tunnel client depends on that resolver answering.
+        if (ShowDnsBlocked)
+            _ = RefreshBlockedSitesAsync();
     }
 
     // ── Settings handlers ─────────────────────────────────────────────────────

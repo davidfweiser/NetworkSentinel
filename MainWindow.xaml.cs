@@ -17,6 +17,9 @@ public partial class MainWindow : Window
     /// resulting PasswordChanged does not write the same value straight back and re-save.</summary>
     private bool _syncingDuckDnsToken;
 
+    /// <summary>Same guard for the resolver password box, which DNS filter setup also fills in.</summary>
+    private bool _syncingDnsFilterPassword;
+
     private void OnLoaded(object sender, RoutedEventArgs e)
     {
         if (Resources["PulseStoryboard"] is Storyboard pulse)
@@ -29,6 +32,10 @@ public partial class MainWindow : Window
             _syncingDuckDnsToken = true;
             DuckDnsTokenBox.Password = vm.DuckDnsToken;
             _syncingDuckDnsToken = false;
+
+            _syncingDnsFilterPassword = true;
+            DnsFilterPasswordBox.Password = vm.DnsFilterPassword;
+            _syncingDnsFilterPassword = false;
 
             // Unsubscribe first: Loaded fires again if the window is ever re-shown,
             // and a second subscription would scroll twice for one open.
@@ -46,6 +53,18 @@ public partial class MainWindow : Window
     /// </summary>
     private void OnViewModelPropertyChanged(object? sender, System.ComponentModel.PropertyChangedEventArgs e)
     {
+        // DNS filter setup writes the resolver password into the view model itself, and
+        // a PasswordBox cannot be bound, so the box has to be told. Without this the
+        // field sits empty over a password that is stored and working, which reads as
+        // setup having failed to save it.
+        if (e.PropertyName == nameof(MainViewModel.DnsFilterPassword) && sender is MainViewModel source)
+        {
+            _syncingDnsFilterPassword = true;
+            try { DnsFilterPasswordBox.Password = source.DnsFilterPassword; }
+            finally { _syncingDnsFilterPassword = false; }
+            return;
+        }
+
         if (e.PropertyName != nameof(MainViewModel.IsRuleEditorOpen)) return;
         if (sender is not MainViewModel vm || !vm.IsRuleEditorOpen) return;
 
@@ -59,6 +78,13 @@ public partial class MainWindow : Window
         if (_syncingDuckDnsToken || DataContext is not MainViewModel vm)
             return;
         vm.DuckDnsToken = DuckDnsTokenBox.Password;
+    }
+
+    private void OnDnsFilterPasswordChanged(object sender, RoutedEventArgs e)
+    {
+        if (_syncingDnsFilterPassword || DataContext is not MainViewModel vm)
+            return;
+        vm.DnsFilterPassword = DnsFilterPasswordBox.Password;
     }
 
     private void OnClosed(object? sender, EventArgs e)
