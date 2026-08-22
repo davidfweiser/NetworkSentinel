@@ -142,6 +142,24 @@ sudo ./scripts/setup-dns-filter.sh
 
 **Its firewall rules live in their own nftables tables** (`inet dnsfilter`, `ip dnsfilter_nat`) rather than `inet networksentinel`. `FirewallService` deletes every rule whose comment starts with `NetworkSentinel`, so **Remove all rules** would otherwise strip the protection that keeps the resolver from answering the whole internet.
 
+#### The switch — Settings → DNS filtering (0.7.14)
+
+Once the script has run, filtering is turned on and off from inside Network Sentinel — **Settings → DNS filtering**, in the desktop app, the TUI and the web console alike. The script fills in the resolver address, so the switch works as soon as the app restarts.
+
+**It switches filtering, not the resolver.** Stopping the service would take DNS away from every tunnel client at once — an outage, not "filtering off". Switching protection off leaves the resolver answering normally and unfiltered, which is what AdGuard Home's own *Disable protection* does and the only reading of the switch that cannot strand a client mid-session.
+
+**The state is read back from the resolver, never mirrored into `settings.json`.** Anyone can flip protection in AdGuard's own UI, and a switch that reports *on* while nothing is being filtered is worse than no switch — the same reasoning that makes the auto-block status come from the engine rather than from the settings. What is stored here is only the address and credentials needed to reach the API.
+
+The status line beside the switch distinguishes three states, because they need different responses:
+
+| Status | Means |
+|--------|-------|
+| `Filtering names at the resolver` | Working |
+| `Resolver answering UNFILTERED — protection is off` | Deliberately off; DNS still resolves |
+| `Resolver unreachable (…)` | Cannot tell — the service is down, the address is wrong, or the credentials were rejected |
+
+"Cannot tell" is deliberately never rendered as "off". A resolver that has stopped answering is a different problem from one that has been told to stop filtering, and reporting the first as the second sends you looking for a setting when the service is simply down.
+
 The one manual step it cannot do for you is pointing clients at it — `DNS = <tunnel-ip>` under `[Interface]` in each WireGuard client config, or `rightdns=` for strongSwan. Nothing is filtered until you do. The script prints the exact line and the two `dig` commands that verify it.
 
 > **This blocks by name, and that is a real limit.** Malware that dials a hard-coded IP makes no DNS query and passes straight through; a phishing domain registered an hour ago is on no list yet. Name filtering and the IP-based threat-intel feeds cover different halves of the problem, which is why both are on by default.
@@ -374,7 +392,7 @@ gradient rather than an outline.
 | **Firewall & Block** | Managed rules grouped as In/Out pairs; manual IP and port blocking; **Restore allowlisted** |
 | **Firewall Config** (0.7.1, rebuilt 0.7.4) | The whole host firewall — UFW's rules, Network Sentinel's, and everyone else's — plus listening services and their firewall verdict; add / edit / delete any of them |
 | **Allowlist** | Add/remove trusted domains and IPs; refresh the feed |
-| **Settings** | Monitoring on/off, poll interval, geo lookups, auth-log and closed-port scan detection, the 0.4.0 detectors (threat intel, new-listener alerts, process reputation, ARP/gateway watch, startup-item watch, exfiltration threshold, honeypot ports), **kernel flow events**, **DNS hygiene** (with approved resolvers), **WireGuard peer monitoring** (with a live peer table), **Suricata signature ingestion** (EVE path, maximum severity, muted sids), **auto-block dry run**, **HTTPS + DuckDNS remote access** (including **Issue certificate**), webhook URL, auto-block + minimum severity + expiry, block direction (in/out), allowlist feed, **change master password**, **Remove all rules** |
+| **Settings** | Monitoring on/off, poll interval, geo lookups, auth-log and closed-port scan detection, the 0.4.0 detectors (threat intel, new-listener alerts, process reputation, ARP/gateway watch, startup-item watch, exfiltration threshold, honeypot ports), **kernel flow events**, **DNS hygiene** (with approved resolvers), **DNS filtering on/off**, **WireGuard peer monitoring** (with a live peer table), **Suricata signature ingestion** (EVE path, maximum severity, muted sids), **auto-block dry run**, **HTTPS + DuckDNS remote access** (including **Issue certificate**), webhook URL, auto-block + minimum severity + expiry, block direction (in/out), allowlist feed, **change master password**, **Remove all rules** |
 
 **The dashboard boxes the desktop had (0.7.7).** Two panels the desktop window
 carried and the console did not: **Threat intensity**, the high/critical count on

@@ -77,6 +77,7 @@ internal sealed class TuiSettings
     private readonly FirewallService _firewall;
     private readonly AllowlistService _allowlist;
     private readonly TrafficMeterService _traffic;
+    private readonly DnsFilterService _dnsFilter;
 
     /// <summary>Own instance, exactly as the desktop view-model keeps one: DuckDNS
     /// lives in its own 0600 file next to the settings, not in AppSettings.</summary>
@@ -90,6 +91,7 @@ internal sealed class TuiSettings
         _firewall = core.Firewall;
         _allowlist = core.Allowlist;
         _traffic = core.Traffic;
+        _dnsFilter = core.DnsFilter;
         Items = BuildCatalogue();
     }
 
@@ -332,6 +334,38 @@ internal sealed class TuiSettings
                         ? "No approved resolvers set — every plaintext query is reported, and DoH cannot be recognised."
                         : $"Approved resolvers: {normalised}";
                 }, "comma-separated IPs, empty to clear"),
+
+            Toggle(detection, "DNS filtering", "Refuse malware and phishing names at the resolver, before anything connects.",
+                () =>
+                {
+                    // Read back from the resolver rather than from settings.json: anyone can
+                    // flip protection in AdGuard's own UI, and a switch that says "on" while
+                    // nothing is filtered is worse than no switch at all.
+                    _dnsFilter.EnsureFresh();
+                    return _dnsFilter.ProtectionEnabled == true;
+                },
+                on =>
+                {
+                    var (ok, message) = _dnsFilter.SetProtection(on);
+                    if (!ok) throw new SettingRejectedException(message);
+                    return message;
+                }),
+
+            Value(detection, "DNS filter resolver", "Admin API of the filtering resolver, e.g. http://10.8.0.1:3000.",
+                SettingKind.Text,
+                () => _settings.DnsFilterUrl.Length == 0 ? "(not configured)" : _settings.DnsFilterUrl,
+                raw =>
+                {
+                    var normalised = DnsFilterService.NormalizeBaseUrl(raw);
+                    if (raw.Trim().Length > 0 && normalised.Length == 0)
+                        throw new SettingRejectedException(
+                            "Enter the resolver's admin address, e.g. 10.8.0.1:3000 or http://10.8.0.1:3000.");
+                    _settings.DnsFilterUrl = normalised;
+                    _dnsFilter.Configure(normalised, _settings.DnsFilterUsername, _settings.DnsFilterPassword);
+                    return normalised.Length == 0
+                        ? "DNS filter resolver cleared — the switch has nothing to control."
+                        : $"DNS filter resolver: {normalised} ({_dnsFilter.Status})";
+                }, "host:port, empty to clear"),
 
             Toggle(detection, "WireGuard peer monitoring", "Per-peer handshake and transfer accounting.",
                 () => _settings.WireGuardMonitorEnabled,

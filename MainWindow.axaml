@@ -1136,6 +1136,40 @@
 
               <Border Classes="card">
                 <StackPanel>
+                  <TextBlock Text="DNS filtering" FontWeight="Bold" FontSize="15"/>
+                  <TextBlock Text="The only control here that stops a connection before it is attempted. Everything else acts on a flow that already exists — and a VPN client's forwarded traffic never becomes a tracked connection at all, so nothing else on this page can block where a client goes. Set up by scripts/setup-dns-filter.sh."
+                             Foreground="{DynamicResource TextSecondaryBrush}" FontSize="12"
+                             Margin="0,4,0,10" TextWrapping="Wrap"/>
+                  <TextBlock Text="{Binding DnsFilterStatus}" FontSize="11"
+                             Foreground="{DynamicResource TextMutedBrush}"
+                             Margin="0,0,0,14" TextWrapping="Wrap"/>
+
+                  <Grid ColumnDefinitions="*,Auto" Margin="0,0,0,14">
+                    <StackPanel Margin="0,0,16,0">
+                      <TextBlock Text="Filter names at the resolver" FontWeight="Bold" FontSize="13"/>
+                      <TextBlock Text="Refuse known malware, phishing and tracking names before anything connects. This switches filtering, not the resolver: turning it off leaves DNS answering normally but unfiltered, so no client loses name resolution."
+                                 Foreground="{DynamicResource TextSecondaryBrush}" FontSize="11"
+                                 Margin="0,2,0,0" TextWrapping="Wrap"/>
+                    </StackPanel>
+                    <CheckBox Grid.Column="1" VerticalAlignment="Center"
+                              IsChecked="{Binding DnsFilterEnabled}"/>
+                  </Grid>
+
+                  <Grid ColumnDefinitions="*,Auto" Margin="0,0,0,14">
+                    <StackPanel Margin="0,0,16,0">
+                      <TextBlock Text="Filtering resolver" FontWeight="Bold" FontSize="13"/>
+                      <TextBlock Text="Admin API of the filtering resolver on this node. The setup script fills this in; clear it to leave the switch unconfigured."
+                                 Foreground="{DynamicResource TextSecondaryBrush}" FontSize="11"
+                                 Margin="0,2,0,0" TextWrapping="Wrap"/>
+                    </StackPanel>
+                    <TextBox Grid.Column="1" Width="220" VerticalAlignment="Center"
+                             Text="{Binding DnsFilterUrl}" Watermark="http://10.8.0.1:3000"/>
+                  </Grid>
+                </StackPanel>
+              </Border>
+
+              <Border Classes="card">
+                <StackPanel>
                   <TextBlock Text="Remote access (web console)" FontWeight="Bold" FontSize="15"/>
                   <TextBlock Text="Reach the browser console from outside this machine over HTTPS. These settings configure the headless web console (--web); this app saves them and keeps the DuckDNS hostname current."
                              Foreground="{DynamicResource TextSecondaryBrush}" FontSize="12"

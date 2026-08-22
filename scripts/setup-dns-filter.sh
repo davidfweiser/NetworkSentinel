@@ -348,6 +348,7 @@ fi
 step "Web UI credentials"
 
 AGH_HASH=""
+AGH_API_PASS=""
 if [[ "$DRY_RUN" != "1" ]]; then
   if [[ "$ASSUME_YES" == "1" ]]; then
     warn "non-interactive: leaving the setup wizard enabled (reachable on ${TUNNEL_IP}:${UI_PORT} only)"
@@ -361,6 +362,10 @@ if [[ "$DRY_RUN" != "1" ]]; then
       else
         warn "no bcrypt tool (install apache2-utils) — falling back to the setup wizard"
       fi
+      # AdGuard stores the bcrypt hash; Network Sentinel's switch has to authenticate
+      # to the same API, so it needs the password itself. It goes into settings.json,
+      # which is written owner-only and already holds the TLS key password.
+      [[ -n "$AGH_HASH" ]] && AGH_API_PASS="$AGH_PASS"
       unset AGH_PASS
     fi
   fi
@@ -732,34 +737,43 @@ if [[ -n "$TARGET_USER" ]]; then
   if [[ -f "$SETTINGS" ]]; then
     if pgrep -u "$TARGET_USER" -f 'NetworkSentinel' >/dev/null 2>&1; then
       warn "Network Sentinel is running — it would overwrite settings.json on exit."
-      say  "  Set this by hand instead, in Settings -> DNS hygiene -> Approved resolvers:"
-      say  "      ${TUNNEL_IP}, 127.0.0.1"
+      say  "  Set these by hand instead:"
+      say  "      Settings -> DNS hygiene -> Approved resolvers:  ${TUNNEL_IP}, 127.0.0.1"
+      say  "      Settings -> DNS filtering -> Filtering resolver: http://${TUNNEL_IP}:${UI_PORT}"
     elif [[ "$DRY_RUN" == "1" ]]; then
       info "[dry-run] would set DnsApprovedResolvers in ${SETTINGS}"
     else
       backup_file "$SETTINGS"
       if python3 -c '
 import json, sys
-path, ip = sys.argv[1], sys.argv[2]
+path, ip, ui_port, user, password = sys.argv[1:6]
 with open(path) as fh:
     cfg = json.load(fh)
 cfg["DnsApprovedResolvers"] = f"{ip},127.0.0.1"
 cfg["DnsHygieneEnabled"] = True
+# Points the in-app DNS filtering switch at this resolver. Without the address the
+# switch has nothing to control and says so rather than pretending to work.
+cfg["DnsFilterUrl"] = f"http://{ip}:{ui_port}"
+if user:
+    cfg["DnsFilterUsername"] = user
+    cfg["DnsFilterPassword"] = password
 with open(path, "w") as fh:
     json.dump(cfg, fh, indent=2)
-' "$SETTINGS" "$TUNNEL_IP"; then
-        info "approved resolvers set, DNS hygiene enabled"
+' "$SETTINGS" "$TUNNEL_IP" "$UI_PORT" "$([[ -n "$AGH_API_PASS" ]] && printf admin)" "$AGH_API_PASS"; then
+        info "approved resolvers set, DNS hygiene enabled, filtering switch pointed at http://${TUNNEL_IP}:${UI_PORT}"
       else
         warn "could not update settings.json - set the approved resolvers in the UI"
       fi
       chown "${TARGET_USER}:" "$SETTINGS" 2>/dev/null || true
     fi
   else
-    say "  No settings.json yet. After first launch, set Settings -> DNS hygiene ->"
-    say "  Approved resolvers to:  ${TUNNEL_IP}, 127.0.0.1"
+    say "  No settings.json yet. After first launch, set:"
+    say "      Settings -> DNS hygiene -> Approved resolvers:  ${TUNNEL_IP}, 127.0.0.1"
+    say "      Settings -> DNS filtering -> Filtering resolver: http://${TUNNEL_IP}:${UI_PORT}"
   fi
 else
-  say "  Set Settings -> DNS hygiene -> Approved resolvers to:  ${TUNNEL_IP}, 127.0.0.1"
+  say "  Set Settings -> DNS hygiene -> Approved resolvers:  ${TUNNEL_IP}, 127.0.0.1"
+  say "  Set Settings -> DNS filtering -> Filtering resolver: http://${TUNNEL_IP}:${UI_PORT}"
 fi
 
 # ---------------------------------------------------------------------------
@@ -795,6 +809,10 @@ else
   say "Web UI:  http://${TUNNEL_IP}:${UI_PORT}   — finish the setup wizard there to set a password"
 fi
 say "Reachable over the tunnel only; the firewall drops it from everywhere else."
+say ""
+say "Filtering can be switched on and off from Network Sentinel itself — Settings ->"
+say "DNS filtering, in the desktop app, the TUI and the web console. That switches"
+say "filtering only: the resolver keeps answering, so no client loses name resolution."
 say ""
 say "Undo everything:   sudo $0 --uninstall"
 say "Backups:           ${BACKUP_DIR}"

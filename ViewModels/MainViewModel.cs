@@ -15,6 +15,7 @@ public partial class MainViewModel : ObservableObject, IDisposable
 {
     /// <summary>Owns and wires the shared service graph (see <see cref="SentinelCore"/>).</summary>
     private readonly SentinelCore _core = new();
+    private readonly DnsFilterService _dnsFilter;
     private readonly NetworkMonitorService _monitor;
     private readonly FirewallService _firewall;
     private readonly AllowlistService _allowlist;
@@ -76,6 +77,7 @@ public partial class MainViewModel : ObservableObject, IDisposable
     [ObservableProperty] private string _authLogStatusText = "";
     [ObservableProperty] private string _probeLogStatusText = "";
     [ObservableProperty] private string _settingsMessage = "";
+    [ObservableProperty] private string _dnsFilterUrl = "";
     [ObservableProperty] private bool _threatIntelEnabled = true;
     [ObservableProperty] private bool _processReputationEnabled = true;
     [ObservableProperty] private bool _newListenerAlertsEnabled = true;
@@ -189,6 +191,7 @@ public partial class MainViewModel : ObservableObject, IDisposable
         _firewall = _core.Firewall;
         _allowlist = _core.Allowlist;
         _prevention = _core.Prevention;
+        _dnsFilter = _core.DnsFilter;
         _autoBlockEnabled = _settings.AutoBlockEnabled;
         _autoBlockMinLevel = _settings.AutoBlockMinLevel;
         if (!AutoBlockLevelOptions.Contains(_autoBlockMinLevel))
@@ -212,6 +215,7 @@ public partial class MainViewModel : ObservableObject, IDisposable
         _uiScale = _settings.GetUiScale();
         _selectedUiScale = ScaleValueToLabel(_uiScale);
         _threatIntelEnabled = _settings.ThreatIntelEnabled;
+        _dnsFilterUrl = _settings.DnsFilterUrl;
         _processReputationEnabled = _settings.ProcessReputationEnabled;
         _newListenerAlertsEnabled = _settings.NewListenerAlertsEnabled;
         _arpWatchEnabled = _settings.ArpWatchEnabled;
@@ -747,6 +751,87 @@ public partial class MainViewModel : ObservableObject, IDisposable
         _settings.UiScale = scale;
         _settings.Save();
         SettingsMessage = $"Text size: {value}";
+    }
+
+    private bool _dnsFilterEnabled;
+
+    /// <summary>
+    /// The DNS filtering switch. Written from two directions that must not be confused:
+    /// the user flipping it, which has to reach the resolver, and the background read
+    /// discovering what the resolver actually says, which must not. A generated
+    /// [ObservableProperty] gives one setter for both, and the sync path would then
+    /// push a write back for a state it had just been told — so this one is by hand.
+    /// </summary>
+    public bool DnsFilterEnabled
+    {
+        get => _dnsFilterEnabled;
+        set
+        {
+            if (_dnsFilterEnabled == value) return;
+            _dnsFilterEnabled = value;
+            OnPropertyChanged();
+
+            // Nothing is persisted: the resolver owns this state. Only the address is ours.
+            var (ok, message) = _dnsFilter.SetProtection(value);
+            SettingsMessage = message;
+            if (!ok)
+            {
+                // Put the switch back where reality is, or it sits lit over a resolver
+                // that never changed.
+                _dnsFilterEnabled = !value;
+                OnPropertyChanged();
+            }
+            OnPropertyChanged(nameof(DnsFilterStatus));
+        }
+    }
+
+    /// <summary>
+    /// Adopts the resolver's own answer without calling back out to it — the read path
+    /// of <see cref="DnsFilterEnabled"/>.
+    /// </summary>
+    private void SyncDnsFilterFromResolver(bool live)
+    {
+        if (_dnsFilterEnabled == live) return;
+        _dnsFilterEnabled = live;
+        OnPropertyChanged(nameof(DnsFilterEnabled));
+    }
+
+    /// <summary>
+    /// Live filtering state, read back from the resolver rather than from settings.json —
+    /// anyone can flip protection in AdGuard's own UI, and a switch that claims "on"
+    /// while nothing is filtered is worse than no switch. Refreshed in the background.
+    /// </summary>
+    public string DnsFilterStatus
+    {
+        get
+        {
+            _dnsFilter.EnsureFresh();
+            SyncDnsFilterFromResolver(_dnsFilter.ProtectionEnabled == true);
+            return _dnsFilter.Status;
+        }
+    }
+
+    partial void OnDnsFilterUrlChanged(string value)
+    {
+        var normalised = DnsFilterService.NormalizeBaseUrl(value);
+        if (value.Trim().Length > 0 && normalised.Length == 0)
+        {
+            SettingsMessage = "Enter the resolver's admin address, e.g. 10.8.0.1:3000 or http://10.8.0.1:3000.";
+            return;
+        }
+
+        // The TextBox reports every keystroke, so only act when the address actually
+        // settled somewhere new — otherwise typing one URL rewrites settings.json a
+        // character at a time.
+        if (normalised == _settings.DnsFilterUrl) return;
+
+        _settings.DnsFilterUrl = normalised;
+        _settings.Save();
+        _dnsFilter.Configure(normalised, _settings.DnsFilterUsername, _settings.DnsFilterPassword);
+        SettingsMessage = normalised.Length == 0
+            ? "DNS filter resolver cleared — the switch has nothing to control."
+            : $"DNS filter resolver: {normalised}";
+        OnPropertyChanged(nameof(DnsFilterStatus));
     }
 
     partial void OnThreatIntelEnabledChanged(bool value)

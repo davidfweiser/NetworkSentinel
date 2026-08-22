@@ -150,6 +150,9 @@ public sealed class WebApp : IDisposable
     /// </summary>
     private readonly TrafficMeterService _traffic;
 
+    /// <summary>The switch for the filtering resolver installed by scripts/setup-dns-filter.sh.</summary>
+    private readonly DnsFilterService _dnsFilter;
+
     /// <summary>Stand-in shown in the settings page where a DuckDNS token is stored but must not be sent.</summary>
     private const string TokenPlaceholder = "••••••••";
 
@@ -183,6 +186,7 @@ public sealed class WebApp : IDisposable
         _allowlist = _core.Allowlist;
         _prevention = _core.Prevention;
         _traffic = _core.Traffic;
+        _dnsFilter = _core.DnsFilter;
         // TLS flags touch only Web* settings, which nothing in the core graph reads,
         // so applying them after construction is safe.
         ApplyTlsOverrides(tlsOverrides);
@@ -1130,6 +1134,27 @@ public sealed class WebApp : IDisposable
                                 : $"Approved resolvers: {normalised}";
                             break;
                         }
+                        case "dnsFilterEnabled":
+                        {
+                            // The one control here that stops a connection being attempted
+                            // at all, so a failure must be reported, not silently swallowed.
+                            var (ok, message) = _dnsFilter.SetProtection(on);
+                            if (!ok) return ActionResultDto.Fail(message);
+                            label = message;
+                            break;
+                        }
+                        case "dnsFilterUrl":
+                        {
+                            var normalised = DnsFilterService.NormalizeBaseUrl(raw);
+                            if (!string.IsNullOrWhiteSpace(raw) && normalised.Length == 0)
+                                return ActionResultDto.Fail("Enter the resolver's admin address, e.g. 10.8.0.1:3000 or http://10.8.0.1:3000.");
+                            _settings.DnsFilterUrl = normalised;
+                            _dnsFilter.Configure(normalised, _settings.DnsFilterUsername, _settings.DnsFilterPassword);
+                            label = normalised.Length == 0
+                                ? "DNS filter resolver cleared — the switch has nothing to control."
+                                : $"DNS filter resolver: {normalised} ({_dnsFilter.Status})";
+                            break;
+                        }
                         case "wireGuardMonitorEnabled":
                             _monitor.WireGuardMonitorEnabled = on;
                             _settings.WireGuardMonitorEnabled = on;
@@ -1690,6 +1715,9 @@ public sealed class WebApp : IDisposable
                 dnsHygieneEnabled = _settings.DnsHygieneEnabled,
                 dnsApprovedResolvers = _settings.DnsApprovedResolvers,
                 dnsHygieneStatus = DnsHygieneStatusText(),
+                dnsFilterEnabled = DnsFilterOn(),
+                dnsFilterUrl = _settings.DnsFilterUrl,
+                dnsFilterStatus = DnsFilterStatusText(),
                 wireGuardMonitorEnabled = _settings.WireGuardMonitorEnabled,
                 wireGuardPeerMbPer10Min = _settings.WireGuardPeerMbPer10Min,
                 wireGuardStatus = WireGuardStatusText(),
@@ -1949,6 +1977,23 @@ public sealed class WebApp : IDisposable
     /// user's own browser connection mid-request — indistinguishable from a server crash.
     /// </summary>
     /// <summary>DNS hygiene state plus counters for the settings panel.</summary>
+    /// <summary>
+    /// Live state, refreshed in the background. Unknown renders as off in the switch
+    /// itself — the status line beside it is what distinguishes "unreachable" from
+    /// "deliberately off", because those need different action from the operator.
+    /// </summary>
+    private bool DnsFilterOn()
+    {
+        _dnsFilter.EnsureFresh();
+        return _dnsFilter.ProtectionEnabled == true;
+    }
+
+    private string DnsFilterStatusText()
+    {
+        _dnsFilter.EnsureFresh();
+        return _dnsFilter.Status;
+    }
+
     private string DnsHygieneStatusText()
     {
         if (!_settings.DnsHygieneEnabled)
@@ -4065,6 +4110,11 @@ public sealed class WebApp : IDisposable
         <div class="settings-note">Almost nothing connects without resolving a name first, so DNS is where a compromise usually shows earliest — and it is a standard exfiltration channel the exfiltration monitor cannot see, since that counts TCP socket bytes and DNS is UDP. Reads kernel flow events, so it needs root. Port 53 is detected as plaintext and 853 as DoT; DoH is HTTPS and can only be recognised when you list the resolver below.</div>
         ${row('DNS hygiene monitoring', 'Detect plaintext queries leaving the host, encrypted DNS silently falling back, queries to unapproved resolvers, VPN clients bypassing your resolver, and allowlisted domains moving networks. ' + (s.dnsHygieneStatus || ''), sw('dnsHygieneEnabled', s.dnsHygieneEnabled))}
         ${row('Approved resolvers', 'Comma-separated resolver IPs this host is meant to use — for example the local resolver on your tunnel address. Queries anywhere else are flagged, and HTTPS to these addresses is counted as DoH instead of ordinary web traffic.', txt('dnsApprovedResolvers', s.dnsApprovedResolvers || '', '10.8.0.1, 127.0.0.53'))}
+      </div>
+      <div class="settings-group"><h3>DNS filtering</h3>
+        <div class="settings-note">The only control here that can stop a connection before it is attempted. Everything else acts on a flow that already exists — and on a VPN gateway a client's forwarded traffic never becomes a tracked connection at all, so nothing else on this page can block where a client goes. Set up by scripts/setup-dns-filter.sh. This switches <em>filtering</em>, not the resolver: turning it off leaves DNS answering normally but unfiltered, so no client loses name resolution.</div>
+        ${row('DNS filtering', 'Refuse known malware, phishing and tracking names at the resolver, before anything connects. ' + (s.dnsFilterStatus || ''), sw('dnsFilterEnabled', s.dnsFilterEnabled))}
+        ${row('Filtering resolver', 'Admin API of the filtering resolver on this node. The setup script fills this in; clear it to leave the switch unconfigured.', txt('dnsFilterUrl', s.dnsFilterUrl || '', 'http://10.8.0.1:3000'))}
       </div>
       <div class="settings-group"><h3>VPN (WireGuard)</h3>
         <div class="settings-note">WireGuard uses one unconnected UDP socket, so its peers never appear as connections and nothing else on this page can see them. This reads WireGuard's own state instead. Needs root. Only public keys are read — the interface private key and peer preshared keys are discarded and never stored.</div>
