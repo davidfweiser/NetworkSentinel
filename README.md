@@ -532,11 +532,27 @@ first. The build is self-contained — the server needs no .NET runtime.
 | `--desktop-shortcut` | **Installer only** | Also drop an icon on the Desktop (opt-in; desktops only) |
 | `--no-desktop` | **Installer only** | Skip the application-menu entry entirely |
 | `--service-user NAME` | **Installer only**, with `--web-service` | Run the unit as this user (default: the invoking user). It also decides where the data dir lives — settings and the master-password hash go to that user's `~/.local/share/NetworkSentinel`, and the unit's `ReadWritePaths=` is set to it |
-| `--port N` | **Installer only**, with `--web-service` | Web console port (default 18765); written to `web.env` |
+| `--port N` | **Installer only**, with `--web-service` | Web console port (default 18765); written to `web.env`. Omit it on an upgrade and the port already in `web.env` is kept (0.7.15) |
+| `--new-data` | **Installer only**, with `--web-service` | Proceed even though the service user's data directory is empty while another account has a configured one — see below (0.7.15) |
 | `-w` / `--web` | **App** (`networksentinel`) | Run headless web UI in the foreground |
 | `--tui` | **App** | Terminal UI |
 | `--https` (+ `--tls-cert` / `--tls-key`) | **App**, with `-w` | Serve the console over TLS — see [HTTPS and remote access](#https-and-remote-access-050) |
 | `--set-duckdns` | **App** | Configure the DuckDNS hostname (run as your normal user, **not** `sudo`) |
+
+**Two ways an install used to serve nothing you could log into (both fixed in 0.7.15).**
+
+- **The port moved.** Every install wrote the default `WEB_PORT=18765` back into `web.env`, so a console
+  running on any other port disappeared from the address a browser or the iOS app was pointed at. The
+  obvious next move — reinstalling the previous version — wrote the same default again, which made it
+  look like the downgrade had not taken. `--port` still sets the port; omit it and the existing one is kept.
+- **The data directory changed underneath it.** The service user decides where settings, the TLS
+  certificate and the master-password hash are read from. Run the installer through `sudo` and `SUDO_USER`
+  names you; run it from a *root shell* (`sudo -i`, `su -`, a root SSH login) and it is unset, so the
+  service user becomes `root` and the data directory becomes `/root/.local/share/NetworkSentinel` — empty.
+  The unit then starts perfectly with default settings: no master password, no certificate, so
+  [HTTPS never comes up](#https-and-remote-access-050) and the console falls back to plain HTTP on the
+  default port. The installer now refuses that combination, names the account whose home holds the real
+  configuration, and prints the `--service-user` line that fixes it. `--new-data` proceeds anyway.
 
 `--web-service` is **not** a runtime flag for `networksentinel`. If install prints `Unknown option: --web-service`, your package is too old — rebuild with `./scripts/package.sh` and copy the new installer, or use [manual auto-start](#auto-start-on-boot-systemd) below.
 

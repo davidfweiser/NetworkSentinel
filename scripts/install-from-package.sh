@@ -26,9 +26,11 @@ MODE="system"
 PREFIX=""
 WEB_SERVICE=0
 WEB_PORT=18765
+PORT_EXPLICIT=0
 SERVICE_USER=""
 NO_DESKTOP=0
 DESKTOP_SHORTCUT=0
+NEW_DATA=0
 
 usage() {
   cat <<'EOF'
@@ -42,6 +44,8 @@ Install Network Sentinel from this package.
   ./install.sh --user --web-service         User-level systemd web service
 
   --service-user NAME   Run the web service as this user (default: invoking user)
+  --new-data            Allow a web service whose data directory is empty even
+                        though another account has a configured one
   --no-desktop          Skip .desktop menu entry
   --desktop-shortcut    Also drop an icon on ~/Desktop (opt-in; desktops only)
   -h, --help            Show this help
@@ -70,8 +74,10 @@ while [[ $# -gt 0 ]]; do
         echo "error: invalid port: $WEB_PORT" >&2
         exit 1
       fi
+      PORT_EXPLICIT=1
       shift 2
       ;;
+    --new-data) NEW_DATA=1; shift ;;
     --service-user)
       SERVICE_USER="${2:?--service-user requires a name}"
       shift 2
@@ -128,13 +134,77 @@ if [[ -z "$SERVICE_HOME" ]]; then
 fi
 DATA_DIR="${SERVICE_HOME}/.local/share/NetworkSentinel"
 
+# Named here rather than inside install_web_service, because the port an existing
+# install is already using has to be read before the summary below prints it.
+if [[ "$MODE" == "user" ]]; then
+  WEB_ENV_FILE="${XDG_CONFIG_HOME:-$HOME/.config}/networksentinel/web.env"
+else
+  WEB_ENV_FILE="/etc/networksentinel/web.env"
+fi
+
+# An upgrade must not move the console. Every install used to write the default
+# port straight back into web.env, so a console on any other port disappeared from
+# the address people had bookmarked and from whatever app was pointed at it — and
+# reinstalling the previous version, the obvious thing to try next, wrote the same
+# default again. --port still wins; without it the existing choice is kept.
+KEPT_PORT=0
+if [[ "$WEB_SERVICE" -eq 1 && "$PORT_EXPLICIT" -eq 0 && -f "$WEB_ENV_FILE" ]]; then
+  existing_port="$(sed -n 's/^[[:space:]]*WEB_PORT=\([0-9]\{1,5\}\)[[:space:]]*$/\1/p' "$WEB_ENV_FILE" | tail -1)"
+  if [[ -n "$existing_port" ]] && (( existing_port >= 1 && existing_port <= 65535 )); then
+    WEB_PORT="$existing_port"
+    KEPT_PORT=1
+  fi
+fi
+
+# A web service pointed at an empty data directory installs perfectly and serves
+# nothing anyone can use: no master password, no TLS certificate, no settings — so
+# HTTPS never starts and the console falls back to plain HTTP on the default port.
+# The way to get there is ordinary: run this from a root shell rather than through
+# sudo and SUDO_USER is unset, so the service user becomes root and the data
+# directory becomes /root/.local/share/NetworkSentinel while the real configuration
+# sits in someone's home. Nothing about the install looks wrong afterwards.
+if [[ "$WEB_SERVICE" -eq 1 && "$NEW_DATA" -eq 0 && ! -f "${DATA_DIR}/settings.json" ]]; then
+  configured=()
+  while IFS=: read -r pw_name _ pw_uid _ _ pw_home _; do
+    [[ "$pw_name" == "$SERVICE_USER" ]] && continue
+    (( pw_uid == 0 || pw_uid >= 1000 )) || continue
+    [[ -n "$pw_home" && -f "${pw_home}/.local/share/NetworkSentinel/settings.json" ]] || continue
+    configured+=("${pw_name} (${pw_home}/.local/share/NetworkSentinel)")
+  done < <(getent passwd)
+
+  if (( ${#configured[@]} > 0 )); then
+    {
+      echo "error: the web service would run as '${SERVICE_USER}', whose data directory is empty:"
+      echo "         ${DATA_DIR}"
+      echo "       but a configured one already exists:"
+      for entry in "${configured[@]}"; do
+        echo "         ${entry}"
+      done
+      echo
+      echo "       Started this way the console comes up with default settings — no master"
+      echo "       password, no certificate — so HTTPS does not start and it serves plain"
+      echo "       HTTP on port ${WEB_PORT} instead of the port you configured."
+      echo
+      echo "       Point it at the right account:"
+      echo "         sudo ./install.sh --web-service --service-user ${configured[0]%% *}"
+      echo "       or, if a fresh configuration really is what you want:"
+      echo "         sudo ./install.sh --web-service --new-data"
+    } >&2
+    exit 1
+  fi
+fi
+
 echo "Installing Network Sentinel"
 echo "  mode    : $MODE"
 echo "  app     : $LIBDIR"
 echo "  bin     : $BINDIR"
 echo "  user    : $SERVICE_USER (data → $DATA_DIR)"
 if [[ "$WEB_SERVICE" -eq 1 ]]; then
-  echo "  web     : systemd service on port $WEB_PORT"
+  if [[ "$KEPT_PORT" -eq 1 ]]; then
+    echo "  web     : systemd service on port $WEB_PORT (kept from the existing install; --port to change)"
+  else
+    echo "  web     : systemd service on port $WEB_PORT"
+  fi
 fi
 
 mkdir -p "$LIBDIR" "$BINDIR" "$DOCDIR"
@@ -298,11 +368,12 @@ fi
 install_web_service() {
   local unit_src unit_dst env_dir env_file
   mkdir -p "$DATA_DIR"
+  # One definition of where the port lives, shared with the carry-over above.
+  env_file="$WEB_ENV_FILE"
+  env_dir="$(dirname "$env_file")"
   if [[ "$MODE" == "user" ]]; then
     # User systemd
     unit_dst="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/networksentinel-web.service"
-    env_dir="${XDG_CONFIG_HOME:-$HOME/.config}/networksentinel"
-    env_file="${env_dir}/web.env"
     mkdir -p "$(dirname "$unit_dst")" "$env_dir"
   else
     if [[ "$(id -u)" -ne 0 ]]; then
@@ -310,8 +381,6 @@ install_web_service() {
       exit 1
     fi
     unit_dst="/etc/systemd/system/networksentinel-web.service"
-    env_dir="/etc/networksentinel"
-    env_file="${env_dir}/web.env"
     mkdir -p "$env_dir"
   fi
 
