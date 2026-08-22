@@ -167,4 +167,86 @@ public class DnsFilterServiceTests
         using var content = DnsFilterService.JsonBody("{\"enabled\":true}");
         Assert.Equal("application/json", content.Headers.ContentType?.ToString());
     }
+
+    /// <summary>
+    /// The blocked-sites view is only as honest as this parse. AdGuard has shipped
+    /// both question.name and question.host across 0.107 releases, and the rule can
+    /// arrive as a scalar or inside a rules[] array — a view that renders blank rows
+    /// for the shape it did not expect would read as "nothing was blocked".
+    /// </summary>
+    [Fact]
+    public void BlockedEntries_ReadBothQuestionShapes()
+    {
+        const string json = """
+        {"data":[
+          {"time":"2026-08-22T14:50:01.123Z","client":"10.87.0.2",
+           "question":{"class":"IN","name":"doubleclick.net","type":"A"},
+           "reason":"FilteredBlackList","rule":"||doubleclick.net^"},
+          {"time":"2026-08-22T14:50:09.500Z","client":"10.87.0.3",
+           "question":{"class":"IN","host":"ads.example.org","type":"A"},
+           "reason":"FilteredSafeBrowsing",
+           "rules":[{"filter_list_id":2,"text":"||ads.example.org^"}]}
+        ],"oldest":"2026-08-22T14:00:00Z"}
+        """;
+
+        Assert.True(DnsFilterService.TryParseBlocked(json, out var entries));
+        Assert.Equal(2, entries.Count);
+
+        Assert.Equal("doubleclick.net", entries[0].Domain);
+        Assert.Equal("10.87.0.2", entries[0].Client);
+        Assert.Equal("Blocklist", entries[0].Reason);
+        Assert.Equal("||doubleclick.net^", entries[0].Rule);
+
+        Assert.Equal("ads.example.org", entries[1].Domain);
+        Assert.Equal("Safe browsing", entries[1].Reason);
+        Assert.Equal("||ads.example.org^", entries[1].Rule);
+    }
+
+    /// <summary>
+    /// A resolver that ignores response_status=blocked must not have its ordinary
+    /// traffic listed as blocked — the whole point of the view is what was refused.
+    /// </summary>
+    [Fact]
+    public void BlockedEntries_SkipQueriesThatWereNotFiltered()
+    {
+        const string json = """
+        {"data":[
+          {"time":"2026-08-22T14:50:01Z","client":"10.87.0.2",
+           "question":{"name":"example.com","type":"A"},"reason":"NotFilteredNotFound"},
+          {"time":"2026-08-22T14:50:02Z","client":"10.87.0.2",
+           "question":{"name":"tracker.example","type":"A"},"reason":"FilteredBlackList"}
+        ]}
+        """;
+
+        Assert.True(DnsFilterService.TryParseBlocked(json, out var entries));
+        Assert.Single(entries);
+        Assert.Equal("tracker.example", entries[0].Domain);
+    }
+
+    /// <summary>An empty log is a valid answer, not a parse failure.</summary>
+    [Theory]
+    [InlineData("""{"data":[]}""")]
+    [InlineData("""{"data":null}""")]
+    public void BlockedEntries_EmptyLogParsesToNothing(string json)
+    {
+        Assert.True(DnsFilterService.TryParseBlocked(json, out var entries));
+        Assert.Empty(entries);
+    }
+
+    [Theory]
+    [InlineData("not json")]
+    [InlineData("""{"unexpected":true}""")]
+    public void BlockedEntries_RejectWhatItCannotRead(string json)
+    {
+        Assert.False(DnsFilterService.TryParseBlocked(json, out var entries));
+        Assert.Empty(entries);
+    }
+
+    /// <summary>An unknown reason code shows as itself rather than as a blank column.</summary>
+    [Fact]
+    public void UnknownReason_PassesThrough()
+    {
+        Assert.Equal("Blocklist", DnsFilterService.DescribeReason("FilteredBlackList"));
+        Assert.Equal("FilteredSomethingNew", DnsFilterService.DescribeReason("FilteredSomethingNew"));
+    }
 }

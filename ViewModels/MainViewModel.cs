@@ -38,6 +38,14 @@ public partial class MainViewModel : ObservableObject, IDisposable
     [ObservableProperty] private bool _showPorts;
     [ObservableProperty] private bool _showFirewall;
     [ObservableProperty] private bool _showSettings;
+    [ObservableProperty] private bool _showDnsBlocked;
+
+    /// <summary>
+    /// Whether a filtering resolver is configured at all. The blocked-sites rail item
+    /// is bound to this: without a resolver the view has nothing to read, and an item
+    /// that only ever says "not configured" is a worse answer than no item.
+    /// </summary>
+    [ObservableProperty] private bool _dnsFilterConfigured;
     [ObservableProperty] private string _searchText = "";
     [ObservableProperty] private string _heroSubtitle = "Watching local ports, remote peers, and break-in patterns in real time.";
     [ObservableProperty] private string _firewallStatusText = "";
@@ -78,6 +86,7 @@ public partial class MainViewModel : ObservableObject, IDisposable
     [ObservableProperty] private string _probeLogStatusText = "";
     [ObservableProperty] private string _settingsMessage = "";
     [ObservableProperty] private string _dnsFilterUrl = "";
+    [ObservableProperty] private string _blockedSitesStatus = "";
     [ObservableProperty] private string _dnsFilterUsername = "";
     [ObservableProperty] private string _dnsFilterPassword = "";
     [ObservableProperty] private bool _threatIntelEnabled = true;
@@ -218,6 +227,7 @@ public partial class MainViewModel : ObservableObject, IDisposable
         _selectedUiScale = ScaleValueToLabel(_uiScale);
         _threatIntelEnabled = _settings.ThreatIntelEnabled;
         _dnsFilterUrl = _settings.DnsFilterUrl;
+        _dnsFilterConfigured = _settings.DnsFilterUrl.Length > 0;
         _dnsFilterUsername = _settings.DnsFilterUsername;
         _dnsFilterPassword = _settings.DnsFilterPassword;
         _processReputationEnabled = _settings.ProcessReputationEnabled;
@@ -646,6 +656,7 @@ public partial class MainViewModel : ObservableObject, IDisposable
         ShowFirewall = SelectedNav == "Firewall";
         ShowFirewallConfig = SelectedNav == "FirewallConfig";
         ShowSettings = SelectedNav == "Settings";
+        ShowDnsBlocked = SelectedNav == "DnsBlocked";
 
         if (ShowFirewall)
             RefreshFirewallRules();
@@ -655,6 +666,27 @@ public partial class MainViewModel : ObservableObject, IDisposable
             _ = RefreshFirewallConfigAsync();
         if (ShowSettings)
             RefreshMonitorStatusText();
+        // Read on arrival rather than on the poll: this is the resolver's query log,
+        // and every tunnel client depends on that resolver answering.
+        if (ShowDnsBlocked)
+            _ = RefreshBlockedSitesAsync();
+    }
+
+    /// <summary>Names the resolver refused, newest first. Empty when it cannot be read.</summary>
+    public ObservableCollection<DnsFilterService.BlockedQuery> BlockedSites { get; } = new();
+
+    [RelayCommand]
+    private async Task RefreshBlockedSitesAsync()
+    {
+        BlockedSitesStatus = "Reading the resolver…";
+        var (ok, message, entries) = await _dnsFilter.GetBlockedAsync().ConfigureAwait(true);
+        BlockedSites.Clear();
+        if (ok)
+        {
+            foreach (var entry in entries)
+                BlockedSites.Add(entry);
+        }
+        BlockedSitesStatus = message;
     }
 
     // ── Settings handlers ─────────────────────────────────────────────────────
@@ -832,6 +864,9 @@ public partial class MainViewModel : ObservableObject, IDisposable
         _settings.DnsFilterUrl = normalised;
         _settings.Save();
         _dnsFilter.Configure(normalised, _settings.DnsFilterUsername, _settings.DnsFilterPassword);
+        DnsFilterConfigured = normalised.Length > 0;
+        if (!DnsFilterConfigured && ShowDnsBlocked)
+            Navigate("Dashboard");
         SettingsMessage = normalised.Length == 0
             ? "DNS filter resolver cleared — the switch has nothing to control."
             : $"DNS filter resolver: {normalised}";

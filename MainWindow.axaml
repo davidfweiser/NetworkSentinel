@@ -109,6 +109,11 @@
                        IsChecked="{Binding ShowFirewallConfig, Mode=OneWay}"
                        Command="{Binding NavigateCommand}" CommandParameter="FirewallConfig"
                        ToolTip.Tip="Add, edit and delete inbound and outbound rules"/>
+          <RadioButton Classes="nav" Content="Blocked Sites" GroupName="Nav"
+                       IsVisible="{Binding DnsFilterConfigured}"
+                       IsChecked="{Binding ShowDnsBlocked, Mode=OneWay}"
+                       Command="{Binding NavigateCommand}" CommandParameter="DnsBlocked"
+                       ToolTip.Tip="Names the filtering resolver refused"/>
           <RadioButton Classes="nav" Content="Settings" GroupName="Nav"
                        IsChecked="{Binding ShowSettings, Mode=OneWay}"
                        Command="{Binding NavigateCommand}" CommandParameter="Settings"/>
@@ -513,6 +518,32 @@
         </Border>
 
         <!-- PORTS -->
+        <Border Classes="card" IsVisible="{Binding ShowDnsBlocked}">
+          <DockPanel>
+            <StackPanel DockPanel.Dock="Top" Margin="0,0,0,12">
+              <TextBlock Text="Names your filtering resolver refused" FontWeight="Bold" FontSize="15"/>
+              <TextBlock Text="Newest first, read from the resolver's own query log when you open this page. This is a name-based block: a client that dials a hard-coded address never asks, so it never appears here — that half is what the threat-intel feeds and the prevention engine cover."
+                         Foreground="{DynamicResource TextSecondaryBrush}" FontSize="12"
+                         Margin="0,4,0,0" TextWrapping="Wrap"/>
+              <StackPanel Orientation="Horizontal" Margin="0,10,0,0">
+                <Button Content="Refresh" Command="{Binding RefreshBlockedSitesCommand}"/>
+                <TextBlock Text="{Binding BlockedSitesStatus}" VerticalAlignment="Center"
+                           Margin="12,0,0,0" FontSize="12"
+                           Foreground="{DynamicResource TextMutedBrush}"/>
+              </StackPanel>
+            </StackPanel>
+            <DataGrid ItemsSource="{Binding BlockedSites}" AutoGenerateColumns="False" IsReadOnly="True">
+              <DataGrid.Columns>
+                <DataGridTextColumn Header="Time" Binding="{Binding TimeText}" Width="90"/>
+                <DataGridTextColumn Header="Name" Binding="{Binding Domain}" Width="280"/>
+                <DataGridTextColumn Header="Client" Binding="{Binding Client}" Width="140"/>
+                <DataGridTextColumn Header="Why" Binding="{Binding Reason}" Width="140"/>
+                <DataGridTextColumn Header="Rule" Binding="{Binding Rule}" Width="*"/>
+              </DataGrid.Columns>
+            </DataGrid>
+          </DockPanel>
+        </Border>
+
         <Border Classes="card" IsVisible="{Binding ShowPorts}">
           <DockPanel>
             <StackPanel DockPanel.Dock="Top" Margin="0,0,0,12">

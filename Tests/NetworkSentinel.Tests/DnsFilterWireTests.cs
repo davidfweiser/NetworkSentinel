@@ -23,6 +23,8 @@ public class DnsFilterWireTests
 
         public List<string> Paths { get; } = new();
         public List<string> Bodies { get; } = new();
+        public List<string> Queries { get; } = new();
+        public List<string> ContentTypes { get; } = new();
         public string? LastAuthorization { get; private set; }
 
         /// <summary>Status code to answer per path; anything unlisted gets 404.</summary>
@@ -58,6 +60,8 @@ public class DnsFilterWireTests
 
                 var path = ctx.Request.Url?.AbsolutePath ?? "";
                 Paths.Add(path);
+                Queries.Add(ctx.Request.Url?.Query ?? "");
+                ContentTypes.Add(ctx.Request.ContentType ?? "");
                 LastAuthorization = ctx.Request.Headers["Authorization"];
                 using (var reader = new StreamReader(ctx.Request.InputStream))
                     Bodies.Add(await reader.ReadToEndAsync());
@@ -170,5 +174,86 @@ public class DnsFilterWireTests
         Assert.False(await service.RefreshAsync());
         Assert.Null(service.ProtectionEnabled);
         Assert.Contains("unreachable", service.Status);
+    }
+
+    /// <summary>
+    /// The header AdGuard Home refuses. It compares Content-Type rather than parsing
+    /// it, so the "; charset=utf-8" that StringContent writes by default came back as
+    /// 415 — with the resolver running, reachable and authenticated, which is the
+    /// hardest failure of all to place from the outside.
+    /// </summary>
+    [Fact]
+    public async Task SettingProtection_SendsBareApplicationJson()
+    {
+        using var resolver = new FakeResolver();
+        resolver.Routes["/control/protection"] = (200, "");
+
+        using var service = new DnsFilterService();
+        service.Configure(resolver.BaseUrl, "admin", "pw");
+
+        Assert.True((await service.SetProtectionAsync(true)).Ok);
+        Assert.Equal("application/json", resolver.ContentTypes[0]);
+    }
+
+    /// <summary>
+    /// The blocked-sites view. Asking for the whole query log and filtering here would
+    /// pull megabytes off a resolver every tunnel client depends on, so the filter and
+    /// the limit go in the query string — and the credentials must ride along, or the
+    /// view is empty on exactly the resolvers that have a password.
+    /// </summary>
+    [Fact]
+    public async Task BlockedSites_AskTheResolverForBlockedOnly()
+    {
+        using var resolver = new FakeResolver();
+        resolver.Routes["/control/querylog"] = (200, """
+        {"data":[{"time":"2026-08-22T14:50:01Z","client":"10.87.0.2",
+                  "question":{"name":"doubleclick.net","type":"A"},
+                  "reason":"FilteredBlackList","rule":"||doubleclick.net^"}]}
+        """);
+
+        using var service = new DnsFilterService();
+        service.Configure(resolver.BaseUrl, "admin", "pw");
+
+        var (ok, message, entries) = await service.GetBlockedAsync(25);
+        Assert.True(ok);
+        Assert.Single(entries);
+        Assert.Equal("doubleclick.net", entries[0].Domain);
+        Assert.Contains("1 blocked", message);
+
+        Assert.Contains("/control/querylog", resolver.Paths);
+        Assert.Contains("response_status=blocked", resolver.Queries[0]);
+        Assert.Contains("limit=25", resolver.Queries[0]);
+        var expected = "Basic " + Convert.ToBase64String(Encoding.UTF8.GetBytes("admin:pw"));
+        Assert.Equal(expected, resolver.LastAuthorization);
+    }
+
+    /// <summary>
+    /// An unconfigured resolver, a refused login and an empty log are three different
+    /// answers. Collapsing any of them into "nothing was blocked" would report a view
+    /// that could not be read as a resolver with nothing to report.
+    /// </summary>
+    [Fact]
+    public async Task BlockedSites_SeparateEmptyFromUnreadable()
+    {
+        using var resolver = new FakeResolver();
+        resolver.Routes["/control/querylog"] = (200, """{"data":[]}""");
+
+        using var service = new DnsFilterService();
+        service.Configure(resolver.BaseUrl, "admin", "pw");
+
+        var empty = await service.GetBlockedAsync();
+        Assert.True(empty.Ok);
+        Assert.Empty(empty.Entries);
+        Assert.Contains("Nothing blocked yet", empty.Message);
+
+        resolver.Routes["/control/querylog"] = (401, "");
+        var refused = await service.GetBlockedAsync();
+        Assert.False(refused.Ok);
+        Assert.Contains("credentials", refused.Message);
+
+        using var unconfigured = new DnsFilterService();
+        var none = await unconfigured.GetBlockedAsync();
+        Assert.False(none.Ok);
+        Assert.Contains("not configured", none.Message);
     }
 }

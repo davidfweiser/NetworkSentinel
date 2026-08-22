@@ -12,7 +12,7 @@ Three ways to run it:
 
 > **Host-based** intrusion detection and prevention. It detects on its own heuristics and, with Suricata attached (0.6.0), on signature/payload inspection — then enforces in the kernel via `nftables`. It is not an inline network appliance: it protects the machine it runs on, not a segment, and it does not sit in the forwarding path.
 
-Linux port of the original Windows WPF Network Sentinel. Platform layers use `/proc/net`, `ss`, conntrack netlink, `nftables`/`iptables` (elevated via **pkexec**), and XDG data paths. Version **0.7.15**.
+Linux port of the original Windows WPF Network Sentinel. Platform layers use `/proc/net`, `ss`, conntrack netlink, `nftables`/`iptables` (elevated via **pkexec**), and XDG data paths. Version **0.7.16**.
 
 ---
 
@@ -198,6 +198,33 @@ server=/localdomain/192.168.0.1          # dnsmasq
 ```
 
 Check for `dhcp-range`/`dhcp-host` first — if it is also your DHCP server, do not disable it; give AdGuard a different DNS port instead.
+
+#### Blocked Sites — what the resolver actually refused (0.7.16)
+
+A **Blocked Sites** item appears in the navigation — the desktop rail and the web console
+alike — as soon as a filtering resolver is configured, and takes itself away again if the
+address is cleared. It lists what the resolver turned down, newest first:
+
+| Column | From |
+|--------|------|
+| Time | The query's timestamp, in this machine's local time |
+| Name | The name that was asked for |
+| Client | Which tunnel client asked |
+| Why | `Blocklist`, `Safe browsing`, `Parental`, `Blocked service`… — AdGuard's reason code in words, and unknown codes pass through as themselves rather than as a blank column |
+| Rule | The filter rule that matched |
+
+It reads AdGuard's own query log — `/control/querylog?response_status=blocked` — **when you
+open the view and when you press Refresh, never on the dashboard poll**. The query log is the
+busiest thing AdGuard serves, and this console polls its own state every couple of seconds
+against a resolver every tunnel client depends on for every name they resolve.
+
+Three answers that look alike are kept apart, for the same reason the switch's status line
+keeps them apart: an empty log ("nothing blocked yet — or the query log is switched off in
+AdGuard") is not a refused login, and neither is a resolver that cannot be reached.
+
+> An empty list is not proof of a quiet network. This blocks by **name**: a client dialling a
+> hard-coded address never asks the resolver, so it never appears here — that half is the
+> prevention engine's and the threat-intel feeds' to catch.
 
 The one manual step it cannot do for you is pointing clients at it — `DNS = <tunnel-ip>` under `[Interface]` in each WireGuard client config, or `rightdns=` for strongSwan. Nothing is filtered until you do. The script prints the exact line and the two `dig` commands that verify it.
 
@@ -599,17 +626,17 @@ first. The build is self-contained — the server needs no .NET runtime.
 
 ```bash
 # build machine
-scp dist/networksentinel-0.7.15-linux-x64.install.sh user@server:
+scp dist/networksentinel-0.7.16-linux-x64.install.sh user@server:
 
 # server
-chmod +x networksentinel-0.7.15-linux-x64.install.sh
-sudo ./networksentinel-0.7.15-linux-x64.install.sh --web-service
+chmod +x networksentinel-0.7.16-linux-x64.install.sh
+sudo ./networksentinel-0.7.16-linux-x64.install.sh --web-service
 ```
 
 Confirm the installer is current before using root:
 
 ```bash
-./networksentinel-0.7.15-linux-x64.install.sh --help
+./networksentinel-0.7.16-linux-x64.install.sh --help
 # Should list: --web-service
 ```
 
@@ -661,8 +688,8 @@ sudo ./….install.sh --web-service --port 18765
 ./….install.sh --user --desktop-shortcut    # ~/.local + icon on the Desktop
 
 # classic tarball
-tar xzf networksentinel-0.7.15-linux-x64.tar.gz
-cd networksentinel-0.7.15-linux-x64
+tar xzf networksentinel-0.7.16-linux-x64.tar.gz
+cd networksentinel-0.7.16-linux-x64
 sudo ./install.sh --web-service
 ```
 

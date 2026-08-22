@@ -1,4 +1,5 @@
 using System;
+using System.Globalization;
 using System.IO;
 using System.Net.Http;
 using System.Net.Http.Headers;
@@ -305,6 +306,164 @@ public sealed class DnsFilterService : IDisposable
 
     public (bool Ok, string Message) SetProtection(bool enabled)
         => Task.Run(() => SetProtectionAsync(enabled)).GetAwaiter().GetResult();
+
+    /// <summary>
+    /// One query the resolver refused. What the blocked-sites view is made of, and
+    /// deliberately only what a person reading that view needs: which name, from
+    /// which client, why, and under which rule.
+    /// </summary>
+    public sealed record BlockedQuery
+    {
+        public DateTime Time { get; init; }
+        public string Domain { get; init; } = "";
+        public string Client { get; init; } = "";
+        public string Reason { get; init; } = "";
+        public string Rule { get; init; } = "";
+
+        public string TimeText => Time == default ? "" : Time.ToString("HH:mm:ss");
+    }
+
+    /// <summary>
+    /// AdGuard's reason codes, in words. The raw value is passed through when it is
+    /// one this does not know: a new filtering source should show up as its own name
+    /// rather than as a blank column.
+    /// </summary>
+    public static string DescribeReason(string raw) => raw switch
+    {
+        "FilteredBlackList"     => "Blocklist",
+        "FilteredSafeBrowsing"  => "Safe browsing",
+        "FilteredParental"      => "Parental",
+        "FilteredBlockedService" => "Blocked service",
+        "FilteredSafeSearch"    => "Safe search",
+        "FilteredInvalid"       => "Invalid query",
+        "Rewrite"               => "Rewritten",
+        "RewriteEtcHosts"       => "Rewritten (hosts)",
+        _ => raw
+    };
+
+    /// <summary>
+    /// Reads the blocked entries out of a /control/querylog document. Split from the
+    /// request so it is testable without a resolver, like the status parse.
+    ///
+    /// Two shapes are accepted for the queried name: AdGuard has used both
+    /// <c>question.name</c> and <c>question.host</c> across 0.107 releases, and a view
+    /// that silently lists blank domains is worse than one that does not load.
+    /// </summary>
+    public static bool TryParseBlocked(string json, out IReadOnlyList<BlockedQuery> entries)
+    {
+        var list = new List<BlockedQuery>();
+        entries = list;
+        try
+        {
+            using var doc = JsonDocument.Parse(json);
+            if (doc.RootElement.ValueKind != JsonValueKind.Object) return false;
+            if (!doc.RootElement.TryGetProperty("data", out var data)) return false;
+            if (data.ValueKind == JsonValueKind.Null) return true;   // no entries yet
+            if (data.ValueKind != JsonValueKind.Array) return false;
+
+            foreach (var row in data.EnumerateArray())
+            {
+                if (row.ValueKind != JsonValueKind.Object) continue;
+
+                var reason = Text(row, "reason");
+                // The query is filtered server-side, but a resolver that ignores the
+                // parameter must not fill the view with things it did *not* block.
+                if (reason.StartsWith("NotFiltered", StringComparison.Ordinal)) continue;
+
+                var domain = "";
+                if (row.TryGetProperty("question", out var q) && q.ValueKind == JsonValueKind.Object)
+                {
+                    domain = Text(q, "name");
+                    if (domain.Length == 0) domain = Text(q, "host");
+                }
+                if (domain.Length == 0) continue;
+
+                var rule = Text(row, "rule");
+                if (rule.Length == 0 &&
+                    row.TryGetProperty("rules", out var rules) &&
+                    rules.ValueKind == JsonValueKind.Array)
+                {
+                    foreach (var r in rules.EnumerateArray())
+                    {
+                        rule = Text(r, "text");
+                        if (rule.Length > 0) break;
+                    }
+                }
+
+                var time = default(DateTime);
+                var timeText = Text(row, "time");
+                if (timeText.Length > 0 &&
+                    DateTime.TryParse(timeText, CultureInfo.InvariantCulture,
+                        DateTimeStyles.RoundtripKind, out var parsed))
+                {
+                    time = parsed.Kind == DateTimeKind.Utc ? parsed.ToLocalTime() : parsed;
+                }
+
+                list.Add(new BlockedQuery
+                {
+                    Time = time,
+                    Domain = domain,
+                    Client = Text(row, "client"),
+                    Reason = DescribeReason(reason),
+                    Rule = rule
+                });
+            }
+            return true;
+        }
+        catch (JsonException)
+        {
+            return false;
+        }
+
+        static string Text(JsonElement parent, string name)
+            => parent.TryGetProperty(name, out var v) && v.ValueKind == JsonValueKind.String
+                ? v.GetString() ?? ""
+                : "";
+    }
+
+    /// <summary>
+    /// The most recent names this resolver refused. Read on demand — opening the view
+    /// or pressing refresh — never on the dashboard poll: the query log is the busiest
+    /// thing AdGuard serves, and a console polling it every two seconds would be a
+    /// load on the resolver every client depends on.
+    /// </summary>
+    public async Task<(bool Ok, string Message, IReadOnlyList<BlockedQuery> Entries)> GetBlockedAsync(
+        int limit = 100, CancellationToken ct = default)
+    {
+        var none = (IReadOnlyList<BlockedQuery>)Array.Empty<BlockedQuery>();
+        string url;
+        lock (_gate) url = _baseUrl;
+        if (url.Length == 0)
+            return (false, $"DNS filtering is not configured — run {SetupScriptHint()} on this node first", none);
+
+        limit = Math.Clamp(limit, 1, 500);
+        try
+        {
+            using var request = new HttpRequestMessage(HttpMethod.Get,
+                $"{url}/control/querylog?response_status=blocked&limit={limit}");
+            Authorize(request);
+            using var response = await _http.SendAsync(request, ct).ConfigureAwait(false);
+            var body = await response.Content.ReadAsStringAsync(ct).ConfigureAwait(false);
+
+            if (!response.IsSuccessStatusCode)
+                return (false, response.StatusCode == System.Net.HttpStatusCode.Unauthorized
+                    ? "The resolver rejected the credentials — check the DNS filter username and password"
+                    : $"The resolver answered {(int)response.StatusCode}", none);
+
+            if (!TryParseBlocked(body, out var parsed))
+                return (false, "The resolver's query log could not be read", none);
+
+            return (true, parsed.Count == 0
+                ? "Nothing blocked yet — the log is empty, or the query log is switched off in AdGuard"
+                : $"{parsed.Count} blocked", parsed);
+        }
+        catch (Exception ex) when (ex is HttpRequestException or TaskCanceledException)
+        {
+            return (false, ex is TaskCanceledException
+                ? "The resolver did not answer within 6s"
+                : "The resolver could not be reached", none);
+        }
+    }
 
     /// <summary>
     /// A JSON body whose Content-Type is exactly <c>application/json</c>.

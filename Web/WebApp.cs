@@ -661,6 +661,33 @@ public sealed class WebApp : IDisposable
             return;
         }
 
+        // Its own route rather than a field on /api/state: the query log is the busiest
+        // thing AdGuard serves, and the dashboard poll runs every couple of seconds
+        // against a resolver every tunnel client depends on. This is read when the view
+        // is opened and when refresh is pressed, and not otherwise.
+        if (req.Method == "GET" && path == "/api/dns-blocked")
+        {
+            var limit = 100;
+            if (int.TryParse(req.Query["limit"], out var requested))
+                limit = requested;
+
+            var (ok, message, entries) = _dnsFilter.GetBlockedAsync(limit).GetAwaiter().GetResult();
+            WriteJson(res, 200, new
+            {
+                ok,
+                message,
+                entries = entries.Select(e => new
+                {
+                    time = e.TimeText,
+                    domain = e.Domain,
+                    client = e.Client,
+                    reason = e.Reason,
+                    rule = e.Rule
+                }).ToArray()
+            });
+            return;
+        }
+
         if (req.Method == "POST" && path == "/api/action")
         {
             var body = ReadBody(req);
@@ -1739,6 +1766,9 @@ public sealed class WebApp : IDisposable
                 dnsApprovedResolvers = _settings.DnsApprovedResolvers,
                 dnsHygieneStatus = DnsHygieneStatusText(),
                 dnsFilterEnabled = DnsFilterOn(),
+                // Drives the nav item: the blocked-sites view is meaningless without
+                // a resolver, so it is not offered until one is configured.
+                dnsFilterConfigured = _dnsFilter.Configured,
                 dnsFilterUrl = _settings.DnsFilterUrl,
                 dnsFilterUsername = _settings.DnsFilterUsername,
                 dnsFilterPasswordSet = _settings.DnsFilterPassword.Length > 0,
@@ -2875,6 +2905,7 @@ public sealed class WebApp : IDisposable
     <button data-tab="firewall">Firewall &amp; Block</button>
     <button data-tab="fwconfig" class="sub" title="Add, edit and delete inbound and outbound rules">Firewall Config</button>
     <button data-tab="allowlist" class="sub" title="Domains and IPs that are never blocked">Allowlist</button>
+    <button data-tab="dnsblocked" id="navDnsBlocked" class="hidden" title="Names the filtering resolver refused">Blocked Sites</button>
     <button data-tab="settings">Settings</button>
     <button data-tab="help" class="sub">Help</button>
   </nav>
@@ -3112,6 +3143,21 @@ public sealed class WebApp : IDisposable
     <div id="tbl-allowlist"></div>
   </section>
 
+  <section id="tab-dnsblocked" class="hidden">
+    <div class="toolbar">
+      <button id="btnRefreshBlocked">Refresh</button>
+      <select id="blockedLimit">
+        <option value="50">Last 50</option>
+        <option value="100" selected>Last 100</option>
+        <option value="250">Last 250</option>
+        <option value="500">Last 500</option>
+      </select>
+    </div>
+    <p class="muted" id="blockedStatus" style="margin:0 0 10px;font-size:.85rem">Loading…</p>
+    <p class="muted" style="margin:0 0 10px;font-size:.85rem">Names your filtering resolver refused, newest first. This is a name-based block: a client that dials a hard-coded address never asks, so it never appears here.</p>
+    <div id="tbl-dnsblocked"></div>
+  </section>
+
   <section id="tab-settings" class="hidden">
     <div id="settingsPanel"></div>
     <div class="settings-group">
@@ -3246,6 +3292,28 @@ public sealed class WebApp : IDisposable
     </table></div>`;
   }
 
+  async function loadBlockedSites() {
+    const limit = ($('blockedLimit') || {}).value || 100;
+    $('blockedStatus').textContent = 'Reading the resolver…';
+    try {
+      const res = await fetch('/api/dns-blocked?limit=' + encodeURIComponent(limit),
+        { cache: 'no-store', credentials: 'same-origin' });
+      const data = await res.json();
+      $('blockedStatus').textContent = data.message || '';
+      const rows = (data.entries || []).map(e => `<tr>
+        <td>${esc(e.time || '')}</td>
+        <td>${esc(e.domain || '')}</td>
+        <td>${esc(e.client || '')}</td>
+        <td>${esc(e.reason || '')}</td>
+        <td class="mono">${esc(e.rule || '')}</td>
+      </tr>`).join('');
+      $('tbl-dnsblocked').innerHTML = table(['Time', 'Name', 'Client', 'Why', 'Rule'], rows);
+    } catch (e) {
+      $('blockedStatus').textContent = 'Could not read the resolver: ' + (e.message || e);
+      $('tbl-dnsblocked').innerHTML = '';
+    }
+  }
+
   async function ensureAuth() {
     try {
       const res = await fetch('/api/auth/status', { cache: 'no-store', credentials: 'same-origin' });
@@ -3273,7 +3341,8 @@ public sealed class WebApp : IDisposable
   function isFrozenTab() {
     // Firewall Config joins them: a redraw mid-edit would wipe the form, and the
     // rule tables are something you read and act on rather than watch.
-    return tab === 'allowlist' || tab === 'firewall' || tab === 'settings' || tab === 'fwconfig';
+    return tab === 'allowlist' || tab === 'firewall' || tab === 'settings' || tab === 'fwconfig'
+        || tab === 'dnsblocked';
   }
 
   function getRefreshMs() {
@@ -3842,6 +3911,11 @@ public sealed class WebApp : IDisposable
     updateCriticalAlerts();
     const forceLists = !!opts.forceLists;
     $('ver').textContent = 'v' + (state.version || '?');
+    // The blocked-sites view has nothing to show without a resolver, so the nav item
+    // appears only once one is configured — and takes itself away again if it is cleared.
+    const dnsOn = !!(state.settings && state.settings.dnsFilterConfigured);
+    $('navDnsBlocked').classList.toggle('hidden', !dnsOn);
+    if (!dnsOn && tab === 'dnsblocked') showTab('dashboard');
     $('clock').textContent = state.clock || '';
     checkForUpgrade();
     // Don't overwrite a recent action result (add/remove/block) with the generic status.
@@ -4195,14 +4269,14 @@ public sealed class WebApp : IDisposable
       </div>`;
   }
 
-  document.getElementById('nav').addEventListener('click', (e) => {
-    const btn = e.target.closest('button[data-tab]');
-    if (!btn) return;
-    tab = btn.dataset.tab;
+  function showTab(name) {
+    tab = name;
     document.querySelectorAll('nav button').forEach(b => b.classList.toggle('active', b.dataset.tab === tab));
     document.querySelectorAll('main > section').forEach(sec => {
       sec.classList.toggle('hidden', sec.id !== 'tab-' + tab);
     });
+    // Read from the resolver on arrival — this list is not part of the state poll.
+    if (tab === 'dnsblocked') loadBlockedSites();
     // Freeze live poll on allowlist/firewall so lists stay readable.
     if (isFrozenTab()) {
       stopPolling();
@@ -4210,7 +4284,16 @@ public sealed class WebApp : IDisposable
     } else {
       syncSleepMode();
     }
+  }
+
+  document.getElementById('nav').addEventListener('click', (e) => {
+    const btn = e.target.closest('button[data-tab]');
+    if (!btn) return;
+    showTab(btn.dataset.tab);
   });
+
+  $('btnRefreshBlocked').onclick = () => loadBlockedSites();
+  $('blockedLimit').onchange = () => loadBlockedSites();
 
   $('btnSleep').onclick = () => toggleSleep();
   $('btnWakeBanner').onclick = () => toggleSleep(false);
