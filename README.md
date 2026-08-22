@@ -12,7 +12,7 @@ Three ways to run it:
 
 > **Host-based** intrusion detection and prevention. It detects on its own heuristics and, with Suricata attached (0.6.0), on signature/payload inspection — then enforces in the kernel via `nftables`. It is not an inline network appliance: it protects the machine it runs on, not a segment, and it does not sit in the forwarding path.
 
-Linux port of the original Windows WPF Network Sentinel. Platform layers use `/proc/net`, `ss`, conntrack netlink, `nftables`/`iptables` (elevated via **pkexec**), and XDG data paths. Version **0.7.13**.
+Linux port of the original Windows WPF Network Sentinel. Platform layers use `/proc/net`, `ss`, conntrack netlink, `nftables`/`iptables` (elevated via **pkexec**), and XDG data paths. Version **0.7.14**.
 
 ---
 
@@ -118,7 +118,33 @@ Flows come from the conntrack event source, so this covers traffic the socket ta
 > `host + clients → local resolver → [DoT/DoH] → upstream`.
 > Queries to a local address are never flagged, because that is the wanted design: you keep full visibility here while the network sees nothing. Pointing everything straight at an external DoH endpoint hides your queries from your ISP *and* from this program — and from Suricata's DNS rules.
 
-Network Sentinel does not configure your resolver. Installing one and pointing it upstream over DoT is a fifteen-minute job you do once; getting it wrong costs name resolution for the host and every VPN client at the same time, possibly while you are remote and depending on that tunnel to fix it. Detection and enforcement are what this program is for.
+The app itself never touches your resolver at runtime — detection and enforcement are what it does. But getting that arrangement in place is fiddly in exactly the way that punishes you for it: getting it wrong costs name resolution for the host and every VPN client at once, possibly while you are remote and depending on that tunnel to fix it. So the setup is a script you run once, separately from the app.
+
+### Setting up the filtering resolver — `scripts/setup-dns-filter.sh` (0.7.14)
+
+Installs **AdGuard Home** on this node as the resolver for your tunnel clients, in the arrangement above. This is the piece that blocks a bad site *by name, before the connection exists* — the prevention engine can only act on an address once a connection to it is already open.
+
+```bash
+sudo ./scripts/setup-dns-filter.sh --dry-run   # print every change, make none
+sudo ./scripts/setup-dns-filter.sh
+```
+
+| It does | Detail |
+|---------|--------|
+| **Detects the tunnel** | WireGuard from sysfs (`DEVTYPE=wireguard`), else `xfrm`/`ipsec`/`tun`. The client subnet is derived from the interface, not assumed — a `/32` server address (what `wg-quick` examples produce) falls back to the enclosing `/24` rather than guessing wrong |
+| **Binds narrowly** | Port 53 on the tunnel address and loopback **only**. AdGuard Home's own default is `0.0.0.0`, which on a public VPS is an open resolver: free DNS amplification for whoever finds it, and your address in the abuse reports |
+| **Filters** | AdGuard base list, two malware lists, **Phishing Army** and **PhishTank/OpenPhish**, NoCoin, plus a DoH-bootstrap list so browsers cannot route around it |
+| **Encrypts upstream** | DoT to Quad9 by default (`--upstream cloudflare\|adguard\|nextdns:<id>`). Port 853 is identifiable, so the DNS-hygiene monitor recognises it as encrypted without being told — a DoH upstream on 443 would have to be allowlisted by hand |
+| **Never falls back to plaintext** | `fallback_dns` is empty on purpose. Silent fallback is the exact failure the **Encrypted DNS stopped** detector exists to catch; better a loud outage than queries quietly leaving in the clear |
+| **Firewalls** | Port 53 accepted from the tunnel subnet, dropped everywhere else. Client DoT (853) is rejected, and stray plaintext DNS to a hard-coded `8.8.8.8` is DNAT'd back to your resolver (`--stray-dns reject\|allow` to change that) |
+| **Registers itself** | Writes the resolver into **Approved resolvers** and enables DNS hygiene, so the new setup validates instead of alerting `Unapproved resolver` on every client |
+| **Backs out** | Everything it touches is copied to `/var/backups/ns-dns-filter/<timestamp>/`, and `--uninstall` restores it |
+
+**Its firewall rules live in their own nftables tables** (`inet dnsfilter`, `ip dnsfilter_nat`) rather than `inet networksentinel`. `FirewallService` deletes every rule whose comment starts with `NetworkSentinel`, so **Remove all rules** would otherwise strip the protection that keeps the resolver from answering the whole internet.
+
+The one manual step it cannot do for you is pointing clients at it — `DNS = <tunnel-ip>` under `[Interface]` in each WireGuard client config, or `rightdns=` for strongSwan. Nothing is filtered until you do. The script prints the exact line and the two `dig` commands that verify it.
+
+> **This blocks by name, and that is a real limit.** Malware that dials a hard-coded IP makes no DNS query and passes straight through; a phishing domain registered an hour ago is on no list yet. Name filtering and the IP-based threat-intel feeds cover different halves of the problem, which is why both are on by default.
 
 ### VPN peer monitoring — WireGuard (0.6.0)
 
@@ -496,17 +522,17 @@ first. The build is self-contained — the server needs no .NET runtime.
 
 ```bash
 # build machine
-scp dist/networksentinel-0.7.13-linux-x64.install.sh user@server:
+scp dist/networksentinel-0.7.14-linux-x64.install.sh user@server:
 
 # server
-chmod +x networksentinel-0.7.13-linux-x64.install.sh
-sudo ./networksentinel-0.7.13-linux-x64.install.sh --web-service
+chmod +x networksentinel-0.7.14-linux-x64.install.sh
+sudo ./networksentinel-0.7.14-linux-x64.install.sh --web-service
 ```
 
 Confirm the installer is current before using root:
 
 ```bash
-./networksentinel-0.7.13-linux-x64.install.sh --help
+./networksentinel-0.7.14-linux-x64.install.sh --help
 # Should list: --web-service
 ```
 
@@ -558,8 +584,8 @@ sudo ./….install.sh --web-service --port 18765
 ./….install.sh --user --desktop-shortcut    # ~/.local + icon on the Desktop
 
 # classic tarball
-tar xzf networksentinel-0.7.13-linux-x64.tar.gz
-cd networksentinel-0.7.13-linux-x64
+tar xzf networksentinel-0.7.14-linux-x64.tar.gz
+cd networksentinel-0.7.14-linux-x64
 sudo ./install.sh --web-service
 ```
 
