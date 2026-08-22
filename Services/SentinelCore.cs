@@ -22,6 +22,7 @@ public sealed class SentinelCore : IDisposable
     public AllowlistService Allowlist { get; } = new();
     public PreventionService Prevention { get; }
     public TrafficMeterService Traffic { get; } = new();
+    public DnsFilterService DnsFilter { get; } = new();
 
     public SentinelCore(AppSettings? settings = null)
     {
@@ -59,6 +60,9 @@ public sealed class SentinelCore : IDisposable
         Monitor.WireGuardMonitorEnabled = Settings.WireGuardMonitorEnabled;
         Monitor.DnsApprovedResolvers = Settings.DnsApprovedResolvers;
         Monitor.DnsHygieneEnabled = Settings.DnsHygieneEnabled;
+        // The filtering resolver is a separate process, so the switch only needs to know
+        // where to reach it; its live state is read back rather than assumed from here.
+        DnsFilter.Configure(Settings.DnsFilterUrl, Settings.DnsFilterUsername, Settings.DnsFilterPassword);
         Monitor.WebhookUrl = Settings.WebhookUrl;
         Monitor.WebhookMinLevel = Settings.GetWebhookMinLevel();
 
@@ -96,5 +100,6 @@ public sealed class SentinelCore : IDisposable
         Monitor.Dispose();
         Allowlist.Dispose();
         Traffic.Dispose();
+        DnsFilter.Dispose();
     }
 }
