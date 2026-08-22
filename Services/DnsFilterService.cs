@@ -1,3 +1,4 @@
+using System.IO;
 using System.Net.Http;
 using System.Net.Http.Headers;
 using System.Text;
@@ -210,7 +211,7 @@ public sealed class DnsFilterService : IDisposable
         string url;
         lock (_gate) url = _baseUrl;
         if (url.Length == 0)
-            return (false, "DNS filtering is not configured — run scripts/setup-dns-filter.sh on this node first");
+            return (false, $"DNS filtering is not configured — run {SetupScriptHint()} on this node first");
 
         // /control/protection is the current endpoint; older AdGuard Home builds only
         // accept the whole DNS config. Try both before reporting a failure.
@@ -264,6 +265,26 @@ public sealed class DnsFilterService : IDisposable
     }
 
     /// <summary>Blocking wrapper for the synchronous settings paths in the TUI, GUI and web console.</summary>
+    /// <summary>
+    /// Where to tell someone the setup script is. Installed packages put it beside the
+    /// binary; a source checkout has it under scripts/. Naming a path that exists beats
+    /// naming a repo-relative one on a server that has no repo — which is every server
+    /// this is meant to run on.
+    /// </summary>
+    internal static string SetupScriptHint()
+    {
+        try
+        {
+            var beside = Path.Combine(AppContext.BaseDirectory, "setup-dns-filter.sh");
+            if (File.Exists(beside)) return beside;
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or ArgumentException)
+        {
+            // Fall through to the generic name — a hint is not worth an exception.
+        }
+        return "scripts/setup-dns-filter.sh";
+    }
+
     public (bool Ok, string Message) SetProtection(bool enabled)
         => Task.Run(() => SetProtectionAsync(enabled)).GetAwaiter().GetResult();
 

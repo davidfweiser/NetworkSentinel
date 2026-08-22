@@ -367,6 +367,32 @@ internal sealed class TuiSettings
                         : $"DNS filter resolver: {normalised} ({_dnsFilter.Status})";
                 }, "host:port, empty to clear"),
 
+            Value(detection, "DNS filter user", "Admin user for that API — \"admin\" for a resolver the setup script installed.",
+                SettingKind.Text,
+                () => _settings.DnsFilterUsername.Length == 0 ? "(no login)" : _settings.DnsFilterUsername,
+                raw =>
+                {
+                    _settings.DnsFilterUsername = raw.Trim();
+                    _dnsFilter.Configure(_settings.DnsFilterUrl, _settings.DnsFilterUsername, _settings.DnsFilterPassword);
+                    return _settings.DnsFilterUsername.Length == 0
+                        ? "DNS filter user cleared — the resolver is assumed to need no login."
+                        : $"DNS filter user: {_settings.DnsFilterUsername} ({_dnsFilter.Status})";
+                }, "user name, empty to clear"),
+
+            // Never shown back, for the same reason as the DuckDNS token: the prompt is
+            // the only place a credential is typed.
+            Value(detection, "DNS filter password", "Written to settings.json (owner-only) and never displayed again.",
+                SettingKind.Text,
+                () => _settings.DnsFilterPassword.Length > 0 ? "(stored)" : "(not set)",
+                raw =>
+                {
+                    _settings.DnsFilterPassword = raw;
+                    _dnsFilter.Configure(_settings.DnsFilterUrl, _settings.DnsFilterUsername, _settings.DnsFilterPassword);
+                    return raw.Length == 0
+                        ? "DNS filter password cleared."
+                        : $"DNS filter password saved ({_dnsFilter.Status})";
+                }, "password, empty to clear"),
+
             Toggle(detection, "WireGuard peer monitoring", "Per-peer handshake and transfer accounting.",
                 () => _settings.WireGuardMonitorEnabled,
                 on =>

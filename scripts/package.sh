@@ -54,7 +54,11 @@ cp "$ROOT/scripts/install-from-package.sh" "$STAGE/install.sh"
 cp "$ROOT/scripts/uninstall-from-package.sh" "$STAGE/uninstall.sh"
 # HTTPS setup: the console points at this script when a certificate is missing.
 cp "$ROOT/scripts/issue-duckdns-cert.sh" "$STAGE/issue-duckdns-cert.sh"
-chmod +x "$STAGE/install.sh" "$STAGE/uninstall.sh" "$STAGE/issue-duckdns-cert.sh"
+# The DNS filtering switch is inert until this has run, and the message it shows
+# names the script — so the package has to carry it, or the instruction points at
+# a file that only exists in the source tree.
+cp "$ROOT/scripts/setup-dns-filter.sh" "$STAGE/setup-dns-filter.sh"
+chmod +x "$STAGE/install.sh" "$STAGE/uninstall.sh" "$STAGE/issue-duckdns-cert.sh" "$STAGE/setup-dns-filter.sh"
 
 # systemd unit + env example
 mkdir -p "$STAGE/systemd"

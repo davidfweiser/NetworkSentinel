@@ -78,6 +78,8 @@ public partial class MainViewModel : ObservableObject, IDisposable
     [ObservableProperty] private string _probeLogStatusText = "";
     [ObservableProperty] private string _settingsMessage = "";
     [ObservableProperty] private string _dnsFilterUrl = "";
+    [ObservableProperty] private string _dnsFilterUsername = "";
+    [ObservableProperty] private string _dnsFilterPassword = "";
     [ObservableProperty] private bool _threatIntelEnabled = true;
     [ObservableProperty] private bool _processReputationEnabled = true;
     [ObservableProperty] private bool _newListenerAlertsEnabled = true;
@@ -216,6 +218,8 @@ public partial class MainViewModel : ObservableObject, IDisposable
         _selectedUiScale = ScaleValueToLabel(_uiScale);
         _threatIntelEnabled = _settings.ThreatIntelEnabled;
         _dnsFilterUrl = _settings.DnsFilterUrl;
+        _dnsFilterUsername = _settings.DnsFilterUsername;
+        _dnsFilterPassword = _settings.DnsFilterPassword;
         _processReputationEnabled = _settings.ProcessReputationEnabled;
         _newListenerAlertsEnabled = _settings.NewListenerAlertsEnabled;
         _arpWatchEnabled = _settings.ArpWatchEnabled;
@@ -831,6 +835,35 @@ public partial class MainViewModel : ObservableObject, IDisposable
         SettingsMessage = normalised.Length == 0
             ? "DNS filter resolver cleared — the switch has nothing to control."
             : $"DNS filter resolver: {normalised}";
+        OnPropertyChanged(nameof(DnsFilterStatus));
+    }
+
+    partial void OnDnsFilterUsernameChanged(string value)
+    {
+        var trimmed = value.Trim();
+        // Same keystroke guard as the address above: a TextBox reports every character,
+        // and each one would otherwise be a settings.json write and an API reconfigure.
+        if (trimmed == _settings.DnsFilterUsername) return;
+
+        _settings.DnsFilterUsername = trimmed;
+        _settings.Save();
+        _dnsFilter.Configure(_settings.DnsFilterUrl, _settings.DnsFilterUsername, _settings.DnsFilterPassword);
+        SettingsMessage = trimmed.Length == 0
+            ? "DNS filter user cleared — the resolver is assumed to need no login."
+            : $"DNS filter user: {trimmed}";
+        OnPropertyChanged(nameof(DnsFilterStatus));
+    }
+
+    partial void OnDnsFilterPasswordChanged(string value)
+    {
+        if (value == _settings.DnsFilterPassword) return;
+
+        _settings.DnsFilterPassword = value;
+        _settings.Save();
+        _dnsFilter.Configure(_settings.DnsFilterUrl, _settings.DnsFilterUsername, _settings.DnsFilterPassword);
+        SettingsMessage = value.Length == 0
+            ? "DNS filter password cleared."
+            : "DNS filter password saved.";
         OnPropertyChanged(nameof(DnsFilterStatus));
     }
 

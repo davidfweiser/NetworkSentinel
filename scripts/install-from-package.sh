@@ -222,6 +222,14 @@ if [[ -f "${PKG_ROOT}/issue-duckdns-cert.sh" ]]; then
   chmod +x "${LIBDIR}/issue-duckdns-cert.sh"
 fi
 
+# Likewise the DNS filter setup: the in-app switch does nothing until this has run,
+# and it has to be on the node it configures — which is rarely the machine with the
+# source tree on it.
+if [[ -f "${PKG_ROOT}/setup-dns-filter.sh" ]]; then
+  cp "${PKG_ROOT}/setup-dns-filter.sh" "${LIBDIR}/setup-dns-filter.sh"
+  chmod +x "${LIBDIR}/setup-dns-filter.sh"
+fi
+
 # Record layout for uninstall
 cat > "$META" <<EOF
 MODE=${MODE}

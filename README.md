@@ -129,6 +129,14 @@ sudo ./scripts/setup-dns-filter.sh --dry-run   # print every change, make none
 sudo ./scripts/setup-dns-filter.sh
 ```
 
+The script ships **inside the package** and is installed beside the binary, so a server that
+has never seen the source tree still has it (`/usr/local/lib/networksentinel/setup-dns-filter.sh`,
+or `~/.local/lib/networksentinel/` for a user install). Run it **through `sudo` from your own
+shell, not from a root shell** — it reads `SUDO_USER` to find the `settings.json` it should point
+at the new resolver, exactly as the installer does for the data directory. Stop the console first
+(`sudo systemctl stop networksentinel-web`): a running instance rewrites `settings.json` on exit
+and would drop what the script wrote. It says so rather than losing the values silently.
+
 | It does | Detail |
 |---------|--------|
 | **Detects the tunnel** | WireGuard from sysfs (`DEVTYPE=wireguard`), else `xfrm`/`ipsec`/`tun`. The client subnet is derived from the interface, not assumed — a `/32` server address (what `wg-quick` examples produce) falls back to the enclosing `/24` rather than guessing wrong |
@@ -144,7 +152,9 @@ sudo ./scripts/setup-dns-filter.sh
 
 #### The switch — Settings → DNS filtering (0.7.15)
 
-Once the script has run, filtering is turned on and off from inside Network Sentinel — **Settings → DNS filtering**, in the desktop app, the TUI and the web console alike. The script fills in the resolver address, so the switch works as soon as the app restarts.
+Once the script has run, filtering is turned on and off from inside Network Sentinel — **Settings → DNS filtering**, in the desktop app, the TUI and the web console alike. The script fills in the resolver address and the admin credentials, so the switch works as soon as the app restarts.
+
+Setting it up **by hand** takes three fields in that same panel: the resolver's admin address, the user (`admin` for a resolver this script installed) and that user's password. Before 0.7.15 only the address had a field, while the API call still sent the credentials — so a resolver with a password could be pointed at, but never authenticated to, and the switch failed with *the resolver rejected the credentials* with nowhere to fix it. The password is written to `settings.json`, which is owner-only, and the web console never sends it back to the page — it renders a placeholder, so re-saving the form leaves the stored value alone and clearing the field removes it.
 
 **It switches filtering, not the resolver.** Stopping the service would take DNS away from every tunnel client at once — an outage, not "filtering off". Switching protection off leaves the resolver answering normally and unfiltered, which is what AdGuard Home's own *Disable protection* does and the only reading of the switch that cannot strand a client mid-session.
 

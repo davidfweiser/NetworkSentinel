@@ -1155,6 +1155,29 @@ public sealed class WebApp : IDisposable
                                 : $"DNS filter resolver: {normalised} ({_dnsFilter.Status})";
                             break;
                         }
+                        case "dnsFilterUsername":
+                        {
+                            _settings.DnsFilterUsername = raw.Trim();
+                            _dnsFilter.Configure(_settings.DnsFilterUrl, _settings.DnsFilterUsername, _settings.DnsFilterPassword);
+                            label = _settings.DnsFilterUsername.Length == 0
+                                ? "DNS filter user cleared — the resolver is assumed to need no login."
+                                : $"DNS filter user: {_settings.DnsFilterUsername} ({_dnsFilter.Status})";
+                            break;
+                        }
+                        case "dnsFilterPassword":
+                        {
+                            // Same placeholder contract as the DuckDNS token: the page never
+                            // receives the stored value, so echoing the bullets back means
+                            // "unchanged" and an empty field means "remove it".
+                            if (raw == TokenPlaceholder)
+                                return ActionResultDto.Success(_dnsFilter.Status);
+                            _settings.DnsFilterPassword = raw;
+                            _dnsFilter.Configure(_settings.DnsFilterUrl, _settings.DnsFilterUsername, _settings.DnsFilterPassword);
+                            label = raw.Length == 0
+                                ? "DNS filter password cleared."
+                                : $"DNS filter password saved ({_dnsFilter.Status})";
+                            break;
+                        }
                         case "wireGuardMonitorEnabled":
                             _monitor.WireGuardMonitorEnabled = on;
                             _settings.WireGuardMonitorEnabled = on;
@@ -1717,6 +1740,8 @@ public sealed class WebApp : IDisposable
                 dnsHygieneStatus = DnsHygieneStatusText(),
                 dnsFilterEnabled = DnsFilterOn(),
                 dnsFilterUrl = _settings.DnsFilterUrl,
+                dnsFilterUsername = _settings.DnsFilterUsername,
+                dnsFilterPasswordSet = _settings.DnsFilterPassword.Length > 0,
                 dnsFilterStatus = DnsFilterStatusText(),
                 wireGuardMonitorEnabled = _settings.WireGuardMonitorEnabled,
                 wireGuardPeerMbPer10Min = _settings.WireGuardPeerMbPer10Min,
@@ -4115,6 +4140,8 @@ public sealed class WebApp : IDisposable
         <div class="settings-note">The only control here that can stop a connection before it is attempted. Everything else acts on a flow that already exists — and on a VPN gateway a client's forwarded traffic never becomes a tracked connection at all, so nothing else on this page can block where a client goes. Set up by scripts/setup-dns-filter.sh. This switches <em>filtering</em>, not the resolver: turning it off leaves DNS answering normally but unfiltered, so no client loses name resolution.</div>
         ${row('DNS filtering', 'Refuse known malware, phishing and tracking names at the resolver, before anything connects. ' + (s.dnsFilterStatus || ''), sw('dnsFilterEnabled', s.dnsFilterEnabled))}
         ${row('Filtering resolver', 'Admin API of the filtering resolver on this node. The setup script fills this in; clear it to leave the switch unconfigured.', txt('dnsFilterUrl', s.dnsFilterUrl || '', 'http://10.8.0.1:3000'))}
+        ${row('Resolver user', 'Admin user for that API — "admin" for an AdGuard Home the setup script installed. Leave empty if the resolver needs no login.', txt('dnsFilterUsername', s.dnsFilterUsername || '', 'admin'))}
+        ${row('Resolver password', 'Password for that user. Stored owner-only in settings.json and never sent back to this page. ' + (s.dnsFilterPasswordSet ? 'A password is saved — replace the placeholder to change it, or empty the field to remove it.' : 'No password saved yet.'), txt('dnsFilterPassword', s.dnsFilterPasswordSet ? '••••••••' : '', 'resolver admin password'))}
       </div>
       <div class="settings-group"><h3>VPN (WireGuard)</h3>
         <div class="settings-note">WireGuard uses one unconnected UDP socket, so its peers never appear as connections and nothing else on this page can see them. This reads WireGuard's own state instead. Needs root. Only public keys are read — the interface private key and peer preshared keys are discarded and never stored.</div>

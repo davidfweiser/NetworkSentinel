@@ -1165,6 +1165,28 @@
                     <TextBox Grid.Column="1" Width="220" VerticalAlignment="Center"
                              Text="{Binding DnsFilterUrl}" Watermark="http://10.8.0.1:3000"/>
                   </Grid>
+
+                  <Grid ColumnDefinitions="*,Auto" Margin="0,0,0,14">
+                    <StackPanel Margin="0,0,16,0">
+                      <TextBlock Text="Resolver user" FontWeight="Bold" FontSize="13"/>
+                      <TextBlock Text="Admin user for that API — &quot;admin&quot; for an AdGuard Home the setup script installed. Leave empty if the resolver needs no login."
+                                 Foreground="{DynamicResource TextSecondaryBrush}" FontSize="11"
+                                 Margin="0,2,0,0" TextWrapping="Wrap"/>
+                    </StackPanel>
+                    <TextBox Grid.Column="1" Width="220" VerticalAlignment="Center"
+                             Text="{Binding DnsFilterUsername}" Watermark="admin"/>
+                  </Grid>
+
+                  <Grid ColumnDefinitions="*,Auto" Margin="0,0,0,14">
+                    <StackPanel Margin="0,0,16,0">
+                      <TextBlock Text="Resolver password" FontWeight="Bold" FontSize="13"/>
+                      <TextBlock Text="Password for that user. Stored owner-only in settings.json. Without it the switch cannot authenticate and reports that the resolver rejected the credentials."
+                                 Foreground="{DynamicResource TextSecondaryBrush}" FontSize="11"
+                                 Margin="0,2,0,0" TextWrapping="Wrap"/>
+                    </StackPanel>
+                    <TextBox Grid.Column="1" Width="220" VerticalAlignment="Center"
+                             PasswordChar="●" Text="{Binding DnsFilterPassword}" Watermark="resolver admin password"/>
+                  </Grid>
                 </StackPanel>
               </Border>
 
