@@ -246,6 +246,34 @@ print(ipaddress.ip_network(f"{ip}/{prefix}", strict=False))
 
 info "tunnel interface: ${TUNNEL_IFACE}"
 info "resolver address: ${TUNNEL_IP}  (this is what clients will use)"
+
+# Anything already holding port 53 on the tunnel address — or on the wildcard, which
+# covers it — stops AdGuard Home dead. The failure is unpleasant to find later: the
+# UDP sockets bind, only the TCP one collides, so the daemon exits 1 and systemd
+# restarts it forever. Nothing is listening on the admin port either, so the switch
+# in the app can only report that the resolver could not be reached, which says
+# nothing about a port conflict. Catch it here, while nothing has been installed.
+if command -v ss >/dev/null 2>&1; then
+  DNS_HOLDERS="$(ss -lntupH 2>/dev/null | awk -v ip="$TUNNEL_IP" '
+    {
+      local = $5
+      if (local !~ /:53$/) next
+      host = local
+      sub(/:53$/, "", host)
+      if (host == ip || host == "0.0.0.0" || host == "*" || host == "[::]" || host == "::") {
+        proc = ""
+        for (i = 7; i <= NF; i++) proc = proc (proc == "" ? "" : " ") $i
+        printf "  %-5s %-24s %s\n", $1, local, proc
+      }
+    }')"
+  if [[ -n "$DNS_HOLDERS" ]]; then
+    say ""
+    say "Already listening on port 53 where AdGuard Home needs to be:"
+    say "$DNS_HOLDERS"
+    say ""
+    die "port 53 is taken on ${TUNNEL_IP} — stop that resolver (or bind it elsewhere) and re-run; nothing has been changed"
+  fi
+fi
 info "client subnet:    ${TUNNEL_SUBNET}"
 
 if [[ "$TUNNEL_IP" == 0.0.0.0 || "$TUNNEL_IP" == 127.* ]]; then
