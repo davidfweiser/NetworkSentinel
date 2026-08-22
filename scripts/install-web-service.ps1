@@ -10,7 +10,8 @@
   at system startup (highest privileges).
 
 .PARAMETER Port
-  Web listen port (default 18765).
+  Web listen port. Defaults to the port the installed task is already using, or
+  18765 on a first install. Passing -Port explicitly always wins.
 
 .PARAMETER TaskName
   Scheduled task name (default NetworkSentinel-Web).
@@ -27,6 +28,33 @@ if ($Port -lt 1 -or $Port -gt 65535) {
     throw "Port must be 1-65535."
 }
 
+# An upgrade must not move the console.
+#
+# Every install used to register the task with the default port, so a console on any
+# other port disappeared from the address people had bookmarked and from whatever app
+# was pointed at it - and reinstalling the previous version, the obvious thing to try
+# next, wrote the same default again. The port already in use is read back from the
+# registered task's own arguments; -Port still wins when it is given.
+$PortExplicit = $PSBoundParameters.ContainsKey('Port')
+$PreviousPort = 0
+
+$existingTask = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
+if ($existingTask) {
+    foreach ($existingAction in $existingTask.Actions) {
+        if ($existingAction.Arguments -match '(?:^|\s)-w\s+(\d{1,5})(?:\s|$)') {
+            $found = [int]$Matches[1]
+            if ($found -ge 1 -and $found -le 65535) { $PreviousPort = $found }
+            break
+        }
+    }
+}
+
+$KeptPort = $false
+if (-not $PortExplicit -and $PreviousPort -ne 0 -and $PreviousPort -ne $Port) {
+    $Port = $PreviousPort
+    $KeptPort = $true
+}
+
 $Root = Split-Path -Parent $PSScriptRoot
 $Project = Join-Path $Root "NetworkSentinel.csproj"
 if (-not (Test-Path $Project)) {
@@ -38,7 +66,12 @@ $PublishDir = Join-Path $Root "bin\publish\win-x64-server"
 $ExeName = "NetworkSentinel.exe"
 
 Write-Host "Network Sentinel - install web service" -ForegroundColor Cyan
-Write-Host "  Port      : $Port"
+if ($KeptPort) {
+    Write-Host "  Port      : $Port (kept from the installed task; pass -Port to change it)"
+}
+else {
+    Write-Host "  Port      : $Port"
+}
 Write-Host "  Install   : $InstallDir"
 Write-Host "  Task name : $TaskName"
 Write-Host ""
@@ -75,6 +108,18 @@ catch {
 
 # Open Windows Firewall for the web UI (inbound TCP)
 $fwName = "NetworkSentinel-Web-$Port"
+if ($PreviousPort -ne 0 -and $PreviousPort -ne $Port) {
+    # The rule name carries the port, so a deliberate move would otherwise leave the
+    # old port allowed inbound with nothing listening on it.
+    $stale = "NetworkSentinel-Web-$PreviousPort"
+    try {
+        netsh advfirewall firewall delete rule name="$stale" 2>$null | Out-Null
+        Write-Host "Removed the firewall rule for the previous port: $stale" -ForegroundColor Yellow
+    }
+    catch {
+        Write-Host "Note: could not remove $stale - $($_.Exception.Message)" -ForegroundColor DarkYellow
+    }
+}
 try {
     netsh advfirewall firewall delete rule name="$fwName" 2>$null | Out-Null
     netsh advfirewall firewall add rule name="$fwName" dir=in action=allow protocol=TCP localport=$Port enable=yes profile=any description="Network Sentinel headless web UI" | Out-Null
