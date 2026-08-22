@@ -12,7 +12,7 @@ Three ways to run it:
 
 > **Host-based** intrusion detection and prevention. It detects on its own heuristics and, with Suricata attached (0.6.0), on signature/payload inspection — then enforces in the kernel via `nftables`. It is not an inline network appliance: it protects the machine it runs on, not a segment, and it does not sit in the forwarding path.
 
-Linux port of the original Windows WPF Network Sentinel. Platform layers use `/proc/net`, `ss`, conntrack netlink, `nftables`/`iptables` (elevated via **pkexec**), and XDG data paths. Version **0.7.14**.
+Linux port of the original Windows WPF Network Sentinel. Platform layers use `/proc/net`, `ss`, conntrack netlink, `nftables`/`iptables` (elevated via **pkexec**), and XDG data paths. Version **0.7.15**.
 
 ---
 
@@ -120,7 +120,7 @@ Flows come from the conntrack event source, so this covers traffic the socket ta
 
 The app itself never touches your resolver at runtime — detection and enforcement are what it does. But getting that arrangement in place is fiddly in exactly the way that punishes you for it: getting it wrong costs name resolution for the host and every VPN client at once, possibly while you are remote and depending on that tunnel to fix it. So the setup is a script you run once, separately from the app.
 
-### Setting up the filtering resolver — `scripts/setup-dns-filter.sh` (0.7.14)
+### Setting up the filtering resolver — `scripts/setup-dns-filter.sh` (0.7.15)
 
 Installs **AdGuard Home** on this node as the resolver for your tunnel clients, in the arrangement above. This is the piece that blocks a bad site *by name, before the connection exists* — the prevention engine can only act on an address once a connection to it is already open.
 
@@ -142,7 +142,7 @@ sudo ./scripts/setup-dns-filter.sh
 
 **Its firewall rules live in their own nftables tables** (`inet dnsfilter`, `ip dnsfilter_nat`) rather than `inet networksentinel`. `FirewallService` deletes every rule whose comment starts with `NetworkSentinel`, so **Remove all rules** would otherwise strip the protection that keeps the resolver from answering the whole internet.
 
-#### The switch — Settings → DNS filtering (0.7.14)
+#### The switch — Settings → DNS filtering (0.7.15)
 
 Once the script has run, filtering is turned on and off from inside Network Sentinel — **Settings → DNS filtering**, in the desktop app, the TUI and the web console alike. The script fills in the resolver address, so the switch works as soon as the app restarts.
 
@@ -182,7 +182,7 @@ This reads WireGuard's own state (`wg show all dump`) instead:
 - The peer table in **Settings → VPN (WireGuard)** is read-only by design. Revoking a peer is `wg set <iface> peer <key> remove` — a WireGuard configuration change, not something a monitoring console should do behind your back.
 - Needs **root** (`CAP_NET_ADMIN`); `wg show` cannot read device state otherwise. Without it the setting explains why rather than failing quietly.
 - Per-peer transfer notices are **off by default, and informational when on**: a VPN user streaming video legitimately
-  moves gigabytes, so any threshold low enough to catch a slow leak would fire constantly on normal use. Through 0.7.13
+  moves gigabytes, so any threshold low enough to catch a slow leak would fire constantly on normal use. Through 0.7.14
   a peer crossing the threshold raised a **High Data Exfiltration** threat, which was wrong twice over — the counter sees
   encrypted volume and nothing of what is inside, and the threat carried the peer's *endpoint* as its source address, the
   one address [that must never be blocked](#tunnel-endpoints-are-never-auto-blocked).
@@ -544,17 +544,17 @@ first. The build is self-contained — the server needs no .NET runtime.
 
 ```bash
 # build machine
-scp dist/networksentinel-0.7.14-linux-x64.install.sh user@server:
+scp dist/networksentinel-0.7.15-linux-x64.install.sh user@server:
 
 # server
-chmod +x networksentinel-0.7.14-linux-x64.install.sh
-sudo ./networksentinel-0.7.14-linux-x64.install.sh --web-service
+chmod +x networksentinel-0.7.15-linux-x64.install.sh
+sudo ./networksentinel-0.7.15-linux-x64.install.sh --web-service
 ```
 
 Confirm the installer is current before using root:
 
 ```bash
-./networksentinel-0.7.14-linux-x64.install.sh --help
+./networksentinel-0.7.15-linux-x64.install.sh --help
 # Should list: --web-service
 ```
 
@@ -606,8 +606,8 @@ sudo ./….install.sh --web-service --port 18765
 ./….install.sh --user --desktop-shortcut    # ~/.local + icon on the Desktop
 
 # classic tarball
-tar xzf networksentinel-0.7.14-linux-x64.tar.gz
-cd networksentinel-0.7.14-linux-x64
+tar xzf networksentinel-0.7.15-linux-x64.tar.gz
+cd networksentinel-0.7.15-linux-x64
 sudo ./install.sh --web-service
 ```
 
