@@ -9,6 +9,12 @@ using NetworkSentinel.Native;
 namespace NetworkSentinel.Services;
 
 /// <summary>
+/// Signature of <see cref="AllowlistService.IsAllowed"/>, so the DNS monitor can consult the
+/// never-block list without taking a dependency on the service itself.
+/// </summary>
+public delegate bool AllowlistLookup(string ip, out string reason);
+
+/// <summary>
 /// Watches how this machine — and anything it forwards for — resolves names.
 ///
 /// DNS is where a compromise usually shows first: almost nothing connects without
@@ -28,8 +34,9 @@ namespace NetworkSentinel.Services;
 ///   - port 853 is DoT, and is recognised as encrypted
 ///   - DoH is HTTPS on 443 and is indistinguishable from ordinary web traffic. It is
 ///     only counted as encrypted DNS when the destination is a resolver you listed
-///     in <see cref="ApprovedResolvers"/>. Without that list, a DoH setup looks like
-///     no DNS at all rather than like a leak.
+///     in <see cref="ApprovedResolvers"/> — allowlist entries do not count here, or every
+///     HTTPS connection to a trusted site would read as encrypted DNS. Without that list,
+///     a DoH setup looks like no DNS at all rather than like a leak.
 ///
 /// Flows arrive from the conntrack event source, so this covers traffic the socket
 /// tables never show — including DNS forwarded on behalf of VPN clients. That needs
@@ -91,6 +98,17 @@ public sealed class DnsHygieneMonitor : IDisposable
     /// the WireGuard peer list.
     /// </summary>
     public Func<string, bool>? IsVpnClientAddress { get; set; }
+
+    /// <summary>
+    /// Asks the allowlist whether a destination is already known-good, so a resolver you
+    /// listed among your trusted sites counts as approved without having to be typed into
+    /// <see cref="ApprovedResolvers"/> a second time. Wired to AllowlistService.IsAllowed.
+    ///
+    /// This only ever suppresses the <c>unapproved resolver</c> alert; the flow still falls
+    /// through to the plaintext-egress and fallback checks, because an allowlisted address
+    /// is a statement about who you trust, not about whether the query was encrypted.
+    /// </summary>
+    public AllowlistLookup? IsAddressAllowlisted { get; set; }
 
     public string Status => _status;
 
@@ -203,7 +221,7 @@ public sealed class DnsHygieneMonitor : IDisposable
             _lastPlaintext = now;
 
             var fromVpnClient = IsVpnClientAddress?.Invoke(flow.SourceAddress) == true;
-            var approved = _approved.Contains(flow.DestinationAddress);
+            var approved = IsApprovedDestination(flow.DestinationAddress, out var trustedBy);
 
             if (fromVpnClient)
             {
@@ -211,6 +229,9 @@ public sealed class DnsHygieneMonitor : IDisposable
                 return;
             }
 
+            // The approved list being empty means "not configured", not "nothing is approved" —
+            // arming the check off the allowlist instead would flag every host that ever ran a
+            // query, since the allowlist is populated out of the box.
             if (!approved && _approved.Count > 0)
             {
                 AddUnapprovedResolver(flow, now);
@@ -226,7 +247,7 @@ public sealed class DnsHygieneMonitor : IDisposable
                 return;
             }
 
-            AddPlaintextEgress(flow, now);
+            AddPlaintextEgress(flow, now, trustedBy);
         }
     }
 
@@ -294,9 +315,47 @@ public sealed class DnsHygieneMonitor : IDisposable
         _lastEncrypted = now;
     }
 
-    private void AddPlaintextEgress(ConntrackFlow flow, DateTime now)
+    /// <summary>
+    /// Whether a destination is one this host is meant to resolve through: either typed into
+    /// <see cref="ApprovedResolvers"/>, or already trusted by the allowlist. Checks the typed
+    /// list first because it is a plain hash lookup and this runs per flow.
+    /// </summary>
+    private bool IsApprovedDestination(string address, out string trustedBy)
+    {
+        if (_approved.Contains(address))
+        {
+            trustedBy = "";
+            return true;
+        }
+
+        if (IsAddressAllowlisted is { } lookup)
+        {
+            try
+            {
+                if (lookup(address, out var reason))
+                {
+                    trustedBy = string.IsNullOrWhiteSpace(reason) ? "the allowlist" : reason;
+                    return true;
+                }
+            }
+            catch
+            {
+                // A failing allowlist must not silence the check — fall through to unapproved.
+            }
+        }
+
+        trustedBy = "";
+        return false;
+    }
+
+    private void AddPlaintextEgress(ConntrackFlow flow, DateTime now, string trustedBy = "")
     {
         if (!TryNoteEmit($"plaintext|{flow.DestinationAddress}", now, PlaintextCooldown)) return;
+
+        var trust = trustedBy.Length == 0
+            ? ""
+            : $"{flow.DestinationAddress} is not in your approved resolver list, but the allowlist already " +
+              $"trusts it ({trustedBy}), so this is reported as a plaintext query rather than as a hijack. ";
 
         _pending.Add(new ThreatEvent
         {
@@ -305,7 +364,8 @@ public sealed class DnsHygieneMonitor : IDisposable
             Level = ThreatLevel.Medium,
             SourceIp = flow.DestinationAddress,
             Title = $"Plaintext DNS to {flow.DestinationAddress}",
-            Detail = "Queries are leaving this machine unencrypted on port 53, so the network path can read " +
+            Detail = trust +
+                     "Queries are leaving this machine unencrypted on port 53, so the network path can read " +
                      "and rewrite them. Point the host at a local resolver that forwards upstream over DoT, " +
                      "which keeps queries visible here while hiding them from the network.",
             Origin = "Resolving…",
@@ -324,9 +384,11 @@ public sealed class DnsHygieneMonitor : IDisposable
             Level = ThreatLevel.High,
             SourceIp = flow.DestinationAddress,
             Title = $"DNS to unapproved resolver {flow.DestinationAddress}",
-            Detail = $"{flow.SourceAddress} queried {flow.DestinationAddress}:53, which is not in the approved " +
-                     "resolver list. Something changed the resolver configuration, or answers are being " +
-                     "redirected on the network.",
+            Detail = $"{flow.SourceAddress} queried {flow.DestinationAddress}:53, which is neither in the " +
+                     "approved resolver list nor on the allowlist. Something changed the resolver " +
+                     "configuration, or answers are being redirected on the network. If this resolver is " +
+                     "yours, add it to Approved resolvers — allowlisting it also clears this alert, but only " +
+                     "the approved list makes HTTPS to it count as DoH.",
             Origin = "Resolving…",
             Method = "DNS hygiene · unapproved resolver"
         });

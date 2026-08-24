@@ -318,7 +318,7 @@ internal sealed class TuiSettings
                     return on ? $"DNS hygiene: on ({_monitor.DnsHygieneStatus})" : "DNS hygiene monitoring: off";
                 }),
 
-            Value(detection, "Approved resolvers", "Resolver IPs that count as yours. DoH is only recognised toward these.",
+            Value(detection, "Approved resolvers", "Resolver IPs that count as yours, on top of anything the allowlist trusts. DoH is only recognised toward these.",
                 SettingKind.Text,
                 () => _settings.DnsApprovedResolvers.Length == 0 ? "(none)" : _settings.DnsApprovedResolvers,
                 raw =>
@@ -331,7 +331,7 @@ internal sealed class TuiSettings
                     _monitor.DnsApprovedResolvers = normalised;
                     _settings.DnsApprovedResolvers = normalised;
                     return parsed.Count == 0
-                        ? "No approved resolvers set — every plaintext query is reported, and DoH cannot be recognised."
+                        ? "No approved resolvers set — the destination check is off, every plaintext query is reported, and DoH cannot be recognised."
                         : $"Approved resolvers: {normalised}";
                 }, "comma-separated IPs, empty to clear"),
 
