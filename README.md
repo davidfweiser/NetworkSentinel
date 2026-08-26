@@ -10,9 +10,21 @@ Three ways to run it (same idea as the Linux build):
 | **Terminal UI (`--tui`)** | Server Core, RDP console, SSH-style workflows |
 | **Headless web UI (`-w`)** | Browser dashboard on a server (master-password protected) |
 
-> Awareness / monitoring tooling — not a full IDS/IPS replacement. Version **0.7.16**.
+> Awareness / monitoring tooling — not a full IDS/IPS replacement. Version **0.7.17**.
 
 ---
+
+## What's new in 0.7.17
+
+One fix: trusting a resolver in one place now trusts it in the other. This is the first number the Windows line reaches ahead of Linux, which carries the same change on top of its 0.7.16.
+
+| Area | What changed |
+|------|--------------|
+| **The allowlist answers "is this resolver mine?"** | Adding a resolver to the known-good sites did nothing for the DNS hygiene check. The unapproved-resolver test read **Settings → Approved resolvers** and nothing else, so a resolver you had already told the app to trust still alerted at **High** as a suspected hijack, and the only way to quiet it was to type the same address into a second list. A destination now counts as approved if **either** list has it — the typed list first, since it is a hash lookup and this runs per flow, with the allowlist consulted only on a miss. A failing allowlist falls through to unapproved rather than silencing the check. |
+| **What deliberately did not change** | **Approved resolvers** stays the arming switch: empty still means "not configured" rather than "nothing is approved", because the allowlist ships populated and arming off it would flag every host on first use. And allowlist entries still do **not** make HTTPS count as DoH — that branch reads the typed list alone, or every connection to a trusted site would register as encrypted DNS and **Encrypted DNS stopped** would never fire again. |
+| **Allowlisted clears the hijack alert, and nothing else** | Trusting who answers says nothing about whether the question was readable in transit, so plaintext to an allowlisted resolver is still **Plaintext DNS egress** at Medium — now naming the allowlist entry that spared it the hijack verdict. The unapproved alert says the same thing from the other side: add it to Approved resolvers if it is yours, and note that only that list makes HTTPS to it count as DoH. |
+
+The setting's description is corrected on all three front-ends, including the desktop Settings page the Linux build does not have, and the empty-list message now names the destination check as the thing being switched off. Seven new tests cover both lists, neither list, the arming switch, a throwing allowlist, and both directions of the DoH rule — **352 total**.
 
 ## What's new in 0.7.16
 

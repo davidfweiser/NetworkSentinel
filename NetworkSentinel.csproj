@@ -15,7 +15,7 @@
     <RootNamespace>NetworkSentinel</RootNamespace>
     <Product>Network Sentinel</Product>
     <Description>Native Windows network port monitor with GUI, TUI, and headless web UI</Description>
-    <Version>0.7.16</Version>
+    <Version>0.7.17</Version>
     <Company>Network Sentinel</Company>
     <!-- The test project lives in a subfolder; keep it out of the app's implicit compile glob. -->
     <DefaultItemExcludes>$(DefaultItemExcludes);Tests/**</DefaultItemExcludes>
