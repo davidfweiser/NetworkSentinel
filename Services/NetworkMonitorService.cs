@@ -454,6 +454,16 @@ public sealed class NetworkMonitorService : IDisposable
         set => _exfil.IsIpAllowlisted = value;
     }
 
+    /// <summary>
+    /// Allowlist hook used by the DNS monitor, so a resolver already listed among your
+    /// trusted sites counts as approved. Set by the front-end.
+    /// </summary>
+    public AllowlistLookup? IsDnsDestinationAllowlisted
+    {
+        get => _dns.IsAddressAllowlisted;
+        set => _dns.IsAddressAllowlisted = value;
+    }
+
     public IReadOnlyList<NetworkConnection> Connections
     {
         get { lock (_sync) return _connections.Values.OrderByDescending(c => c.LastSeen).ToList(); }

@@ -69,6 +69,9 @@ public sealed class SentinelCore : IDisposable
         // Lets the DNS monitor see every allowlist answer and catch poisoning of the never-block list.
         Allowlist.ResolutionObserver = Monitor.AllowlistResolutionObserver;
         Monitor.IsIpAllowlisted = ip => Allowlist.IsAllowed(ip, out _);
+        // A resolver you already trust enough to allowlist is a resolver you approve of, so
+        // it does not have to be named twice to stop reading as a hijack.
+        Monitor.IsDnsDestinationAllowlisted = Allowlist.IsAllowed;
         // A VPN peer's public endpoint must never be auto-blocked — that kills the tunnel.
         // Covers WireGuard peers and IPSec (site-to-site included) alike.
         Prevention.IsProtectedAddress = Monitor.IsVpnTunnelEndpoint;
