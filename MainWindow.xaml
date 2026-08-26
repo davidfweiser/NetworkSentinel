@@ -1845,7 +1845,7 @@
                                             </Grid.ColumnDefinitions>
                                             <StackPanel Margin="0,0,16,0">
                                                 <TextBlock Text="DNS hygiene" FontWeight="Bold" FontSize="13"/>
-                                                <TextBlock Text="Watch how names get resolved: plaintext queries leaving the machine, encrypted DNS silently falling back to plaintext, queries to resolvers you did not approve, and allowlisted domains resolving into unfamiliar networks — the shape of a poisoning attack aimed at the never-block list. Needs kernel flow events. List your resolver IPs in the box; without them DoH on 443 is indistinguishable from ordinary web traffic."
+                                                <TextBlock Text="Watch how names get resolved: plaintext queries leaving the machine, encrypted DNS silently falling back to plaintext, queries to resolvers you did not approve, and allowlisted domains resolving into unfamiliar networks — the shape of a poisoning attack aimed at the never-block list. Needs kernel flow events. List your resolver IPs in the box; anything the allowlist already trusts counts as approved too, but only the listed ones make DoH on 443 distinguishable from ordinary web traffic."
                                                            Foreground="{StaticResource TextSecondaryBrush}" FontSize="11"
                                                            Margin="0,2,0,0" TextWrapping="Wrap"/>
                                                 <TextBlock Text="{Binding DnsHygieneStatusText}" FontSize="11" Margin="0,4,0,0"

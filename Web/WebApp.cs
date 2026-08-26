@@ -1281,7 +1281,7 @@ public sealed class WebApp : IDisposable
                             _settings.DnsApprovedResolvers = raw;
                             _monitor.DnsApprovedResolvers = raw;
                             label = string.IsNullOrEmpty(raw)
-                                ? "No approved resolvers set — DoH cannot be recognised and every resolver looks acceptable."
+                                ? "No approved resolvers set — the destination check is off and DoH cannot be recognised."
                                 : $"Approved resolvers: {raw}";
                             break;
                         case "webhookUrl":
@@ -4314,7 +4314,7 @@ public sealed class WebApp : IDisposable
         ${row('Suricata signature alerts', 'Read Suricata\'s EVE JSON log and turn signature matches into threats, which then flow through the allowlist, geo enrichment, webhooks and auto-block like any other detection. Suricata is not bundled — install it and point the path below at its eve.json. ' + (s.suricataStatus || ''), sw('suricataEnabled', s.suricataEnabled))}
         ${row('Suricata EVE log path', 'Full path to Suricata\'s eve.json.', txt('suricataEvePath', s.suricataEvePath || '', 'C:\\\\Program Files\\\\Suricata\\\\log\\\\eve.json'))}
         ${row('DNS hygiene','Watch how names get resolved: plaintext queries leaving the machine, encrypted DNS silently falling back, queries to resolvers you did not approve, and allowlisted domains resolving into unfamiliar networks — the shape of a poisoning attack aimed at the never-block list. Needs kernel flow events. ' + (s.dnsHygieneStatus || ''), sw('dnsHygieneEnabled', s.dnsHygieneEnabled))}
-        ${row('Approved resolvers', 'Comma-separated resolver IPs this host is meant to use. Queries anywhere else are flagged, and 443 traffic to these addresses is recognised as DoH — without them, DoH is indistinguishable from ordinary web traffic.', txt('dnsApprovedResolvers', s.dnsApprovedResolvers || '', '1.1.1.1, 9.9.9.9'))}
+        ${row('Approved resolvers', 'Comma-separated resolver IPs this host is meant to use. Queries anywhere else are flagged, unless the allowlist already trusts the destination. Leave empty to turn the check off. 443 traffic to these addresses is recognised as DoH — without them, DoH is indistinguishable from ordinary web traffic; allowlisted addresses are not counted for that.', txt('dnsApprovedResolvers', s.dnsApprovedResolvers || '', '1.1.1.1, 9.9.9.9'))}
       </div>
       <div class="settings-group"><h3>DNS filtering</h3>
         <div class="settings-note">The only control here that can stop a connection before it is attempted. Everything else acts on a flow that already exists — and on a VPN gateway a client's forwarded traffic never becomes a tracked connection at all, so nothing else on this page can block where a client goes. This switches <em>filtering</em>, not the resolver: turning it off leaves DNS answering normally but unfiltered, so no client loses name resolution. <strong>Setting a resolver up is not something this console can do</strong> — it needs Administrator consent at that machine's own desktop. Turn the switch on in the desktop app, or run scripts\setup-dns-filter.ps1 from an elevated prompt there.</div>

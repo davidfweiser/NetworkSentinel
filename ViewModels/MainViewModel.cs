@@ -1144,7 +1144,7 @@ public partial class MainViewModel : ObservableObject, IDisposable
         _settings.Save();
         _monitor.DnsApprovedResolvers = cleaned;
         SettingsMessage = string.IsNullOrEmpty(cleaned)
-            ? "No approved resolvers set — DoH cannot be recognised and every resolver looks acceptable."
+            ? "No approved resolvers set — the destination check is off and DoH cannot be recognised."
             : $"Approved resolvers: {cleaned}";
     }
 
