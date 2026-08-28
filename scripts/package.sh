@@ -58,7 +58,12 @@ cp "$ROOT/scripts/issue-duckdns-cert.sh" "$STAGE/issue-duckdns-cert.sh"
 # names the script — so the package has to carry it, or the instruction points at
 # a file that only exists in the source tree.
 cp "$ROOT/scripts/setup-dns-filter.sh" "$STAGE/setup-dns-filter.sh"
-chmod +x "$STAGE/install.sh" "$STAGE/uninstall.sh" "$STAGE/issue-duckdns-cert.sh" "$STAGE/setup-dns-filter.sh"
+# The diagnostics are only useful on the node with the problem, and a node installed
+# from this tarball has no source tree to run them out of.
+cp "$ROOT/scripts/diagnose-ipsec.sh" "$STAGE/diagnose-ipsec.sh"
+cp "$ROOT/scripts/diagnose-site-access.sh" "$STAGE/diagnose-site-access.sh"
+chmod +x "$STAGE/install.sh" "$STAGE/uninstall.sh" "$STAGE/issue-duckdns-cert.sh" \
+         "$STAGE/setup-dns-filter.sh" "$STAGE/diagnose-ipsec.sh" "$STAGE/diagnose-site-access.sh"
 
 # systemd unit + env example
 mkdir -p "$STAGE/systemd"
@@ -156,6 +161,13 @@ HTTPS + remote access (0.5.0)
 
   Before forwarding a port: this console can change the firewall, so prefer
   a VPN/Tailscale. If you do forward one, forward only the HTTPS port.
+
+Diagnostics (read-only — they change nothing)
+---------------------------------------------
+  sudo ./diagnose-site-access.sh        # a VPN client can reach the web but not one
+                                        # site (YouTube by default): resolver, firewall
+                                        # rules, IPv6, MTU, and this node's own reach
+  sudo ./diagnose-ipsec.sh <peer-ip>    # a site-to-site IPSec tunnel that won't come up
 
 Uninstall
 ---------

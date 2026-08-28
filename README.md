@@ -1171,6 +1171,7 @@ All three UIs write the same `~/.local/share/NetworkSentinel/settings.json`, so 
 | `scripts/setup-dns-filter.sh` | Installs AdGuard Home as the resolver for tunnel clients; `--uninstall` reverses it |
 | `scripts/issue-duckdns-cert.sh` | Let's Encrypt DNS-01 issuance for a duckdns.org name |
 | `scripts/diagnose-ipsec.sh` | Read-only triage for a site-to-site tunnel that won't come up |
+| `scripts/diagnose-site-access.sh` | Read-only triage for one site a tunnel client cannot reach (YouTube by default) |
 | `Web/WebAuthStore.cs` | Master password hash + session tokens |
 | `scripts/package.sh` | Build self-contained tarball + `.install.sh` |
 | `scripts/install-from-package.sh` | Server/desktop installer (shipped as `install.sh`) |
@@ -1250,6 +1251,7 @@ On GNOME / Pop!_OS the indicator appears in the top bar (StatusNotifier / AppInd
 | Port shows `LISTEN` locally but unreachable from outside | On a cloud VPS (Linode, AWS, DigitalOcean, …), the process listening (`sudo ss -ltnp \| grep 18765`) only proves the app is up — the provider's network firewall/security group can still drop inbound traffic before it reaches the box. Open the port in the provider's dashboard. |
 | Service dies after logout (user unit) | `sudo loginctl enable-linger "$USER"` |
 | Site-to-site VPN tunnel dropped and won't come back | Run `sudo bash scripts/diagnose-ipsec.sh <peer-ip>` — see [below](#a-site-to-site-tunnel-that-wont-come-up). |
+| A VPN client reaches the web but **not one site** (YouTube, signed in) | Run `sudo bash scripts/diagnose-site-access.sh` — see [below](#a-tunnel-client-that-cant-reach-one-site). |
 
 ### A site-to-site tunnel that won't come up
 
@@ -1272,6 +1274,29 @@ Read-only, takes about 25 s, changes nothing. It answers three questions in orde
 - **A peer on a dynamic address outgrows a pinned rule.** Scoping the source to the peer's `/32` is the right instinct, but every ISP rotation then breaks the tunnel until someone edits both the provider firewall *and* `right=`. Identify the peer by identity instead — `right=%any` with `rightid=`, authenticated by a strong PSK or certificate — and the address stops mattering. The provider firewall rule still has to widen to all sources, so the authentication is doing the work the address filter used to.
 
 **This app never auto-blocks a tunnel endpoint** — see [Tunnel endpoints are never auto-blocked](#tunnel-endpoints-are-never-auto-blocked). If the script does find a rule naming your peer, it was a manual block or predates 0.6.6.
+
+### A tunnel client that can't reach one site
+
+```bash
+sudo bash scripts/diagnose-site-access.sh          # the YouTube name set
+sudo bash scripts/diagnose-site-access.sh news.example.com   # or any other names
+```
+
+Read-only, changes nothing, prints no keys or passwords. The case it was written for is a client that reaches the whole web except one family of sites — and is fine with the tunnel switched off. That shape is rarely "the VPN is broken"; it is one of five things, and the script prints the evidence for each in the order they turn out to be the answer.
+
+**Why it is usually Google that breaks alone.** Every name YouTube touches has an AAAA record and a signed-in page needs a dozen *different* hosts to answer, so it is the site most sensitive to a resolver that refuses one name, to IPv6 that is offered but not carried, and to a per-client DNS rate limit. Most of what you would reach for as a control — a news site, a speed test — is a single v4 host and stays up through all three.
+
+| What the script shows | What it means |
+|---|---|
+| A `FILTERED` line in section 1 | The resolver refused a name the site needs, so the client never learns an address. Allow it back with a `@@||name^` rule in AdGuard's **user rules**. `youtubei.googleapis.com` is the one to look for first: without it a signed-in page is inert while the logged-out page still renders, which is exactly "I can't use YouTube logged in". `jnn-pa.googleapis.com` is the other — blocklists do carry it, and playback fails with *something went wrong* when it is refused |
+| Section 1's `ratelimit` note | `setup-dns-filter.sh` writes `ratelimit: 40`, which is **per client**, and queries over it are dropped silently — no error, just no answer. One Mac opening a signed-in YouTube tab bursts past 40 q/s: the page loads and individual subresources fail. `allowed_clients` already keeps the resolver from being an open relay, so on a tunnel-only resolver the limit can be raised or set to `0` |
+| Section 2 names an address | A rule on this node is dropping it. If it is an auto-block rule, **allowlist** the address rather than unblocking — an unblock only suppresses re-blocking for 24 h, so it would come back tomorrow |
+| Section 3 says `PROBLEM` | The tunnel hands clients IPv6 this node cannot forward. macOS prefers IPv6 whenever a name has an AAAA record, so Google blackholes while v4-only sites are fine. Either make v6 work end to end (address, `net.ipv6.conf.all.forwarding=1`, masquerade, route) or take v6 out of the tunnel so clients fall back to v4 |
+| Section 4 well below 1420 | An MTU problem: the page starts and stalls, or video never begins. WireGuard costs 60 bytes over IPv4 and 80 over IPv6, so the client's `MTU =` has to fit inside the path minus that. The Mac's path to the node is the half that usually breaks, so run the client-side probe the script prints before changing anything |
+| Section 5 shows 403/429 | The path works and **Google is refusing this address**. Datacenter ranges collect that treatment, and on the Mac it appears as *Sign in to confirm you're not a bot* or an endless spinner on a page that otherwise loads. Nothing on the node fixes it — the exit address is the problem |
+| All five clean | The problem is between the Mac and the node rather than on it. The script ends with the client-side checklist to run next, with the tunnel up |
+
+The script's last section is that client-side checklist — which resolver macOS is actually using, what the tunnel resolver answers when asked directly, whether v4 and v6 disagree, and the tunnel's `AllowedIPs` / `DNS` / `MTU`. Run both halves before changing anything: the node's view and the client's view fail differently, and the pair identifies the cause where either alone is ambiguous.
 
 ---
 
