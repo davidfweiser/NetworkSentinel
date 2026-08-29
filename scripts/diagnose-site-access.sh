@@ -161,8 +161,9 @@ else
         info "asking the resolver at ${LOCAL_DNS}"
     fi
 
-    printf '\n  %-36s %-22s %s\n' "name" "this node's resolver" "control (${CONTROL_DNS})"
+    printf '\n  %-34s %-16s %-18s %s\n' "name" "A (this node)" "AAAA (this node)" "control A"
     DNS_BLOCKED=0
+    AAAA_SLOW=0
     for d in "${DOMAINS[@]}"; do
         local_out="$(dig +time=3 +tries=1 "@${LOCAL_DNS}" A "$d" 2>/dev/null)"
         local_status="$(printf '%s' "$local_out" | sed -n 's/.*status: \([A-Z]*\).*/\1/p' | head -1)"
@@ -186,12 +187,40 @@ else
             note="  <-- resolver did not answer"
         fi
         local_first="$(printf '%s' "$local_ips" | awk '{print $1}')"
-        printf '  %-36s %-22s %s%s\n' "$d" \
-            "${local_status} ${local_first:-—}" "${ctl_status}" "$note"
+
+        # The AAAA is asked for separately and TIMED. A resolver that answers A
+        # instantly and stalls on AAAA looks perfect to an A-only check, while a
+        # client sits through the full resolver timeout on every dual-stack name
+        # before it can render anything — and every Google name is dual-stack.
+        aaaa_out="$(dig +time=5 +tries=2 "@${LOCAL_DNS}" AAAA "$d" 2>/dev/null)"
+        aaaa_status="$(printf '%s' "$aaaa_out" | sed -n 's/.*status: \([A-Z]*\).*/\1/p' | head -1)"
+        aaaa_ms="$(printf '%s' "$aaaa_out" | sed -n 's/;; Query time: \([0-9]*\) msec.*/\1/p' | head -1)"
+        [ -z "$aaaa_status" ] && aaaa_status="NO-REPLY"
+        if [ "$aaaa_status" = "NO-REPLY" ]; then
+            note="${note}  <-- AAAA TIMED OUT"
+            AAAA_SLOW=$(( AAAA_SLOW + 1 ))
+        elif [ -n "$aaaa_ms" ] && [ "$aaaa_ms" -gt 1000 ] 2>/dev/null; then
+            note="${note}  <-- AAAA SLOW"
+            AAAA_SLOW=$(( AAAA_SLOW + 1 ))
+        fi
+
+        printf '  %-34s %-16s %-18s %s%s\n' "$d" \
+            "${local_status} ${local_first:-—}" \
+            "${aaaa_status} ${aaaa_ms:-?}ms" "${ctl_status}" "$note"
         RESOLVED_IPS="${RESOLVED_IPS} ${local_ips} ${ctl_ips}"
     done
     verdict "a FILTERED line above is the whole answer: the client never learns an address."
     verdict "blocked names: ${DNS_BLOCKED} (0 = the resolver is not what is stopping you)"
+    if [ "${AAAA_SLOW:-0}" -gt 0 ]; then
+        verdict "PROBLEM: ${AAAA_SLOW} name(s) answer A promptly and stall on AAAA. A client"
+        verdict "asks for both, and waits out its resolver timeout — commonly ten seconds —"
+        verdict "before it can open anything. Every Google name is dual-stack, so a signed-in"
+        verdict "page that needs a dozen of them is unusable while a v4-only site is instant."
+        verdict "That is the same shape as a routing fault and it is not one: nothing is"
+        verdict "blocked and nothing is unreachable, the answers are just too slow to use."
+        verdict "Look at what serves AAAA here — an upstream that stalls, or aaaa_disabled"
+        verdict "interacting badly with a client that asks anyway."
+    fi
 
     # Refusing these is correct behaviour, so they get their own table: a blocked
     # count here is not a fault to fix, it is the fact that explains an adblock wall.
@@ -610,6 +639,9 @@ cat <<'EOF'
                                   AdGuard (user_rules: @@||name^) and it is fixed. The
                                   signed-in page dies without youtubei.googleapis.com in
                                   particular, while the logged-out page still renders.
+  Section 1 flags AAAA SLOW    -> the resolver answers A and stalls on AAAA. Clients wait
+  or AAAA TIMED OUT               out the full resolver timeout on every dual-stack name.
+                                  Looks like a dead network, is a slow one.
   Section 1 flags ratelimit    -> 40 queries/second per client is under what one Mac asks
                                   for when a signed-in YouTube tab opens, and the excess
                                   is dropped in silence. Raise it and retest.
