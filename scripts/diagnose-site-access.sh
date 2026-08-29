@@ -408,38 +408,88 @@ info "ipv6 NAT/masquerade:   ${NAT6:-none found}"
 # aaaa_disabled is set on the resolver — the node then cannot look up an AAAA either,
 # and a working v6 path reports as broken. That is a measurement artefact, and one
 # that shows up exactly when someone is mid-way through testing this hypothesis.
-V6_PROBE="2001:4860:4860::8888"       # Google Public DNS, answers ICMPv6
-V6_PROBE_ALT="2606:4700:4700::1111"   # Cloudflare, in case the first is filtered
+V6_PING="2001:4860:4860::8888"        # Google Public DNS, answers ICMPv6
+V6_TCP="[2606:4700:4700::1111]"       # Cloudflare, answers TCP/443
+V6_TCP_ALT="[2001:4860:4860::8888]"   # Google DoH, same
 
-v6_reaches() {
-    # $1 = source address, or empty for the node's default source
-    local src="$1" target
-    for target in "$V6_PROBE" "$V6_PROBE_ALT"; do
+# ICMP and TCP are different questions and a firewall can answer them differently.
+# Testing only ICMP was the flaw in the first version of this probe: ping proves a
+# route exists in both directions, and says nothing about whether a stateful filter
+# somewhere upstream will pass a TCP handshake from the same source. That pair —
+# ping fine, TCP dead — is the signature of a provider firewall, and it is invisible
+# to a script that only pings. Both are asked, and the combination is reported.
+v6_pings() {
+    local src="$1"
+    if [ -n "$src" ]; then
+        ping -6 -c1 -W3 -I "$src" "$V6_PING" >/dev/null 2>&1
+    else
+        ping -6 -c1 -W3 "$V6_PING" >/dev/null 2>&1
+    fi
+}
+
+# -k because the cert cannot match a literal address; any HTTP status back proves the
+# handshake completed, which is the whole question.
+v6_connects() {
+    local src="$1" target code
+    have curl || return 2
+    for target in "$V6_TCP" "$V6_TCP_ALT"; do
         if [ -n "$src" ]; then
-            ping -6 -c1 -W3 -I "$src" "$target" >/dev/null 2>&1 && return 0
+            code="$(curl -6 -k -sS -o /dev/null -m 8 --interface "$src" \
+                    -w '%{http_code}' "https://${target}/" 2>/dev/null)"
         else
-            ping -6 -c1 -W3 "$target" >/dev/null 2>&1 && return 0
+            code="$(curl -6 -k -sS -o /dev/null -m 8 \
+                    -w '%{http_code}' "https://${target}/" 2>/dev/null)"
         fi
+        [ "${code:-000}" != "000" ] && return 0
     done
     return 1
 }
 
+describe_v6() {
+    local src="$1" ping_ok tcp_ok
+    v6_pings "$src" && ping_ok=1 || ping_ok=0
+    v6_connects "$src"
+    case "$?" in
+        0) tcp_ok=1 ;;
+        2) tcp_ok=2 ;;
+        *) tcp_ok=0 ;;
+    esac
+    if [ "$tcp_ok" = "2" ]; then
+        [ "$ping_ok" = "1" ] && echo "ping yes, TCP untested (no curl)" || echo "no"
+    elif [ "$ping_ok" = "1" ] && [ "$tcp_ok" = "1" ]; then
+        echo "yes (ping and TCP)"
+    elif [ "$ping_ok" = "1" ]; then
+        echo "PING ONLY — TCP blocked"
+    elif [ "$tcp_ok" = "1" ]; then
+        echo "TCP only (ICMP filtered, which is harmless)"
+    else
+        echo "no"
+    fi
+}
+
 V6_EGRESS="no"
-if [ -n "$NODE_V6" ] && v6_reaches ""; then
-    V6_EGRESS="yes"
-fi
+[ -n "$NODE_V6" ] && V6_EGRESS="$(describe_v6 "")"
 info "this node over IPv6:   ${V6_EGRESS}  (its own address — says nothing about clients)"
 
 TUN_V6_ADDR="${TUN_V6%%/*}"
 V6_TUN_EGRESS="untested"
 if [ -n "$TUN_V6_ADDR" ]; then
-    if v6_reaches "$TUN_V6_ADDR"; then
-        V6_TUN_EGRESS="yes"
-    else
-        V6_TUN_EGRESS="no"
-    fi
+    V6_TUN_EGRESS="$(describe_v6 "$TUN_V6_ADDR")"
     info "FROM the tunnel prefix: ${V6_TUN_EGRESS}  <-- this is the one that matters"
 fi
+
+case "$V6_TUN_EGRESS" in
+    "PING ONLY"*)
+        verdict "PROBLEM: from the tunnel prefix, ICMPv6 gets through and TCP does not."
+        verdict "A route exists in both directions, so this is not a routing fault and not"
+        verdict "the tunnel: something upstream is passing pings and dropping handshakes."
+        verdict "On a cloud instance that is the provider firewall — the layer no check in"
+        verdict "this script can see. Look at its IPv6 rules, and at whether its stateful"
+        verdict "handling covers the routed range as well as the instance's own address."
+        verdict "Clients get IPv6 from this prefix, so every v6 connection they open dies"
+        verdict "here while v4 stays perfect — which looks exactly like 'only Google broke'."
+        ;;
+esac
 
 if [ -n "$TUN_V6" ] && [ "$V6_TUN_EGRESS" = "no" ]; then
     verdict "PROBLEM: the tunnel hands clients IPv6 that cannot reach the internet. Traffic"
@@ -574,6 +624,9 @@ cat <<'EOF'
                                   common cause of "only Google is broken". The line to read
                                   is "FROM the tunnel prefix", not the NAT one: a routed
                                   prefix needs no NAT, so its absence proves nothing.
+  Section 3 says PING ONLY     -> the route is fine and TCP is being dropped upstream.
+                                  Ping is not a connectivity test; that pair is what a
+                                  provider firewall looks like from inside the box.
   Section 4 much below 1420    -> lower the client's MTU. Symptom is a page that starts
                                   and stalls, or video that never begins.
   Section 5 shows 403/429      -> Google is refusing the VPS address itself. Not fixable
