@@ -164,6 +164,7 @@ else
     printf '\n  %-34s %-16s %-18s %s\n' "name" "A (this node)" "AAAA (this node)" "control A"
     DNS_BLOCKED=0
     AAAA_SLOW=0
+    AAAA_OFF=0
     for d in "${DOMAINS[@]}"; do
         local_out="$(dig +time=3 +tries=1 "@${LOCAL_DNS}" A "$d" 2>/dev/null)"
         local_status="$(printf '%s' "$local_out" | sed -n 's/.*status: \([A-Z]*\).*/\1/p' | head -1)"
@@ -196,6 +197,11 @@ else
         aaaa_status="$(printf '%s' "$aaaa_out" | sed -n 's/.*status: \([A-Z]*\).*/\1/p' | head -1)"
         aaaa_ms="$(printf '%s' "$aaaa_out" | sed -n 's/;; Query time: \([0-9]*\) msec.*/\1/p' | head -1)"
         [ -z "$aaaa_status" ] && aaaa_status="NO-REPLY"
+        case "$aaaa_out" in
+            *fake-for-negative-caching.adguard.com*)
+                note="${note}  <-- AAAA SUPPRESSED (aaaa_disabled)"
+                AAAA_OFF=$(( AAAA_OFF + 1 )) ;;
+        esac
         if [ "$aaaa_status" = "NO-REPLY" ]; then
             note="${note}  <-- AAAA TIMED OUT"
             AAAA_SLOW=$(( AAAA_SLOW + 1 ))
@@ -211,6 +217,13 @@ else
     done
     verdict "a FILTERED line above is the whole answer: the client never learns an address."
     verdict "blocked names: ${DNS_BLOCKED} (0 = the resolver is not what is stopping you)"
+    if [ "${AAAA_OFF:-0}" -gt 0 ]; then
+        verdict "AAAA is suppressed for ${AAAA_OFF} name(s) — an instant empty answer carrying"
+        verdict "AdGuard's synthetic SOA, which is aaaa_disabled working, not a fault. Worth"
+        verdict "reading twice while testing: clients get no AAAA at all, so IPv6 cannot be"
+        verdict "what is breaking them right now, and any v6 test run on this node is measuring"
+        verdict "the setting rather than the network."
+    fi
     if [ "${AAAA_SLOW:-0}" -gt 0 ]; then
         verdict "PROBLEM: ${AAAA_SLOW} name(s) answer A promptly and stall on AAAA. A client"
         verdict "asks for both, and waits out its resolver timeout — commonly ten seconds —"
@@ -582,16 +595,23 @@ verdict "usually breaks — run the client-side probe in the checklist below bef
 say "5. Can this node itself reach the site"
 
 if have curl; then
-    printf '  %-34s %-14s %s\n' "name" "HTTP (v4)" "time"
+    printf '  %-34s %-14s %s\n' "name" "HTTP (v4)" "time (DNS called out when slow)"
     for d in "${DOMAINS[@]}"; do
+        # time_namelookup as well as time_total: a ten-second "failure" that is nine
+        # seconds of DNS is a different fault from one that is nine seconds of connect,
+        # and a single total cannot tell them apart.
         out="$(curl -4 -sS -o /dev/null -m "$CURL_TIMEOUT" \
-               -w '%{http_code} %{time_total}' "https://${d}/" 2>/dev/null)"
+               -w '%{http_code} %{time_total} %{time_namelookup}' "https://${d}/" 2>/dev/null)"
         code="$(printf '%s' "$out" | awk '{print $1}')"
         secs="$(printf '%s' "$out" | awk '{print $2}')"
+        dns_secs="$(printf '%s' "$out" | awk '{print $3}')"
         flag=""
         case "${code:-000}" in
             000) flag="  <-- no connection at all" ;;
             429|403) flag="  <-- reachable, but refused: see the note below" ;;
+        esac
+        case "${dns_secs:-0}" in
+            [1-9]*) flag="${flag}  <-- ${dns_secs}s of that was DNS" ;;
         esac
         printf '  %-34s %-14s %ss%s\n' "$d" "${code:-000}" "${secs:-?}" "$flag"
     done
