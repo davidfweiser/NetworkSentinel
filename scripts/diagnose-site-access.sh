@@ -41,6 +41,18 @@ DEFAULT_DOMAINS=(
     oauthaccountmanager.googleapis.com  # token refresh on Apple platforms
 )
 
+# Blocked on purpose by any DNS ad blocker — and YouTube's player asks for them, so
+# refusing them is visible to the page. These are NOT names to allow reflexively;
+# they are here because a page that loads and then refuses to play is a different
+# fault from a page that cannot connect, and this is what tells the two apart.
+AD_DOMAINS=(
+    googleads.g.doubleclick.net
+    static.doubleclick.net
+    pagead2.googlesyndication.com
+    securepubads.g.doubleclick.net
+    www.googleadservices.com
+)
+
 if [ "$#" -gt 0 ]; then
     DOMAINS=("$@")
 else
@@ -180,6 +192,30 @@ else
     done
     verdict "a FILTERED line above is the whole answer: the client never learns an address."
     verdict "blocked names: ${DNS_BLOCKED} (0 = the resolver is not what is stopping you)"
+
+    # Refusing these is correct behaviour, so they get their own table: a blocked
+    # count here is not a fault to fix, it is the fact that explains an adblock wall.
+    echo ""
+    echo "  ad endpoints (refusing these is the blocker working — but YouTube sees it):"
+    AD_BLOCKED=0
+    for d in "${AD_DOMAINS[@]}"; do
+        a_out="$(dig +time=3 +tries=1 "@${LOCAL_DNS}" A "$d" 2>/dev/null)"
+        a_status="$(printf '%s' "$a_out" | sed -n 's/.*status: \([A-Z]*\).*/\1/p' | head -1)"
+        a_ips="$(printf '%s' "$a_out" | awk '$4=="A" {print $5}' | head -1)"
+        [ -z "$a_status" ] && a_status="NO-REPLY"
+        mark=""
+        if [ "$a_status" = "NXDOMAIN" ] || [ "${a_ips}" = "0.0.0.0" ]; then
+            mark="  <-- refused"
+            AD_BLOCKED=$(( AD_BLOCKED + 1 ))
+        fi
+        printf '  %-36s %s%s\n' "$d" "${a_status} ${a_ips}" "$mark"
+    done
+    if [ "$AD_BLOCKED" -gt 0 ]; then
+        verdict "${AD_BLOCKED} ad endpoint(s) refused. On its own that is the blocker doing its"
+        verdict "job. It becomes the answer when the page LOADS but will not PLAY, because"
+        verdict "that is what YouTube does when it notices — and it is the one cause that"
+        verdict "disappears with the tunnel off while every check in this script stays clean."
+    fi
 fi
 
 echo ""
@@ -209,6 +245,46 @@ if [ -n "$QLOG" ]; then
         | sed -n 's/.*"QH":"\([^"]*\)".*/\1/p' | sort | uniq -c | sort -rn | head -20 \
         | sed 's/^/    /'
     echo "    (no lines above = nothing in these families was filtered)"
+
+    # The ad endpoints, counted separately. Refusing these is the blocker doing its
+    # job, not a fault — but YouTube's player asks for them, notices the refusal, and
+    # answers with a wall instead of a video. That is the one cause where every
+    # connectivity check in this script comes back clean and the site still fails.
+    echo ""
+    echo "  ad endpoints refused (this is the ad blocker working as intended):"
+    AD_HITS="$(tail -n 20000 "$QLOG" 2>/dev/null \
+        | grep -F '"IsFiltered":true' \
+        | grep -Ei 'doubleclick|googlesyndication|googleadservices|googletagservices' \
+        | sed -n 's/.*"QH":"\([^"]*\)".*/\1/p' | sort | uniq -c | sort -rn | head -10)"
+    if [ -n "$AD_HITS" ]; then
+        printf '%s\n' "$AD_HITS" | sed 's/^/    /'
+        verdict "YouTube can see these being refused. If the page LOADS and then refuses to"
+        verdict "play — an anti-adblock notice, or a video that never starts while the rest of"
+        verdict "the site works — that is this, not a network fault, and it explains why the"
+        verdict "same client is fine with the tunnel off: off the tunnel it is not filtered."
+        verdict "Confirm by pausing protection for five minutes and reloading; if that fixes"
+        verdict "it, decide whether you would rather see ads or allow these names."
+    else
+        echo "    (none — the ad endpoints are being answered, so this is not an adblock wall)"
+    fi
+
+    # Which clients are actually using this resolver, and for what record types. A
+    # client absent from this list is not using it at all, which makes every
+    # resolver-side setting — filters, aaaa_disabled, the rate limit — irrelevant to it.
+    echo ""
+    echo "  tunnel clients seen asking this resolver (last 20k queries):"
+    tail -n 20000 "$QLOG" 2>/dev/null \
+        | sed -n 's/.*"IP":"\([^"]*\)".*/\1/p' | sort | uniq -c | sort -rn | head -10 \
+        | sed 's/^/    /'
+    echo "  record types asked for the site families above:"
+    tail -n 20000 "$QLOG" 2>/dev/null \
+        | grep -Ei 'youtube|googlevideo|ytimg|ggpht' \
+        | sed -n 's/.*"QT":"\([^"]*\)".*/\1/p' | sort | uniq -c | sort -rn | head -6 \
+        | sed 's/^/    /'
+    verdict "a client missing from that list is not using this resolver — check the DNS line"
+    verdict "in its tunnel config before trusting any resolver-side test."
+    verdict "HTTPS records in the type list matter: they carry ipv6hint values, so a client"
+    verdict "can still be handed IPv6 while aaaa_disabled is on."
 fi
 
 if [ -f /opt/AdGuardHome/AdGuardHome.yaml ]; then
@@ -216,6 +292,14 @@ if [ -f /opt/AdGuardHome/AdGuardHome.yaml ]; then
     echo "  resolver settings that change which family a client can reach:"
     grep -nE '^[[:space:]]*(protection_enabled|filtering_enabled|safebrowsing_enabled|parental_enabled|blocking_mode|aaaa_disabled|enable_dnssec|ratelimit):' \
         /opt/AdGuardHome/AdGuardHome.yaml 2>/dev/null | sed 's/^/    /'
+    if grep -qE '^[[:space:]]*aaaa_disabled:[[:space:]]*true' /opt/AdGuardHome/AdGuardHome.yaml 2>/dev/null; then
+        verdict "aaaa_disabled is ON. Two consequences worth knowing before you read section 3:"
+        verdict "this node cannot look up an AAAA either, so any v6 test by NAME reports broken"
+        verdict "whether or not it is (section 3 uses literal addresses and is unaffected); and"
+        verdict "HTTPS/SVCB records still carry ipv6hint values, so a client can be handed IPv6"
+        verdict "regardless. Removing v6 from the client tunnel config is the deterministic"
+        verdict "version of this test — no cache, no record type, can lie to you."
+    fi
     RATE="$(sed -n 's/^[[:space:]]*ratelimit:[[:space:]]*\([0-9]*\).*/\1/p' \
             /opt/AdGuardHome/AdGuardHome.yaml 2>/dev/null | head -1)"
     if [ -n "${RATE:-}" ] && [ "$RATE" != "0" ] && [ "$RATE" -lt 100 ] 2>/dev/null; then
@@ -310,29 +394,40 @@ info "ipv6 NAT/masquerade:   ${NAT6:-none found}"
 # on an un-routed one is a workaround rather than the intended shape. What decides it
 # is whether a packet SOURCED FROM THE TUNNEL PREFIX gets an answer, because that is
 # the address a client's traffic will carry once it is forwarded.
+#
+# Every probe here uses a literal address. Testing v6 by name breaks the moment
+# aaaa_disabled is set on the resolver — the node then cannot look up an AAAA either,
+# and a working v6 path reports as broken. That is a measurement artefact, and one
+# that shows up exactly when someone is mid-way through testing this hypothesis.
+V6_PROBE="2001:4860:4860::8888"       # Google Public DNS, answers ICMPv6
+V6_PROBE_ALT="2606:4700:4700::1111"   # Cloudflare, in case the first is filtered
+
+v6_reaches() {
+    # $1 = source address, or empty for the node's default source
+    local src="$1" target
+    for target in "$V6_PROBE" "$V6_PROBE_ALT"; do
+        if [ -n "$src" ]; then
+            ping -6 -c1 -W3 -I "$src" "$target" >/dev/null 2>&1 && return 0
+        else
+            ping -6 -c1 -W3 "$target" >/dev/null 2>&1 && return 0
+        fi
+    done
+    return 1
+}
+
 V6_EGRESS="no"
-if have curl && [ -n "$NODE_V6" ]; then
-    code="$(curl -6 -sS -o /dev/null -m "$CURL_TIMEOUT" -w '%{http_code}' https://www.youtube.com/ 2>/dev/null)"
-    [ "${code:-000}" != "000" ] && V6_EGRESS="yes (HTTP ${code})"
+if [ -n "$NODE_V6" ] && v6_reaches ""; then
+    V6_EGRESS="yes"
 fi
-info "this node over IPv6:   ${V6_EGRESS}  (from its own address — says nothing about clients)"
+info "this node over IPv6:   ${V6_EGRESS}  (its own address — says nothing about clients)"
 
 TUN_V6_ADDR="${TUN_V6%%/*}"
 V6_TUN_EGRESS="untested"
 if [ -n "$TUN_V6_ADDR" ]; then
-    if have curl; then
-        code="$(curl -6 -sS -o /dev/null -m "$CURL_TIMEOUT" --interface "$TUN_V6_ADDR" \
-                -w '%{http_code}' https://www.youtube.com/ 2>/dev/null)"
-        if [ "${code:-000}" != "000" ]; then
-            V6_TUN_EGRESS="yes (HTTP ${code})"
-        else
-            V6_TUN_EGRESS="no"
-        fi
-    fi
-    if [ "$V6_TUN_EGRESS" = "no" ] && have ping6; then
-        # Second opinion in case it was TLS rather than routing that failed.
-        ping6 -c1 -W3 -I "$TUN_V6_ADDR" 2001:4860:4860::8888 >/dev/null 2>&1 \
-            && V6_TUN_EGRESS="ping only (TLS failed, routing works)"
+    if v6_reaches "$TUN_V6_ADDR"; then
+        V6_TUN_EGRESS="yes"
+    else
+        V6_TUN_EGRESS="no"
     fi
     info "FROM the tunnel prefix: ${V6_TUN_EGRESS}  <-- this is the one that matters"
 fi
@@ -459,6 +554,10 @@ cat <<'EOF'
   Section 1 flags ratelimit    -> 40 queries/second per client is under what one Mac asks
                                   for when a signed-in YouTube tab opens, and the excess
                                   is dropped in silence. Raise it and retest.
+  Ad endpoints refused, and    -> not a network fault. The page loads, YouTube notices the
+  the page loads but won't        refusal and answers with a wall instead of a video. This is
+  play                            the only cause where every other check is clean and the
+                                  tunnel being off "fixes" it. Pause protection to confirm.
   Section 2 names an address   -> a firewall rule here is dropping it. If it is an
                                   auto-block rule, allowlist the address rather than
                                   unblocking: an unblock only suppresses it for 24 h.
