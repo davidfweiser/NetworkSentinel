@@ -345,6 +345,15 @@ echo "  rules this app wrote (auto-block writes these):"
 { have iptables && iptables -S 2>/dev/null | grep -i 'networksentinel'; } | head -20 | sed 's/^/    /'
 echo "    (empty = this app has written no rules)"
 
+# The layer this script structurally cannot see. Worth saying plainly, because every
+# check above answers "not the firewall" while meaning only "not the firewall ON THIS
+# HOST", and a provider firewall fails exactly like a silent drop.
+echo ""
+echo "  NOT visible from inside this machine: the provider's own firewall."
+echo "    On Linode that is Cloud Firewall, attached per-interface and enforced upstream."
+echo "    Check its inbound AND outbound policies, and whether its rules cover IPv6 at all"
+echo "    — a v4-only ruleset with a DROP default silently blackholes every v6 client."
+
 echo ""
 echo "  rules that would drop QUIC (UDP 443) — YouTube prefers it, and a silent drop"
 echo "  shows up as stalling video rather than as an error:"
