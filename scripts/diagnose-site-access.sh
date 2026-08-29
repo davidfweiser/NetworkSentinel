@@ -306,19 +306,57 @@ if [ -z "$NAT6" ] && have nft; then
 fi
 info "ipv6 NAT/masquerade:   ${NAT6:-none found}"
 
+# Absence of NAT66 proves nothing on its own: a routed prefix needs none, and NAT66
+# on an un-routed one is a workaround rather than the intended shape. What decides it
+# is whether a packet SOURCED FROM THE TUNNEL PREFIX gets an answer, because that is
+# the address a client's traffic will carry once it is forwarded.
 V6_EGRESS="no"
 if have curl && [ -n "$NODE_V6" ]; then
     code="$(curl -6 -sS -o /dev/null -m "$CURL_TIMEOUT" -w '%{http_code}' https://www.youtube.com/ 2>/dev/null)"
     [ "${code:-000}" != "000" ] && V6_EGRESS="yes (HTTP ${code})"
-    info "this node over IPv6:   ${V6_EGRESS}"
+fi
+info "this node over IPv6:   ${V6_EGRESS}  (from its own address — says nothing about clients)"
+
+TUN_V6_ADDR="${TUN_V6%%/*}"
+V6_TUN_EGRESS="untested"
+if [ -n "$TUN_V6_ADDR" ]; then
+    if have curl; then
+        code="$(curl -6 -sS -o /dev/null -m "$CURL_TIMEOUT" --interface "$TUN_V6_ADDR" \
+                -w '%{http_code}' https://www.youtube.com/ 2>/dev/null)"
+        if [ "${code:-000}" != "000" ]; then
+            V6_TUN_EGRESS="yes (HTTP ${code})"
+        else
+            V6_TUN_EGRESS="no"
+        fi
+    fi
+    if [ "$V6_TUN_EGRESS" = "no" ] && have ping6; then
+        # Second opinion in case it was TLS rather than routing that failed.
+        ping6 -c1 -W3 -I "$TUN_V6_ADDR" 2001:4860:4860::8888 >/dev/null 2>&1 \
+            && V6_TUN_EGRESS="ping only (TLS failed, routing works)"
+    fi
+    info "FROM the tunnel prefix: ${V6_TUN_EGRESS}  <-- this is the one that matters"
 fi
 
-if [ -n "$TUN_V6" ] && { [ "$FWD6" != "1" ] || [ -z "$NAT6" ] || [ "$V6_EGRESS" = "no" ]; }; then
-    verdict "PROBLEM: the tunnel hands clients IPv6 this node cannot carry."
-    verdict "macOS prefers IPv6 whenever a name has an AAAA record. Every Google name does;"
-    verdict "most other sites you would test with do not — which is exactly why YouTube fails"
-    verdict "alone. Fix by making v6 work end to end (forwarding + masquerade + a route), or"
-    verdict "by removing v6 from the tunnel entirely so clients fall back to v4."
+if [ -n "$TUN_V6" ] && [ "$V6_TUN_EGRESS" = "no" ]; then
+    verdict "PROBLEM: the tunnel hands clients IPv6 that cannot reach the internet. Traffic"
+    verdict "sourced from ${TUN_V6_ADDR} gets no answer, and that is the address a forwarded"
+    verdict "client packet carries."
+    verdict "macOS prefers IPv6 whenever a name has an AAAA record. Every Google name has one;"
+    verdict "most of what you would test with does not — which is exactly why YouTube fails"
+    verdict "alone. Three ways out, cheapest first:"
+    verdict "  - prove it in 30s: set aaaa_disabled: true in AdGuardHome.yaml, restart it, and"
+    verdict "    reload the page. Clients stop seeing AAAA records and fall back to v4."
+    verdict "  - make v6 real: have the provider ROUTE this prefix to the node (on Linode that"
+    verdict "    is a routed range, requested per instance) — no NAT needed once it is routed."
+    verdict "  - or drop v6 from the tunnel: remove the v6 Address and ::/0 from the clients."
+elif [ -n "$TUN_V6" ] && [ "$FWD6" != "1" ]; then
+    verdict "PROBLEM: the tunnel carries IPv6 but net.ipv6.conf.all.forwarding is ${FWD6}, so"
+    verdict "this node will not pass a client's v6 packet at all. Set it to 1 (and persist it"
+    verdict "in /etc/sysctl.d/) before looking any further."
+elif [ -n "$TUN_V6" ] && [ "$V6_TUN_EGRESS" = "untested" ]; then
+    verdict "the tunnel carries IPv6 and this node could not test whether that prefix reaches"
+    verdict "the internet (no curl). Install curl and re-run: everything else here is guesswork"
+    verdict "without it, because a missing NAT rule is normal for a properly routed prefix."
 elif [ -z "$TUN_V6" ] && [ -n "$NODE_V6" ]; then
     verdict "the tunnel is v4-only while this node has v6. That is consistent as long as the"
     verdict "client's AllowedIPs is 0.0.0.0/0 (v6 then stays on its local link, outside the"
@@ -425,7 +463,9 @@ cat <<'EOF'
                                   auto-block rule, allowlist the address rather than
                                   unblocking: an unblock only suppresses it for 24 h.
   Section 3 says PROBLEM       -> v6 the tunnel offers but cannot carry. The single most
-                                  common cause of "only Google is broken".
+                                  common cause of "only Google is broken". The line to read
+                                  is "FROM the tunnel prefix", not the NAT one: a routed
+                                  prefix needs no NAT, so its absence proves nothing.
   Section 4 much below 1420    -> lower the client's MTU. Symptom is a page that starts
                                   and stalls, or video that never begins.
   Section 5 shows 403/429      -> Google is refusing the VPS address itself. Not fixable
