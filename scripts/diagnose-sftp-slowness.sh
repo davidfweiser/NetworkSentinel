@@ -302,8 +302,45 @@ if have ss; then
         [ -n "$SS_FILTER" ] && SS_FILTER="${SS_FILTER} or "
         SS_FILTER="${SS_FILTER}sport = :${p} or dport = :${p}"
     done
-    SS_OUT="$(ss -tinp state established "( ${SS_FILTER} )" 2>/dev/null | head -30)"
+    SS_OUT="$(ss -tinp state established "( ${SS_FILTER} )" 2>/dev/null | head -40)"
     block "$SS_OUT" "(no established SSH session on those ports — either nothing is connected, or sshd is on a port this did not find. Re-run during the slow transfer.)"
+
+    # The decisive numbers are buried in that wall of text, so pull them out. The
+    # one that ends most of these investigations is app_limited: the kernel saying
+    # TCP had room it was never given data to fill. Nothing about the network can
+    # explain a connection carrying that flag.
+    if [ -n "$SS_OUT" ]; then
+        echo ""
+        echo "  what those sockets amount to:"
+        printf '%s\n' "$SS_OUT" | awk '
+            /rtt:/ {
+                mss=0; cwnd=0; rtt=0; app="no"; retr="none";
+                for (i = 1; i <= NF; i++) {
+                    if ($i ~ /^mss:/)     { split($i, a, ":"); mss  = a[2] }
+                    if ($i ~ /^cwnd:/)    { split($i, a, ":"); cwnd = a[2] }
+                    if ($i ~ /^rtt:/)     { split($i, a, ":"); split(a[2], b, "/"); rtt = b[1] }
+                    if ($i ~ /^retrans:/) { split($i, a, ":"); retr = a[2] }
+                    if ($i == "app_limited") app = "YES"
+                }
+                inflight = mss * cwnd;
+                rate = (rtt > 0) ? inflight / (rtt / 1000) / 1000000 : 0;
+                printf "    %-24s in flight %7d B   rtt %6.1f ms   = %6.2f MB/s   retrans %-6s app_limited %s\n",
+                       peer, inflight, rtt, rate, retr, app;
+                if (app == "YES") limited = 1;
+                if (retr != "none") lossy = 1;
+                next
+            }
+            /:[0-9]+/ { peer = $4 }
+            END {
+                if (limited)
+                    print "\n--> app_limited YES means the kernel had window it was never given data to\n" \
+                          "--> fill. TCP, the path and this host are then all innocent by definition:\n" \
+                          "--> the program at one end or the other is the bottleneck. On a download\n" \
+                          "--> that is the SFTP CLIENT and how many reads it keeps outstanding."
+                if (!lossy)
+                    print "--> No retrans on any socket: there is no packet loss to explain anything."
+            }'
+    fi
 else
     info "(ss not installed — iproute2 provides it)"
 fi
@@ -466,6 +503,12 @@ cat <<'EOF'
     rules                          old auto-blocks or collapse them into an nftables set.
   Section 3 pins one core       -> CPU-bound. Without AES-NI use chacha20-poly1305; with
                                    high steal time the VPS neighbours are the ceiling.
+  Section 4 says app_limited    -> the decisive one. TCP had room the program never
+                                   filled, so no amount of tuning here helps. On a
+                                   download it is the client's read pipeline: OpenSSH's
+                                   own sftp keeps 64 requests in flight, a GUI client or
+                                   a gvfs/sshfs mount often keeps one. Multiply in-flight
+                                   bytes by 1000/rtt to see the ceiling it buys you.
   Section 4 shows retrans       -> packet loss on the path. This is the most common cause
                                    of "shell fine, transfer slow" that has nothing to do
                                    with this host. Try BBR (net.ipv4.tcp_congestion_control
