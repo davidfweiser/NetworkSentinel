@@ -62,8 +62,10 @@ cp "$ROOT/scripts/setup-dns-filter.sh" "$STAGE/setup-dns-filter.sh"
 # from this tarball has no source tree to run them out of.
 cp "$ROOT/scripts/diagnose-ipsec.sh" "$STAGE/diagnose-ipsec.sh"
 cp "$ROOT/scripts/diagnose-site-access.sh" "$STAGE/diagnose-site-access.sh"
+cp "$ROOT/scripts/diagnose-sftp-slowness.sh" "$STAGE/diagnose-sftp-slowness.sh"
 chmod +x "$STAGE/install.sh" "$STAGE/uninstall.sh" "$STAGE/issue-duckdns-cert.sh" \
-         "$STAGE/setup-dns-filter.sh" "$STAGE/diagnose-ipsec.sh" "$STAGE/diagnose-site-access.sh"
+         "$STAGE/setup-dns-filter.sh" "$STAGE/diagnose-ipsec.sh" "$STAGE/diagnose-site-access.sh" \
+         "$STAGE/diagnose-sftp-slowness.sh"
 
 # systemd unit + env example
 mkdir -p "$STAGE/systemd"
@@ -168,6 +170,9 @@ Diagnostics (read-only — they change nothing)
                                         # site (YouTube by default): resolver, firewall
                                         # rules, IPv6, MTU, and this node's own reach
   sudo ./diagnose-ipsec.sh <peer-ip>    # a site-to-site IPSec tunnel that won't come up
+  sudo ./diagnose-sftp-slowness.sh      # ssh to this box is fast and sftp to it is slow:
+                                        # auto-block, inline inspection, chain length,
+                                        # CPU, loss/MTU, shaping, and SFTP's own window
 
 Uninstall
 ---------

@@ -1172,6 +1172,7 @@ All three UIs write the same `~/.local/share/NetworkSentinel/settings.json`, so 
 | `scripts/issue-duckdns-cert.sh` | Let's Encrypt DNS-01 issuance for a duckdns.org name |
 | `scripts/diagnose-ipsec.sh` | Read-only triage for a site-to-site tunnel that won't come up |
 | `scripts/diagnose-site-access.sh` | Read-only triage for one site a tunnel client cannot reach (YouTube by default) |
+| `scripts/diagnose-sftp-slowness.sh` | Read-only triage for SFTP that crawls while SSH to the same host is fast |
 | `Web/WebAuthStore.cs` | Master password hash + session tokens |
 | `scripts/package.sh` | Build self-contained tarball + `.install.sh` |
 | `scripts/install-from-package.sh` | Server/desktop installer (shipped as `install.sh`) |
@@ -1252,6 +1253,7 @@ On GNOME / Pop!_OS the indicator appears in the top bar (StatusNotifier / AppInd
 | Service dies after logout (user unit) | `sudo loginctl enable-linger "$USER"` |
 | Site-to-site VPN tunnel dropped and won't come back | Run `sudo bash scripts/diagnose-ipsec.sh <peer-ip>` — see [below](#a-site-to-site-tunnel-that-wont-come-up). |
 | A VPN client reaches the web but **not one site** (YouTube, signed in) | Run `sudo bash scripts/diagnose-site-access.sh` — see [below](#a-tunnel-client-that-cant-reach-one-site). |
+| **SSH to the server is fast, SFTP to it is slow** | Run `sudo bash scripts/diagnose-sftp-slowness.sh` on the server — see [below](#sftp-that-crawls-while-ssh-is-fast). |
 
 ### A site-to-site tunnel that won't come up
 
@@ -1297,6 +1299,35 @@ Read-only, changes nothing, prints no keys or passwords. The case it was written
 | All five clean | The problem is between the Mac and the node rather than on it. The script ends with the client-side checklist to run next, with the tunnel up |
 
 The script's last section is that client-side checklist — which resolver macOS is actually using, what the tunnel resolver answers when asked directly, whether v4 and v6 disagree, and the tunnel's `AllowedIPs` / `DNS` / `MTU`. Run both halves before changing anything: the node's view and the client's view fail differently, and the pair identifies the cause where either alone is ambiguous.
+
+### SFTP that crawls while SSH is fast
+
+```bash
+sudo bash scripts/diagnose-sftp-slowness.sh              # client address from $SSH_CONNECTION
+sudo bash scripts/diagnose-sftp-slowness.sh 203.0.113.9  # or name it
+```
+
+Run it **on the server**, ideally while a slow transfer is in flight — three of its sections read live per-socket kernel counters. Read-only, changes nothing, prints no keys and nothing from `settings.json` beyond the named auto-block and exfiltration keys.
+
+An interactive shell that feels instant on the same host, port, key and cipher rules a great deal out before you start: the route is up, the port is open, authentication works, and the ciphers are agreed. What is left divides in two, and the two fail differently:
+
+- **Slow to connect** — seconds of nothing, then a prompt, then normal speed. That is name resolution or authentication (`UseDNS yes` with a slow reverse zone is the usual one), and it is worse in SFTP than in SSH only because several GUI clients open more than one connection and pay it again on each.
+- **Slow to transfer** — connects at once, bytes crawl. Nothing above is involved.
+
+The reason a shell stays fast through the second case is arithmetic rather than luck: an interactive session is a few dozen small packets a second, so anything that costs *per packet* or drops one in a hundred is invisible in it and ruinous in a transfer moving tens of thousands. Every cause below has that shape.
+
+| What the script shows | What it means |
+|---|---|
+| A rule naming your client, or an exfiltration alert against it | **This app did it.** An SFTP *download* is outbound traffic from the server to a single address, which is exactly the [exfiltration monitor](#intrusion-detection-040)'s signature: 250 MB inside 10 minutes raises a **High** `Large outbound transfer`, and High is the default auto-block level. The transfer then dies rather than slows. Allowlist the address you transfer to — an unblock only suppresses re-blocking for 24 h, so it would come back tomorrow — or raise **Settings → exfiltration threshold**. Uploads *to* the server never trip it; the counter is outbound only |
+| `NFQUEUE` rules in section 2 | Suricata is inspecting inline, so every packet makes a kernel→userspace round trip before it is released. The largest throughput cost on this list, and the one an interactive shell feels least. Bypass the SSH port, or run Suricata in IDS (`af-packet`) mode where it copies packets instead of gating them |
+| Thousands of rules in section 2 | Chains are walked top to bottom **per packet**, and this app writes one rule per blocked address at the head of the chain. A few hundred is noise; a few thousand on a shared-CPU VPS is not. Set an auto-block expiry, or collapse the plain address blocks into an nftables set — one hash lookup instead of N comparisons |
+| One core pinned in section 3 | CPU-bound, not network-bound. Without AES-NI (the script says) `chacha20-poly1305` beats the AES ciphers; high `st` in the `vmstat` line is steal time, and that ceiling belongs to the hypervisor's other tenants |
+| `retrans:` climbing in section 4 | Packet loss on the path — the most common cause of this symptom that has nothing to do with the host at all. One loss in a few hundred packets halves a bulk stream's window and is imperceptible interactively. `bbr` tolerates it far better than `cubic` |
+| A low `mss:`, or ICMP being dropped | An MTU black hole. The handshake and a shell use small packets and work perfectly; a transfer sends full-size ones that vanish with no error, because the `fragmentation needed` ICMP that would have said so is being dropped. `net.ipv4.tcp_mtu_probing=1` recovers from it |
+| A shaping qdisc in section 5 | `tbf`/`htb`/`police`/`cake` caps throughput and leaves latency alone — which *is* "the shell is fine, the transfer is slow". Read its rate |
+| Everything clean | Then it is SFTP itself, and the script's client-side tests prove it |
+
+**When the server is clean, suspect the protocol.** OpenSSH's `sftp` defaults to a 32 KB buffer and 64 outstanding requests — 2 MB in flight, which caps the transfer at 2 MB per round trip no matter what the link is worth: about 20 MB/s at 100 ms RTT, 10 MB/s at 200 ms. `ssh host 'cat bigfile' > /dev/null` uses the same transport with none of that windowing, so comparing the two separates the network from SFTP in one step. If the plain `ssh` pipe is fast and `sftp` is not, raise the windows (`sftp -B 262144 -R 256`) or use `rsync`/`scp`/`tar` over ssh. Two client-side habits produce the same result on their own: a file-manager mount (`gvfs`, `sshfs`) or a GUI client issuing small serialised reads, and a transfer of **many small files**, where SFTP pays several round trips per file and no buffer size helps — stream those with `tar` instead.
 
 ---
 
