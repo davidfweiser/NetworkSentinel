@@ -353,16 +353,16 @@ cat <<EOF
   #    This is the control. It uses the same host, port, key and cipher:
   ssh ${SSHD_PORT:+-p $SSHD_PORT }<user>@<this-host> 'dd if=/dev/zero bs=1M count=500' > /dev/null
 
-  # 2. What SFTP gets over that same transport, with its defaults:
-  sftp ${SSHD_PORT:+-P $SSHD_PORT }<user>@<this-host> <<'X'
-  get /path/to/500mb.bin /dev/null
-X
+  # 2. What SFTP gets over that same transport, with its defaults. The host:path
+  #    form does the whole transfer in one shot — no interactive session:
+  sftp ${SSHD_PORT:+-P $SSHD_PORT }<user>@<this-host>:/path/to/500mb.bin /tmp/sftp-speedtest.bin
 
-  # 3. The same SFTP transfer with the protocol's windows opened up.
-  #    Defaults are a 32 KB buffer and 64 outstanding requests = 2 MB in flight,
-  #    which caps you at 2 MB / RTT no matter how fat the link is: about 20 MB/s
-  #    at 100 ms, 10 MB/s at 200 ms. These flags raise it 8x:
-  sftp -B 262144 -R 256 ${SSHD_PORT:+-P $SSHD_PORT }<user>@<this-host>
+  # 3. The same transfer with the protocol's windows opened up. Defaults are a
+  #    32 KB buffer and 64 outstanding requests = 2 MB in flight, which caps you
+  #    at 2 MB / RTT no matter how fat the link is: about 20 MB/s at 100 ms,
+  #    10 MB/s at 200 ms. These flags raise it 8x:
+  sftp -B 262144 -R 256 ${SSHD_PORT:+-P $SSHD_PORT }<user>@<this-host>:/path/to/500mb.bin /tmp/sftp-speedtest.bin
+  rm -f /tmp/sftp-speedtest.bin
 
   # 4. Round-trip time to this host — every number above depends on it:
   ping -c 20 <this-host>
