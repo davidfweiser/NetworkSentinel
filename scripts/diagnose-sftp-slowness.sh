@@ -80,9 +80,23 @@ else
     info "will say so. Pass it as an argument: sudo bash $0 <client-ip>"
 fi
 
-SSHD_PORT="$(awk '/^[[:space:]]*Port[[:space:]]+[0-9]+/ {print $2; exit}' /etc/ssh/sshd_config 2>/dev/null)"
-SSHD_PORT="${SSHD_PORT:-22}"
-info "sshd port: ${SSHD_PORT}"
+# sshd's real port(s). A non-default port is ordinary, and /etc/ssh/sshd_config
+# alone misses both an sshd_config.d drop-in and anything sshd was started with,
+# so ask the listening sockets and the daemon's own effective config first. Get
+# this wrong and section 4 filters for a port nothing is talking on and prints
+# an empty table — which reads as "no problem here" when it means "wrong port".
+SSHD_BIN="$(command -v sshd 2>/dev/null || echo /usr/sbin/sshd)"
+SSHD_PORTS="$(ss -ltnp 2>/dev/null | awk '/"sshd"/ {n=split($4,a,":"); print a[n]}' | sort -un | tr '\n' ' ')"
+if [ -z "${SSHD_PORTS// /}" ] && [ -x "$SSHD_BIN" ]; then
+    SSHD_PORTS="$("$SSHD_BIN" -T 2>/dev/null | awk '/^port /{print $2}' | sort -un | tr '\n' ' ')"
+fi
+if [ -z "${SSHD_PORTS// /}" ]; then
+    SSHD_PORTS="$(awk '/^[[:space:]]*Port[[:space:]]+[0-9]+/ {print $2}' \
+                  /etc/ssh/sshd_config /etc/ssh/sshd_config.d/*.conf 2>/dev/null | sort -un | tr '\n' ' ')"
+fi
+SSHD_PORTS="${SSHD_PORTS:-22}"
+SSHD_PORT="$(printf '%s' "$SSHD_PORTS" | awk '{print $1}')"
+info "sshd port(s): ${SSHD_PORTS% }"
 
 DEF_IFACE="$(ip -4 route show default 2>/dev/null | awk '{print $5; exit}')"
 if [ -n "${DEF_IFACE:-}" ]; then
@@ -232,7 +246,13 @@ fi
 # ---------------------------------------------------------------------------
 say "3. CPU — the other way a fast link delivers slow bytes"
 
-info "cores: $(nproc 2>/dev/null || echo '?')   load: $(cut -d' ' -f1-3 /proc/loadavg 2>/dev/null)"
+CORES="$(nproc 2>/dev/null || echo '?')"
+info "cores: ${CORES}   load: $(cut -d' ' -f1-3 /proc/loadavg 2>/dev/null)"
+if [ "$CORES" = "1" ]; then
+    verdict "ONE core. Everything that touches a packet — sshd's cipher, WireGuard's,"
+    verdict "the firewall chain, the resolver, this app — competes for the same core,"
+    verdict "and a bulk transfer is the only workload here big enough to notice."
+fi
 if grep -qm1 ' aes ' /proc/cpuinfo 2>/dev/null || grep -qm1 'aes' /proc/cpuinfo 2>/dev/null; then
     info "AES-NI: present (so aes128-gcm/aes256-gcm ciphers run at line rate)"
 else
@@ -265,12 +285,25 @@ CC="$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo '?')"
 MTU_PROBE="$(sysctl -n net.ipv4.tcp_mtu_probing 2>/dev/null || echo '?')"
 info "congestion control: ${CC}"
 info "tcp_mtu_probing:    ${MTU_PROBE}  (0 = off; 1 or 2 recovers from an MTU black hole)"
-info "rmem_max: $(sysctl -n net.core.rmem_max 2>/dev/null)  wmem_max: $(sysctl -n net.core.wmem_max 2>/dev/null)"
+info "core rmem_max/wmem_max: $(sysctl -n net.core.rmem_max 2>/dev/null) / $(sysctl -n net.core.wmem_max 2>/dev/null)"
+info "tcp_rmem (min default max): $(sysctl -n net.ipv4.tcp_rmem 2>/dev/null | tr '\t' ' ')"
+info "tcp_wmem (min default max): $(sysctl -n net.ipv4.tcp_wmem 2>/dev/null | tr '\t' ' ')"
+verdict "The THIRD tcp_rmem/tcp_wmem number is the ceiling autotuning may reach, and it"
+verdict "is what a transfer runs into. net.core.*mem_max only caps a program that sets"
+verdict "its buffer explicitly, so a 212992 there is not by itself a limit on ssh."
+verdict "A window has to hold rtt x bandwidth: 100 ms at 100 Mbit needs ~1.25 MB."
 
 echo ""
-echo "  live SSH sockets — run this DURING the slow transfer, the numbers are the answer:"
+echo "  live SSH sockets on port(s) ${SSHD_PORTS% } — run this DURING the slow transfer,"
+echo "  the numbers here are the answer:"
 if have ss; then
-    ss -tin "( sport = :${SSHD_PORT} or dport = :${SSHD_PORT} )" 2>/dev/null | head -30 | sed 's/^/    /'
+    SS_FILTER=""
+    for p in $SSHD_PORTS; do
+        [ -n "$SS_FILTER" ] && SS_FILTER="${SS_FILTER} or "
+        SS_FILTER="${SS_FILTER}sport = :${p} or dport = :${p}"
+    done
+    SS_OUT="$(ss -tinp state established "( ${SS_FILTER} )" 2>/dev/null | head -30)"
+    block "$SS_OUT" "(no established SSH session on those ports — either nothing is connected, or sshd is on a port this did not find. Re-run during the slow transfer.)"
 else
     info "(ss not installed — iproute2 provides it)"
 fi
@@ -281,6 +314,33 @@ verdict "hundred halves a bulk stream's window and is imperceptible interactivel
 verdict "'rtt:' is the round trip; 'cwnd:' times MSS divided by rtt is the ceiling this"
 verdict "connection can reach no matter what the link is worth."
 verdict "'mss:' well under 1448 on a 1500-MTU path means something is clamping it."
+
+echo ""
+echo "  is the transfer going through a tunnel:"
+WG_IFACES="$(ip -brief link show type wireguard 2>/dev/null | awk '{print $1}')"
+if [ -n "$WG_IFACES" ]; then
+    for w in $WG_IFACES; do
+        info "${w}: MTU $(cat "/sys/class/net/${w}/mtu" 2>/dev/null || echo '?'), $(wg show "$w" peers 2>/dev/null | wc -l) peer(s)"
+    done
+    if [ -n "$CLIENT_IP" ]; then
+        VIA="$(ip route get "$CLIENT_IP" 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="dev") print $(i+1)}' | head -1)"
+        info "route to ${CLIENT_IP} leaves via: ${VIA:-unknown}"
+        for w in $WG_IFACES; do
+            [ "$VIA" = "$w" ] && verdict "THE TRANSFER GOES THROUGH THE TUNNEL. Every byte is encrypted twice — once"
+            [ "$VIA" = "$w" ] && verdict "by SSH, once by WireGuard — and WireGuard's per-peer crypto is effectively"
+            [ "$VIA" = "$w" ] && verdict "one CPU's worth. On the single core section 3 counted, that is a hard"
+            [ "$VIA" = "$w" ] && verdict "throughput ceiling an interactive shell never approaches. Compare a transfer"
+            [ "$VIA" = "$w" ] && verdict "to this host's PUBLIC address with the tunnel down: if that is fast, the"
+            [ "$VIA" = "$w" ] && verdict "tunnel is the cost, not SFTP."
+        done
+    else
+        verdict "Pass the client address to find out whether its traffic takes the tunnel."
+    fi
+    verdict "A tunnel MTU above the path's (1420 is the usual safe value over a 1500 link)"
+    verdict "shows up as a transfer that starts and stalls while the shell stays fine."
+else
+    echo "    (no WireGuard interface — the transfer takes the plain route)"
+fi
 
 echo ""
 echo "  does anything here drop the ICMP that Path MTU Discovery needs:"
@@ -317,9 +377,19 @@ fi
 say "6. Connect-time cost (complaint A: the pause BEFORE anything transfers)"
 
 echo "  sshd settings that add seconds to every new session:"
-SSHD_KEYS="$(grep -inE '^[[:space:]]*(UseDNS|GSSAPIAuthentication|MaxStartups|LoginGraceTime)' \
+# sshd -T prints the EFFECTIVE config — drop-ins and command-line flags included —
+# which is what the daemon is actually running, unlike any one file.
+SSHD_KEYS="$("$SSHD_BIN" -T 2>/dev/null | grep -iE '^(usedns|gssapiauthentication|maxstartups|logingracetime|subsystem)')"
+[ -z "$SSHD_KEYS" ] && SSHD_KEYS="$(grep -inE '^[[:space:]]*(UseDNS|GSSAPIAuthentication|MaxStartups|LoginGraceTime)' \
              /etc/ssh/sshd_config /etc/ssh/sshd_config.d/*.conf 2>/dev/null)"
-block "$SSHD_KEYS" "(none set — the defaults apply, and both costly ones are off: UseDNS no, GSSAPI no)"
+block "$SSHD_KEYS" "(nothing set — the defaults apply, and both costly ones are off: UseDNS no, GSSAPI no)"
+
+echo ""
+echo "  per-user overrides (a Match block can give the sftp account a chroot the"
+echo "  shell account does not have):"
+MATCHES="$(grep -inE '^[[:space:]]*(Match|ChrootDirectory|ForceCommand)' \
+           /etc/ssh/sshd_config /etc/ssh/sshd_config.d/*.conf 2>/dev/null)"
+block "$MATCHES" "(no Match, ChrootDirectory or ForceCommand — every account gets the same treatment)"
 
 if [ -n "$CLIENT_IP" ]; then
     echo ""
@@ -402,6 +472,9 @@ cat <<'EOF'
                                    = bbr), which tolerates loss far better than cubic.
   Section 4 shows a low mss     -> or the client-side ping test in item 6 fails: an MTU
     or drops ICMP                  black hole. Small packets pass, full ones vanish.
+  Section 4 says the transfer   -> WireGuard encrypts every byte a second time, on one
+    takes the tunnel               core's worth of crypto. Test against the host's public
+                                   address with the tunnel down before blaming SFTP.
   Section 5 shows a shaper      -> a qdisc is capping throughput. Read its rate.
   Section 6 slow reverse DNS    -> only explains a slow CONNECT, never a slow transfer.
     with UseDNS yes                Set UseDNS no.
