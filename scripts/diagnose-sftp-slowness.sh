@@ -456,19 +456,27 @@ verdict "Neither is slow by itself, but a ChrootDirectory on a slow or network f
 say "Run these on the client — they separate the network from SFTP itself"
 
 cat <<EOF
-  # 1. What the SSH transport is worth, with SFTP taken out of the picture.
-  #    This is the control. It uses the same host, port, key and cipher:
-  ssh ${SSHD_PORT:+-p $SSHD_PORT }<user>@<this-host> 'dd if=/dev/zero bs=1M count=500' > /dev/null
+  # 0. Make a test file on this host first — the tests below need something real
+  #    to move. 200 MB keeps each run under the 250 MB / 10 min that raises a
+  #    High 'Large outbound transfer' threat against YOUR OWN address; with
+  #    auto-block on, back-to-back runs can otherwise firewall you out mid-test.
+  #    Allowlist your client address before benchmarking and the question is moot.
+  ssh ${SSHD_PORT:+-p $SSHD_PORT }<user>@<this-host> \\
+      'dd if=/dev/urandom of=~/speedtest.bin bs=1M count=200 status=none'
 
-  # 2. What SFTP gets over that same transport, with its defaults. The host:path
-  #    form does the whole transfer in one shot — no interactive session:
-  sftp ${SSHD_PORT:+-P $SSHD_PORT }<user>@<this-host>:/path/to/500mb.bin /tmp/sftp-speedtest.bin
+  # 1. What the SSH transport is worth, with SFTP taken out of the picture.
+  #    This is the control — same host, port, key and cipher, no SFTP layer.
+  #    The local dd prints the rate:
+  ssh ${SSHD_PORT:+-p $SSHD_PORT }<user>@<this-host> 'cat ~/speedtest.bin' | dd of=/dev/null bs=1M
+
+  # 2. What SFTP gets over that same transport, with its defaults:
+  time sftp ${SSHD_PORT:+-P $SSHD_PORT }<user>@<this-host>:speedtest.bin /tmp/sftp-speedtest.bin
 
   # 3. The same transfer with the protocol's windows opened up. Defaults are a
   #    32 KB buffer and 64 outstanding requests = 2 MB in flight, which caps you
   #    at 2 MB / RTT no matter how fat the link is: about 20 MB/s at 100 ms,
   #    10 MB/s at 200 ms. These flags raise it 8x:
-  sftp -B 262144 -R 256 ${SSHD_PORT:+-P $SSHD_PORT }<user>@<this-host>:/path/to/500mb.bin /tmp/sftp-speedtest.bin
+  time sftp -B 262144 -R 256 ${SSHD_PORT:+-P $SSHD_PORT }<user>@<this-host>:speedtest.bin /tmp/sftp-speedtest.bin
   rm -f /tmp/sftp-speedtest.bin
 
   # 4. Round-trip time to this host — every number above depends on it:
@@ -477,12 +485,15 @@ cat <<EOF
   # 5. If the transfer is MANY SMALL FILES rather than one big one, SFTP pays
   #    several round trips per file and no buffer size helps. Stream it instead:
   ssh <user>@<this-host> 'tar cf - /path/to/dir' | tar xf -
-  rsync -az -e ssh <user>@<this-host>:/path/to/dir/ ./dir/
+  rsync -az -e 'ssh ${SSHD_PORT:+-p $SSHD_PORT}' <user>@<this-host>:/path/to/dir/ ./dir/
 
   # 6. MTU black hole, from the client side (1472 + 28 = 1500):
   ping -c 3 -M do -s 1472 <this-host>    # Linux
   ping -c 3 -D -s 1472 <this-host>       # macOS
   #    Fails while a normal ping succeeds -> lower the MTU or turn on tcp_mtu_probing.
+
+  # 7. Tidy up when you are done:
+  ssh ${SSHD_PORT:+-p $SSHD_PORT }<user>@<this-host> 'rm -f ~/speedtest.bin'
 EOF
 
 say "Reading the result"
