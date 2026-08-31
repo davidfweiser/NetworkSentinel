@@ -464,10 +464,17 @@ cat <<EOF
   ssh ${SSHD_PORT:+-p $SSHD_PORT }<user>@<this-host> \\
       'dd if=/dev/urandom of=~/speedtest.bin bs=1M count=200 status=none'
 
-  # 1. What the SSH transport is worth, with SFTP taken out of the picture.
-  #    This is the control — same host, port, key and cipher, no SFTP layer.
-  #    The local dd prints the rate:
-  ssh ${SSHD_PORT:+-p $SSHD_PORT }<user>@<this-host> 'cat ~/speedtest.bin' | dd of=/dev/null bs=1M
+  # 1. What the SSH transport is worth with SFTP taken out of the picture. Use
+  #    scp's LEGACY mode (-O): same host, port, key and cipher, a plain stream,
+  #    no SFTP layer. Without -O, OpenSSH 9+ scp runs over SFTP and measures the
+  #    very thing you are trying to exclude:
+  time scp -O ${SSHD_PORT:+-P $SSHD_PORT }<user>@<this-host>:speedtest.bin /tmp/sftp-speedtest.bin
+
+  #    NOT a control:  ssh <host> 'cat file' | dd of=/dev/null
+  #    That measures the client's pipe, not the link — ssh hands the pipe 32 KB
+  #    at a time and dd reads it back in short reads, so it reports a fraction of
+  #    what the same transport does to a file, and reads as a transport problem
+  #    that is not there.
 
   # 2. What SFTP gets over that same transport, with its defaults:
   time sftp ${SSHD_PORT:+-P $SSHD_PORT }<user>@<this-host>:speedtest.bin /tmp/sftp-speedtest.bin
