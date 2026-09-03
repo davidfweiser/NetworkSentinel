@@ -336,6 +336,18 @@ if [[ -f "${PKG_ROOT}/README-INSTALL.txt" ]]; then
   cp "${PKG_ROOT}/README-INSTALL.txt" "${DOCDIR}/"
 fi
 
+# The MIT licence and the third-party notices install with the binary: the
+# self-contained build carries the Inter typeface, whose OFL-1.1 licence has to
+# accompany the font wherever it goes. Older packages predate these files, so
+# both copies stay conditional.
+# (`[[ -f ]] && cp` would abort the run under `set -e` when the last document is
+# the missing one — the loop's status becomes the failed test's.)
+for doc in LICENSE THIRD-PARTY-NOTICES.md; do
+  if [[ -f "${PKG_ROOT}/${doc}" ]]; then
+    cp "${PKG_ROOT}/${doc}" "${DOCDIR}/"
+  fi
+done
+
 # Desktop entry (optional; harmless on servers)
 if [[ "$NO_DESKTOP" -eq 0 ]]; then
   DESKTOP_SRC="${PKG_ROOT}/networksentinel.desktop"

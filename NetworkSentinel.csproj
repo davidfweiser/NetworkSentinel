@@ -14,6 +14,11 @@
     <Product>Network Sentinel</Product>
     <Description>Linux-native network port monitor and intrusion awareness console</Description>
     <Version>0.7.16</Version>
+    <Authors>David Weiser</Authors>
+    <Copyright>Copyright (c) 2026 David Weiser</Copyright>
+    <!-- Assembly metadata only; the authoritative texts are LICENSE and
+         THIRD-PARTY-NOTICES.md, which scripts/package.sh ships in the tarball. -->
+    <PackageLicenseExpression>MIT</PackageLicenseExpression>
     <!-- The test project lives in a subfolder; keep it out of the app's implicit compile glob. -->
     <DefaultItemExcludes>$(DefaultItemExcludes);Tests/**</DefaultItemExcludes>
   </PropertyGroup>

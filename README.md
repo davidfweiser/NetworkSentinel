@@ -1333,4 +1333,21 @@ The reason a shell stays fast through the second case is arithmetic rather than 
 
 ## License
 
-Private project — all rights reserved unless you add a license file later.
+**MIT** — see [`LICENSE`](LICENSE). Use it, fork it, ship it, sell it; keep the
+copyright notice with it and accept that it comes with no warranty.
+
+Third-party components are listed in [`THIRD-PARTY-NOTICES.md`](THIRD-PARTY-NOTICES.md),
+which the release tarball and the installer both carry into
+`$PREFIX/share/doc/networksentinel/`. Two points in there are worth knowing
+before you distribute a build of your own:
+
+- The self-contained binary embeds the **Inter** typeface, licensed under the
+  **SIL Open Font License 1.1** rather than MIT. The OFL requires its notice to
+  travel with the font, which is why the notices file has to accompany a
+  release and not just sit in this repository.
+- The **threat-intel feeds and geolocation endpoints are third-party services**,
+  not data shipped with the app. Spamhaus DROP data is Spamhaus' copyright and
+  database right, used under their terms; the two geolocation providers scope
+  their keyless free tiers to non-commercial use with per-day caps. Running the
+  app means accepting those providers' terms — the MIT licence on this code
+  grants you nothing with respect to their data.

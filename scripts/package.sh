@@ -67,6 +67,13 @@ chmod +x "$STAGE/install.sh" "$STAGE/uninstall.sh" "$STAGE/issue-duckdns-cert.sh
          "$STAGE/setup-dns-filter.sh" "$STAGE/diagnose-ipsec.sh" "$STAGE/diagnose-site-access.sh" \
          "$STAGE/diagnose-sftp-slowness.sh"
 
+# Licence and third-party notices. The self-contained build embeds the .NET
+# runtime, Avalonia and the Inter typeface, and Inter's OFL-1.1 licence requires
+# its notice to travel with the font — so these are part of the artifact, not
+# repository decoration.
+cp "$ROOT/LICENSE" "$STAGE/LICENSE"
+cp "$ROOT/THIRD-PARTY-NOTICES.md" "$STAGE/THIRD-PARTY-NOTICES.md"
+
 # systemd unit + env example
 mkdir -p "$STAGE/systemd"
 cp "$ROOT/scripts/systemd/networksentinel-web.service" "$STAGE/systemd/"
