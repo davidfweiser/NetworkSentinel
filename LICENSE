@@ -19,3 +19,14 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
+
+---
+
+Scope note (not part of the MIT License text above)
+
+This licence applies to all revisions in this repository's history, including
+the Windows WPF implementation that preceded the Linux port — commits eccaab0
+through 0b55296, July 2026, which are the origin of this codebase rather than
+imported third-party work. Git history is immutable, so the LICENSE file exists
+only from the revision that added it and a checkout of an earlier commit will
+not contain a copy; this notice is what covers those revisions.
