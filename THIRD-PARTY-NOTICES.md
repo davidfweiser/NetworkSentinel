@@ -343,3 +343,21 @@ and license Suricata yourself.
 The host tools the app shells out to — `nft`, `iptables`, `ufw`, `ss`, `pkexec`,
 `sudo`, `journalctl` — are part of the operating system and are neither shipped
 nor modified.
+
+---
+
+## First-party assets
+
+For completeness, because the question comes up for anything shipped inside a
+release artifact: the application artwork is **not** third-party material.
+
+| Asset | Origin |
+|---|---|
+| `Assets/icon.png`, `Assets/icon.ico`, `Assets/icons/icon-{16,24,32,48,64,128,256,512}.png` | Generated with Anthropic's Claude for this project |
+| `Data/allowlist-default.json` | Written for this project; a list of well-known hostnames, not a redistributed database |
+
+No third party holds rights in these files, none of them originates from an icon
+pack, stock library or another project, and no attribution to Anthropic is
+required or implied — under Anthropic's terms of service Anthropic claims no
+ownership of the output its models produce. They are covered by this project's
+own MIT licence along with the rest of the repository.
