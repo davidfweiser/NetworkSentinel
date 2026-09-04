@@ -110,6 +110,7 @@ public partial class MainViewModel : ObservableObject, IDisposable
     // current whenever either front-end is open.
     [ObservableProperty] private bool _httpsEnabled;
     [ObservableProperty] private string _httpsPortText = "18443";
+    [ObservableProperty] private string _publicHostname = "";
     [ObservableProperty] private string _tlsCertPath = "";
     [ObservableProperty] private string _tlsKeyPath = "";
     [ObservableProperty] private bool _httpsRedirect = true;
@@ -245,6 +246,7 @@ public partial class MainViewModel : ObservableObject, IDisposable
         // OnChanged handlers below and re-save settings during construction.
         _httpsEnabled = _settings.WebHttpsEnabled;
         _httpsPortText = _settings.WebHttpsPort.ToString();
+        _publicHostname = _settings.WebPublicHostname;
         _tlsCertPath = _settings.WebTlsCertPath;
         _tlsKeyPath = _settings.WebTlsKeyPath;
         _httpsRedirect = _settings.WebHttpsRedirect;
@@ -978,7 +980,8 @@ public partial class MainViewModel : ObservableObject, IDisposable
     {
         if (value && string.IsNullOrWhiteSpace(TlsCertPath))
         {
-            SettingsMessage = "Choose a certificate first — run scripts/issue-duckdns-cert.sh to get one.";
+            SettingsMessage = "Choose a certificate first — any certificate for a name you own works, " +
+                              "or run scripts/issue-duckdns-cert.sh for a free one on a duckdns.org name.";
             HttpsEnabled = false;
             return;
         }
@@ -1003,6 +1006,29 @@ public partial class MainViewModel : ObservableObject, IDisposable
         _settings.Save();
         SettingsMessage = $"Web console HTTPS port set to {port} — restart the web console to apply.";
         RefreshRemoteAccessStatus(reloadCertificate: true);
+    }
+
+    /// <summary>
+    /// The name the console is reached by, for the status line and the web console's banner.
+    /// Empty falls back to the DuckDNS hostname, so a user with their own domain never has to
+    /// touch the DuckDNS rows. The box keeps whatever was typed; only the cleaned-up name is
+    /// stored, the same way the DuckDNS subdomain is handled.
+    /// </summary>
+    partial void OnPublicHostnameChanged(string value)
+    {
+        var normalized = AppSettings.NormalizeHostname(value);
+        if ((value ?? "").Trim().Length > 0 && normalized.Length == 0)
+        {
+            SettingsMessage = "Enter a hostname, e.g. sentinel.example.com.";
+            return;
+        }
+
+        _settings.WebPublicHostname = normalized;
+        _settings.Save();
+        SettingsMessage = normalized.Length == 0
+            ? "Public hostname cleared — the DuckDNS name is used when one is set."
+            : $"Console hostname: {normalized}";
+        RefreshRemoteAccessStatus();
     }
 
     partial void OnTlsCertPathChanged(string value) => ApplyTlsPath(certChanged: true, value);
@@ -1194,11 +1220,7 @@ public partial class MainViewModel : ObservableObject, IDisposable
         if (reloadCertificate || _httpsStatusPart.Length == 0)
             _httpsStatusPart = BuildHttpsStatusPart();
 
-        var parts = new List<string> { _httpsStatusPart, _duckDns.Status };
-        if (_duckDns.Config.IsUsable && _settings.WebHttpsEnabled)
-            parts.Add($"Console URL: https://{_duckDns.Hostname}:{_settings.WebHttpsPort}/");
-
-        var text = string.Join("  ·  ", parts);
+        var text = ComposeRemoteAccessStatus();
         if (text != RemoteAccessStatus)
             RemoteAccessStatus = text;
     }
@@ -1224,9 +1246,20 @@ public partial class MainViewModel : ObservableObject, IDisposable
     private string BuildRemoteAccessStatus()
     {
         _httpsStatusPart = BuildHttpsStatusPart();
+        return ComposeRemoteAccessStatus();
+    }
+
+    /// <summary>
+    /// Certificate state, DuckDNS state, and the URL the console answers on. The URL uses the
+    /// public hostname when one is set and the DuckDNS name otherwise, so it appears for an
+    /// own-domain setup that never enables DuckDNS at all.
+    /// </summary>
+    private string ComposeRemoteAccessStatus()
+    {
         var parts = new List<string> { _httpsStatusPart, _duckDns.Status };
-        if (_duckDns.Config.IsUsable && _settings.WebHttpsEnabled)
-            parts.Add($"Console URL: https://{_duckDns.Hostname}:{_settings.WebHttpsPort}/");
+        var hostname = _settings.PublicHostnameOr(_duckDns.Hostname);
+        if (hostname.Length > 0 && _settings.WebHttpsEnabled)
+            parts.Add($"Console URL: https://{hostname}:{_settings.WebHttpsPort}/");
         return string.Join("  ·  ", parts);
     }
 
