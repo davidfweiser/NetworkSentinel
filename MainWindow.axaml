@@ -1224,7 +1224,7 @@
               <Border Classes="card">
                 <StackPanel>
                   <TextBlock Text="Remote access (web console)" FontWeight="Bold" FontSize="15"/>
-                  <TextBlock Text="Reach the browser console from outside this machine over HTTPS. These settings configure the headless web console (--web); this app saves them and keeps the DuckDNS hostname current."
+                  <TextBlock Text="Reach the browser console from outside this machine over HTTPS. These settings configure the headless web console (--web); this app saves them and keeps the DuckDNS hostname current. Already own a domain? Point a record at this machine, fill in the hostname and certificate paths below, and leave the DuckDNS rows empty — DuckDNS is only here to supply a free name and a free certificate to those without one."
                              Foreground="{DynamicResource TextSecondaryBrush}" FontSize="12"
                              Margin="0,4,0,10" TextWrapping="Wrap"/>
                   <TextBlock Text="{Binding RemoteAccessStatus}" FontSize="11"
@@ -1270,10 +1270,21 @@
                               IsChecked="{Binding HttpsEnabled}"/>
                   </Grid>
 
+                  <Grid ColumnDefinitions="*,Auto" Margin="0,0,0,14">
+                    <StackPanel Margin="0,0,16,0">
+                      <TextBlock Text="Public hostname" FontWeight="Bold" FontSize="13"/>
+                      <TextBlock Text="The name this console is reached by from outside — the name your certificate covers. Fill this in when the name is your own; leave it empty to use the DuckDNS name above. Cosmetic: it names the console in the status line and the web console's startup banner, and is never matched against incoming requests."
+                                 Foreground="{DynamicResource TextSecondaryBrush}" FontSize="11"
+                                 Margin="0,2,0,0" TextWrapping="Wrap"/>
+                    </StackPanel>
+                    <TextBox Grid.Column="1" Width="280" VerticalAlignment="Center"
+                             Text="{Binding PublicHostname}" Watermark="sentinel.example.com"/>
+                  </Grid>
+
                   <Grid ColumnDefinitions="*,Auto,Auto" Margin="0,0,0,14">
                     <StackPanel Margin="0,0,16,0">
                       <TextBlock Text="Issue certificate" FontWeight="Bold" FontSize="13"/>
-                      <TextBlock Text="Get a free trusted Let's Encrypt certificate for your duckdns.org name. Proves control through the DuckDNS token above, so nothing needs to be reachable on port 80. Takes a few minutes waiting on DNS, then fills in the two paths below. Renewals are automatic."
+                      <TextBlock Text="DuckDNS route only: get a free trusted Let's Encrypt certificate for your duckdns.org name. Proves control through the DuckDNS token above, so nothing needs to be reachable on port 80. Takes a few minutes waiting on DNS, then fills in the two paths below. Renewals are automatic. With your own domain, issue a certificate however you normally do and fill those paths in yourself."
                                  Foreground="{DynamicResource TextSecondaryBrush}" FontSize="11"
                                  Margin="0,2,0,0" TextWrapping="Wrap"/>
                       <TextBlock Text="First run only: installs acme.sh and registers a Let's Encrypt account with the email beside it."

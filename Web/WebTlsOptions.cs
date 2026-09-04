@@ -12,8 +12,12 @@ public sealed class WebTlsOptions
     public string? KeyPath { get; set; }
     public string? PfxPassword { get; set; }
 
+    /// <summary>Name the console is reached by — used in the startup banner, not for routing.</summary>
+    public string? PublicHostname { get; set; }
+
     public bool HasAny => Enabled.HasValue || Port.HasValue ||
                           !string.IsNullOrWhiteSpace(CertPath) ||
                           !string.IsNullOrWhiteSpace(KeyPath) ||
-                          !string.IsNullOrWhiteSpace(PfxPassword);
+                          !string.IsNullOrWhiteSpace(PfxPassword) ||
+                          !string.IsNullOrWhiteSpace(PublicHostname);
 }
