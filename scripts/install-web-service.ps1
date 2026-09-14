@@ -84,6 +84,26 @@ Write-Host "Publishing..." -ForegroundColor Yellow
 & dotnet publish $Project -c Release -r win-x64 --self-contained false -o $PublishDir
 if ($LASTEXITCODE -ne 0) { throw "dotnet publish failed." }
 
+# The running console holds its files, and the task re-launches a console that is not
+# running (see the trigger below), so stop both before replacing anything. Registering
+# the task again re-enables it.
+# If the install then fails, the trap turns the task back on: left disabled, the console
+# would not start at the next boot either, and nothing would say why.
+$TaskDisabled = $false
+trap {
+    if ($TaskDisabled) {
+        Enable-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue | Out-Null
+    }
+    break
+}
+if ($existingTask) {
+    Disable-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue | Out-Null
+    $TaskDisabled = $true
+    Stop-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
+}
+Get-Process -Name "NetworkSentinel" -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+Start-Sleep -Milliseconds 400
+
 New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null
 Get-ChildItem $InstallDir -Force -ErrorAction SilentlyContinue |
     Where-Object { $_.Name -ne "logs" } |
@@ -132,8 +152,16 @@ catch {
 # Scheduled task at startup, highest privileges
 $arg = "-w $Port"
 $action = New-ScheduledTaskAction -Execute $Exe -Argument $arg -WorkingDirectory $InstallDir
+
+# A boot trigger fires once, and -RestartCount only retries a launch Task Scheduler could
+# not make: a console that starts and then exits with an error is left stopped. The
+# trigger repeats every 5 minutes for as long as the machine is up; with IgnoreNew a tick
+# while the console runs does nothing, and one after it stopped starts it.
 $trigger = New-ScheduledTaskTrigger -AtStartup
-$settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1)
+$trigger.Repetition = (New-ScheduledTaskTrigger -Once -At (Get-Date) -RepetitionInterval (New-TimeSpan -Minutes 5)).Repetition
+
+# ExecutionTimeLimit zero is no limit; the default of 72 hours ends the console three days in.
+$settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable -MultipleInstances IgnoreNew -ExecutionTimeLimit ([TimeSpan]::Zero) -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1)
 $principal = New-ScheduledTaskPrincipal -UserId "SYSTEM" -LogonType ServiceAccount -RunLevel Highest
 
 Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false -ErrorAction SilentlyContinue
@@ -145,7 +173,7 @@ Start-ScheduledTask -TaskName $TaskName
 Write-Host ""
 Write-Host "Installed." -ForegroundColor Green
 Write-Host "  App     : $Exe -w $Port"
-Write-Host "  Task    : $TaskName (At startup, SYSTEM, highest)"
+Write-Host "  Task    : $TaskName (At startup, SYSTEM, highest; restarted within 5 minutes if it stops)"
 Write-Host "  Open    : http://localhost:$Port/  (or http://<server-ip>:$Port/)"
 Write-Host "  First visit creates a master password."
 Write-Host ""

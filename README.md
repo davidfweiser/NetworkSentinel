@@ -664,17 +664,42 @@ The task is what makes it survive a reboot, and it is configured for an unattend
 
 | Setting | Value | Why |
 |---------|-------|-----|
-| Trigger | **At startup** | Runs at boot — **no one has to log in** |
+| Trigger | **At startup**, repeating **every 5 minutes** | Runs at boot — **no one has to log in** — and starts the console again whenever it has stopped |
+| `-MultipleInstances IgnoreNew` | on | What makes the repeat safe: a tick while the console is running does nothing |
+| `-ExecutionTimeLimit` | **none** | The default is 72 hours, after which Task Scheduler ends the console — three days after every start |
 | Principal | `SYSTEM`, **Highest** | Already elevated, so firewall rules work without a UAC prompt |
 | `-StartWhenAvailable` | on | Catches up if the machine was off at the scheduled moment |
-| `-RestartCount 3`, `-RestartInterval 1m` | on | Restarts the console if it exits unexpectedly |
+| `-RestartCount 3`, `-RestartInterval 1m` | on | Retries a launch Task Scheduler itself could not make. It does **not** restart a console that starts and then exits with an error — that is the repeating trigger's job |
 | `-AllowStartIfOnBatteries` | on | A laptop-as-server does not silently skip startup |
+
+Installs made before the repeat and the time limit existed have neither: a console that failed at boot stayed down until someone started it by hand. Re-run the installer on an existing server to pick them up. `install-web-service.ps1` keeps the port the task already uses; the package installer takes `-Port` (default 18765) and `-HttpsPort` (default 18443) each time, so pass the ones you use.
 
 Check it after install, and after the first reboot:
 
 ```powershell
 schtasks /Query /TN "NetworkSentinel-Web" /V /FO LIST | findstr /C:"Status" /C:"Next Run" /C:"Last Result"
 ```
+
+To keep the console stopped — say, to run the TUI in its place — disable the task rather than only ending it, or it is back within five minutes:
+
+```powershell
+schtasks /Change /TN "NetworkSentinel-Web" /DISABLE
+schtasks /End /TN "NetworkSentinel-Web"
+# later:
+schtasks /Change /TN "NetworkSentinel-Web" /ENABLE
+```
+
+**If the console only comes up once someone has logged in**, check what is actually registered, not what the installer would register:
+
+```powershell
+$t = Get-ScheduledTask -TaskName "NetworkSentinel-Web"
+$t.Principal | Format-List UserId, LogonType, RunLevel    # expect SYSTEM, ServiceAccount, Highest
+$t.Triggers  | Select-Object @{n='Type';e={$_.CimClass.CimClassName}}, @{n='Every';e={$_.Repetition.Interval}}   # expect MSFT_TaskBootTrigger, PT5M
+$t.Settings  | Format-List ExecutionTimeLimit, MultipleInstances   # expect PT0S, IgnoreNew
+Get-Content "$env:ProgramData\NetworkSentinel\logs\crash.log" -Tail 40   # a failed start lands here
+```
+
+`LogonType Interactive` is Task Scheduler's *Run only when user is logged on*, which cannot run before anyone signs in; editing the task by hand can leave it that way, and re-running the installer puts it back. If the task is right and `crash.log` says nothing, look at the network: a connection that authenticates with a user's credentials (802.1X, some Wi-Fi) or a VPN client started at sign-in is not there at boot.
 
 Restart it after changing HTTPS or certificate settings (Kestrel binds its endpoints at startup):
 

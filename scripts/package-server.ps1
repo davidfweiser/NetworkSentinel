@@ -186,7 +186,7 @@ $runtimeNote = if ($FrameworkDependent) {
     "  Browser:  http://localhost:18765/   (or http://SERVER-IP:18765/)"
     "  First visit creates a master password (Settings can change it later)."
     "  App folder: %ProgramData%\NetworkSentinel"
-    "  Startup task: NetworkSentinel-Web (SYSTEM, at boot)"
+    "  Startup task: NetworkSentinel-Web (SYSTEM, at boot; started again within 5 min if it stops)"
     ""
     "Manual run (no service):"
     "  .\NetworkSentinel.exe -w 18765"
