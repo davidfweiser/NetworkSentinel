@@ -135,7 +135,23 @@ Write-Host "  Port      : $Port"
 Write-Host "  Task name : $TaskName"
 Write-Host ""
 
-# Stop previous instance
+# Stop previous instance. The task goes first: it re-launches a console that is not
+# running (see the trigger below), so killing only the process could let it come back
+# mid-copy and hold the files being replaced. Registering the task again re-enables it.
+# If the install then fails, the trap turns the task back on: left disabled, the console
+# would not start at the next boot either, and nothing would say why.
+$TaskDisabled = $false
+trap {
+    if ($TaskDisabled) {
+        Enable-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue | Out-Null
+    }
+    break
+}
+if (Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue) {
+    Disable-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue | Out-Null
+    $TaskDisabled = $true
+    Stop-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
+}
 Get-Process -Name "NetworkSentinel" -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
 Start-Sleep -Milliseconds 400
 
@@ -208,11 +224,23 @@ if ($HttpsPort -gt 0 -and $HttpsPort -ne $Port) {
 # Startup task (SYSTEM, highest)
 $arg = "-w $Port"
 $action = New-ScheduledTaskAction -Execute $Exe -Argument $arg -WorkingDirectory $InstallDir
+
+# A boot trigger fires once, and -RestartCount only retries a launch Task Scheduler could
+# not make: a console that starts and then exits with an error is left stopped. So one
+# that failed at boot - something it needs was not up yet - stayed down until somebody
+# started it. The trigger repeats every 5 minutes for as long as the machine is up; with
+# IgnoreNew a tick while the console runs does nothing, and one after it stopped starts it.
 $trigger = New-ScheduledTaskTrigger -AtStartup
+$trigger.Repetition = (New-ScheduledTaskTrigger -Once -At (Get-Date) -RepetitionInterval (New-TimeSpan -Minutes 5)).Repetition
+
+# ExecutionTimeLimit zero is no limit. Left out, it is Task Scheduler's default of 72
+# hours, and the console was ended three days after every start.
 $settings = New-ScheduledTaskSettingsSet `
     -AllowStartIfOnBatteries `
     -DontStopIfGoingOnBatteries `
     -StartWhenAvailable `
+    -MultipleInstances IgnoreNew `
+    -ExecutionTimeLimit ([TimeSpan]::Zero) `
     -RestartCount 3 `
     -RestartInterval (New-TimeSpan -Minutes 1)
 $principal = New-ScheduledTaskPrincipal -UserId "SYSTEM" -LogonType ServiceAccount -RunLevel Highest
@@ -234,7 +262,8 @@ if ($StartNow) {
 Write-Host ""
 Write-Host "Installed successfully (no compile required)." -ForegroundColor Green
 Write-Host "  App     : $Exe -w $Port"
-Write-Host "  Task    : $TaskName  (runs as SYSTEM at boot, before anyone logs in)"
+Write-Host "  Task    : $TaskName  (runs as SYSTEM at boot, before anyone logs in,"
+Write-Host "            and starts it again within 5 minutes if it stops)"
 Write-Host "  Open    : http://localhost:$Port/  or  http://<server-ip>:$Port/"
 Write-Host "  First browser visit creates a master password."
 if ($HttpsPort -gt 0 -and $HttpsPort -ne $Port) {
