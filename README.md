@@ -10,9 +10,22 @@ Three ways to run it (same idea as the Linux build):
 | **Terminal UI (`--tui`)** | Server Core, RDP console, SSH-style workflows |
 | **Headless web UI (`-w`)** | Browser dashboard on a server (master-password protected) |
 
-> Awareness / monitoring tooling — not a full IDS/IPS replacement. Version **0.7.17**.
+> Awareness / monitoring tooling — not a full IDS/IPS replacement. Version **0.7.18**.
 
 ---
+
+## What's new in 0.7.18
+
+One fix, for the server: the web console now comes back on its own. A console that failed to start at boot used to stay down until someone started it by hand — so on a server nobody logs in to, "after a reboot" could mean "not until someone notices". Windows only; the scheduled task is this build's alone.
+
+| Area | What changed |
+|------|--------------|
+| **A failed start is retried** | The task's `-RestartCount 3` looked like a safety net and was not one: Task Scheduler only retries a launch it could not make, never a program that starts and then exits with an error — a probe task that exited 1 ran exactly once. The at-startup trigger now also repeats **every 5 minutes** for as long as the machine is up, with `IgnoreNew`, so a tick while the console runs does nothing and a tick after it has stopped starts it. |
+| **No more 72-hour limit** | The task never set a time limit, so it got Task Scheduler's default of 72 hours, and the console was ended three days after every start. It now has none. |
+| **Upgrades do not race the retry** | Both installers disable and stop the task before replacing files, or a tick could relaunch the old binary mid-copy and lock it. A failed install turns the task back on rather than leaving the server with no console at the next boot. `install-web-service.ps1` also stops the running console first now — it used to copy over files the console still had open. |
+| **Stopping it on purpose** | Because the task brings a stopped console back, `schtasks /End` alone lasts at most five minutes. Disable the task to keep it down — see [Starting at boot](#starting-at-boot), which also lists what to check if the console still waits for someone to log in. |
+
+**An existing server gets this only by re-running the installer.** The package installer does not read the old port back, so pass `-Port` and `-HttpsPort` if yours are not the defaults. No application code changed — the fix is entirely in how the task is registered.
 
 ## What's new in 0.7.17
 
@@ -635,11 +648,11 @@ Self-contained by default — the server does **not** need the .NET SDK or a com
 
 ```powershell
 # Copy the .install.cmd to the server, then run it (UAC prompt if not elevated):
-.\NetworkSentinel-windows-server-x64-0.7.13.install.cmd
+.\NetworkSentinel-windows-server-x64-0.7.18.install.cmd
 # optional port:
-.\NetworkSentinel-windows-server-x64-0.7.13.install.cmd -Port 18765
+.\NetworkSentinel-windows-server-x64-0.7.18.install.cmd -Port 18765
 # unpack without installing:
-.\NetworkSentinel-windows-server-x64-0.7.13.install.cmd --extract-only
+.\NetworkSentinel-windows-server-x64-0.7.18.install.cmd --extract-only
 ```
 
 The one-file installer is a `.cmd`, not a `.ps1`: `cmd.exe` stops reading the script at `exit /b`, so the ZIP appended to it is never parsed. PowerShell tokenizes an entire `-File` script before running any of it, and the cost on appended binary is quadratic (16 MB ≈ 5½ minutes) before it fails to parse at all — so the shell-style "payload after exit" trick only works with a `cmd` entry point.
