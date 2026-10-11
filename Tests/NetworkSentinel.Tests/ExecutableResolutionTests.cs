@@ -121,4 +121,63 @@ public class ExecutableResolutionTests
     {
         Assert.Equal("/usr/sbin/nft", FirewallService.ResolveExecutable("/usr/sbin/nft"));
     }
+
+    [Fact]
+    public void PathIsNeverConsulted()
+    {
+        // Ubuntu's ~/.profile puts ~/.local/bin on PATH; a tool planted there must not
+        // be what pkexec or sudo is handed to run as root.
+        if (OperatingSystem.IsWindows()) return;
+
+        var dir = Path.Combine(Path.GetTempPath(), "ns-path-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(dir);
+        var original = Environment.GetEnvironmentVariable("PATH");
+        try
+        {
+            var tool = Path.Combine(dir, "ns-planted-tool");
+            File.WriteAllText(tool, "#!/bin/sh\nexit 0\n");
+            File.SetUnixFileMode(tool, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
+            Environment.SetEnvironmentVariable("PATH", dir + Path.PathSeparator + original);
+
+            Assert.Null(FirewallService.ResolveExecutable("ns-planted-tool"));
+            Assert.DoesNotContain(dir, FirewallService.ExecutableSearchPath());
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable("PATH", original);
+            Directory.Delete(dir, recursive: true);
+        }
+    }
+
+    [Fact]
+    public void AToolOthersCanRewriteIsNotTrusted()
+    {
+        if (OperatingSystem.IsWindows()) return;
+
+        var dir = Path.Combine(Path.GetTempPath(), "ns-mode-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(dir);
+        try
+        {
+            File.SetUnixFileMode(dir, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
+            var tool = Path.Combine(dir, "tool");
+            File.WriteAllText(tool, "#!/bin/sh\nexit 0\n");
+
+            File.SetUnixFileMode(tool, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
+            Assert.True(FirewallService.IsSafeToRunPrivileged(tool));
+
+            File.SetUnixFileMode(tool, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute |
+                                       UnixFileMode.OtherWrite);
+            Assert.False(FirewallService.IsSafeToRunPrivileged(tool));
+
+            // Same file, safe mode, but in a directory a group can write to.
+            File.SetUnixFileMode(tool, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
+            File.SetUnixFileMode(dir, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute |
+                                      UnixFileMode.GroupWrite);
+            Assert.False(FirewallService.IsSafeToRunPrivileged(tool));
+        }
+        finally
+        {
+            Directory.Delete(dir, recursive: true);
+        }
+    }
 }

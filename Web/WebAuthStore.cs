@@ -289,30 +289,12 @@ public sealed class WebAuthStore
     private void SaveUnlocked()
     {
         Directory.CreateDirectory(_dataDirectory);
-        var path = AuthPath;
-        var tmp = path + ".tmp";
-        File.WriteAllText(tmp, JsonSerializer.Serialize(_auth, JsonOptions));
-        try
-        {
-            // Owner read/write only when the OS supports it (Linux).
-            if (OperatingSystem.IsLinux() || OperatingSystem.IsMacOS())
-                File.SetUnixFileMode(tmp, UnixFileMode.UserRead | UnixFileMode.UserWrite);
-        }
-        catch
-        {
-            // best-effort
-        }
-
-        File.Move(tmp, path, overwrite: true);
-        try
-        {
-            if (OperatingSystem.IsLinux() || OperatingSystem.IsMacOS())
-                File.SetUnixFileMode(path, UnixFileMode.UserRead | UnixFileMode.UserWrite);
-        }
-        catch
-        {
-            // best-effort
-        }
+        // Unique temp name created O_EXCL with mode 0600 from the start. The old fixed
+        // "<path>.tmp" was created under the umask (world-readable hash for a moment) and
+        // followed a symlink planted under that name — as root, during
+        // `sudo --set-master-password`, that overwrote whatever the link pointed at.
+        AppPaths.WriteAtomic(AuthPath, JsonSerializer.Serialize(_auth, JsonOptions),
+            UnixFileMode.UserRead | UnixFileMode.UserWrite);
     }
 
     private sealed class AuthFile

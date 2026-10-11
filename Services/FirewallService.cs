@@ -1424,15 +1424,21 @@ public sealed class FirewallService
     private static void InvalidateUfwProbe() => _ufwState = (false, DateTime.MinValue);
 
     /// <summary>
-    /// Where a firewall tool or an elevation helper is looked for. PATH first, then
-    /// the sbin directories — a desktop session on Debian and its derivatives leaves
-    /// those out of a normal user's PATH, and <c>nft</c>, <c>iptables</c> and
-    /// <c>ufw</c> all live there, so resolving against PATH alone finds <c>sudo</c>
-    /// but none of the binaries it would be asked to run.
+    /// The only places a firewall tool or an elevation helper is looked for. Every
+    /// binary resolved here is run as root (through pkexec or sudo), or *is* the
+    /// elevation helper, so PATH is deliberately not consulted: Ubuntu's stock
+    /// <c>~/.profile</c> puts <c>~/.local/bin</c> on it, and anything running as the
+    /// user could drop an <c>nft</c> there for the next approved prompt — or a fake
+    /// <c>pkexec</c> to collect the password. The sbin directories also matter in
+    /// their own right: a desktop session on Debian and its derivatives leaves them
+    /// out of a normal user's PATH, and <c>nft</c>, <c>iptables</c> and <c>ufw</c> all
+    /// live there. The two NixOS entries hold its system profile and its setuid
+    /// wrappers (sudo, pkexec), and are root-owned like the rest.
     /// </summary>
-    private static readonly string[] FallbackToolDirectories =
+    internal static readonly string[] TrustedToolDirectories =
     {
-        "/usr/local/sbin", "/usr/local/bin", "/usr/sbin", "/usr/bin", "/sbin", "/bin"
+        "/usr/local/sbin", "/usr/local/bin", "/usr/sbin", "/usr/bin", "/sbin", "/bin",
+        "/run/wrappers/bin", "/run/current-system/sw/bin"
     };
 
     /// <summary>
@@ -1513,8 +1519,11 @@ public sealed class FirewallService
         if (IsRootProcess())
             return RunDirect(file, args);
 
-        // Resolve absolute path so pkexec/sudo can find the binary in secure PATH.
-        var resolved = ResolveExecutable(file) ?? file;
+        // Resolve the absolute path here, from the trusted directories only: pkexec and
+        // sudo run whatever path they are handed, so this is the decision about what root runs.
+        var resolved = ResolveExecutable(file);
+        if (resolved == null)
+            return FirewallOperationResult.Fail($"{file}: command not found in the system directories.");
 
         // Nothing to elevate to: the capability is already held, and the command will
         // do exactly what it would do under sudo. Returned whichever way it goes — a
@@ -1663,34 +1672,50 @@ public sealed class FirewallService
            || message.Contains("No such file", StringComparison.OrdinalIgnoreCase);
 
     /// <summary>
-    /// Absolute path of a command, or null when it is not installed. Resolved by
-    /// walking PATH and then <see cref="FallbackToolDirectories"/> in this process —
-    /// see <see cref="CommandExists"/> for why <c>which</c> is no longer used.
+    /// Absolute path of a command, or null when it is not installed (or is installed
+    /// somewhere anyone but root could have replaced it). Resolved in this process
+    /// against <see cref="TrustedToolDirectories"/> only — see that list for why PATH is
+    /// not used, and <see cref="CommandExists"/> for why <c>which</c> is not either.
     /// </summary>
     internal static string? ResolveExecutable(string name)
     {
         if (name.Contains('/')) return name;
 
         foreach (var dir in ExecutableSearchPath())
-            if (IsExecutableFile(Path.Combine(dir, name)))
-                return Path.Combine(dir, name);
+        {
+            var candidate = Path.Combine(dir, name);
+            if (IsExecutableFile(candidate) && IsSafeToRunPrivileged(candidate))
+                return candidate;
+        }
 
         return null;
     }
 
-    /// <summary>PATH, then the sbin fallbacks, each directory yielded once.</summary>
-    internal static IEnumerable<string> ExecutableSearchPath()
+    /// <summary>The trusted directories, in search order.</summary>
+    internal static IEnumerable<string> ExecutableSearchPath() => TrustedToolDirectories;
+
+    /// <summary>
+    /// Whether neither the file nor the directory holding it can be rewritten by
+    /// anyone outside its owner. The trusted directories are root's on every sane
+    /// install; this catches the ones that are not — a group-writable
+    /// <c>/usr/local/bin</c> handed to a "staff" group, a binary left mode 0777 — where
+    /// a non-root account could swap in what root is about to run.
+    /// </summary>
+    internal static bool IsSafeToRunPrivileged(string path)
     {
-        var seen = new HashSet<string>(StringComparer.Ordinal);
-
-        var path = Environment.GetEnvironmentVariable("PATH") ?? "";
-        foreach (var dir in path.Split(Path.PathSeparator, StringSplitOptions.RemoveEmptyEntries))
-            if (seen.Add(dir))
-                yield return dir;
-
-        foreach (var dir in FallbackToolDirectories)
-            if (seen.Add(dir))
-                yield return dir;
+        if (OperatingSystem.IsWindows()) return true;   // no Unix mode to read
+        try
+        {
+            const UnixFileMode othersCanWrite = UnixFileMode.GroupWrite | UnixFileMode.OtherWrite;
+            if ((File.GetUnixFileMode(path) & othersCanWrite) != 0)
+                return false;
+            var dir = Path.GetDirectoryName(path);
+            return dir != null && (File.GetUnixFileMode(dir) & othersCanWrite) == 0;
+        }
+        catch
+        {
+            return false;
+        }
     }
 
     /// <summary>
@@ -1806,6 +1831,7 @@ public sealed class FirewallService
     /// </summary>
     private static FirewallOperationResult RunDirectArgs(string file, string[] argv, int timeoutMs = DefaultProcessTimeoutMs, string? askpass = null)
     {
+        if (!TryResolveForSpawn(ref file, out var missing)) return missing!;
         var psi = new ProcessStartInfo(file);
         foreach (var a in argv)
             psi.ArgumentList.Add(a);
@@ -1814,8 +1840,30 @@ public sealed class FirewallService
 
     private static FirewallOperationResult RunDirect(string file, string args, int timeoutMs = DefaultProcessTimeoutMs, string? askpass = null)
     {
+        if (!TryResolveForSpawn(ref file, out var missing)) return missing!;
         var psi = new ProcessStartInfo(file, args);
         return RunProcess(psi, file, timeoutMs, askpass);
+    }
+
+    /// <summary>
+    /// Turns a bare command name into its trusted absolute path. Handing a bare name to
+    /// <see cref="ProcessStartInfo"/> makes the runtime search PATH, which is exactly the
+    /// lookup <see cref="ResolveExecutable"/> exists to avoid — for <c>sudo</c> and
+    /// <c>pkexec</c> above all. The failure text says "not found", so the elevation
+    /// fallbacks read it as a missing helper and move on to the next one.
+    /// </summary>
+    private static bool TryResolveForSpawn(ref string file, out FirewallOperationResult? missing)
+    {
+        missing = null;
+        if (file.Contains('/')) return true;
+        var resolved = ResolveExecutable(file);
+        if (resolved == null)
+        {
+            missing = FirewallOperationResult.Fail($"{file}: command not found in the system directories.");
+            return false;
+        }
+        file = resolved;
+        return true;
     }
 
     /// <summary>Starts a process, drains both pipes, and turns its exit into a result.</summary>
