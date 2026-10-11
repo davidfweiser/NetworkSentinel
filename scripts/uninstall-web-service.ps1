@@ -57,7 +57,7 @@ Start-Sleep -Milliseconds 500
 # master password, certificates, DuckDNS token, and ACME account with it, so only
 # the files that came out of the package go unless -PurgeData was asked for.
 $dataNames = @(
-    "logs", "settings.json", "web-master.json", "allowlist.json",
+    "logs", "settings.json", "web-master.json", "web-api-tokens.json", "allowlist.json",
     "allowlist-resolved.json", "auto-block-suppress.json", "host-history.json",
     "threat-log.jsonl", "threat-intel-cache.json", "duckdns.json",
     "tls", "acme", "renew-cert.ps1"
