@@ -161,6 +161,18 @@ public sealed class WebApp : IDisposable
     private bool _listeningLocalOnly;
     private WebApplication? _host;
     private readonly LoginThrottle _loginThrottle = new();
+
+    /// <summary>The credentials a bot uses on /api/v1 — see <see cref="ApiTokenStore"/>.</summary>
+    private readonly ApiTokenStore _apiTokens = new();
+
+    /// <summary>
+    /// Bad-token lockout for the token API. Its own instance, not the login one: a
+    /// bot left running with a revoked token would otherwise lock the operator out of
+    /// the sign-in page from every address the two share.
+    /// </summary>
+    private readonly LoginThrottle _apiThrottle = new();
+
+    private readonly DateTime _startedUtc = DateTime.UtcNow;
     private readonly DuckDnsUpdater _duckDns = new();
     private TlsCertificateProvider? _tls;
     private int _httpsPort;
@@ -482,12 +494,21 @@ public sealed class WebApp : IDisposable
         if (req.IsHttps)
             res.Headers["Strict-Transport-Security"] = "max-age=31536000";
 
-        if (TryRedirectToHttps(ctx))
-            return;
-
         var path = (req.Path.Value ?? "").TrimEnd('/');
         if (path.Length == 0)
             path = "/";
+
+        // Ahead of the HTTPS redirect on purpose. A client that follows the redirect
+        // would work — while sending its token in the clear on every poll, first.
+        // Refusing outright is what gets a plain-HTTP bot noticed and fixed.
+        if (path == TokenApiRoot || path.StartsWith(TokenApiRoot + "/", StringComparison.Ordinal))
+        {
+            HandleTokenApi(ctx, path);
+            return;
+        }
+
+        if (TryRedirectToHttps(ctx))
+            return;
 
         if (req.Method == "GET" && (path is "/" or "/index.html"))
         {
@@ -651,6 +672,12 @@ public sealed class WebApp : IDisposable
 
             _loginThrottle.RecordSuccess(ClientAddress(ctx));
 
+            // A password is usually changed because something leaked. Other sessions
+            // die with it; API tokens do not, and a token minted from a stolen session
+            // would outlive the change unless the operator is pointed at the list.
+            if (_apiTokens.List().Count > 0)
+                changeMsg += " API tokens are unchanged — revoke any you do not recognise.";
+
             WriteJson(res, 200, new { ok = true, message = changeMsg });
             return;
         }
@@ -667,24 +694,7 @@ public sealed class WebApp : IDisposable
         // is opened and when refresh is pressed, and not otherwise.
         if (req.Method == "GET" && path == "/api/dns-blocked")
         {
-            var limit = 100;
-            if (int.TryParse(req.Query["limit"], out var requested))
-                limit = requested;
-
-            var (ok, message, entries) = _dnsFilter.GetBlockedAsync(limit).GetAwaiter().GetResult();
-            WriteJson(res, 200, new
-            {
-                ok,
-                message,
-                entries = entries.Select(e => new
-                {
-                    time = e.TimeText,
-                    domain = e.Domain,
-                    client = e.Client,
-                    reason = e.Reason,
-                    rule = e.Rule
-                }).ToArray()
-            });
+            WriteDnsBlocked(req, res);
             return;
         }
 
@@ -714,6 +724,540 @@ public sealed class WebApp : IDisposable
         }
 
         WriteJson(res, 404, new { ok = false, message = "Not found." });
+    }
+
+    // ── Token API ──────────────────────────────────────────────────────────────
+    //
+    // What a bot talks to. Everything under /api/v1 answers to an API token and nothing
+    // else. /monitor is what the console shows, read-only; /control runs the console's
+    // actions for a token that was created with control access.
+    //
+    // Neither reaches the Settings page. The read routes are built section by section
+    // rather than from /api/state, which carries that page — and with it the webhook
+    // URL, the resolver's login name and where the TLS key lives — and the control
+    // route runs only the actions named in ControlActions.
+    //
+    // The separation runs both ways. A session cookie does not open these routes, so
+    // there is no ambient browser credential here for another site to ride on; and an
+    // API token is never a session (it is not in WebAuthStore's table), so it cannot
+    // reach /api/state, /api/action or the password endpoints however it is presented.
+
+    private const string TokenApiRoot = "/api/v1";
+    private const string MonitorApiRoot = TokenApiRoot + "/monitor";
+    private const string ControlApiPath = TokenApiRoot + "/control";
+    private const int MonitorThreatLimit = 200;
+    private const int MonitorBlockedLimit = 1000;
+
+    /// <summary>
+    /// Every console action a control token may run — a list of what is allowed, not of
+    /// what is refused, so an action added to <see cref="RunAction"/> later stays closed
+    /// to tokens until someone decides otherwise here.
+    ///
+    /// Left out on purpose: <c>set_setting</c> (the Settings page; see
+    /// <see cref="ControlRefusal"/> for its one exception), <c>issue_cert</c> (a button
+    /// on that page), and <c>api_token_create</c> / <c>api_token_revoke</c> — a token
+    /// that could mint tokens would outlive its own expiry, pinning and revocation.
+    /// </summary>
+    internal static readonly HashSet<string> ControlActions = new(StringComparer.Ordinal)
+    {
+        "sleep", "pause", "wake", "resume", "toggle_sleep", "toggle_monitor",
+        "toggle_autoblock", "cycle_min_level", "set_min_level",
+        "clear_threats", "authorize",
+        "block", "unblock", "block_port", "unblock_port",
+        "remove_rule", "remove_all_rules", "restore_allowlisted",
+        "add_allowlist", "remove_allowlist", "refresh_allowlist",
+        "save_config_rule", "delete_host_rule", "rescan_firewall"
+    };
+
+    /// <summary>Why a control token may not run this action, or null when it may.</summary>
+    internal static string? ControlRefusal(string? requestedAction, string? settingName)
+    {
+        var action = (requestedAction ?? "").Trim().ToLowerInvariant();
+        if (ControlActions.Contains(action))
+            return null;
+
+        // The one Settings switch that is not really a setting: it is the Auto-block
+        // button in the console's header, which only toggles. A bot needs to say which
+        // way, or two bots — or one that retries — would leave it wherever they met.
+        if (action == "set_setting" && (settingName ?? "").Trim() == "autoBlockEnabled")
+            return null;
+
+        return action is "set_setting" or "issue_cert"
+            ? "Settings are not available to API tokens — change them in the console."
+            : action is "api_token_create" or "api_token_revoke"
+                ? "API tokens are managed in the console, not by another token."
+                : $"Unknown action: {SingleLine(requestedAction ?? "", 40)}";
+    }
+
+    private void HandleTokenApi(HttpContext ctx, string path)
+    {
+        var req = ctx.Request;
+        var res = ctx.Response;
+        var presented = BearerToken(req);
+
+        // Loopback is exempt because it never leaves the machine. Anything else over
+        // plain HTTP has already put the token on the wire by the time it gets here.
+        if (!req.IsHttps && !IsLoopbackClient(ctx))
+        {
+            WriteJson(res, 403, new
+            {
+                ok = false,
+                message = "The token API is served over HTTPS only (plain HTTP is accepted from localhost)." +
+                          (presented != null
+                              ? " The token in this request crossed the network unencrypted — revoke it and create a new one."
+                              : "")
+            });
+            return;
+        }
+
+        var client = ClientAddress(ctx);
+        if (_apiThrottle.IsLocked(client, out var retryAfter))
+        {
+            res.Headers["Retry-After"] = ((int)Math.Ceiling(retryAfter.TotalSeconds)).ToString();
+            WriteJson(res, 429, new
+            {
+                ok = false,
+                message = $"Too many rejected tokens. Try again in {LoginThrottle.Describe(retryAfter)}."
+            });
+            return;
+        }
+
+        var verdict = presented == null
+            ? ApiTokenVerdict.Rejected
+            : _apiTokens.Verify(presented, ctx.Connection.RemoteIpAddress);
+        if (verdict.Outcome == ApiTokenOutcome.Rejected)
+        {
+            // Only a token that was offered and refused is a guess. A request with none
+            // is somebody opening the URL in a browser, and counting those would let
+            // them lock out a bot that shares their address.
+            //
+            // Failures age out on their own. Clearing them on the next good request
+            // would let a guesser behind the bot's own address go unthrottled forever.
+            var lockout = presented == null ? TimeSpan.Zero : _apiThrottle.RecordFailure(client);
+            if (lockout > TimeSpan.Zero)
+                Console.Error.WriteLine($"Token API: {client} locked out for {LoginThrottle.Describe(lockout)} after repeated rejected tokens.");
+
+            res.Headers["WWW-Authenticate"] = "Bearer";
+            WriteJson(res, 401, new { ok = false, message = "A valid API token is required (Authorization: Bearer <token>)." });
+            return;
+        }
+
+        if (verdict.Outcome == ApiTokenOutcome.RateLimited)
+        {
+            res.Headers["Retry-After"] = ((int)Math.Ceiling(verdict.RetryAfter.TotalSeconds)).ToString();
+            WriteJson(res, 429, new
+            {
+                ok = false,
+                message = $"Rate limit reached ({ApiTokenStore.RequestsPerMinute} requests a minute per token)."
+            });
+            return;
+        }
+
+        var token = verdict.Token!;
+
+        // The operator's address is shielded from auto-block while they work; a token
+        // holder's is not, or a stolen read-only token would buy an attacker immunity
+        // from the firewall. The exception is a token pinned to named addresses: the
+        // operator vouched for exactly those, and a poller is the kind of client the
+        // reconnect heuristics would otherwise learn to block.
+        if (token.AllowedSources.Length > 0)
+            _prevention.Protect(client);
+
+        if (path == ControlApiPath)
+        {
+            HandleControl(ctx, token, client);
+            return;
+        }
+
+        if (req.Method != "GET")
+        {
+            res.Headers["Allow"] = "GET";
+            WriteJson(res, 405, new { ok = false, message = $"The monitoring routes are read-only: GET only. Actions go to POST {ControlApiPath}." });
+            return;
+        }
+
+        switch (path)
+        {
+            case MonitorApiRoot + "/health":
+                WriteJson(res, 200, MonitorHealth(token));
+                return;
+
+            case MonitorApiRoot + "/summary":
+                WriteJson(res, 200, MonitorSummary());
+                return;
+
+            case MonitorApiRoot + "/threats":
+                MonitorThreats(req, res);
+                return;
+
+            case MonitorApiRoot + "/blocked":
+                WriteJson(res, 200, MonitorBlocked());
+                return;
+
+            case MonitorApiRoot + "/connections":
+                WriteJson(res, 200, new { ok = true, connections = ConnectionRows() });
+                return;
+
+            case MonitorApiRoot + "/hosts":
+                RefreshBlockedIps(force: false);
+                WriteJson(res, 200, new { ok = true, hosts = HostRows(_prevention.BlockedIps) });
+                return;
+
+            case MonitorApiRoot + "/ports":
+                WriteJson(res, 200, new { ok = true, ports = PortRows() });
+                return;
+
+            // The rows carry the identifiers the control route takes back: `name` for
+            // remove_rule, `key` for delete_host_rule and for editing with save_config_rule.
+            case MonitorApiRoot + "/firewall":
+            {
+                var scan = HostScan();
+                WriteJson(res, 200, new
+                {
+                    ok = true,
+                    firewall = FirewallPrivilege(),
+                    firewallRules = ManagedRuleRows(),
+                    configRules = ConfigRuleRows(scan),
+                    hostFirewall = MonitorHostFirewall(scan),
+                    listeners = ListenerRows(scan)
+                });
+                return;
+            }
+
+            case MonitorApiRoot + "/allowlist":
+                WriteJson(res, 200, new { ok = true, allowlistStatus = _allowlist.StatusText, allowlist = AllowlistRows() });
+                return;
+
+            case MonitorApiRoot + "/traffic":
+                WriteJson(res, 200, new { ok = true, traffic = TrafficSnapshot() });
+                return;
+
+            case MonitorApiRoot + "/dns-blocked":
+                WriteDnsBlocked(req, res);
+                return;
+
+            default:
+                WriteJson(res, 404, new { ok = false, message = "Not found." });
+                return;
+        }
+    }
+
+    /// <summary>
+    /// Runs one console action for a control token. The request body is the console's
+    /// own: <c>{"action": "block", "ip": "203.0.113.9"}</c>.
+    /// </summary>
+    private void HandleControl(HttpContext ctx, ApiTokenInfo token, string client)
+    {
+        var req = ctx.Request;
+        var res = ctx.Response;
+
+        if (req.Method != "POST")
+        {
+            res.Headers["Allow"] = "POST";
+            WriteJson(res, 405, new { ok = false, message = "The control route takes POST with a JSON body." });
+            return;
+        }
+
+        if (!token.CanControl)
+        {
+            WriteJson(res, 403, new
+            {
+                ok = false,
+                message = "This token is read-only. Control needs a token created with control access, under Settings → API tokens."
+            });
+            return;
+        }
+
+        ActionRequest? actionReq = null;
+        try
+        {
+            actionReq = JsonSerializer.Deserialize<ActionRequest>(ReadBody(req), JsonOptions);
+        }
+        catch
+        {
+            // falls through to the same answer as an empty body
+        }
+
+        if (actionReq == null || string.IsNullOrWhiteSpace(actionReq.Action))
+        {
+            WriteJson(res, 400, new { ok = false, message = "Send a JSON body with an \"action\"." });
+            return;
+        }
+
+        var refusal = ControlRefusal(actionReq.Action, actionReq.Name);
+        if (refusal != null)
+        {
+            Console.WriteLine($"Control API: token \"{token.Name}\" ({token.Id}) from {client} was refused " +
+                              $"{DescribeControl(actionReq, refused: true)}.");
+            WriteJson(res, 403, new { ok = false, message = refusal });
+            return;
+        }
+
+        var what = DescribeControl(actionReq, refused: false);
+
+        var result = RunAction(actionReq, origin: "API");
+
+        // Attributed everywhere an operator would look: the journal, the console's own
+        // status line, and the token's row. A rule that appears or vanishes with nobody
+        // at the keyboard has to be traceable to the credential that did it.
+        _statusMessage = $"{token.Name} (API): {result.Message}";
+        _apiTokens.NoteAction(token.Id, what);
+        Console.WriteLine($"Control API: token \"{token.Name}\" ({token.Id}) from {client} ran {what} — " +
+                          $"{(result.Ok ? "ok" : "failed")}: {SingleLine(result.Message, 300)}");
+
+        WriteJson(res, result.Ok ? 200 : 400, new { ok = result.Ok, message = result.Message });
+    }
+
+    /// <summary>
+    /// The host firewall's status for a token. Not <see cref="HostFirewallInfo"/>: that
+    /// one also carries the page's how-to-grant-sudo text, which names the service
+    /// account and where its firewall binaries live — useful to the operator reading
+    /// it, and nothing a bot needs.
+    /// </summary>
+    private object MonitorHostFirewall(HostFirewallSnapshot scan) => new
+    {
+        host = scan.HostLabel,
+        backend = scan.Backend,
+        status = scan.Status,
+        enabled = scan.Enabled,
+        defaultInbound = scan.DefaultInbound,
+        defaultOutbound = scan.DefaultOutbound,
+        description = scan.Description,
+        canWriteRules = _firewall.CanApplyRules,
+        rulesSummary = scan.RulesSummary,
+        backendsSeen = scan.BackendsSeen,
+        errors = scan.Errors,
+        scannedUtc = UtcStamp(scan.ScannedUtc)
+    };
+
+    /// <summary>
+    /// The action and what it was aimed at, for the journal and the token's row. A
+    /// refused request is described by its names only: the value of a setting a bot was
+    /// not allowed to write may be a password, and the journal is no place for it.
+    /// </summary>
+    private static string DescribeControl(ActionRequest req, bool refused)
+    {
+        var parts = new List<string?> { req.Name };
+        if (!refused)
+        {
+            parts.AddRange(new[] { req.Ip, req.Value, req.Label });
+            if (!string.IsNullOrWhiteSpace(req.RuleAction))
+                parts.Add($"[{req.RuleAction} {req.Direction} {req.Protocol} ports={req.Ports} from={req.Addresses}]");
+            parts.Add(req.Key);
+        }
+
+        var detail = string.Join(" ", parts
+            .Where(v => !string.IsNullOrWhiteSpace(v))
+            .Select(v => SingleLine(v!, 100))
+            .Distinct());
+        var action = SingleLine(req.Action.Trim().ToLowerInvariant(), 40);
+        return SingleLine(detail.Length == 0 ? action : $"{action} {detail}", 240);
+    }
+
+    /// <summary>Caller-supplied text bound for the journal: one line, bounded, no control characters.</summary>
+    private static string SingleLine(string text, int max)
+    {
+        var flat = new string(text.Select(c => char.IsControl(c) ? ' ' : c).ToArray()).Trim();
+        return flat.Length <= max ? flat : flat[..max] + "…";
+    }
+
+    /// <summary>
+    /// The header only. A token in a query string ends up in proxy logs, shell history
+    /// and Referer headers, so that spelling is not accepted at all.
+    /// </summary>
+    private static string? BearerToken(HttpRequest req)
+    {
+        var header = req.Headers.Authorization.ToString();
+        if (!header.StartsWith("Bearer ", StringComparison.OrdinalIgnoreCase))
+            return null;
+
+        var token = header["Bearer ".Length..].Trim();
+        return token.Length == 0 ? null : token;
+    }
+
+    private static string UtcStamp(DateTime time) => time.ToUniversalTime().ToString("o");
+
+    /// <summary>
+    /// Cheap enough to poll often: is the service up, which build, is it watching. The
+    /// token's own expiry is here so the bot can say so before it stops being let in.
+    /// </summary>
+    private object MonitorHealth(ApiTokenInfo token)
+    {
+        var stats = _monitor.Stats;
+        var now = DateTime.UtcNow;
+        return new
+        {
+            ok = true,
+            service = "networksentinel",
+            version = _appVersion,
+            host = Environment.MachineName,
+            serverTimeUtc = UtcStamp(now),
+            startedUtc = UtcStamp(_startedUtc),
+            uptimeSeconds = (long)(now - _startedUtc).TotalSeconds,
+            monitoring = stats.IsMonitoring,
+            status = stats.StatusText,
+            token = new
+            {
+                id = token.Id,
+                name = token.Name,
+                expiresUtc = token.ExpiresUtc is { } expires ? UtcStamp(expires) : null
+            }
+        };
+    }
+
+    private object MonitorSummary()
+    {
+        RefreshBlockedIps(force: false);
+        var stats = _monitor.Stats;
+        var threats = _monitor.Threats;
+        var live = _traffic.Live;
+        var last = live.Count > 0 ? live[^1] : null;
+
+        return new
+        {
+            ok = true,
+            version = _appVersion,
+            host = Environment.MachineName,
+            serverTimeUtc = UtcStamp(DateTime.UtcNow),
+            monitoring = stats.IsMonitoring,
+            status = stats.StatusText,
+            stats = new
+            {
+                listeningPorts = stats.ListeningPorts,
+                activeConnections = stats.ActiveConnections,
+                remoteHosts = stats.RemoteHosts,
+                threatsToday = stats.ThreatsToday,
+                highThreats = stats.HighThreats
+            },
+            threats = new
+            {
+                total = threats.Count,
+                critical = threats.Count(t => t.Level == ThreatLevel.Critical),
+                high = threats.Count(t => t.Level == ThreatLevel.High),
+                medium = threats.Count(t => t.Level == ThreatLevel.Medium),
+                low = threats.Count(t => t.Level == ThreatLevel.Low),
+                info = threats.Count(t => t.Level == ThreatLevel.Info),
+                // Newest first, so this is the cursor to hand back as ?since=.
+                latestTs = threats.Count > 0 ? UtcStamp(threats[0].Timestamp) : null
+            },
+            blockedCount = _prevention.BlockedCount,
+            autoBlock = new
+            {
+                enabled = _prevention.Enabled,
+                dryRun = _prevention.DryRun,
+                minLevel = _prevention.MinLevel.ToString(),
+                summary = _prevention.Describe()
+            },
+            firewall = new { canEnforce = _firewall.IsAdministrator },
+            traffic = new
+            {
+                enabled = _settings.TrafficMeterEnabled,
+                inBytesPerSecond = last?.BytesInPerSecond,
+                outBytesPerSecond = last?.BytesOutPerSecond
+            }
+        };
+    }
+
+    /// <summary>
+    /// Newest first. <c>since</c> takes the <c>ts</c> of the last event already seen and
+    /// returns only what is newer, so a poll costs what has happened since the last one.
+    /// </summary>
+    private void MonitorThreats(HttpRequest req, HttpResponse res)
+    {
+        var limit = 50;
+        if (req.Query.TryGetValue("limit", out var limitText) &&
+            (!int.TryParse(limitText, out limit) || limit < 1 || limit > MonitorThreatLimit))
+        {
+            WriteJson(res, 400, new { ok = false, message = $"limit must be a number from 1 to {MonitorThreatLimit}." });
+            return;
+        }
+
+        var minLevel = ThreatLevel.Info;
+        if (req.Query.TryGetValue("minLevel", out var levelText) &&
+            (!Enum.TryParse(levelText.ToString(), ignoreCase: true, out minLevel) || !Enum.IsDefined(minLevel)))
+        {
+            WriteJson(res, 400, new { ok = false, message = "minLevel must be Info, Low, Medium, High or Critical (or its number, 0 to 4)." });
+            return;
+        }
+
+        DateTime? since = null;
+        if (req.Query.TryGetValue("since", out var sinceText))
+        {
+            if (!DateTimeOffset.TryParse(sinceText.ToString(), System.Globalization.CultureInfo.InvariantCulture,
+                    System.Globalization.DateTimeStyles.AssumeUniversal, out var parsed))
+            {
+                WriteJson(res, 400, new { ok = false, message = "since must be an ISO 8601 timestamp, e.g. the ts of the last event you received." });
+                return;
+            }
+
+            since = parsed.UtcDateTime;
+        }
+
+        var all = _monitor.Threats;
+        var matching = all
+            .Where(t => t.Level >= minLevel && (since == null || t.Timestamp.ToUniversalTime() > since))
+            .ToList();
+
+        WriteJson(res, 200, new
+        {
+            ok = true,
+            count = matching.Count,
+            returned = Math.Min(matching.Count, limit),
+            latestTs = all.Count > 0 ? UtcStamp(all[0].Timestamp) : null,
+            threats = matching.Take(limit).Select(t =>
+            {
+                var status = _prevention.DescribeEnforcement(t);
+                return new
+                {
+                    ts = UtcStamp(t.Timestamp),
+                    level = t.LevelText,
+                    levelNum = (int)t.Level,
+                    type = t.TypeText,
+                    sourceIp = t.SourceIp,
+                    title = t.Title,
+                    detail = t.Detail,
+                    origin = t.Origin,
+                    method = t.Method,
+                    blocked = status?.IsBlocked,
+                    blockStatus = status?.Text
+                };
+            })
+        });
+    }
+
+    private object MonitorBlocked()
+    {
+        RefreshBlockedIps(force: false);
+        var blocked = _prevention.BlockedIps;
+        return new
+        {
+            ok = true,
+            count = blocked.Count,
+            truncated = blocked.Count > MonitorBlockedLimit,
+            addresses = blocked.OrderBy(ip => ip, StringComparer.Ordinal).Take(MonitorBlockedLimit)
+        };
+    }
+
+    private void WriteDnsBlocked(HttpRequest req, HttpResponse res)
+    {
+        var limit = 100;
+        if (int.TryParse(req.Query["limit"], out var requested))
+            limit = requested;
+
+        var (ok, message, entries) = _dnsFilter.GetBlockedAsync(limit).GetAwaiter().GetResult();
+        WriteJson(res, 200, new
+        {
+            ok,
+            message,
+            entries = entries.Select(e => new
+            {
+                time = e.TimeText,
+                domain = e.Domain,
+                client = e.Client,
+                reason = e.Reason,
+                rule = e.Rule
+            }).ToArray()
+        });
     }
 
     private static string ReadBody(HttpRequest req)
@@ -975,7 +1519,13 @@ public sealed class WebApp : IDisposable
         return ActionResultDto.Success(_statusMessage);
     }
 
-    private ActionResultDto RunAction(ActionRequest req)
+    /// <param name="origin">
+    /// Who is acting — "Web UI" for the console, "API" for a control token. It goes into
+    /// the description of any block rule written, so the firewall list says which it
+    /// was. A fixed word, never the token's name: rule descriptions reach nft and ufw
+    /// command lines, and free text does not belong there.
+    /// </param>
+    private ActionResultDto RunAction(ActionRequest req, string origin = "Web UI")
     {
         try
         {
@@ -1031,6 +1581,31 @@ public sealed class WebApp : IDisposable
                     _monitor.ClearThreats();
                     _statusMessage = "Threat alerts cleared.";
                     return ActionResultDto.Success(_statusMessage);
+
+                case "api_token_create":
+                {
+                    if (!int.TryParse((req.Value ?? "0").Trim(), out var days))
+                        return ActionResultDto.Fail("Expiry must be a number of days.");
+                    var control = string.Equals((req.Kind ?? "").Trim(), "control", StringComparison.OrdinalIgnoreCase);
+                    if (!_apiTokens.TryCreate(req.Name, days, req.Addresses, control, out var apiToken, out var createMsg))
+                        return ActionResultDto.Fail(createMsg);
+
+                    // The token rides on this one response and nowhere else — not the
+                    // status line, which every later state poll repeats, and not the journal.
+                    Console.WriteLine($"Token API: {(control ? "control" : "read-only")} token \"{(req.Name ?? "").Trim()}\" created.");
+                    _statusMessage = "API token created.";
+                    return new ActionResultDto { Ok = true, Message = createMsg, Token = apiToken };
+                }
+
+                case "api_token_revoke":
+                {
+                    if (!_apiTokens.Revoke(req.Value, out var revokeMsg))
+                        return ActionResultDto.Fail(revokeMsg);
+
+                    Console.WriteLine($"Token API: {revokeMsg}");
+                    _statusMessage = revokeMsg;
+                    return ActionResultDto.Success(revokeMsg);
+                }
 
                 case "set_setting":
                 {
@@ -1419,7 +1994,7 @@ public sealed class WebApp : IDisposable
                         "Both" => FirewallDirection.Both,
                         _ => FirewallDirection.Inbound
                     };
-                    var r = _firewall.BlockPort(port, proto, dir, $"Web UI port block · {proto}/{port}");
+                    var r = _firewall.BlockPort(port, proto, dir, $"{origin} port block · {proto}/{port}");
                     _statusMessage = r.Message;
                     return r.Success ? ActionResultDto.Success(r.Message) : ActionResultDto.Fail(r.Message);
                 }
@@ -1473,7 +2048,7 @@ public sealed class WebApp : IDisposable
                         return ActionResultDto.Fail("IP required.");
                     if (!_firewall.IsAdministrator)
                         return ActionResultDto.Fail("Cannot block — need root or pkexec/sudo (use authorize first).");
-                    var r = _firewall.BlockIp(ip, ResolveDirection(), $"Web UI block · {ip}");
+                    var r = _firewall.BlockIp(ip, ResolveDirection(), $"{origin} block · {ip}");
                     if (r.Success)
                     {
                         var key = FirewallService.TryNormalizeIp(ip, out var normalized, out _) ? normalized : ip;
@@ -1726,12 +2301,7 @@ public sealed class WebApp : IDisposable
             statusMessage = _statusMessage,
             // Hero subtitle on both front-ends counts the same thing.
             blockedCount = blocked.Count,
-            firewall = new
-            {
-                isAdmin = _firewall.IsAdministrator,
-                isRoot = _firewall.IsRoot,
-                privilegeText = _firewall.PrivilegeText
-            },
+            firewall = FirewallPrivilege(),
             settings = new
             {
                 autoBlockEnabled = _prevention.Enabled,
@@ -1820,34 +2390,26 @@ public sealed class WebApp : IDisposable
                 isMonitoring = stats.IsMonitoring
             },
             allowlistStatus = _allowlist.StatusText,
-            connections = _monitor.Connections.Take(250).Select(c => new
+            // Names and bookkeeping only — the store keeps a hash, so there is no token to send.
+            apiTokens = _apiTokens.List().Select(t => new
             {
-                protocol = c.Protocol,
-                local = c.DisplayLocal,
-                remote = c.DisplayRemote,
-                remoteAddress = c.RemoteAddress,
-                remotePort = c.RemotePort,
-                state = c.StateText,
-                process = c.ProcessName,
-                pid = c.ProcessId,
-                geo = c.GeoSummary,
-                lastSeen = c.LastSeen.ToString("HH:mm:ss")
+                id = t.Id,
+                name = t.Name,
+                createdUtc = UtcStamp(t.CreatedUtc),
+                expiresUtc = t.ExpiresUtc is { } expires ? UtcStamp(expires) : null,
+                expired = t.Expired,
+                canControl = t.CanControl,
+                allowedSources = t.AllowedSources,
+                lastUsedUtc = t.LastUsedUtc is { } used ? UtcStamp(used) : null,
+                lastUsedFrom = t.LastUsedFrom,
+                lastRefusedUtc = t.LastRefusedUtc is { } refused ? UtcStamp(refused) : null,
+                lastRefusedFrom = t.LastRefusedFrom,
+                lastRefusedWhy = t.LastRefusedWhy,
+                lastActionUtc = t.LastActionUtc is { } acted ? UtcStamp(acted) : null,
+                lastAction = t.LastAction
             }),
-            hosts = _monitor.RemoteHosts.Take(250).Select(h => new
-            {
-                ip = h.IpAddress,
-                name = h.DisplayName,
-                hostName = h.HostName,
-                geo = h.GeoSummary,
-                active = h.ActiveConnections,
-                total = h.TotalConnections,
-                ports = h.PortsTouched,
-                threat = h.ThreatText,
-                threatLevel = (int)h.ThreatLevel,
-                status = h.Status,
-                blocked = blocked.Contains(h.IpAddress) || h.IsBlocked,
-                lastSeen = h.LastSeenText
-            }),
+            connections = ConnectionRows(),
+            hosts = HostRows(blocked),
             threats = _monitor.Threats.Take(200).Select(t =>
             {
                 // Answers "is this address being blocked?" for the browser notification,
@@ -1871,39 +2433,9 @@ public sealed class WebApp : IDisposable
                     blocked = status?.IsBlocked
                 };
             }),
-            ports = _monitor.ListeningPorts.Select(p => new
-            {
-                protocol = p.Protocol,
-                endpoint = p.DisplayEndpoint,
-                // Split out so the Firewall Config list can show a bind-address
-                // column of its own instead of only the "addr:port" display form.
-                address = p.Address,
-                port = p.Port,
-                process = p.ProcessName,
-                pid = p.ProcessId,
-                hint = p.ServiceHint
-            }),
-            firewallRules = _firewall.GetManagedRules().Select(r => new
-            {
-                name = r.Name,
-                isProtected = IsOwnWebRule(r.Name),
-                kind = r.KindText,
-                // Explicit address field so the UI always has an IP column even if target is a port.
-                address = string.IsNullOrWhiteSpace(r.AddressText) ? r.TargetText : r.AddressText,
-                target = r.TargetText,
-                ports = r.LocalPorts,
-                direction = r.DirectionText,
-                protocol = r.Protocol,
-                enabled = r.Enabled,
-                action = r.ActionText,
-                description = r.Description
-            }),
-            allowlist = _allowlist.GetEntries().Select(e => new
-            {
-                kind = e.Kind,
-                value = e.Value,
-                detail = e.Detail
-            }),
+            ports = PortRows(),
+            firewallRules = ManagedRuleRows(),
+            allowlist = AllowlistRows(),
             activity = _monitor.Activity.Select(a => new
             {
                 time = a.Time.ToString("HH:mm:ss"),
@@ -1915,61 +2447,153 @@ public sealed class WebApp : IDisposable
             // The whole host firewall as the kernel holds it — UFW's rules, this
             // app's, and everyone else's — in evaluation order, so precedence is
             // visible rather than implied. Cached; the tab's Refresh forces a rescan.
-            configRules = hostScan.Inbound.Concat(hostScan.Outbound).Select(r => new
-            {
-                name = r.Name,
-                key = ScannedRuleKey(r),
-                label = r.LabelText,
-                isProtected = IsOwnWebRule(r.Name),
-                isCustom = r.IsCustom,
-                isForeign = r.IsForeign && r.Kind == FirewallRuleKind.Other,
-                inbound = r.IsInbound,
-                action = r.ActionText,
-                direction = r.DirectionText,
-                protocol = r.ProtocolText,
-                ports = r.PortRangeText,
-                addresses = r.AddressListText,
-                origin = r.OriginText,
-                expiry = r.ExpiryText
-            }),
-            hostFirewall = new
-            {
-                host = hostScan.HostLabel,
-                backend = hostScan.Backend,
-                status = hostScan.Status,
-                enabled = hostScan.Enabled,
-                defaultInbound = hostScan.DefaultInbound,
-                defaultOutbound = hostScan.DefaultOutbound,
-                description = hostScan.Description,
-                privilegeNote = hostScan.PrivilegeNote,
-                // Whether Save and Delete can land at all, decided here rather than
-                // discovered at the write: on this surface nothing can prompt, so a
-                // host with no passwordless sudo can never apply a rule and the page
-                // has no business offering an editor that will always fail.
-                canWriteRules = _firewall.CanApplyRules,
-                // Two remedies, capability first — see FirewallService for why that
-                // order. Blank when writes already work, so the page has nothing to draw.
-                elevationLead = _firewall.CanApplyRules ? "" : FirewallService.HeadlessElevationLead,
-                elevationCapCommands = _firewall.CanApplyRules ? "" : FirewallService.CapabilityInstallCommands(),
-                elevationAlternative = _firewall.CanApplyRules ? "" : FirewallService.HeadlessElevationAlternative,
-                elevationSudoCommands = _firewall.CanApplyRules ? "" : FirewallService.SudoersInstallCommands(),
-                elevationTail = _firewall.CanApplyRules ? "" : FirewallService.HeadlessElevationTail,
-                rulesSummary = hostScan.RulesSummary,
-                backendsSeen = hostScan.BackendsSeen,
-                errors = hostScan.Errors,
-                scannedAt = hostScan.ScannedUtc.ToLocalTime().ToString("HH:mm:ss")
-            },
-            listeners = hostScan.Listeners.Select(l => new
-            {
-                protocol = l.Protocol,
-                address = l.Address,
-                port = l.Port,
-                service = l.ServiceName,
-                process = l.Process,
-                covered = l.Covered
-            })
+            configRules = ConfigRuleRows(hostScan),
+            hostFirewall = HostFirewallInfo(hostScan),
+            listeners = ListenerRows(hostScan)
         };
     }
+
+    // One definition of each table, shared by the console's state poll and the token
+    // API's read routes — so the identifiers a control token hands back (a rule's name,
+    // a scanned rule's key) are by construction the ones the page would have sent.
+
+    private object FirewallPrivilege()
+        => new
+        {
+            isAdmin = _firewall.IsAdministrator,
+            isRoot = _firewall.IsRoot,
+            privilegeText = _firewall.PrivilegeText
+        };
+
+    private IEnumerable<object> ConnectionRows()
+        => _monitor.Connections.Take(250).Select(c => new
+        {
+            protocol = c.Protocol,
+            local = c.DisplayLocal,
+            remote = c.DisplayRemote,
+            remoteAddress = c.RemoteAddress,
+            remotePort = c.RemotePort,
+            state = c.StateText,
+            process = c.ProcessName,
+            pid = c.ProcessId,
+            geo = c.GeoSummary,
+            lastSeen = c.LastSeen.ToString("HH:mm:ss")
+        });
+
+    private IEnumerable<object> HostRows(IReadOnlySet<string> blocked)
+        => _monitor.RemoteHosts.Take(250).Select(h => new
+        {
+            ip = h.IpAddress,
+            name = h.DisplayName,
+            hostName = h.HostName,
+            geo = h.GeoSummary,
+            active = h.ActiveConnections,
+            total = h.TotalConnections,
+            ports = h.PortsTouched,
+            threat = h.ThreatText,
+            threatLevel = (int)h.ThreatLevel,
+            status = h.Status,
+            blocked = blocked.Contains(h.IpAddress) || h.IsBlocked,
+            lastSeen = h.LastSeenText
+        });
+
+    private IEnumerable<object> PortRows()
+        => _monitor.ListeningPorts.Select(p => new
+        {
+            protocol = p.Protocol,
+            endpoint = p.DisplayEndpoint,
+            // Split out so the Firewall Config list can show a bind-address
+            // column of its own instead of only the "addr:port" display form.
+            address = p.Address,
+            port = p.Port,
+            process = p.ProcessName,
+            pid = p.ProcessId,
+            hint = p.ServiceHint
+        });
+
+    private IEnumerable<object> ManagedRuleRows()
+        => _firewall.GetManagedRules().Select(r => new
+        {
+            name = r.Name,
+            isProtected = IsOwnWebRule(r.Name),
+            kind = r.KindText,
+            // Explicit address field so the UI always has an IP column even if target is a port.
+            address = string.IsNullOrWhiteSpace(r.AddressText) ? r.TargetText : r.AddressText,
+            target = r.TargetText,
+            ports = r.LocalPorts,
+            direction = r.DirectionText,
+            protocol = r.Protocol,
+            enabled = r.Enabled,
+            action = r.ActionText,
+            description = r.Description
+        });
+
+    private IEnumerable<object> AllowlistRows()
+        => _allowlist.GetEntries().Select(e => new
+        {
+            kind = e.Kind,
+            value = e.Value,
+            detail = e.Detail
+        });
+
+    private IEnumerable<object> ConfigRuleRows(HostFirewallSnapshot hostScan)
+        => hostScan.Inbound.Concat(hostScan.Outbound).Select(r => new
+        {
+            name = r.Name,
+            key = ScannedRuleKey(r),
+            label = r.LabelText,
+            isProtected = IsOwnWebRule(r.Name),
+            isCustom = r.IsCustom,
+            isForeign = r.IsForeign && r.Kind == FirewallRuleKind.Other,
+            inbound = r.IsInbound,
+            action = r.ActionText,
+            direction = r.DirectionText,
+            protocol = r.ProtocolText,
+            ports = r.PortRangeText,
+            addresses = r.AddressListText,
+            origin = r.OriginText,
+            expiry = r.ExpiryText
+        });
+
+    private object HostFirewallInfo(HostFirewallSnapshot hostScan)
+        => new
+        {
+            host = hostScan.HostLabel,
+            backend = hostScan.Backend,
+            status = hostScan.Status,
+            enabled = hostScan.Enabled,
+            defaultInbound = hostScan.DefaultInbound,
+            defaultOutbound = hostScan.DefaultOutbound,
+            description = hostScan.Description,
+            privilegeNote = hostScan.PrivilegeNote,
+            // Whether Save and Delete can land at all, decided here rather than
+            // discovered at the write: on this surface nothing can prompt, so a
+            // host with no passwordless sudo can never apply a rule and the page
+            // has no business offering an editor that will always fail.
+            canWriteRules = _firewall.CanApplyRules,
+            // Two remedies, capability first — see FirewallService for why that
+            // order. Blank when writes already work, so the page has nothing to draw.
+            elevationLead = _firewall.CanApplyRules ? "" : FirewallService.HeadlessElevationLead,
+            elevationCapCommands = _firewall.CanApplyRules ? "" : FirewallService.CapabilityInstallCommands(),
+            elevationAlternative = _firewall.CanApplyRules ? "" : FirewallService.HeadlessElevationAlternative,
+            elevationSudoCommands = _firewall.CanApplyRules ? "" : FirewallService.SudoersInstallCommands(),
+            elevationTail = _firewall.CanApplyRules ? "" : FirewallService.HeadlessElevationTail,
+            rulesSummary = hostScan.RulesSummary,
+            backendsSeen = hostScan.BackendsSeen,
+            errors = hostScan.Errors,
+            scannedAt = hostScan.ScannedUtc.ToLocalTime().ToString("HH:mm:ss")
+        };
+
+    private IEnumerable<object> ListenerRows(HostFirewallSnapshot hostScan)
+        => hostScan.Listeners.Select(l => new
+        {
+            protocol = l.Protocol,
+            address = l.Address,
+            port = l.Port,
+            service = l.ServiceName,
+            process = l.Process,
+            covered = l.Covered
+        });
 
     /// <summary>
     /// Everything the data-flow card draws: the live rate series, the legends and
@@ -2327,6 +2951,9 @@ public sealed class WebApp : IDisposable
     {
         public bool Ok { get; init; }
         public string Message { get; init; } = "";
+
+        /// <summary>A newly minted monitoring-API token, on the one response that creates it.</summary>
+        public string? Token { get; init; }
 
         public static ActionResultDto Success(string message) => new() { Ok = true, Message = message };
         public static ActionResultDto Fail(string message) => new() { Ok = false, Message = message };
@@ -2721,15 +3348,36 @@ public sealed class WebApp : IDisposable
     display: block; color: var(--muted); font-size: .75rem;
     text-transform: uppercase; letter-spacing: .05em; margin: 0 0 6px;
   }
-  .pw-change input[type="password"] {
+  .pw-change input[type="password"], .pw-change input[type="text"], .pw-change select {
     width: 100%; max-width: 360px; background: var(--bg-deep);
     border: 1px solid var(--stroke); color: var(--text);
     border-radius: 8px; padding: 10px 12px; font: inherit; font-size: .92rem;
     margin-bottom: 12px;
   }
-  .pw-change input[type="password"]:focus {
+  .pw-change select { display: block; }
+  .pw-change #apiTokenSources { max-width: 520px; margin-bottom: 6px; }
+  .pw-change #apiTokenSourcesHint { margin-bottom: 14px; }
+  .pw-change p.desc code { font-family: var(--mono); font-size: .8rem; color: var(--text); }
+  .pw-change input[type="password"]:focus, .pw-change input[type="text"]:focus, .pw-change select:focus {
     outline: 1px solid var(--blue); border-color: var(--blue);
   }
+  .token-reveal {
+    margin-top: 14px; padding: 12px 14px; background: var(--bg-deep);
+    border: 1px solid var(--success); border-radius: 8px;
+  }
+  .token-reveal p { margin: 0 0 8px; color: var(--muted); font-size: .82rem; line-height: 1.45; }
+  .token-reveal code {
+    display: block; margin: 0 0 10px; font-family: var(--mono); font-size: .82rem;
+    color: var(--text); word-break: break-all; user-select: all;
+  }
+  .token-reveal button {
+    appearance: none; font: inherit; font-size: .8rem; cursor: pointer; margin-right: 8px;
+    padding: 6px 12px; border-radius: 8px; background: var(--bg-card);
+    border: 1px solid var(--stroke); color: var(--text);
+  }
+  .api-tokens { max-width: 1040px; margin-top: 10px; }
+  .api-tokens .badge { white-space: nowrap; }
+  .api-tokens .warn { color: #ffa8b6; font-weight: 400; font-size: .78rem; }
   .pw-change .pw-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 12px; margin-top: 4px; }
   .pw-change button[type="submit"] {
     appearance: none; font: inherit; font-size: .85rem; font-weight: 600; cursor: pointer;
@@ -3163,6 +3811,42 @@ public sealed class WebApp : IDisposable
   <section id="tab-settings" class="hidden">
     <div id="settingsPanel"></div>
     <div class="settings-group">
+      <h3>API tokens</h3>
+      <form id="apiTokenForm" class="pw-change" autocomplete="off">
+        <p class="desc">Tokens for a bot or script. A <strong>read-only</strong> token sees what this console shows at <code>/api/v1/monitor/…</code> and can change nothing. A <strong>control</strong> token can also run the console's actions through <code>/api/v1/control</code> — block and unblock, firewall rules, the allowlist, sleep and wake, auto-block on or off. Neither kind can sign in here, open Settings, or create or revoke tokens. Only a hash is stored, so each token is shown once, when it is created.</p>
+        <p class="desc" id="apiTokenTransport"></p>
+        <label for="apiTokenName">Name</label>
+        <input id="apiTokenName" type="text" name="tokenName" maxlength="48" placeholder="GrokBot" required />
+        <label for="apiTokenAccess">Access</label>
+        <select id="apiTokenAccess" name="tokenAccess">
+          <option value="read" selected>Read only</option>
+          <option value="control">Read and control — can change the firewall</option>
+        </select>
+        <label for="apiTokenExpiry">Expires</label>
+        <select id="apiTokenExpiry" name="tokenExpiry">
+          <option value="30">In 30 days</option>
+          <option value="90" selected>In 90 days</option>
+          <option value="365">In 1 year</option>
+          <option value="0">Never</option>
+        </select>
+        <label for="apiTokenSources">Allowed source addresses</label>
+        <input id="apiTokenSources" type="text" name="tokenSources" spellcheck="false" placeholder="203.0.113.7, 10.8.0.0/24 — empty allows any address" />
+        <p class="desc" id="apiTokenSourcesHint">Optional for a read-only token. Required for a control token: it is refused from anywhere else, so a copy that leaks is useless on its own.</p>
+        <div class="pw-actions">
+          <button type="submit" id="btnApiTokenCreate">Create token</button>
+          <p class="pw-msg" id="apiTokenMsg" aria-live="polite"></p>
+        </div>
+        <div id="apiTokenReveal" class="token-reveal hidden">
+          <p>Copy this token into the bot now. It will not be shown again — if it is lost, revoke it and create another.</p>
+          <code id="apiTokenValue"></code>
+          <p>Try it: <span class="mono" id="apiTokenExample"></span></p>
+          <button type="button" id="btnApiTokenCopy">Copy token</button>
+          <button type="button" id="btnApiTokenDone">Done — hide it</button>
+        </div>
+      </form>
+      <div id="apiTokenList" class="api-tokens"></div>
+    </div>
+    <div class="settings-group">
       <h3>Master password</h3>
       <form id="changePasswordForm" class="pw-change" autocomplete="off">
         <p class="desc">Change the password required to open this web console. It is stored only as a one-way PBKDF2-SHA256 hash with a random salt on this machine — never as plain text.</p>
@@ -3192,7 +3876,7 @@ public sealed class WebApp : IDisposable
         <li><strong>Firewall &amp; Block</strong> — managed rules, manual IP/port blocking, remove rules</li>
         <li><strong>Firewall Config</strong> — add, edit and delete inbound and outbound rules</li>
         <li><strong>Allowlist</strong> — domains/IPs that are never blocked</li>
-        <li><strong>Settings</strong> — auto-block behavior, block direction, geo lookups, refresh speed, and master password</li>
+        <li><strong>Settings</strong> — auto-block behavior, block direction, geo lookups, refresh speed, API tokens, and master password</li>
       </ul>
       <p><strong>Sleep / Wake</strong> — the first button in the header stops every watcher (connections, listening ports, auth log, port-scan probes, ARP, startup items, exfiltration, honeypot) and parks the console. Press it again to wake up and start monitoring from live data. Firewall blocks stay in force while asleep — sleeping stops watching, it does not unblock anything. Sleep applies to this web service; a desktop or TUI instance is a separate process and keeps running.</p>
       <p class="muted">Firewall actions need root or an elevation helper (pkexec/sudo). Prefer running the web service as root once rather than elevating per action.</p>
@@ -4269,6 +4953,49 @@ public sealed class WebApp : IDisposable
              'Deletes every Network Sentinel block rule (the access rule for this console is kept) and stops auto-block from re-adding them for 24h.',
              '<button type="button" class="rm-lg" data-remove-all>Remove all rules</button>')}
       </div>`;
+    renderApiTokens();
+  }
+
+  // Outside settingsPanel on purpose: that panel is rebuilt on every render, which
+  // would wipe a half-typed token name and the one-time token box along with it.
+  function renderApiTokens() {
+    const s = state.settings || {};
+    $('apiTokenTransport').textContent = s.httpsActive
+      ? 'The API answers over HTTPS only; a request over plain HTTP is refused unless it comes from this machine.'
+      : 'HTTPS is off, so the API answers this machine only (localhost). Turn HTTPS on under Remote access before pointing a bot on another host at it — a token must never cross the network unencrypted.';
+
+    const when = (iso) => iso ? new Date(iso).toLocaleString() : '';
+    const tokens = state.apiTokens || [];
+    if (!tokens.length) {
+      $('apiTokenList').innerHTML = '<div class="settings-note">No API tokens yet — the API refuses every request until one is created.</div>';
+      return;
+    }
+    const rows = tokens.map(t => {
+      const used = t.lastUsedUtc
+        ? `${esc(when(t.lastUsedUtc))}${t.lastUsedFrom ? ' from ' + esc(t.lastUsedFrom) : ''}`
+        : 'Never';
+      const acted = t.lastActionUtc
+        ? `<div class="muted">Last action ${esc(when(t.lastActionUtc))}: <span class="mono">${esc(t.lastAction || '')}</span></div>`
+        : '';
+      const refused = t.lastRefusedUtc
+        ? `<div class="warn">Refused ${esc(when(t.lastRefusedUtc))}${t.lastRefusedFrom ? ' from ' + esc(t.lastRefusedFrom) : ''} — ${esc(t.lastRefusedWhy || '')}</div>`
+        : '';
+      const expires = t.expiresUtc
+        ? `<span class="${t.expired ? 'warn' : ''}">${t.expired ? 'Expired ' : ''}${esc(when(t.expiresUtc))}</span>`
+        : 'Never';
+      return `<tr>
+        <td>${esc(t.name)}<div class="mono muted">${esc(t.id)}</div></td>
+        <td>${t.canControl ? '<span class="badge lvl-high">Control</span>' : '<span class="badge lvl-info">Read only</span>'}</td>
+        <td>${esc(when(t.createdUtc))}</td>
+        <td>${expires}</td>
+        <td class="mono">${esc(t.allowedSources || 'any')}</td>
+        <td>${used}${acted}${refused}</td>
+        <td class="row-actions"><button type="button" class="rm" data-revoke-token="${esc(t.id)}" data-token-name="${esc(t.name)}">Revoke</button></td>
+      </tr>`;
+    }).join('');
+    $('apiTokenList').innerHTML = `<div data-scroll style="overflow-x:auto"><table><thead><tr>
+        <th>Token</th><th>Access</th><th>Created</th><th>Expires</th><th>Allowed from</th><th>Last used</th><th></th>
+      </tr></thead><tbody>${rows}</tbody></table></div>`;
   }
 
   function showTab(name) {
@@ -4480,6 +5207,70 @@ public sealed class WebApp : IDisposable
       apiAction('remove_all_rules').finally(() => {
         if (btn.isConnected) { btn.disabled = false; btn.textContent = 'Remove all rules'; }
       });
+    }
+  });
+
+  $('apiTokenForm').addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const msg = $('apiTokenMsg');
+    const btn = $('btnApiTokenCreate');
+    msg.textContent = '';
+    msg.classList.remove('err', 'ok');
+    if ($('apiTokenAccess').value === 'control' &&
+        !confirm('Create a CONTROL token?\n\nWhoever holds it can block and unblock addresses, add and delete firewall rules, edit the allowlist, switch auto-block and put monitoring to sleep — from the addresses you listed. It cannot open Settings or manage tokens.'))
+      return;
+    btn.disabled = true;
+    try {
+      const data = await apiAction('api_token_create', {
+        name: $('apiTokenName').value.trim(),
+        value: $('apiTokenExpiry').value,
+        kind: $('apiTokenAccess').value,
+        addresses: $('apiTokenSources').value.trim()
+      });
+      if (!data.ok || !data.token) {
+        msg.textContent = data.message || 'Could not create the token.';
+        msg.classList.add('err');
+        return;
+      }
+      $('apiTokenName').value = '';
+      $('apiTokenSources').value = '';
+      // Back to the safe choice, so the next token is not a control token by leftover.
+      $('apiTokenAccess').value = 'read';
+      $('apiTokenValue').textContent = data.token;
+      $('apiTokenExample').textContent =
+        `curl -H "Authorization: Bearer ${data.token}" ${location.origin}/api/v1/monitor/summary`;
+      $('apiTokenReveal').classList.remove('hidden');
+      msg.textContent = 'Token created.';
+      msg.classList.add('ok');
+    } finally {
+      btn.disabled = false;
+    }
+  });
+  $('btnApiTokenCopy').onclick = async () => {
+    const btn = $('btnApiTokenCopy');
+    try {
+      // Clipboard access needs a secure context; over plain HTTP the token is
+      // selected instead, so Ctrl+C still takes it.
+      await navigator.clipboard.writeText($('apiTokenValue').textContent);
+      btn.textContent = 'Copied';
+    } catch {
+      window.getSelection().selectAllChildren($('apiTokenValue'));
+      btn.textContent = 'Selected — press Ctrl+C';
+    }
+  };
+  $('btnApiTokenDone').onclick = () => {
+    $('apiTokenValue').textContent = '';
+    $('apiTokenExample').textContent = '';
+    $('btnApiTokenCopy').textContent = 'Copy token';
+    $('apiTokenMsg').textContent = '';
+    $('apiTokenReveal').classList.add('hidden');
+  };
+  $('apiTokenList').addEventListener('click', (e) => {
+    const btn = e.target.closest('[data-revoke-token]');
+    if (!btn) return;
+    if (confirm(`Revoke the API token "${btn.dataset.tokenName}"?\n\nWhatever is using it is refused from its next request on. This cannot be undone — a replacement is a new token.`)) {
+      btn.disabled = true;
+      apiAction('api_token_revoke', { value: btn.dataset.revokeToken });
     }
   });
 
