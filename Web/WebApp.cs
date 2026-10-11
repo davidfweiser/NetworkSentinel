@@ -1404,7 +1404,9 @@ public sealed class WebApp : IDisposable
                 {
                     if (!int.TryParse((req.Value ?? "").Trim(), out var port) || port is < 1 or > 65535)
                         return ActionResultDto.Fail("Enter a valid port number (1–65535).");
-                    if (port == _port)
+                    // Both listeners: on an HTTPS-only console the plain-HTTP port serves
+                    // nothing, and it was the TLS port that could be blocked from here.
+                    if (port == _port || (_httpsActive && port == _httpsPort))
                         return ActionResultDto.Fail(
                             $"Port {port} serves this web console — blocking it would cut off this page. Choose another port.");
                     if (!_firewall.IsAdministrator)
