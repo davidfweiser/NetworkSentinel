@@ -83,13 +83,16 @@ Gates, in order — a threat must clear all of them before a rule is written:
 |------|-----|
 | Severity ≥ minimum | The configured `Medium`/`High`/`Critical` threshold |
 | Not `New Remote Host` | First contact is not evidence of anything |
+| Source proven | Auto-block acts on the address a threat names, so that address must not be one an attacker could pick. Evidence that never completed a TCP handshake — half-open SYN-RECEIVED sockets, closed-port probes from the kernel log, Suricata alerts on UDP/ICMP or on TCP with no app-layer protocol — carries a forgeable source, and is alerted on but never blocked: otherwise six forged SYNs "from" your own address would lock you out. A stealth SYN scan is therefore reported, not auto-blocked; a connect scan or a brute-force over real sessions still is. DNS-hygiene alerts name a resolver this host queried, not an attacker, and are never blocked either |
 | Routable public address | LAN, loopback, CGNAT (100.64/10 — Tailscale and many VPN tunnels) and multicast are never auto-blocked. CGNAT can still be blocked **manually**, behind a confirmation — a hostile tunnel peer is a real case, and only LAN/loopback/link-local/multicast are refused outright |
 | Not allowlisted | Known-good stays reachable |
 | Not this machine | A detector that attributes a threat to the wrong end of a flow can never firewall the host off from itself — matters most on a VPS whose own address is public |
+| Not a configured resolver | A `nameserver` in `/etc/resolv.conf` (or systemd-resolved's upstream list) is never auto-blocked — the block would take name resolution with it |
 | Not a WireGuard tunnel endpoint | A peer's public endpoint is where its tunnel packets come from; blocking it does not drop an attacker, it drops the tunnel and everything reached through it. Independent of the WireGuard *monitoring* setting, and remembered for 24 h — see [tunnel endpoints are never auto-blocked](#tunnel-endpoints-are-never-auto-blocked) |
 | Not protected | See lockout protection below |
 | Not already blocked | No duplicate rules |
 | Not suppressed | An address you deliberately released stays released for 24 h |
+| Under the rate cap | At most 20 auto-blocks in any rolling minute. A real attack is a handful of addresses; dozens a minute means a detector is being fed, and past the cap threats are reported but not acted on |
 | Not retried too soon | An address is claimed for 10 minutes once a batch acts on it. A block that fails for a reason other than elevation (a timed-out `nft`, xtables lock contention) retries after **45 s** instead — one transient error should not leave an active attacker alone for ten minutes. Elevation failures pause auto-block globally for 5 minutes, lifted as soon as you authorize elevation |
 
 - **Dry run** (**Settings → Auto-block → Dry run**) runs every gate and reports what it *would* have dropped, without writing a single rule. Blocking turns a false positive from noise into an outage, so a new detection source — a fresh Suricata ruleset especially — belongs here first. The console shows `Would block …` lines exactly where it would otherwise show `Auto-blocked …`.
@@ -494,7 +497,7 @@ The first button in the web console's hero action row is a single **Sleep ⇄ Wa
 
 ### Web UI security
 - First browser visit **creates a master password** (min. 8 characters)
-- Creating it from **another machine** additionally asks for a one-time **setup code**, printed where the console runs (the terminal, or `journalctl -u networksentinel-web`). Without this, whoever reached the port first — the console binds all interfaces before any password exists — could claim the master password and with it firewall control. Setup from localhost needs no code
+- Creating it asks for a one-time **setup code**, printed where the console runs (the terminal, or `journalctl -u networksentinel-web`). Without this, whoever reached the port first — the console binds all interfaces before any password exists — could claim the master password and with it firewall control. Setup from localhost needs the code too: "local" includes every account on the machine, any web page open in a browser on it (a cross-site form post reaches setup without a cookie), and — behind `tailscale serve` or any reverse proxy on the same host — every visitor. `sudo networksentinel --set-master-password` remains the no-browser alternative
 - Every later visit **requires that password**; change it under **Settings → Master password**. Changing it signs out every other session and revokes every API token
 - Can't reach a browser yet (e.g. still opening the port in a cloud firewall)? Set/reset it from the terminal instead: `sudo networksentinel --set-master-password`
 - Hash stored as PBKDF2-SHA256 (random salt, 200k iterations) in `~/.local/share/NetworkSentinel/web-master.json` — never plain text
@@ -646,7 +649,7 @@ The token is stored in `~/.local/share/NetworkSentinel/duckdns.json` with mode `
 - Desktop libraries for Avalonia GUI (usual X11/Wayland desktop)
 - **Text size (0.7.12, a setting in 0.7.13).** Every size in the GUI is an absolute device-independent pixel, so on a 4K panel whose desktop session does not scale, the window opened ~2000px wide with 11px labels. The content is drawn through a `LayoutTransformControl`, which scales during layout rather than at paint, so wrapping, trimming and the table columns all stay correct — the window gets bigger rather than clipped. Choose the step under **Settings → Display → Text size**: 100% is the original sizing, 175% the default (sized for an unscaled 4K panel), up to 250%. It applies straight away and persists as `UiScale` in `settings.json`, clamped to 1.0–2.5 on read. GUI only — the TUI is sized by the terminal and the web console by the browser
 - **policykit-1** (`pkexec`) recommended for firewall password prompts. Failing that, the app drives an **askpass** dialog through `sudo -A` (`ssh-askpass`, `ksshaskpass`, `gnome-ssh-askpass`, or whatever `SUDO_ASKPASS` names), and failing that it needs passwordless sudo — see [Firewall elevation on a headless server](#firewall-elevation-on-a-headless-server-no-pkexec)
-- No `which` binary is needed: `sudo`, `pkexec`, `ufw`, `nft`, `iptables` and `ss` are resolved in-process against `PATH` plus `/usr/local/sbin`, `/usr/sbin` and `/sbin` — a desktop session's `PATH` omits the sbin directories on Debian and its derivatives
+- No `which` binary is needed: `sudo`, `pkexec`, `ufw`, `nft`, `iptables` and `ss` are resolved in-process against the system directories only (`/usr/local/sbin`, `/usr/local/bin`, `/usr/sbin`, `/usr/bin`, `/sbin`, `/bin`, and NixOS's `/run/wrappers/bin` and `/run/current-system/sw/bin`), never `PATH` — these binaries run as root, and `PATH` often includes `~/.local/bin`, where anything running as you could plant a fake `nft` or `pkexec`. A binary (or its directory) that a group or other users can write to is refused
 - `ufw` when the host uses it — Firewall Config reads it and writes through it; the app never enables it for you (that can lock you out of SSH)
 - `nft` (nftables) or `iptables` for host firewall changes, and for reading the ruleset where UFW is not in use
 - `ss` (iproute2) for the exfiltration monitor and the Firewall Config listening-services table — present on essentially every distro; without it those report themselves unavailable
@@ -1179,7 +1182,7 @@ All three UIs write the same `~/.local/share/NetworkSentinel/settings.json`, so 
 | `AutoBlockEnabled` | `false` | Create firewall rules automatically |
 | `AutoBlockMinLevel` | `"High"` | Minimum severity for auto-block |
 | `AutoBlockInbound` / `AutoBlockOutbound` | `true` / `true` | Direction of auto-created rules |
-| `AutoBlockExpiryMinutes` | `0` (off) | Auto-block lifetime; manual blocks are always permanent |
+| `AutoBlockExpiryMinutes` | `1440` (24 h) | Auto-block lifetime (0 = never expire); manual blocks are always permanent |
 | `AllowlistUseRemoteFeed` | `true` | Refresh the known-good list from the online feed |
 
 ### Auto-block

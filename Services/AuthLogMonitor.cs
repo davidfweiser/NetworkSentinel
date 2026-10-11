@@ -25,29 +25,40 @@ public sealed class AuthLogMonitor : IDisposable
     private const int HighThreshold = 4;
     private const int CriticalThreshold = 10;
 
+    // sshd puts the username — chosen by whoever is connecting, and allowed to contain
+    // spaces — *before* the address it logs. An unanchored pattern takes the leftmost
+    // "from <ip>", so a username such as "x from 8.8.8.8 port 22" named any address the
+    // attacker liked as the culprit (the fail2ban/DenyHosts log-injection class). Every
+    // pattern is therefore anchored on the tail sshd itself writes — "from <ip> port <n>",
+    // then its fixed suffixes, then end of line — and lets the username run greedily up
+    // to it, so the address is always the last one on the line.
+    private const string Tail = @"(?: ssh2)?(?: \[preauth\])?\s*$";
+
     // "Failed password for invalid user admin from 203.0.113.7 port 51022 ssh2"
     private static readonly Regex FailedPassword = new(
-        @"Failed (?:password|publickey|keyboard-interactive(?:/pam)?|none) for (?<invalid>invalid user )?(?<user>\S+) from (?<ip>\S+) port \d+",
+        @"Failed (?:password|publickey|keyboard-interactive(?:/pam)?|none) for (?<invalid>invalid user )?(?<user>.*) from (?<ip>\S+) port \d+" + Tail,
         RegexOptions.Compiled);
 
     // "Invalid user oracle from 203.0.113.7 port 40122"
     private static readonly Regex InvalidUser = new(
-        @"Invalid user (?<user>\S*) from (?<ip>\S+)",
+        @"Invalid user (?<user>.*) from (?<ip>\S+) port \d+" + Tail,
         RegexOptions.Compiled);
 
     // "Connection closed by invalid user a 203.0.113.7 port 50110 [preauth]"
     private static readonly Regex PreauthAbandon = new(
-        @"Connection (?:closed|reset) by (?:invalid |authenticating )user (?<user>\S+) (?<ip>\S+) port \d+",
+        @"Connection (?:closed|reset) by (?:invalid |authenticating )user (?<user>.*) (?<ip>\S+) port \d+" + Tail,
         RegexOptions.Compiled);
 
     // PAM: "authentication failure; logname= uid=0 euid=0 tty=ssh ruser= rhost=203.0.113.7  user=root"
+    // Here the username comes *after* the address, so the fields before rhost= are spelled
+    // out: a greedy ".*rhost=" would take an "rhost=" smuggled into the trailing user=.
     private static readonly Regex PamFailure = new(
-        @"authentication failure;.*rhost=(?<ip>\S+)(?:\s+user=(?<user>\S+))?",
+        @"authentication failure; logname=\S* uid=\d+ euid=\d+ tty=\S* ruser=\S* rhost=(?<ip>\S+)(?:\s+user=(?<user>.*))?$",
         RegexOptions.Compiled);
 
-    // "error: maximum authentication attempts exceeded for root from 203.0.113.7 port 33990 ssh2"
+    // "error: maximum authentication attempts exceeded for root from 203.0.113.7 port 33990 ssh2 [preauth]"
     private static readonly Regex MaxAttempts = new(
-        @"maximum authentication attempts exceeded for (?:invalid user )?(?<user>\S+) from (?<ip>\S+)",
+        @"maximum authentication attempts exceeded for (?:invalid user )?(?<user>.*) from (?<ip>\S+) port \d+" + Tail,
         RegexOptions.Compiled);
 
     private readonly object _gate = new();
@@ -121,10 +132,15 @@ public sealed class AuthLogMonitor : IDisposable
                 RedirectStandardError = true,
                 UseShellExecute = false
             };
+            // The identifier (-t) is whatever the sender says it is — `logger -t sshd` from
+            // any local account matches it — so the lines must also come from root (_UID is
+            // stamped by journald from the socket credentials and cannot be forged). sshd
+            // logs as root: its unprivileged pre-auth child hands messages to the root monitor.
             foreach (var arg in new[]
             {
                 "--follow", "--lines=0", "--output=cat", "--quiet",
-                "-t", "sshd", "-t", "sshd-session", "-t", "sudo", "-t", "su", "-t", "login"
+                "-t", "sshd", "-t", "sshd-session", "-t", "sudo", "-t", "su", "-t", "login",
+                "_UID=0"
             })
             {
                 psi.ArgumentList.Add(arg);

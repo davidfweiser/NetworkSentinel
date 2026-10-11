@@ -57,4 +57,46 @@ public class LoginThrottleTests
         Assert.True(throttle.IsLocked("203.0.113.7", out _));
         Assert.False(throttle.IsLocked("203.0.113.8", out _));
     }
+
+    [Fact]
+    public void ParallelGuessesAreCutOffAtTheLimit()
+    {
+        // Every attempt is counted before the (slow) password check, so a burst that
+        // arrives all at once gets MaxFailures guesses, not one per server thread.
+        var throttle = new LoginThrottle();
+        var admitted = 0;
+        Parallel.For(0, 200, i =>
+        {
+            if (throttle.TryBeginAttempt("203.0.113.8", out _, out _))
+                Interlocked.Increment(ref admitted);
+        });
+
+        Assert.Equal(LoginThrottle.MaxFailures, admitted);
+        Assert.True(throttle.IsLocked("203.0.113.8", out _));
+    }
+
+    [Fact]
+    public void ARightGuessClearsTheAttemptItCounted()
+    {
+        var throttle = new LoginThrottle();
+        for (var i = 0; i < 10; i++)
+        {
+            Assert.True(throttle.TryBeginAttempt("203.0.113.9", out _, out _));
+            throttle.RecordSuccess("203.0.113.9");
+        }
+        Assert.False(throttle.IsLocked("203.0.113.9", out _));
+    }
+
+    [Fact]
+    public void TheLastAdmittedGuessKnowsTheLockoutItWouldTrigger()
+    {
+        var throttle = new LoginThrottle();
+        var lockout = TimeSpan.Zero;
+        for (var i = 0; i < LoginThrottle.MaxFailures; i++)
+            Assert.True(throttle.TryBeginAttempt("203.0.113.10", out _, out lockout));
+
+        Assert.True(lockout > TimeSpan.Zero);
+        Assert.False(throttle.TryBeginAttempt("203.0.113.10", out var retryAfter, out _));
+        Assert.True(retryAfter > TimeSpan.Zero);
+    }
 }

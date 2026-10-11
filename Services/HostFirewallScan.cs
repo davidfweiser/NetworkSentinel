@@ -1073,7 +1073,10 @@ public sealed class HostFirewallScanner
             var stamp = scanned.Comment;
             if (stamp.Length == 0 || !byName.TryGetValue(stamp, out var owned)) continue;
 
-            rules[i] = Clone(scanned, origin: owned.OriginText, kind: owned.Kind, label: owned.LabelText);
+            // The ledger's name, too: Delete hands Name to RemoveRule, and the scanned
+            // Name is the label cut to 48 characters — an IPv6 block's own name is longer,
+            // so its row could never be deleted ("already removed") while it stayed in force.
+            rules[i] = Clone(scanned, name: owned.Name, origin: owned.OriginText, kind: owned.Kind, label: owned.LabelText);
         }
     }
 
@@ -1126,9 +1129,9 @@ public sealed class HostFirewallScanner
 
     private static FirewallRuleInfo Clone(
         FirewallRuleInfo rule, string? origin = null, FirewallRuleKind? kind = null,
-        string? label = null, bool? isBlock = null, string? verdict = null) => new()
+        string? label = null, bool? isBlock = null, string? verdict = null, string? name = null) => new()
     {
-        Name = rule.Name,
+        Name = name ?? rule.Name,
         Label = label ?? rule.Label,
         Description = rule.Description,
         Enabled = rule.Enabled,

@@ -378,3 +378,57 @@ public class FirewallRuleSpecTests
         Assert.Equal(FirewallRuleSpecs.AnyAddressText, rule.AddressListText);
     }
 }
+
+/// <summary>
+/// Managed iptables rules are deleted by their full specification, read back from
+/// <c>iptables -S</c>, never by a line number that can shift between list and delete.
+/// </summary>
+public class IptablesDeleteSpecTests
+{
+    private const string Listing = """
+-P INPUT ACCEPT
+-A INPUT -j ufw-before-input
+-A INPUT -s 203.0.113.9/32 -m comment --comment NetworkSentinel-IP-203_0_113_9-In -j DROP
+-A INPUT -p tcp -m tcp --dport 22 -m comment --comment NetworkSentinel-Rule-SSH -j ACCEPT
+-A INPUT -p tcp -m tcp --dport 2222 -m comment --comment NetworkSentinel-Rule-SSH-2 -j ACCEPT
+-A INPUT -p tcp -m tcp --tcp-flags FIN,SYN,RST,ACK SYN -m conntrack --ctstate NEW -m limit --limit 50/sec -m comment --comment NetworkSentinel-ProbeLog -j LOG --log-prefix "NS-PROBE "
+-A OUTPUT -d 203.0.113.9/32 -m comment --comment NetworkSentinel-IP-203_0_113_9-Out -j DROP
+""";
+
+    [Fact]
+    public void BuildsADeleteFromTheListedSpec()
+    {
+        var spec = Assert.Single(FirewallService.IptablesDeleteSpecs(Listing, "INPUT", "NetworkSentinel-IP-203_0_113_9-In"));
+        Assert.Equal(
+            new[] { "-D", "INPUT", "-s", "203.0.113.9/32", "-m", "comment", "--comment", "NetworkSentinel-IP-203_0_113_9-In", "-j", "DROP" },
+            spec);
+    }
+
+    [Fact]
+    public void MatchesTheWholeCommentOnly()
+    {
+        var spec = Assert.Single(FirewallService.IptablesDeleteSpecs(Listing, "INPUT", "NetworkSentinel-Rule-SSH"));
+        Assert.Contains("22", spec);
+        Assert.DoesNotContain("2222", spec);
+    }
+
+    [Fact]
+    public void LooksOnlyInTheNamedChain()
+    {
+        Assert.Empty(FirewallService.IptablesDeleteSpecs(Listing, "INPUT", "NetworkSentinel-IP-203_0_113_9-Out"));
+        Assert.Single(FirewallService.IptablesDeleteSpecs(Listing, "OUTPUT", "NetworkSentinel-IP-203_0_113_9-Out"));
+    }
+
+    [Fact]
+    public void KeepsAQuotedValueWithASpaceAsOneArgument()
+    {
+        var spec = Assert.Single(FirewallService.IptablesDeleteSpecs(Listing, "INPUT", "NetworkSentinel-ProbeLog"));
+        Assert.Equal("NS-PROBE ", spec[^1]);
+        Assert.Equal("--log-prefix", spec[^2]);
+    }
+
+    [Fact]
+    public void SplitsEscapedQuotes()
+        => Assert.Equal(new[] { "-A", "X", "--comment", "say \"hi\"", "" },
+            FirewallService.SplitIptablesLine("-A X --comment \"say \\\"hi\\\"\" \"\""));
+}

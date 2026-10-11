@@ -200,7 +200,13 @@ public sealed class WebApp : IDisposable
     {
         _bindAll = bindAll;
         _port = ResolvePort(requestedPort);
-        _core = new SentinelCore();
+
+        // Never serve on defaults that stand in for a damaged settings file: they mean
+        // plain HTTP on every interface, whatever the operator had configured.
+        var settings = AppSettings.Load();
+        if (settings.LoadError is { } broken)
+            throw new InvalidOperationException("The web console will not start: " + broken);
+        _core = new SentinelCore(settings);
         _settings = _core.Settings;
         _monitor = _core.Monitor;
         _firewall = _core.Firewall;
@@ -429,14 +435,18 @@ public sealed class WebApp : IDisposable
 
         Console.WriteLine();
         Console.WriteLine("  Open the URL above in your browser.");
-        if (_auth.IsConfigured)
+        if (_auth.LoadError is { } damaged)
+        {
+            Console.WriteLine($"  WARNING: {damaged}");
+        }
+        else if (_auth.IsConfigured)
         {
             Console.WriteLine("  Master password required on every login.");
         }
         else
         {
             Console.WriteLine("  First visit: create a master password in the browser.");
-            Console.WriteLine($"  Setup code (asked for when setting up from another machine): {_setupCode}");
+            Console.WriteLine($"  Setup code (asked for on the setup page): {_setupCode}");
         }
         Console.WriteLine("  Press Ctrl+C to stop.");
         Console.WriteLine();
@@ -535,7 +545,7 @@ public sealed class WebApp : IDisposable
                 configured = _auth.IsConfigured,
                 authenticated = authed,
                 minPasswordLength = WebAuthStore.MinPasswordLength,
-                setupCodeRequired = !_auth.IsConfigured && !IsLoopbackClient(ctx)
+                setupCodeRequired = !_auth.IsConfigured
             });
             return;
         }
@@ -550,16 +560,18 @@ public sealed class WebApp : IDisposable
                 return;
             }
 
-            if (IsLockedOut(ctx, res))
+            if (!TryBeginGuess(ctx, res, out _))
                 return;
 
-            // Remote first-visit setup must quote the code printed on the server
-            // console; without it, the first scanner to find the port would claim
-            // the master password. Local setup needs nothing.
-            if (!IsLoopbackClient(ctx) && !SetupCodeMatches(authReq.SetupCode))
+            // First-visit setup must quote the code printed on the server console;
+            // without it, the first scanner to find the port would claim the master
+            // password. That holds for loopback callers too: "local" is any account on
+            // this machine, a web page open in a browser here (a cross-site form post
+            // needs no cookie to reach setup), a DNS-rebound name, or — behind the
+            // `tailscale serve` proxy the README suggests — every visitor at all.
+            if (!SetupCodeMatches(authReq.SetupCode))
             {
                 Thread.Sleep(400);
-                _loginThrottle.RecordFailure(ClientAddress(ctx));
                 WriteJson(res, 403, new
                 {
                     ok = false,
@@ -573,7 +585,6 @@ public sealed class WebApp : IDisposable
             {
                 // Slow down scripted setup attempts.
                 Thread.Sleep(400);
-                _loginThrottle.RecordFailure(ClientAddress(ctx));
                 WriteJson(res, 400, new { ok = false, message = setupMsg });
                 return;
             }
@@ -601,14 +612,20 @@ public sealed class WebApp : IDisposable
                 return;
             }
 
-            if (IsLockedOut(ctx, res))
+            if (_auth.LoadError is { } damaged)
+            {
+                WriteJson(res, 503, new { ok = false, message = damaged });
+                return;
+            }
+
+            if (!TryBeginGuess(ctx, res, out var lockout))
                 return;
 
-            // Delay blunts a serial guesser; the lockout is what stops a parallel one.
+            // Delay blunts a serial guesser; the lockout — counted before the check,
+            // see TryBeginGuess — is what stops a parallel one.
             if (!_auth.VerifyPassword(authReq.Password ?? ""))
             {
                 Thread.Sleep(600);
-                var lockout = _loginThrottle.RecordFailure(ClientAddress(ctx));
                 WriteJson(res, 401, new
                 {
                     ok = false,
@@ -668,13 +685,12 @@ public sealed class WebApp : IDisposable
             var confirm = authReq.Confirm ?? "";
             var session = GetSessionToken(req);
 
-            if (IsLockedOut(ctx, res))
+            if (!TryBeginGuess(ctx, res, out _))
                 return;
 
             if (!_auth.TryChangePassword(current, next, confirm, session, out var changeMsg))
             {
                 Thread.Sleep(600);
-                _loginThrottle.RecordFailure(ClientAddress(ctx));
                 WriteJson(res, 400, new { ok = false, message = changeMsg });
                 return;
             }
@@ -789,14 +805,13 @@ public sealed class WebApp : IDisposable
             return;
         }
 
-        if (IsLockedOut(ctx, res))
+        if (!TryBeginGuess(ctx, res, out _))
             return;
 
         if (!_auth.VerifyPassword(req.Password ?? ""))
         {
             // Same brakes as the sign-in page, and the same counter: this is the same guess.
             Thread.Sleep(600);
-            _loginThrottle.RecordFailure(client);
             _audit.Write($"console session from {client} tried to create a token without the right master password.");
             // 403, not 401: the page reads 401 as "the session has expired".
             WriteJson(res, 403, new
@@ -1608,11 +1623,17 @@ public sealed class WebApp : IDisposable
         return a.Length == b.Length && System.Security.Cryptography.CryptographicOperations.FixedTimeEquals(a, b);
     }
 
-    /// <summary>Writes a 429 and returns true when this client is currently locked out.</summary>
-    private bool IsLockedOut(HttpContext ctx, HttpResponse res)
+    /// <summary>
+    /// Claims one guess for this client, counted as a failure until
+    /// <see cref="LoginThrottle.RecordSuccess"/> says otherwise. Writes a 429 and
+    /// returns false while the client is locked out. Every handler that checks the
+    /// master password or the setup code goes through here first, so a burst of
+    /// parallel requests is cut off at <see cref="LoginThrottle.MaxFailures"/>.
+    /// </summary>
+    private bool TryBeginGuess(HttpContext ctx, HttpResponse res, out TimeSpan lockoutIfWrong)
     {
-        if (!_loginThrottle.IsLocked(ClientAddress(ctx), out var retryAfter))
-            return false;
+        if (_loginThrottle.TryBeginAttempt(ClientAddress(ctx), out var retryAfter, out lockoutIfWrong))
+            return true;
 
         res.Headers["Retry-After"] = ((int)Math.Ceiling(retryAfter.TotalSeconds)).ToString();
         WriteJson(res, 429, new
@@ -1620,7 +1641,7 @@ public sealed class WebApp : IDisposable
             ok = false,
             message = $"Too many failed attempts. Try again in {LoginThrottle.Describe(retryAfter)}."
         });
-        return true;
+        return false;
     }
 
     /// <summary>
