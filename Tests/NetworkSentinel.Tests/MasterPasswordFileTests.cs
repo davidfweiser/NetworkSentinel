@@ -98,3 +98,102 @@ public class MasterPasswordFileTests
         }
     }
 }
+
+/// <summary>A damaged state file must fail closed, never fall back to "nothing set up yet".</summary>
+public class DamagedStateFileTests
+{
+    private static string NewDir()
+    {
+        var dir = Path.Combine(Path.GetTempPath(), "ns-damaged-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(dir);
+        return dir;
+    }
+
+    [Theory]
+    [InlineData("{ not json")]
+    [InlineData("{}")]
+    public void ADamagedPasswordFileDoesNotReopenSetup(string contents)
+    {
+        var dir = NewDir();
+        try
+        {
+            File.WriteAllText(Path.Combine(dir, "web-master.json"), contents);
+            var store = new WebAuthStore(dir);
+
+            Assert.NotNull(store.LoadError);
+            Assert.True(store.IsConfigured);
+            Assert.False(store.TrySetup("attacker-password", "attacker-password", out var message));
+            Assert.Contains("--set-master-password", message);
+            Assert.False(store.VerifyPassword("attacker-password"));
+            Assert.Equal(contents, File.ReadAllText(Path.Combine(dir, "web-master.json")));
+        }
+        finally
+        {
+            Directory.Delete(dir, recursive: true);
+        }
+    }
+
+    [Fact]
+    public void TheCliResetRepairsADamagedPasswordFile()
+    {
+        var dir = NewDir();
+        try
+        {
+            File.WriteAllText(Path.Combine(dir, "web-master.json"), "{ not json");
+            var store = new WebAuthStore(dir);
+
+            Assert.True(store.SetPassword("correct horse", "correct horse", out _));
+            Assert.Null(store.LoadError);
+            Assert.True(store.VerifyPassword("correct horse"));
+        }
+        finally
+        {
+            Directory.Delete(dir, recursive: true);
+        }
+    }
+
+    [Fact]
+    public void ADamagedSettingsFileIsKeptAndReported()
+    {
+        var dir = NewDir();
+        try
+        {
+            var path = Path.Combine(dir, "settings.json");
+            const string broken = """{ "WebHttpsOnly": true, "MonitorPollMs": "1000" }""";
+            File.WriteAllText(path, broken);
+
+            var settings = NetworkSentinel.Services.AppSettings.Load(path);
+            // A restart loop over the same damaged file must not pile up copies.
+            NetworkSentinel.Services.AppSettings.Load(path);
+
+            Assert.NotNull(settings.LoadError);
+            var backup = Assert.Single(Directory.GetFiles(dir, "settings.json.corrupt-*"));
+            Assert.Equal(broken, File.ReadAllText(backup));
+        }
+        finally
+        {
+            Directory.Delete(dir, recursive: true);
+        }
+    }
+
+    [Fact]
+    public void AGoodSettingsFileLoadsWithoutError()
+    {
+        var dir = NewDir();
+        try
+        {
+            var path = Path.Combine(dir, "settings.json");
+            File.WriteAllText(path, """{ "WebHttpsOnly": true, "MonitorPollMs": 1000 }""");
+
+            var settings = NetworkSentinel.Services.AppSettings.Load(path);
+
+            Assert.Null(settings.LoadError);
+            Assert.True(settings.WebHttpsOnly);
+            Assert.DoesNotContain("LoadError", System.Text.Json.JsonSerializer.Serialize(settings));
+        }
+        finally
+        {
+            Directory.Delete(dir, recursive: true);
+        }
+    }
+}

@@ -1,5 +1,6 @@
 using System.IO;
 using System.Text.Json;
+using System.Text.Json.Serialization;
 using NetworkSentinel.Models;
 
 namespace NetworkSentinel.Services;
@@ -246,32 +247,85 @@ public sealed class AppSettings
     private static string SettingsPath
         => Path.Combine(AppPaths.DataDirectory, "settings.json");
 
-    public static AppSettings Load()
+    /// <summary>
+    /// Why settings.json could not be loaded, or null. The defaults are then in effect,
+    /// and the defaults are not a safe stand-in for a console someone had locked down:
+    /// HTTPS off (plain HTTP on every interface), geo lookups and the remote allowlist
+    /// back on. The web console refuses to start on them; the GUI and TUI carry on.
+    /// </summary>
+    [JsonIgnore]
+    public string? LoadError { get; private set; }
+
+    /// <summary>
+    /// Set when the damaged file could not be copied aside: saving would then overwrite
+    /// the only copy of the operator's settings (TLS paths, the .pfx password, resolver
+    /// credentials) with defaults.
+    /// </summary>
+    private bool _saveBlocked;
+
+    public static AppSettings Load() => Load(SettingsPath);
+
+    internal static AppSettings Load(string path)
     {
         try
         {
-            var path = SettingsPath;
             if (!File.Exists(path))
-                return new AppSettings();
+                return new AppSettings { _path = path };
 
             var json = File.ReadAllText(path);
             var settings = JsonSerializer.Deserialize<AppSettings>(json, JsonOptions) ?? new AppSettings();
             settings.AutoBlockSuppressedUntil ??= new Dictionary<string, DateTime>(StringComparer.OrdinalIgnoreCase);
+            settings._path = path;
             return settings;
         }
-        catch
+        catch (Exception ex)
         {
-            return new AppSettings();
+            // A single hand-edit type error ("MonitorPollMs": "1000") used to discard the
+            // whole file silently, and the next Save() overwrote it with defaults.
+            var backup = $"{path}.corrupt-{DateTime.Now:yyyyMMdd-HHmmss}";
+            var saved = false;
+            try
+            {
+                // The web console exits on this, and systemd restarts it: one copy per
+                // distinct damaged file, not one per restart.
+                var bytes = File.ReadAllBytes(path);
+                var existing = Directory.GetFiles(Path.GetDirectoryName(path)!, Path.GetFileName(path) + ".corrupt-*")
+                    .FirstOrDefault(f => File.ReadAllBytes(f).AsSpan().SequenceEqual(bytes));
+                if (existing != null)
+                    backup = existing;
+                else
+                    File.Copy(path, backup, overwrite: false);
+                saved = true;
+            }
+            catch
+            {
+                // Unreadable or no room: then nothing may overwrite the original either.
+            }
+
+            return new AppSettings
+            {
+                _path = path,
+                _saveBlocked = !saved,
+                LoadError = $"settings.json could not be loaded ({ex.Message}). " +
+                            (saved
+                                ? $"A copy was kept as {Path.GetFileName(backup)}. "
+                                : "It was left untouched, and settings will not be saved over it. ") +
+                            "Fix or remove settings.json, then start again."
+            };
         }
     }
 
+    private string? _path;
+
     public void Save()
     {
+        if (_saveBlocked)
+            return;
         try
         {
             // Owner-only like web-master.json and duckdns.json: settings.json can hold
             // the .pfx password and the webhook URL, which are secrets too.
-            AppPaths.WriteAtomic(SettingsPath, JsonSerializer.Serialize(this, JsonOptions),
+            AppPaths.WriteAtomic(_path ?? SettingsPath, JsonSerializer.Serialize(this, JsonOptions),
                 UnixFileMode.UserRead | UnixFileMode.UserWrite);
         }
         catch

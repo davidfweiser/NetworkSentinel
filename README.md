@@ -497,7 +497,7 @@ The first button in the web console's hero action row is a single **Sleep ⇄ Wa
 
 ### Web UI security
 - First browser visit **creates a master password** (min. 8 characters)
-- Creating it from **another machine** additionally asks for a one-time **setup code**, printed where the console runs (the terminal, or `journalctl -u networksentinel-web`). Without this, whoever reached the port first — the console binds all interfaces before any password exists — could claim the master password and with it firewall control. Setup from localhost needs no code
+- Creating it asks for a one-time **setup code**, printed where the console runs (the terminal, or `journalctl -u networksentinel-web`). Without this, whoever reached the port first — the console binds all interfaces before any password exists — could claim the master password and with it firewall control. Setup from localhost needs the code too: "local" includes every account on the machine, any web page open in a browser on it (a cross-site form post reaches setup without a cookie), and — behind `tailscale serve` or any reverse proxy on the same host — every visitor. `sudo networksentinel --set-master-password` remains the no-browser alternative
 - Every later visit **requires that password**; change it under **Settings → Master password**. Changing it signs out every other session and revokes every API token
 - Can't reach a browser yet (e.g. still opening the port in a cloud firewall)? Set/reset it from the terminal instead: `sudo networksentinel --set-master-password`
 - Hash stored as PBKDF2-SHA256 (random salt, 200k iterations) in `~/.local/share/NetworkSentinel/web-master.json` — never plain text
