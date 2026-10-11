@@ -361,10 +361,12 @@ public sealed class FirewallService
 
         var inName = IpRuleName(normalized, true);
         var outName = IpRuleName(normalized, false);
-        var r1 = RemoveRuleByName(inName);
-        var r2 = RemoveRuleByName(outName);
+        var r1 = RemoveRuleByName(inName, out var o1);
+        var r2 = RemoveRuleByName(outName, out var o2);
 
-        if (!r1.Success && !r2.Success)
+        if (o1 == RemovalOutcome.Failed || o2 == RemovalOutcome.Failed)
+            return o1 == RemovalOutcome.Failed ? r1 : r2;
+        if (o1 == RemovalOutcome.Absent && o2 == RemovalOutcome.Absent)
             return FirewallOperationResult.Fail($"No Network Sentinel block rules found for {normalized}.");
 
         return FirewallOperationResult.Ok($"Unblocked {normalized}. Removed managed inbound/outbound rules when present.");
@@ -411,9 +413,11 @@ public sealed class FirewallService
         if (!IsAdministrator)
             return NoElevation("modify the host firewall");
 
-        var r1 = RemoveRuleByName(PortRuleName(port, protocol, true));
-        var r2 = RemoveRuleByName(PortRuleName(port, protocol, false));
-        if (!r1.Success && !r2.Success)
+        var r1 = RemoveRuleByName(PortRuleName(port, protocol, true), out var o1);
+        var r2 = RemoveRuleByName(PortRuleName(port, protocol, false), out var o2);
+        if (o1 == RemovalOutcome.Failed || o2 == RemovalOutcome.Failed)
+            return o1 == RemovalOutcome.Failed ? r1 : r2;
+        if (o1 == RemovalOutcome.Absent && o2 == RemovalOutcome.Absent)
             return FirewallOperationResult.Fail($"No managed port rules for {protocol}/{port}.");
 
         return FirewallOperationResult.Ok($"Removed managed rules for {protocol}/{port}.");
@@ -478,6 +482,7 @@ public sealed class FirewallService
         var rules = GetManagedRules().ToList();
         int removed = 0;
         int kept = 0;
+        int failed = 0;
         foreach (var rule in rules)
         {
             if (skip != null && skip(rule))
@@ -485,20 +490,22 @@ public sealed class FirewallService
                 kept++;
                 continue;
             }
-            if (RemoveRuleByName(rule.Name).Success)
-                removed++;
+            RemoveRuleByName(rule.Name, out var outcome);
+            if (outcome == RemovalOutcome.Removed) removed++;
+            else if (outcome == RemovalOutcome.Failed) failed++;
         }
 
-        if (kept == 0)
-        {
-            if (BackendIsNft())
-                RunPrivileged("nft", $"flush table {NftTable}");
-            SaveLedger(new List<FirewallRuleInfo>());
-        }
+        // Sweep up anything in our own table the ledger had lost track of. The ledger is
+        // not wiped here any more: an entry still in it is a rule the removal above
+        // could not confirm gone, and it is the only record that will ever retry it.
+        if (kept == 0 && BackendIsNft())
+            RunPrivileged("nft", $"flush table {NftTable}");
 
         var msg = $"Removed {removed} Network Sentinel firewall rule(s).";
         if (kept > 0)
             msg += $" Kept {kept}.";
+        if (failed > 0)
+            return FirewallOperationResult.Fail(msg + $" {failed} could not be removed and may still be in force — see the rule list.");
         return FirewallOperationResult.Ok(msg);
     }
 
@@ -759,20 +766,27 @@ public sealed class FirewallService
     /// an IPv4 and an IPv6 twin and both numbers come back, because leaving one
     /// behind still admits the traffic the delete was supposed to stop.
     /// </summary>
-    private FirewallOperationResult RemoveViaUfw(FirewallRuleInfo rule)
+    private (RemovalOutcome, string) RemoveViaUfw(FirewallRuleInfo rule)
     {
+        // No listing, no delete. The old fallback deleted by the rule's shape, which UFW
+        // matches without the comment — so it removed an operator's identical rule
+        // (their "allow 22/tcp", say) just as readily as ours.
         var listing = RunPrivileged("ufw", "status numbered");
-        var numbers = listing.Success
-            ? UfwWriter.MatchNumbers(rule, UfwWriter.ParseNumbered(listing.Message))
-            : Array.Empty<int>();
+        if (!listing.Success)
+            return (RemovalOutcome.Failed, $"Could not read UFW's rule list: {listing.Message}");
 
-        IReadOnlyList<string[]> commands = numbers.Count > 0
-            ? numbers.OrderByDescending(n => n).Select(n => new[] { "--force", "delete", n.ToString(CultureInfo.InvariantCulture) }).ToList()
-            : UfwWriter.BuildDeleteCommands(FirewallRuleSpecs.FromRule(rule));
+        var numbers = UfwWriter.MatchNumbers(rule, UfwWriter.ParseNumbered(listing.Message));
+        if (numbers.Count == 0)
+            return (RemovalOutcome.Absent, "");
 
-        var result = RunUfwBatch(commands);
+        // Highest first, so each delete leaves the lower numbers where they were. Safe
+        // between the listing and the batch because this app only ever appends to UFW.
+        var result = RunUfwBatch(numbers.OrderByDescending(n => n)
+            .Select(n => new[] { "--force", "delete", n.ToString(CultureInfo.InvariantCulture) }).ToList());
         InvalidateUfwProbe();
-        return result;
+        return result.Success
+            ? (RemovalOutcome.Removed, "")
+            : (RemovalOutcome.Failed, result.Message);
     }
 
     private static FirewallOperationResult RunUfwBatch(IReadOnlyList<string[]> commands)
@@ -799,13 +813,22 @@ public sealed class FirewallService
         if (!rule.IsForeign || rule.Kind != FirewallRuleKind.Other)
             return RemoveRule(rule.Name);
 
+        // Only a rule UFW owns goes through UFW — one listed by `ufw status`, or one in
+        // UFW's own chains. Sending every foreign rule there whenever UFW was active made
+        // deleting a Docker or hand-written nft "tcp dport 22 accept" remove the
+        // operator's UFW "22/tcp ALLOW" as well, matched on shape alone.
         var origin = rule.Origin ?? "";
-        if (origin.Equals("UFW", StringComparison.OrdinalIgnoreCase) || BackendIsUfw())
+        if (origin.Equals("UFW", StringComparison.OrdinalIgnoreCase) ||
+            rule.Chain.StartsWith("ufw", StringComparison.OrdinalIgnoreCase))
         {
-            var viaUfw = RemoveViaUfw(rule);
-            return viaUfw.Success
-                ? FirewallOperationResult.Ok($"Removed “{rule.LabelText}” from UFW.")
-                : FirewallOperationResult.Fail($"UFW refused the delete: {viaUfw.Message}");
+            var (viaUfw, why) = RemoveViaUfw(rule);
+            return viaUfw switch
+            {
+                RemovalOutcome.Removed => FirewallOperationResult.Ok($"Removed “{rule.LabelText}” from UFW."),
+                RemovalOutcome.Absent => FirewallOperationResult.Fail(
+                    $"UFW lists no rule matching “{rule.LabelText}” — it may already be gone. Rescan to check."),
+                _ => FirewallOperationResult.Fail($"UFW refused the delete: {why}")
+            };
         }
 
         if (rule.Handle.Length > 0 && BackendIsNft())
@@ -988,10 +1011,12 @@ public sealed class FirewallService
                 $"-j LOG --log-prefix {Sh(ProbeLogPrefix)} -m comment --comment {Sh(ProbeLogRuleName)} 2>/dev/null || true\n");
         }
 
+        // Only forget the rule once the privileged run went through; a dismissed prompt
+        // leaves it logging, and the ledger entry is what lets the next attempt find it.
+        if (!r.Success)
+            return r;
         RemoveFromLedger(ProbeLogRuleName);
-        return r.Success
-            ? FirewallOperationResult.Ok("Probe logging disabled.")
-            : r;
+        return FirewallOperationResult.Ok("Probe logging disabled.");
     }
 
     public bool IsProbeLoggingInstalled()
@@ -1176,36 +1201,43 @@ public sealed class FirewallService
         $"“{name}” is no longer in the firewall — it was already removed, most likely " +
         "together with another row of the same rule.";
 
-    private FirewallOperationResult RemoveRuleByName(string name)
-    {
-        bool removed = false;
+    /// <summary>What a removal found: the rule taken out, never there, or still in place.</summary>
+    internal enum RemovalOutcome { Removed, Absent, Failed }
 
-        // A rule UFW wrote is not in our nft table and has no comment nft can find;
-        // it has to come out the way it went in.
+    /// <summary>
+    /// Removes one managed rule and says what really happened. The ledger entry goes
+    /// only once the kernel side is confirmed gone (deleted now, or not there to
+    /// delete). It used to be dropped unconditionally and the call reported success
+    /// whenever an entry had existed — so a dismissed pkexec dialog, a failed sudo in
+    /// the expiry sweep, or a listing that timed out all said "Removed" while the
+    /// kernel kept dropping the traffic, and with the entry gone nothing would ever
+    /// look for that rule again.
+    /// </summary>
+    private FirewallOperationResult RemoveRuleByName(string name)
+        => RemoveRuleByName(name, out _);
+
+    private FirewallOperationResult RemoveRuleByName(string name, out RemovalOutcome outcome)
+    {
         var ledgerEntry = LoadLedger().FirstOrDefault(r =>
             string.Equals(r.Name, name, StringComparison.OrdinalIgnoreCase));
-        if (ledgerEntry != null && ledgerEntry.Backend.Equals("ufw", StringComparison.OrdinalIgnoreCase))
-        {
-            removed = RemoveViaUfw(ledgerEntry).Success;
-            RemoveFromLedger(name);
-            return removed
-                ? FirewallOperationResult.Ok($"Removed “{name}”.")
-                : FirewallOperationResult.Fail($"UFW would not remove “{name}”.");
-        }
 
-        if (BackendIsNft())
+        // The backend the rule was written through, not whichever one is current: an
+        // iptables rule stays in iptables after nft is installed, and asking nft for it
+        // found nothing and called it gone.
+        var backend = ledgerEntry?.Backend ?? "";
+        RemovalOutcome kernel;
+        string failure = "";
+
+        if (backend.Equals(UfwBackend, StringComparison.OrdinalIgnoreCase))
         {
-            var list = RunPrivileged("nft", $"-a list table {NftTable}");
-            if (list.Success)
-            {
-                foreach (var handle in FindNftHandles(list.Message, name))
-                {
-                    if (RunPrivileged("nft", $"delete rule {NftTable} input handle {handle}").Success)
-                        removed = true;
-                    else if (RunPrivileged("nft", $"delete rule {NftTable} output handle {handle}").Success)
-                        removed = true;
-                }
-            }
+            // A rule UFW wrote is not in our nft table and has no comment nft can find;
+            // it has to come out the way it went in.
+            (kernel, failure) = RemoveViaUfw(ledgerEntry!);
+        }
+        else if (backend.Equals(NftBackend, StringComparison.OrdinalIgnoreCase) ||
+                 (backend.Length == 0 && BackendIsNft()))
+        {
+            (kernel, failure) = RemoveFromNft(name);
         }
         else
         {
@@ -1217,20 +1249,158 @@ public sealed class FirewallService
                 ? new[] { "iptables", "ip6tables" }.Where(t => t == "iptables" || CommandExists(t)).ToArray()
                 : new[] { IptablesToolFor(name) };
 
+            kernel = RemovalOutcome.Absent;
             foreach (var tool in tools)
+            foreach (var chain in new[] { "INPUT", "OUTPUT" })
             {
-                removed |= DeleteIptablesByComment(tool, "INPUT", name);
-                removed |= DeleteIptablesByComment(tool, "OUTPUT", name);
+                var (one, why) = DeleteIptablesByComment(tool, chain, name);
+                kernel = Combine(kernel, one);
+                if (one == RemovalOutcome.Failed && failure.Length == 0) failure = why;
             }
         }
 
-        // Ledger is always updated so UI stays consistent even if kernel rule was already gone.
-        var hadLedger = LoadLedger().Any(r => string.Equals(r.Name, name, StringComparison.OrdinalIgnoreCase));
-        RemoveFromLedger(name);
+        if (kernel == RemovalOutcome.Failed)
+        {
+            outcome = RemovalOutcome.Failed;
+            return FirewallOperationResult.Fail(
+                $"Could not remove “{name}” — it may still be in force. {failure}".TrimEnd());
+        }
 
-        return removed || hadLedger
+        RemoveFromLedger(name);
+        outcome = kernel == RemovalOutcome.Removed || ledgerEntry != null
+            ? RemovalOutcome.Removed
+            : RemovalOutcome.Absent;
+        return outcome == RemovalOutcome.Removed
             ? FirewallOperationResult.Ok($"Removed “{name}”.")
             : FirewallOperationResult.Fail(AlreadyGoneText(name));
+    }
+
+    /// <summary>A failure anywhere wins; otherwise one removal makes the whole a removal.</summary>
+    private static RemovalOutcome Combine(RemovalOutcome a, RemovalOutcome b)
+        => a == RemovalOutcome.Failed || b == RemovalOutcome.Failed ? RemovalOutcome.Failed
+         : a == RemovalOutcome.Removed || b == RemovalOutcome.Removed ? RemovalOutcome.Removed
+         : RemovalOutcome.Absent;
+
+    private (RemovalOutcome, string) RemoveFromNft(string name)
+    {
+        var list = RunPrivileged("nft", $"-a list table {NftTable}");
+        if (!list.Success)
+        {
+            // No table means none of our rules can exist; anything else means we could not look.
+            return LooksLikeMissingTable(list.Message)
+                ? (RemovalOutcome.Absent, "")
+                : (RemovalOutcome.Failed, list.Message);
+        }
+
+        var outcome = RemovalOutcome.Absent;
+        foreach (var handle in FindNftHandles(list.Message, name))
+        {
+            if (RunPrivileged("nft", $"delete rule {NftTable} input handle {handle}").Success ||
+                RunPrivileged("nft", $"delete rule {NftTable} output handle {handle}").Success)
+            {
+                outcome = Combine(outcome, RemovalOutcome.Removed);
+            }
+            else
+            {
+                return (RemovalOutcome.Failed, $"nft would not delete handle {handle}.");
+            }
+        }
+        return (outcome, "");
+    }
+
+    /// <summary>
+    /// Deletes every rule in <paramref name="chain"/> carrying exactly this comment, by
+    /// its full specification. This used to list with <c>--line-numbers</c> and then
+    /// delete "rule N" in a separate privileged call — on a desktop, a separate pkexec
+    /// prompt that can sit open for minutes while auto-block inserts at the top of the
+    /// same chain, shifting every number, so the delete took out whichever rule had
+    /// slid into slot N (UFW's own jump rule, on iptables-legacy). A spec names the
+    /// rule itself, wherever it has moved to.
+    /// </summary>
+    private (RemovalOutcome, string) DeleteIptablesByComment(string tool, string chain, string name)
+    {
+        var list = RunPrivileged(tool, $"-S {chain}");
+        if (!list.Success)
+            return (RemovalOutcome.Failed, list.Message);
+
+        var specs = IptablesDeleteSpecs(list.Message, chain, name);
+        if (specs.Count == 0)
+            return (RemovalOutcome.Absent, "");
+
+        var exe = ResolveExecutable(tool) ?? tool;
+        var script = string.Join(" && ", specs.Select(argv =>
+            Sh(exe) + " " + string.Join(" ", argv.Select(Sh))));
+        var deleted = RunPrivilegedBatch(script);
+        return deleted.Success
+            ? (RemovalOutcome.Removed, "")
+            : (RemovalOutcome.Failed, deleted.Message);
+    }
+
+    /// <summary>
+    /// The <c>-D</c> argv for each rule in an <c>iptables -S</c> listing of
+    /// <paramref name="chain"/> whose comment is exactly <paramref name="comment"/>.
+    /// The listing is iptables-save syntax, which reads back as a delete once
+    /// <c>-A</c> becomes <c>-D</c>. Matched on the whole comment token, so removing
+    /// "…-Rule-SSH" leaves "…-Rule-SSH-2" alone.
+    /// </summary>
+    internal static IReadOnlyList<string[]> IptablesDeleteSpecs(string listing, string chain, string comment)
+    {
+        var specs = new List<string[]>();
+        foreach (var raw in listing.Split('\n'))
+        {
+            var tokens = SplitIptablesLine(raw.Trim());
+            if (tokens.Count < 2 || tokens[0] != "-A" || tokens[1] != chain) continue;
+
+            var at = tokens.IndexOf("--comment");
+            if (at < 0 || at + 1 >= tokens.Count || tokens[at + 1] != comment) continue;
+
+            tokens[0] = "-D";
+            specs.Add(tokens.ToArray());
+        }
+        return specs;
+    }
+
+    /// <summary>
+    /// Splits one <c>iptables -S</c> line into argv. iptables double-quotes a value
+    /// with spaces in it (a comment, the probe rule's "NS-PROBE " log prefix) and
+    /// backslash-escapes quotes inside one.
+    /// </summary>
+    internal static List<string> SplitIptablesLine(string line)
+    {
+        var tokens = new List<string>();
+        var current = new StringBuilder();
+        bool inQuotes = false, any = false;
+        for (int i = 0; i < line.Length; i++)
+        {
+            var c = line[i];
+            if (inQuotes)
+            {
+                if (c == '\\' && i + 1 < line.Length && (line[i + 1] == '"' || line[i + 1] == '\\'))
+                    current.Append(line[++i]);
+                else if (c == '"')
+                    inQuotes = false;
+                else
+                    current.Append(c);
+            }
+            else if (c == '"')
+            {
+                inQuotes = true;
+                any = true;
+            }
+            else if (char.IsWhiteSpace(c))
+            {
+                if (any) tokens.Add(current.ToString());
+                current.Clear();
+                any = false;
+            }
+            else
+            {
+                current.Append(c);
+                any = true;
+            }
+        }
+        if (any) tokens.Add(current.ToString());
+        return tokens;
     }
 
     /// <summary>
@@ -1244,31 +1414,6 @@ public sealed class FirewallService
            && address.AddressFamily == System.Net.Sockets.AddressFamily.InterNetworkV6
             ? "ip6tables"
             : "iptables";
-
-    private bool DeleteIptablesByComment(string tool, string table, string name)
-    {
-        var list = RunPrivileged(tool, $"-L {table} -n --line-numbers");
-        if (!list.Success) return false;
-
-        // Whole comment, in iptables' own delimiters — see FindNftHandles for why a
-        // substring match deleted the neighbouring "…-2" rule as well.
-        var needle = $"/* {name} */";
-        var lines = list.Message.Split('\n')
-            .Where(l => l.Contains(needle, StringComparison.Ordinal))
-            .Select(l => l.Trim().Split(' ', StringSplitOptions.RemoveEmptyEntries).FirstOrDefault())
-            .Where(s => !string.IsNullOrEmpty(s) && int.TryParse(s, out _))
-            .Select(s => int.Parse(s!))
-            .OrderByDescending(n => n)
-            .ToList();
-
-        bool any = false;
-        foreach (var num in lines)
-        {
-            if (RunPrivileged(tool, $"-D {table} {num}").Success)
-                any = true;
-        }
-        return any;
-    }
 
     /// <summary>
     /// Handles of the rules carrying exactly this comment.
@@ -2096,8 +2241,14 @@ public sealed class FirewallService
         => message.Contains("No such file or directory", StringComparison.OrdinalIgnoreCase)
            || message.Contains("does not exist", StringComparison.OrdinalIgnoreCase);
 
+    private int _sweeping;
+
     private void TrySweepExpired()
     {
+        // A Timer fires on the thread pool whether or not the last tick has finished, and
+        // a sweep can outlast the minute (each removal is a list plus a delete, under a
+        // 30 s process timeout). Two at once raced on the same rules.
+        if (Interlocked.Exchange(ref _sweeping, 1) == 1) return;
         try
         {
             var expired = LoadLedger().Where(r => r.IsExpired).ToList();
@@ -2118,6 +2269,10 @@ public sealed class FirewallService
         catch
         {
             // sweep is best-effort; it simply retries next minute
+        }
+        finally
+        {
+            Interlocked.Exchange(ref _sweeping, 0);
         }
     }
 
