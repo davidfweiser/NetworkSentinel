@@ -739,7 +739,7 @@ No URL ACL is reserved. That was an `HttpListener` requirement; Kestrel binds th
 
 #### Upgrades and uninstall
 
-Re-running the installer **upgrades in place**: it stops the running task, replaces the binaries, and restarts. `%ProgramData%\NetworkSentinel` is both the install folder and the data directory, so the installer removes **only the files the package ships** — the master password hash, settings, allowlist, logs, host history, threat log, `duckdns.json`, `tls\`, and `acme\` all survive. The web console's navigation rail shows the running version (e.g. `v0.7.13`) — check it after an upgrade to confirm the new build is live.
+Re-running the installer **upgrades in place**: it stops the running task, replaces the binaries, and restarts. `%ProgramData%\NetworkSentinel` is both the install folder and the data directory, so the installer removes **only the files the package ships** — the master password hash, API tokens, settings, allowlist, logs, host history, threat log, `duckdns.json`, `tls\`, and `acme\` all survive. The web console's navigation rail shows the running version (e.g. `v0.7.13`) — check it after an upgrade to confirm the new build is live.
 
 Uninstall keeps that same data by default so a reinstall picks up where you left off:
 
@@ -765,7 +765,7 @@ The console is laid out like the desktop window (0.7.4), because they are the sa
 | **Firewall & Block** | Managed rules grouped as In/Out pairs; manual IP and port blocking; **Restore allowlisted** |
 | **Firewall Config** (rebuilt 0.7.4) | The whole host firewall — Windows' own rules, Network Sentinel's, and everyone else's — plus listening services and their firewall verdict; add / edit / delete any of them |
 | **Allowlist** | Add/remove trusted domains and IPs; refresh the feed |
-| **Settings** | Monitoring on/off, page refresh speed, geo lookups, failed-logon monitoring, closed-port scan detection, the intrusion detectors (threat intel, new-listener, process reputation, ARP watch, startup-item watch, exfiltration, honeypot), **kernel flow events**, **DNS hygiene** (with approved resolvers), **DNS filtering** (resolver address, user and password), **WireGuard peer monitoring**, **Suricata signature ingestion** (EVE path), **auto-block dry run**, **HTTPS + DuckDNS remote access** (including **Issue certificate**), webhook alerts, auto-block + minimum severity + expiry, block direction (in/out), allowlist feed, **change master password**, **Remove all rules** |
+| **Settings** | Monitoring on/off, page refresh speed, geo lookups, failed-logon monitoring, closed-port scan detection, the intrusion detectors (threat intel, new-listener, process reputation, ARP watch, startup-item watch, exfiltration, honeypot), **kernel flow events**, **DNS hygiene** (with approved resolvers), **DNS filtering** (resolver address, user and password), **WireGuard peer monitoring**, **Suricata signature ingestion** (EVE path), **auto-block dry run**, **HTTPS + DuckDNS remote access** (including **Issue certificate**), webhook alerts, auto-block + minimum severity + expiry, block direction (in/out), allowlist feed, **API tokens** for a bot — read-only or control, **change master password**, **Remove all rules** |
 
 The console protects itself: it refuses to remove its own firewall access rule, block its own port, or write a Firewall Config rule that would do the same (doing so would cut off your browser mid-request and look exactly like a crash).
 
@@ -856,11 +856,109 @@ The app starts **without** forcing UAC (so TUI/web work on servers). Desktop ins
 ### Web UI security
 - First browser visit **creates a master password** (min. 8 characters)
 - Creating it from **another machine** additionally asks for a one-time **setup code**, printed where the console runs (the terminal, or the service log when it runs as a scheduled task). Without this, whoever reached the port first — the console binds all interfaces before any password exists — could claim the master password and with it firewall control. Setup from localhost needs no code
-- Later visits require that password; change it under **Settings → Master password**
+- Later visits require that password; change it under **Settings → Master password**. Changing it signs out every other session and revokes every API token
 - Can't reach a browser yet (e.g. still opening the port in a cloud firewall), or lost the password? Set/reset it from the terminal instead — see below
 - Hash stored as PBKDF2-SHA256 (random salt, 200k iterations) in `%ProgramData%\NetworkSentinel\web-master.json` — never plain text
 - Session cookie until sign-out, browser close, or 12 hours idle
 - Failed attempts are throttled **per client IP**: five wrong guesses trigger a lockout that doubles with each further attempt (1 minute up to 1 hour), answered with `429` and a `Retry-After`. A fixed delay alone only slows one connection at a time — this caps a parallel guesser
+
+### API tokens — monitoring and control for a bot
+
+A bot or script that works with this console should not hold the master password. A session is the whole console, Settings and credentials included, so every place an unattended client keeps its configuration would become a route to all of it. Tokens are the bot's own credential, in two strengths:
+
+| Access | Can | Cannot |
+|--------|-----|--------|
+| **Read only** (default) | Read status, threats and blocked addresses under `/api/v1/monitor/` — and, if the token is limited to source addresses, the connection, firewall and allowlist tables too | Change anything |
+| **Read and control** | All of the above, plus run the console's actions through `POST /api/v1/control` | Open or change **Settings**, issue a certificate, create or revoke tokens, sign in, change the master password |
+
+Create one under **Settings → API tokens**: a name, the access level, an expiry (30 days, 90 days, a year, or never), the addresses it may be used from — optional for a read-only token, **required for a control token** — and your **master password again**. The token is shown **once**; only its SHA-256 is stored, in `%ProgramData%\NetworkSentinel\web-api-tokens.json`. Send it as a bearer header:
+
+```powershell
+curl.exe -H "Authorization: Bearer nsm_…" https://myhost.duckdns.org:18443/api/v1/monitor/summary
+```
+
+#### Reading — `GET /api/v1/monitor/…`
+
+| Endpoint | Returns |
+|----------|---------|
+| `health` | Version, host name, uptime, whether monitoring is running, and this token's own name and expiry — so the bot can warn before it is locked out |
+| `summary` | The dashboard's counters, threat counts by level, blocked-address count, auto-block state (including dry run), whether the firewall can be written, current in/out byte rates |
+| `threats` | Threat events, newest first, each with its block verdict. `?since=` takes the `ts` of the last event already seen and returns only newer ones (`latestTs` is the cursor); `?minLevel=High`; `?limit=` 1–200, default 50 |
+| `blocked` | Addresses currently blocked by Network Sentinel's rules |
+| `traffic` | The data-flow card: live rates, this month, daily and monthly history |
+| `connections` / `hosts` / `ports` † | The Live Connections, Remote Computers and Open Ports tables |
+| `firewall` † | Managed block rules (`firewallRules`), the whole host firewall (`configRules`, each with its `key`), firewall status, and listening services with their verdict |
+| `allowlist` † | The never-block list and its status |
+| `dns-blocked` † | What the filtering resolver refused (`?limit=`), where one is configured |
+
+† Served only to a token limited to source addresses (`403` otherwise). These are a map of the host — every connection and listener, the firewall as written, what tunnel clients tried to resolve — and a read-only token may otherwise be valid from anywhere. A control token is always limited, so it always has them.
+
+The table rows are the console's own, built by the same code, so the identifiers in them are exactly what the control route takes back. Timestamps in `health`, `summary`, `threats` and `firewall.hostFirewall` are ISO 8601 UTC. Every response is JSON with `ok`; a failure carries a `message`.
+
+#### Controlling — `POST /api/v1/control`
+
+The body is the console's own action format — the same JSON the page posts — so anything the bot does is something the console could have done, through the same checks:
+
+```bash
+curl -X POST -H "Authorization: Bearer nsm_…" -H "Content-Type: application/json" \
+     -d '{"action":"block","ip":"203.0.113.9"}' https://myhost.duckdns.org:18443/api/v1/control
+```
+
+| Action | Fields | Does |
+|--------|--------|------|
+| `block` / `unblock` | `ip` | Block or unblock an address (direction follows the auto-block setting) |
+| `block_port` / `unblock_port` | `value` (port), `kind` (`TCP`/`UDP`), `direction` (`Inbound`/`Outbound`/`Both`) | Block or unblock a local port |
+| `remove_rule` | `value` (a `name` from `firewallRules`) | Remove one managed block |
+| `remove_all_rules` | — | Remove every Network Sentinel block rule; auto-block will not re-add them for 24 h |
+| `restore_allowlisted` | — | Unblock anything on the allowlist |
+| `save_config_rule` | `label`, `ruleAction` (`Allow`/`Block`), `direction`, `protocol`, `ports`, `addresses`; `key` to replace a scanned rule | Add or edit a host firewall rule |
+| `delete_host_rule` | `key` (from `configRules`) | Delete a host firewall rule — Windows' own and other software's included |
+| `rescan_firewall` | — | Re-read the host firewall now |
+| `add_allowlist` / `remove_allowlist` | `value` (domain or IP), `kind` (`Domain`/`IP`) for removal | Edit the never-block list |
+| `refresh_allowlist` | — | Refresh the allowlist feed |
+| `sleep` / `wake` | — | Stop or resume all monitoring (blocks stay in force) |
+| `clear_threats` | — | Clear the threat list |
+| `set_setting` with `name: "autoBlockEnabled"` | `value` (`true`/`false`) | Auto-block on or off, stated explicitly — the only setting a token can write |
+| `set_min_level` | `value` (`Medium`/`High`/`Critical`) | Auto-block minimum severity |
+| `authorize` | — | The header's **Authorize firewall** |
+
+`toggle_autoblock`, `toggle_sleep` and `cycle_min_level` are accepted too, since the page has them, but a bot should say which state it wants: two toggles in a row cancel out. The answer is `{"ok": true, "message": …}` with the console's own wording, `400` when the action was tried and failed (the message says why), and `403` for an action tokens may not run. A failure message is the first paragraph of what the page would show: the page follows it with how to run this service elevated, which names its scheduled task and install folder, and that part stays in the console.
+
+Everything that is a row on the **Settings** page stays there — detectors, webhook, HTTPS, DuckDNS, DNS filtering, and of auto-block: dry run, direction and expiry. On/off and minimum severity are open because they are buttons in the console's header rather than settings.
+
+#### What makes it safe to hand to a bot
+
+- **Separate from the console in both directions.** A token is not a session, so `/api/state` (which carries the settings page), `/api/action` and the password endpoints answer `401` to it however it is presented. A browser session does not open the token routes either, so there is no cookie here for another site to ride on, and no CORS header is sent
+- **Minting takes the password, not just the session.** Creating a token asks for the master password again, throttled like the sign-in page. A token outlives the session that made it, so an unlocked browser or a stolen cookie must not be enough to leave a permanent credential behind
+- **A control token only exists pinned.** It is refused unless it names the addresses the bot calls from, so a copy that leaks — from a config file, a backup, a log — is useless from anywhere else. Read-only tokens can be pinned the same way (`203.0.113.7, 10.8.0.0/24`). Pin only when the bot connects directly: behind a local reverse proxy (`tailscale serve` included) every caller arrives as `127.0.0.1`
+- **Actions are listed, not excluded.** The control route runs the actions in the table above and nothing else, so an action added to the console later is closed to tokens until it is deliberately opened — a test fails until someone decides. A token cannot create or revoke tokens — one that could would outlive its own expiry, pinning and revocation — and that is not a rule the control route has to remember: token management is not among the things the action runner can do at all
+- **The console's own guards still apply.** A token cannot block the port the console is served on, write a rule that blocks all inbound traffic, remove the console's own access rule, or block an allowlisted or LAN address — the same refusals the page gets
+- **Everything is in the audit log.** Tokens created and revoked (and from which address), every control action with the token's name, id, caller and result, every refused token and why, a read-only token trying the control route, lockouts, and a token seen on plain HTTP — one line each in `%ProgramData%\NetworkSentinel\logs\api-audit.log` (rotated at 1 MB with eight older files kept, so a burst of entries cannot push what came before it straight off the end). An action also shows on the console's status line as `GrokBot (API): …` and on the token's row as its last action, and block rules it writes are described as `API block · …` rather than `Web UI block · …`. A refused request is logged by name only, never with the value it tried to set
+- **Nothing from Settings is exposed.** Read responses are built table by table, not from the page's state — no webhook URL, resolver login, TLS paths or token list
+- **HTTPS only.** A request over plain HTTP is refused with `403` unless it comes from localhost, and refused *before* the HTTPS redirect: a client that followed the redirect would work while sending its token in the clear on every call. If the console serves plain HTTP only, the API answers this machine alone. A live token that does arrive in the clear is flagged on its row — and stays flagged until it is revoked — and written to the audit log once, so you hear that it was exposed and not only the bot. The same rule holds where a token is born: one cannot be *created* over plain HTTP from another machine, since it would cross the network unencrypted the moment it was shown
+- **Header only.** A token in a query string ends up in proxy logs and shell history, so that spelling is not accepted
+- **A pinned caller is shielded from auto-block** the way a signed-in operator is — you vouched for that address, and a frequent poller is what the reconnect heuristics would otherwise learn to block. An unpinned token gets no such shield, or a stolen one would buy immunity from the firewall
+- **Refusals say nothing.** Unknown, wrong, expired, revoked and wrong-address all return the same `401`, so the answer cannot confirm that a stolen token is real. The reason goes to you instead: the token's row in Settings shows when it was last used and from where, and the last refusal with its cause — which is also how use of a leaked token shows up
+- **Throttled twice.** Five rejected tokens from one address lock it out for a minute (`429` + `Retry-After`), on a separate counter so a misconfigured bot cannot lock you out of the console. It does not double to an hour the way the sign-in page does: that guards a password a person chose, this guards 256 random bits, and the long lockout only ever caught the bot itself still retrying a token you had just replaced. A request with no token at all is not counted. A valid token is limited to 120 requests a minute
+- **Revocable alone, and all at once.** **Revoke** takes effect on the next request and touches nothing else. **Changing the master password revokes every token**, as it signs out every other session: a password is usually changed because something leaked, and a token minted under the old one is exactly the credential that must not survive. `NetworkSentinel.exe --set-master-password` does the same
+- **The file is the truth.** The running console re-reads `web-api-tokens.json` whenever it changes, before every request. A token revoked by another console on the same data directory stops working here at once, and deleting the file revokes everything — the emergency brake. Writers take turns under a lock file, so one console's bookkeeping write cannot land on top of another's revocation. If a revocation cannot be saved (disk full, permissions) the token is still refused, stays refused however the file changes, and the save is retried until it lands — and the console says the change would not yet survive a restart instead of reporting success
+
+The token file and the audit log sit in `%ProgramData%\NetworkSentinel` under that folder's ACL, exactly as the master-password hash does — there is no per-file owner-only mode as on the Linux build. An account that can write that folder can already replace the master password, so the tokens add no new way in, but it is the same boundary: do not give untrusted local accounts a logon on the server.
+
+A control token is close to the firewall half of the master password, so give one only to a bot you run yourself. If the bot feeds what it reads to a language model, treat `title`, `detail`, `origin` and host and process names as untrusted text: they quote things an attacker chooses — user names from failed logons, reverse-DNS names. With a control token that matters more: the bot should act on what *you* tell it, never on instructions it finds in those fields, and confirming with you before each change is the right default.
+
+#### When a token call is refused
+
+| Symptom | Likely cause / fix |
+|---------|--------------------|
+| Token API answers `403` | The message says which: the request came over **plain HTTP** from another machine (point the bot at the `https://` port — and revoke that token, it has been on the wire unencrypted); a **read-only** token was used on `/api/v1/control`; a token **not limited to source addresses** asked for the connection, firewall, allowlist or blocked-sites tables; or the action is one tokens may not run (Settings, certificates, token management). |
+| Creating a token answers that it "cannot be created over plain HTTP" | You are using the console over plain HTTP from another machine, and the new token would be shown to you unencrypted. Open the console on its `https://` port, or create the token on the machine it runs on. |
+| Creating a token answers "Incorrect master password" | Creating one asks for the master password again — being signed in is not enough. Five wrong tries lock that address out of the sign-in page too; it is the same guess. |
+| Every token stopped working at once | The master password was changed (in the page or with `--set-master-password`), which revokes them all, or `web-api-tokens.json` was removed. Create new ones. |
+| Token API answers `401` with a token that used to work | Every refusal looks the same to the caller on purpose. The reason is on the token's row under **Settings → API tokens**: expired, or called from an address outside its allowed sources. A token missing from the list was revoked. |
+| Token API answers `429` | Either five rejected tokens from that address (a one-minute lockout, with `Retry-After`) or more than 120 requests a minute on one token. Fix the token or slow the poll — every 30–60 seconds is plenty. |
+| A control action answers `400` "Cannot …" | The token was accepted; the console itself is not running elevated, so it cannot write the firewall. Same cause and fix as the page's — the Firewall Config tab spells out the commands. |
+| An allowlist entry removed by the bot is still listed for a while | The list is redrawn when the allowlist's DNS re-resolve finishes, and a change made while one is already running waits for the next. The removal itself is immediate. |
 
 ### HTTPS and remote access
 
@@ -976,6 +1074,8 @@ Start-Process -Wait .\NetworkSentinel.exe --set-master-password
 schtasks /End /TN "NetworkSentinel-Web"
 schtasks /Run /TN "NetworkSentinel-Web"
 ```
+
+Like changing the password in the browser, this revokes every [API token](#api-tokens--monitoring-and-control-for-a-bot): it removes `web-api-tokens.json`, and a running console stops honouring them at once, before the restart.
 
 `Start-Process -Wait` (or running it from `cmd.exe`) matters: the app is a GUI-subsystem binary, so launched directly from PowerShell the prompt would share the console with your shell. Or delete `%ProgramData%\NetworkSentinel\web-master.json` outright and let the next browser visit create a fresh one.
 
@@ -1129,11 +1229,13 @@ The token is written to `duckdns.json`, not `settings.json`; the GUI, TUI, and w
 | `Services/DuckDnsUpdater.cs` | DuckDNS dynamic-DNS refresh loop; token file with an admins-only ACL |
 | `Services/TlsCertificateProvider.cs` | Loads the console's PEM/`.pfx` and re-reads it after an ACME renewal |
 | `Services/CertIssuanceService.cs` | Drives `issue-duckdns-cert.ps1` behind the **Issue certificate** button |
-| `Services/LoginThrottle.cs` | Per-client-IP lockout for the console's password endpoints |
+| `Services/LoginThrottle.cs` | Per-client-IP lockout for the console's password endpoints and, on its own counter, the token API |
 | `ViewModels/MainViewModel.cs` | UI state, commands, auto-block wiring |
 | `ViewModels/MainViewModel.FirewallConfig.cs` / `.Traffic.cs` | Firewall Config page; data-flow chart series and legends |
 | `Web/WebApp.cs` | Headless web console (Kestrel HTTP/HTTPS host + embedded single-page UI) |
 | `Web/WebAuthStore.cs` | Master password hash + session tokens |
+| `Web/ApiTokenStore.cs` | API tokens for a bot (read-only or control): hashed at rest, expiry, source pinning, per-token rate limit; re-read from disk whenever the file changes |
+| `Web/ApiAuditLog.cs` | One line per token event — minted, revoked, refused, every control action — to `logs\api-audit.log` |
 | `Web/WebTlsOptions.cs` | TLS values from the command line, overlaid on the saved settings |
 | `scripts/issue-duckdns-cert.ps1` | Let's Encrypt DNS-01 issuance via Posh-ACME + renewal scheduled task |
 | `scripts/diagnose-ipsec.ps1` | Read-only triage for a site-to-site tunnel that won't come up |
