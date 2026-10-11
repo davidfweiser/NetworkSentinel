@@ -10,9 +10,27 @@ Three ways to run it (same idea as the Linux build):
 | **Terminal UI (`--tui`)** | Server Core, RDP console, SSH-style workflows |
 | **Headless web UI (`-w`)** | Browser dashboard on a server (master-password protected) |
 
-> Awareness / monitoring tooling — not a full IDS/IPS replacement. Version **0.7.18**.
+> Awareness / monitoring tooling — not a full IDS/IPS replacement. Version **0.7.19**.
 
 ---
+
+## What's new in 0.7.19
+
+The Windows side of the Linux security audit: four fixes, each for a way the app could be turned against the machine it protects.
+
+| Area | What changed |
+|------|--------------|
+| **Auto-block cannot be aimed** | Auto-block acts on the address a threat names, so that address must not be one an attacker can pick. A threat whose evidence never completed a TCP handshake — half-open sessions, SYNs the firewall dropped, Suricata alerts on UDP/ICMP or on TCP with no app-layer protocol — is now shown and alerted on but **never auto-blocked**, and its alert says why. Six forged SYNs to port 3389 "from" your own address used to be enough to lock you out. A half-open session is confirmed as soon as it is seen past the handshake, so a connect scan or a real brute-force still blocks. DNS-hygiene alerts name a resolver this machine queried, not an attacker, and are never blocked either. |
+| **Three more gates** | A DNS server an adapter is configured with is never auto-blocked. Auto-blocks are capped at **20 per rolling minute** — past that a detector is being fed, and threats are reported but not acted on. A block held back by a gate is described by its own message (a held-back tunnel endpoint used to read as "the firewall refused the rule"). |
+| **Auto-blocks expire by default** | New installs expire auto-blocks after **24 h** instead of never. An existing `settings.json` keeps the value it already holds, including "never". |
+| **Elevated tools come from Windows, not from the folder you started in** | `netsh.exe` and `powershell.exe` are run from the Windows system directory by absolute path, and `wg.exe` from WireGuard's install directory, with no fallback to a bare name. A bare name is searched for in the current directory before System32, so a `netsh.exe` dropped beside wherever the app was started would have run as Administrator — or been what the DNS-filter setup's consent prompt elevated. A tool that is not where Windows installs it now reads as not installed. |
+| **Master-password file** | `--set-master-password` refuses to run if `%ProgramData%\NetworkSentinel` is a junction or symbolic link (any account can plant one there before the install), and the hash is written through a uniquely named new file rather than a fixed `web-master.json.tmp` that anything already under that name was written straight into. |
+| **Rule removal says what happened** | A delete `netsh` would not carry out used to look the same as a rule that was never there. Unblock answered "no block rules found" for an address that was still blocked, removing one half of an In/Out pair reported success, and the expiry sweep forgot a rule it had failed to remove — leaving the block in force with nothing left to retry it. Removal now reports **removed**, **not there**, or **could not be removed — may still be in force**, and an expiry is only forgotten once the rule is confirmed gone. Remove-all says how many rules it could not remove. The expiry sweep can no longer run twice at once. |
+| **Guesses are counted before they are checked** | Each master-password or setup-code guess is counted against the lockout before the password is looked at, and cleared on success. Checking the lockout first and counting the failure afterwards — with a slow hash and a deliberate delay in between — let a burst of parallel requests all get through: 20 parallel wrong logins now get exactly 5 guesses and 15 refusals. |
+| **Setup always asks for the setup code** | First-visit setup needs the code from the server's own browser too. "Local" covered every account on the machine, any web page open in a browser on it, and every visitor behind a reverse proxy on the same host. Because the scheduled-task service has no console anyone can see, the code is also written to `%ProgramData%\NetworkSentinel\setup-code.txt`, readable by Administrators only and removed once a password is set. |
+| **Damaged files fail closed** | A `web-master.json` that exists but cannot be read counts as configured-but-unusable — nobody can sign in or run setup over it until `--set-master-password` resets it. It used to read as "no password yet" and reopen setup to the first visitor. A `settings.json` that fails to load is copied aside (`settings.json.corrupt-<time>`) and never silently overwritten, and the web console refuses to start on the defaults, which mean plain HTTP on every interface whatever you had configured. |
+
+**Upgrading.** If you set the master password up in a browser on the server itself, nothing changes — the password is already there. A fresh install now needs the code from `setup-code.txt` (or `--set-master-password`, which needs none).
 
 ## What's new in 0.7.18
 
@@ -651,11 +669,11 @@ Self-contained by default — the server does **not** need the .NET SDK or a com
 
 ```powershell
 # Copy the .install.cmd to the server, then run it (UAC prompt if not elevated):
-.\NetworkSentinel-windows-server-x64-0.7.18.install.cmd
+.\NetworkSentinel-windows-server-x64-0.7.19.install.cmd
 # optional port:
-.\NetworkSentinel-windows-server-x64-0.7.18.install.cmd -Port 18765
+.\NetworkSentinel-windows-server-x64-0.7.19.install.cmd -Port 18765
 # unpack without installing:
-.\NetworkSentinel-windows-server-x64-0.7.18.install.cmd --extract-only
+.\NetworkSentinel-windows-server-x64-0.7.19.install.cmd --extract-only
 ```
 
 The one-file installer is a `.cmd`, not a `.ps1`: `cmd.exe` stops reading the script at `exit /b`, so the ZIP appended to it is never parsed. PowerShell tokenizes an entire `-File` script before running any of it, and the cost on appended binary is quadratic (16 MB ≈ 5½ minutes) before it fails to parse at all — so the shell-style "payload after exit" trick only works with a `cmd` entry point.
