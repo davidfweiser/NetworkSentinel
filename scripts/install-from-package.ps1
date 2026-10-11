@@ -265,7 +265,9 @@ Write-Host "  App     : $Exe -w $Port"
 Write-Host "  Task    : $TaskName  (runs as SYSTEM at boot, before anyone logs in,"
 Write-Host "            and starts it again within 5 minutes if it stops)"
 Write-Host "  Open    : http://localhost:$Port/  or  http://<server-ip>:$Port/"
-Write-Host "  First browser visit creates a master password."
+Write-Host "  First browser visit creates a master password. It asks for the setup code in"
+Write-Host "  %ProgramData%\NetworkSentinel\setup-code.txt (Administrators only; the code"
+Write-Host "  changes each time the task starts, and the file goes once a password is set)."
 if ($HttpsPort -gt 0 -and $HttpsPort -ne $Port) {
     Write-Host ""
     Write-Host "  HTTPS   : TCP $HttpsPort is open in the firewall but not served yet." -ForegroundColor Cyan

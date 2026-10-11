@@ -72,9 +72,19 @@ public sealed class CertIssuanceService
             };
         }
 
+        // System32 only, never a bare name — see SystemTools.
+        var powerShell = SystemTools.PowerShell;
+        if (powerShell == null)
+        {
+            return new CertIssuanceResult
+            {
+                Message = "Windows PowerShell was not found in the Windows system directory, so the certificate script cannot run.",
+            };
+        }
+
         var psi = new ProcessStartInfo
         {
-            FileName = "powershell.exe",
+            FileName = powerShell,
             RedirectStandardOutput = true,
             RedirectStandardError = true,
             UseShellExecute = false,

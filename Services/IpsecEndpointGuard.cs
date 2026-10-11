@@ -307,9 +307,13 @@ public sealed class IpsecEndpointGuard : IDisposable
         error = "";
         try
         {
-            var netshExe = Path.Combine(
-                Environment.GetFolderPath(Environment.SpecialFolder.System), "netsh.exe");
-            if (!File.Exists(netshExe)) netshExe = "netsh";
+            // System32 only, never a bare name — see SystemTools.
+            var netshExe = SystemTools.Netsh;
+            if (netshExe == null)
+            {
+                error = "netsh.exe was not found in the Windows system directory";
+                return false;
+            }
 
             var psi = new ProcessStartInfo
             {

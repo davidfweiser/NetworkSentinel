@@ -329,7 +329,11 @@ public sealed class ProbeLogMonitor : IDisposable
                      $"{closedCount} of {probedPorts.Count} probed ports are not open on this machine. " +
                      "These probes never show up as connections — they were caught by the firewall log.",
             Origin = "Origin resolving…",
-            Method = method
+            Method = method,
+            // A SYN the firewall dropped goes no further, so nothing here proves the
+            // logged source sent it: blocking on it would hand anyone who can forge a
+            // source address the power to cut this host off from that address.
+            AutoBlockHoldReason = "SYNs the firewall dropped never complete a handshake, so the source address may be forged"
         });
     }
 
