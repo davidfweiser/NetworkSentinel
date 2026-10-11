@@ -491,3 +491,48 @@ public class FirewallRuleSpecTests
         Assert.Equal(FirewallRuleSpecs.AnyAddressText, rule.AddressListText);
     }
 }
+
+/// <summary>
+/// A delete netsh would not carry out must never read as "that rule was not there":
+/// unblock and the expiry sweep both forget a rule on the strength of the answer.
+/// </summary>
+public class RuleRemovalOutcomeTests
+{
+    private const string Listing =
+        "Rule Name:                            NetworkSentinel-IP-203.0.113.9-In\r\n" +
+        "----------------------------------------------------------------------\r\n" +
+        "Enabled:                              Yes\r\n" +
+        "Direction:                            In\r\n" +
+        "\r\n" +
+        "Rule Name:                            NetworkSentinel-Rule-SSH-2\r\n" +
+        "----------------------------------------------------------------------\r\n" +
+        "Enabled:                              Yes\r\n" +
+        // The label is localized; the name is not.
+        "Regelname:                            NetworkSentinel-Port-TCP-180-In\r\n";
+
+    [Theory]
+    [InlineData("No rules match the specified criteria.", true)]
+    [InlineData("No matching rule.", true)]
+    [InlineData("netsh timed out.", false)]
+    [InlineData("The requested operation requires elevation (Run as administrator).", false)]
+    [InlineData("", false)]
+    public void OnlyNetshsOwnNoMatchAnswerMeansAbsent(string message, bool absent)
+        => Assert.Equal(absent, FirewallService.LooksLikeNoMatchingRule(message));
+
+    [Fact]
+    public void FindsARuleByItsWholeName()
+    {
+        Assert.True(FirewallService.ListingNamesRule(Listing, "NetworkSentinel-IP-203.0.113.9-In"));
+        Assert.True(FirewallService.ListingNamesRule(Listing, "NetworkSentinel-Rule-SSH-2"));
+        Assert.True(FirewallService.ListingNamesRule(Listing, "NetworkSentinel-Port-TCP-180-In"));
+    }
+
+    [Fact]
+    public void APrefixOrSuffixOfAnotherNameIsNotAMatch()
+    {
+        Assert.False(FirewallService.ListingNamesRule(Listing, "NetworkSentinel-Rule-SSH"));
+        Assert.False(FirewallService.ListingNamesRule(Listing, "NetworkSentinel-Port-TCP-80-In"));
+        Assert.False(FirewallService.ListingNamesRule(Listing, "NetworkSentinel-IP-203.0.113.9-Out"));
+        Assert.False(FirewallService.ListingNamesRule(Listing, "SSH-2"));
+    }
+}

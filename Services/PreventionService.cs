@@ -1,3 +1,4 @@
+using System.Net.NetworkInformation;
 using NetworkSentinel.Models;
 
 namespace NetworkSentinel.Services;
@@ -109,10 +110,12 @@ public sealed class PreventionResult
 /// drop traffic must not.
 ///
 /// Ordered gates, cheapest first — a threat must clear all of them:
-///   severity ≥ MinLevel → not informational-only → routable public IP →
-///   not allowlisted → not this machine's own address → not a protected
-///   endpoint (WireGuard peers) → not operator-protected → not already blocked →
-///   not suppressed by a manual unblock → not attempted in the last RetryAfter.
+///   severity ≥ MinLevel → not informational-only → evidence names the actor
+///   (no forgeable source, see <see cref="ThreatEvent.AutoBlockHoldReason"/>) →
+///   routable public IP → not allowlisted → not this machine's own address →
+///   not a configured DNS resolver → not a protected endpoint (WireGuard peers) →
+///   not operator-protected → not already blocked → not suppressed by a manual
+///   unblock → not attempted in the last RetryAfter → under the per-minute cap.
 ///
 /// The engine also answers for the alert channels: <see cref="DescribeEnforcement"/>
 /// turns a threat plus the pass that ran over its batch into the "is this address being
@@ -155,6 +158,16 @@ public sealed class PreventionService
     public static readonly TimeSpan ElevationFailureBackoff = TimeSpan.FromMinutes(5);
 
     private static readonly TimeSpan BlockedIpsMaxAge = TimeSpan.FromSeconds(15);
+
+    /// <summary>
+    /// Most auto-blocks written in any rolling minute. A real attack is a handful of
+    /// addresses; dozens a minute means a detector is being fed — by a flood of forged
+    /// sources or a broken feed — and every further rule is more likely an outage than a
+    /// defence. Past the cap, threats are still reported, just not acted on.
+    /// </summary>
+    public const int MaxBlocksPerMinute = 20;
+
+    private readonly Queue<DateTime> _recentBlocks = new();
 
     private readonly FirewallService _firewall;
     private readonly AllowlistService _allowlist;
@@ -346,6 +359,22 @@ public sealed class PreventionService
                 continue;
             }
 
+            if (!TryTakeBlockSlot())
+            {
+                // Release the claim: the address has not been tried, so it must stay
+                // eligible once the burst is over.
+                lock (_gate) _skipUntil.Remove(ip);
+                decisions.Add(new PreventionDecision
+                {
+                    Ip = ip,
+                    Action = PreventionAction.Skipped,
+                    Message = $"Not blocking {ip} ({threat.LevelText}: {threat.Title}) — over {MaxBlocksPerMinute} auto-blocks " +
+                              "in the last minute; holding off in case a detector is being fed forged sources.",
+                    Threat = threat
+                });
+                continue;
+            }
+
             var reason = $"Auto-block · {threat.LevelText} · {threat.TypeText}: {threat.Title}";
             var result = _firewall.BlockIp(ip, direction, reason, expiresAfter: _firewall.AutoBlockExpiry);
 
@@ -420,6 +449,8 @@ public sealed class PreventionService
                     BlockState.Blocked, "BLOCKED — auto-block rule added"),
                 PreventionAction.Simulated => new EnforcementStatus(
                     BlockState.WouldBlock, "NOT blocked — dry run (it would have been blocked)"),
+                PreventionAction.Skipped => new EnforcementStatus(
+                    BlockState.NotBlocked, decision.Message),
                 _ => new EnforcementStatus(
                     BlockState.Failed, $"NOT blocked — the firewall refused the rule: {decision.FailureReason}")
             };
@@ -442,12 +473,18 @@ public sealed class PreventionService
         if (threat.Type == ThreatType.NewRemoteHost)
             return new EnforcementStatus(BlockState.NotBlocked, "Not blocked — first contact is informational only");
 
+        if (threat.AutoBlockHoldReason is { } hold)
+            return new EnforcementStatus(BlockState.NotBlocked, $"Not blocked — {hold}");
+
         if (_allowlist.IsAllowed(ip, out var reason))
             return new EnforcementStatus(BlockState.NotBlocked,
                 $"Not blocked — allowlisted{(string.IsNullOrWhiteSpace(reason) ? "" : $" ({reason})")}");
 
         if (LocalAddresses.IsOwnAddress(ip))
             return new EnforcementStatus(BlockState.NotBlocked, "Not blocked — this machine's own address");
+
+        if (IsConfiguredResolver(ip))
+            return new EnforcementStatus(BlockState.NotBlocked, "Not blocked — a DNS resolver this machine is configured to use");
 
         if (IsProtectedAddress is { } externallyProtected && externallyProtected(ip))
             return new EnforcementStatus(BlockState.NotBlocked, "Not blocked — protected endpoint (blocking it would cut a VPN tunnel)");
@@ -510,6 +547,11 @@ public sealed class PreventionService
         if (threat.Type == ThreatType.NewRemoteHost)
             return false;
 
+        // The detector could not tell whether the address is the actor: blocking on it
+        // would let whoever forged the packets pick what this host gets cut off from.
+        if (threat.AutoBlockHoldReason != null)
+            return false;
+
         if (!FirewallService.TryNormalizeIp(threat.SourceIp, out var normalized, out _))
             return false;
 
@@ -523,6 +565,13 @@ public sealed class PreventionService
         // threat to the wrong end of a flow (a public-IP host especially) must not be
         // able to firewall the box off from itself.
         if (LocalAddresses.IsOwnAddress(normalized))
+            return false;
+
+        // A resolver an adapter is configured with is infrastructure this host cannot
+        // work without; a detector that names one has far more likely misattributed a
+        // flow than caught an attacker, and the block would take name resolution down
+        // with it.
+        if (IsConfiguredResolver(normalized))
             return false;
 
         if (IsProtectedAddress is { } externallyProtected && externallyProtected(normalized))
@@ -563,6 +612,84 @@ public sealed class PreventionService
 
         ip = normalized;
         return true;
+    }
+
+    /// <summary>
+    /// Takes one of the <see cref="MaxBlocksPerMinute"/> slots, or says the minute is used up.
+    /// Counted per attempt rather than per success: a firewall that fails each rule
+    /// is still spawning a netsh process per threat.
+    /// </summary>
+    private bool TryTakeBlockSlot()
+    {
+        lock (_gate)
+        {
+            var now = DateTime.UtcNow;
+            while (_recentBlocks.Count > 0 && now - _recentBlocks.Peek() > TimeSpan.FromMinutes(1))
+                _recentBlocks.Dequeue();
+            if (_recentBlocks.Count >= MaxBlocksPerMinute)
+                return false;
+            _recentBlocks.Enqueue(now);
+            return true;
+        }
+    }
+
+    private static readonly TimeSpan ResolverCacheTtl = TimeSpan.FromSeconds(60);
+    private static readonly object ResolverGate = new();
+    private static HashSet<string> _resolvers = new(StringComparer.OrdinalIgnoreCase);
+    private static DateTime _resolversReadAt = DateTime.MinValue;
+
+    /// <summary>Overrides the resolver lookup in tests; null asks the adapters.</summary>
+    internal Func<string, bool>? ResolverCheckOverride { get; set; }
+
+    private bool IsConfiguredResolver(string ip)
+    {
+        if (ResolverCheckOverride is { } check)
+            return check(ip);
+
+        lock (ResolverGate)
+        {
+            if (DateTime.UtcNow - _resolversReadAt > ResolverCacheTtl)
+            {
+                try
+                {
+                    _resolvers = new HashSet<string>(ReadAdapterResolvers(), StringComparer.OrdinalIgnoreCase);
+                }
+                catch
+                {
+                    // adapters unreadable right now: keep what the last read found
+                }
+                _resolversReadAt = DateTime.UtcNow;
+            }
+            return _resolvers.Contains(ip);
+        }
+    }
+
+    /// <summary>
+    /// The normalized DNS server addresses of every adapter that is up — the Windows
+    /// counterpart of the <c>nameserver</c> lines the Linux build reads from resolv.conf.
+    /// </summary>
+    internal static IEnumerable<string> ReadAdapterResolvers()
+    {
+        foreach (var nic in NetworkInterface.GetAllNetworkInterfaces())
+        {
+            if (nic.OperationalStatus != OperationalStatus.Up)
+                continue;
+
+            IPAddressCollection servers;
+            try
+            {
+                servers = nic.GetIPProperties().DnsAddresses;
+            }
+            catch
+            {
+                // one adapter that will not answer must not hide the others
+                continue;
+            }
+
+            foreach (var server in servers)
+                if (FirewallService.TryNormalizeIp(server.ToString(), out var normalized, out _))
+                    yield return normalized;
+        }
     }
 
     /// <summary>

@@ -371,9 +371,18 @@ public sealed class DnsHygieneMonitor : IDisposable
                      "`netsh dns add encryption` and set the adapter to DoH — which keeps queries visible " +
                      "here while hiding them from the network.",
             Origin = "Resolving…",
-            Method = "DNS hygiene · plaintext egress"
+            Method = "DNS hygiene · plaintext egress",
+            AutoBlockHoldReason = ResolverHoldReason
         });
     }
+
+    /// <summary>
+    /// Every hygiene alert names the resolver a query went *to*, not anything that
+    /// attacked this host. Auto-blocking it turned a container's 8.8.8.8 fallback,
+    /// or a DoT resolver falling back to port 53, into a block on the resolver itself.
+    /// </summary>
+    internal const string ResolverHoldReason =
+        "the address is a DNS resolver this machine queried, not an attacker";
 
     private void AddUnapprovedResolver(FlowEvent flow, DateTime now)
     {
@@ -392,7 +401,8 @@ public sealed class DnsHygieneMonitor : IDisposable
                      "yours, add it to Approved resolvers — allowlisting it also clears this alert, but only " +
                      "the approved list makes HTTPS to it count as DoH.",
             Origin = "Resolving…",
-            Method = "DNS hygiene · unapproved resolver"
+            Method = "DNS hygiene · unapproved resolver",
+            AutoBlockHoldReason = ResolverHoldReason
         });
     }
 
@@ -412,7 +422,8 @@ public sealed class DnsHygieneMonitor : IDisposable
                      "rather than fail, so a broken upstream, a blocked port 853, or an expired certificate " +
                      "silently removes the protection you configured.",
             Origin = "Resolving…",
-            Method = "DNS hygiene · encrypted-DNS fallback"
+            Method = "DNS hygiene · encrypted-DNS fallback",
+            AutoBlockHoldReason = ResolverHoldReason
         });
     }
 
@@ -432,7 +443,8 @@ public sealed class DnsHygieneMonitor : IDisposable
                      "visible to the network beyond this host, which is usually the exact thing the VPN was " +
                      "meant to prevent. Check that client's DNS setting.",
             Origin = "Resolving…",
-            Method = "DNS hygiene · VPN client leak"
+            Method = "DNS hygiene · VPN client leak",
+            AutoBlockHoldReason = ResolverHoldReason
         });
     }
 

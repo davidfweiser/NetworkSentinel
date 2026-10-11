@@ -13,6 +13,16 @@ namespace NetworkSentinel.Services;
 /// INBOUND events — connections landing on a local port this machine is
 /// actually listening on (or in SYN-RECEIVED) — so outbound ephemeral local
 /// ports from ordinary client traffic can never look like a port scan.
+///
+/// Attribution: a socket in SYN-RECEIVED carries whatever source address the SYN
+/// claimed, and a forged one never gets further. So an inbound session only counts
+/// as evidence against its address once it has completed the handshake (seen in any
+/// post-handshake state, then or on a later poll). Patterns that only trip when the
+/// half-open sessions are counted too are still reported, but carry an
+/// <see cref="ThreatEvent.AutoBlockHoldReason"/> so they never drive an auto-block —
+/// otherwise six forged SYNs to port 3389 "from" the admin's address would firewall the
+/// admin out. The price is that a stealth SYN scan (which never completes a handshake
+/// either) is detected but not auto-blocked; a connect scan still is.
 /// </summary>
 public sealed class IntrusionDetector
 {
@@ -73,6 +83,15 @@ public sealed class IntrusionDetector
                 foreach (var c in conns)
                 {
                     currentKeys.Add(c.Key);
+
+                    // A half-open session first seen on an earlier poll that has since
+                    // completed its handshake: the address really did send it.
+                    if (activity.AwaitingHandshake.TryGetValue(c.Key, out var waiting) && CompletedHandshake(c))
+                    {
+                        waiting.Confirmed = true;
+                        activity.AwaitingHandshake.Remove(c.Key);
+                    }
+
                     if (activity.ActiveKeys.Contains(c.Key))
                         continue;
 
@@ -83,12 +102,27 @@ public sealed class IntrusionDetector
                         ? listeningUdpPorts.Contains(c.LocalPort)
                         : listeningTcpPorts.Contains(c.LocalPort) ||
                           c.State == TcpConnectionState.SynReceived;
-                    activity.Events.Enqueue((now, c.LocalPort, c.State, inbound));
+                    var ev = new SessionEvent(now, c.LocalPort, c.State, inbound)
+                    {
+                        Confirmed = CompletedHandshake(c)
+                    };
+                    activity.Events.Enqueue(ev);
                     if (inbound)
-                        activity.LongInbound.Enqueue((now, c.LocalPort));
+                    {
+                        activity.LongInbound.Enqueue(ev);
+                        if (!ev.Confirmed && c.Protocol == "TCP")
+                            activity.AwaitingHandshake[c.Key] = ev;
+                    }
                     else
+                    {
                         activity.OutboundNew.Enqueue((now, c.RemotePort, c.ProcessName));
+                    }
                 }
+
+                // A session that vanished while half-open never completed: it stays unconfirmed.
+                if (activity.AwaitingHandshake.Count > 0)
+                    foreach (var gone in activity.AwaitingHandshake.Keys.Where(k => !currentKeys.Contains(k)).ToList())
+                        activity.AwaitingHandshake.Remove(gone);
 
                 activity.ActiveKeys = currentKeys;
                 activity.LastSeen = now;
@@ -131,64 +165,64 @@ public sealed class IntrusionDetector
         var recent = activity.Events.Where(e => e.Inbound).ToList();
         if (recent.Count == 0) return;
 
-        var distinctLocalPorts = recent.Select(x => x.LocalPort).Distinct().Count();
-        var sensitiveHits = recent.Count(x => PortCatalog.SensitivePorts.Contains(x.LocalPort));
-        var rdpHits = recent.Count(x => x.LocalPort == 3389);
-        var smbHits = recent.Count(x => x.LocalPort is 445 or 139);
-        var sshHits = recent.Count(x => x.LocalPort == 22);
-        var shortLivedLike = recent.Count(x =>
-            x.State is TcpConnectionState.SynSent or TcpConnectionState.SynReceived
-                or TcpConnectionState.TimeWait or TcpConnectionState.FinWait1
-                or TcpConnectionState.FinWait2 or TcpConnectionState.CloseWait);
+        // Each pattern is judged twice: on every inbound session (to alert), and on the
+        // handshake-confirmed ones only (to decide whether the address may be blocked).
+        var all = new InboundStats(recent);
+        var proven = new InboundStats(recent.Where(e => e.Confirmed).ToList());
 
         // Port scan: many different local service ports hit from one remote IP in a short window
-        if (distinctLocalPorts >= 8)
+        if (all.DistinctLocalPorts >= 8)
         {
             TryAdd(threats, now, ip, ThreatType.PortScan, ThreatLevel.High,
                 "Port scan pattern detected",
-                $"{ip} opened connections to {distinctLocalPorts} different local ports within {Window.TotalSeconds:0}s.",
+                $"{ip} opened connections to {all.DistinctLocalPorts} different local ports within {Window.TotalSeconds:0}s.",
                 origin,
-                "Sequential / multi-port probing");
+                "Sequential / multi-port probing",
+                attributed: proven.DistinctLocalPorts >= 8);
         }
-        else if (distinctLocalPorts >= 5)
+        else if (all.DistinctLocalPorts >= 5)
         {
             TryAdd(threats, now, ip, ThreatType.PortScan, ThreatLevel.Medium,
                 "Possible port reconnaissance",
-                $"{ip} contacted {distinctLocalPorts} local ports in a short window.",
+                $"{ip} contacted {all.DistinctLocalPorts} local ports in a short window.",
                 origin,
-                "Multi-port probing");
+                "Multi-port probing",
+                attributed: proven.DistinctLocalPorts >= 5);
         }
 
         // Brute-force style hammering of login services (repeated NEW sessions)
-        if (rdpHits >= 6)
+        if (all.RdpHits >= 6)
         {
             TryAdd(threats, now, ip, ThreatType.BruteForcePattern, ThreatLevel.Critical,
                 "RDP brute-force pattern",
-                $"{ip} opened {rdpHits} new RDP (3389) sessions in {Window.TotalSeconds:0}s.",
+                $"{ip} opened {all.RdpHits} new RDP (3389) sessions in {Window.TotalSeconds:0}s.",
                 origin,
-                "Remote Desktop (TCP 3389) hammering");
+                "Remote Desktop (TCP 3389) hammering",
+                attributed: proven.RdpHits >= 6);
         }
 
-        if (smbHits >= 8)
+        if (all.SmbHits >= 8)
         {
             TryAdd(threats, now, ip, ThreatType.BruteForcePattern, ThreatLevel.High,
                 "SMB access burst",
-                $"{ip} opened {smbHits} new SMB/NetBIOS sessions in {Window.TotalSeconds:0}s.",
+                $"{ip} opened {all.SmbHits} new SMB/NetBIOS sessions in {Window.TotalSeconds:0}s.",
                 origin,
-                "SMB / NetBIOS (445/139)");
+                "SMB / NetBIOS (445/139)",
+                attributed: proven.SmbHits >= 8);
         }
 
-        if (sshHits >= 6)
+        if (all.SshHits >= 6)
         {
             TryAdd(threats, now, ip, ThreatType.BruteForcePattern, ThreatLevel.High,
                 "SSH brute-force pattern",
-                $"{ip} opened {sshHits} new SSH (22) sessions in {Window.TotalSeconds:0}s.",
+                $"{ip} opened {all.SshHits} new SSH (22) sessions in {Window.TotalSeconds:0}s.",
                 origin,
-                "SSH (TCP 22) hammering");
+                "SSH (TCP 22) hammering",
+                attributed: proven.SshHits >= 6);
         }
 
         // Sensitive port probes
-        if (sensitiveHits >= 3 && distinctLocalPorts >= 2)
+        if (all.SensitiveHits >= 3 && all.DistinctLocalPorts >= 2)
         {
             var ports = string.Join(", ", recent
                 .Where(x => PortCatalog.SensitivePorts.Contains(x.LocalPort))
@@ -199,26 +233,29 @@ public sealed class IntrusionDetector
                 "Sensitive service probing",
                 $"{ip} probed sensitive ports: {ports}.",
                 origin,
-                "Admin / file-share / remote-access ports");
+                "Admin / file-share / remote-access ports",
+                attributed: proven.SensitiveHits >= 3 && proven.DistinctLocalPorts >= 2);
         }
 
         // Rapid reconnect / half-open noise
-        if (shortLivedLike >= 12)
+        if (all.ShortLivedLike >= 12)
         {
             TryAdd(threats, now, ip, ThreatType.ManyShortConnections, ThreatLevel.Medium,
                 "Short-lived connection burst",
-                $"{ip} produced {shortLivedLike} non-established / transitional inbound sessions in {Window.TotalSeconds:0}s.",
+                $"{ip} produced {all.ShortLivedLike} non-established / transitional inbound sessions in {Window.TotalSeconds:0}s.",
                 origin,
-                "Syn flood style / scan noise / flapping");
+                "Syn flood style / scan noise / flapping",
+                attributed: proven.ShortLivedLike >= 12);
         }
 
-        if (recent.Count >= 20 && distinctLocalPorts <= 2)
+        if (all.Count >= 20 && all.DistinctLocalPorts <= 2)
         {
             TryAdd(threats, now, ip, ThreatType.RapidReconnect, ThreatLevel.Low,
                 "Rapid reconnect activity",
-                $"{ip} opened {recent.Count} new inbound sessions against few ports.",
+                $"{ip} opened {all.Count} new inbound sessions against few ports.",
                 origin,
-                "High-frequency reconnects");
+                "High-frequency reconnects",
+                attributed: proven.Count >= 20 && proven.DistinctLocalPorts <= 2);
         }
     }
 
@@ -230,13 +267,15 @@ public sealed class IntrusionDetector
         string ip, HostActivity activity, string origin, DateTime now, List<ThreatEvent> threats)
     {
         var distinct = activity.LongInbound.Select(x => x.LocalPort).Distinct().Count();
+        var provenDistinct = activity.LongInbound.Where(x => x.Confirmed).Select(x => x.LocalPort).Distinct().Count();
         if (distinct >= 16)
         {
             TryAdd(threats, now, ip, ThreatType.PortScan, ThreatLevel.High,
                 "Slow port scan detected",
                 $"{ip} touched {distinct} different local ports over the last {LongWindow.TotalMinutes:0} minutes — paced scanning below the fast-scan threshold.",
                 origin,
-                "Low-and-slow multi-port probing");
+                "Low-and-slow multi-port probing",
+                attributed: provenDistinct >= 16);
         }
         else if (distinct >= 10)
         {
@@ -244,7 +283,8 @@ public sealed class IntrusionDetector
                 "Possible slow port reconnaissance",
                 $"{ip} touched {distinct} different local ports over the last {LongWindow.TotalMinutes:0} minutes.",
                 origin,
-                "Low-and-slow multi-port probing");
+                "Low-and-slow multi-port probing",
+                attributed: provenDistinct >= 10);
         }
     }
 
@@ -300,9 +340,13 @@ public sealed class IntrusionDetector
         string title,
         string detail,
         string origin,
-        string method)
+        string method,
+        bool attributed = true)
     {
-        string key = $"{ip}|{type}";
+        // Attribution is part of the key: a pattern first seen only through half-open
+        // sessions must still be able to fire again, blockable, once the same address
+        // completes enough handshakes to prove it is really the one connecting.
+        string key = $"{ip}|{type}|{(attributed ? "proven" : "unproven")}";
         if (_emitted.Contains(key)) return;
 
         _emitted.Add(key);
@@ -317,8 +361,44 @@ public sealed class IntrusionDetector
             Title = title,
             Detail = detail,
             Origin = origin,
-            Method = method
+            Method = method,
+            AutoBlockHoldReason = attributed ? null : UnprovenSourceReason
         });
+    }
+
+    internal const string UnprovenSourceReason =
+        "the sessions never completed a TCP handshake, so the source address may be forged";
+
+    private static bool CompletedHandshake(NetworkConnection c)
+        => c.Protocol == "TCP" && c.State is TcpConnectionState.Established
+            or TcpConnectionState.FinWait1 or TcpConnectionState.FinWait2
+            or TcpConnectionState.CloseWait or TcpConnectionState.Closing
+            or TcpConnectionState.LastAck or TcpConnectionState.TimeWait;
+
+    /// <summary>The counts the inbound patterns are judged on, over one set of sessions.</summary>
+    private readonly struct InboundStats
+    {
+        public InboundStats(List<SessionEvent> events)
+        {
+            Count = events.Count;
+            DistinctLocalPorts = events.Select(x => x.LocalPort).Distinct().Count();
+            SensitiveHits = events.Count(x => PortCatalog.SensitivePorts.Contains(x.LocalPort));
+            RdpHits = events.Count(x => x.LocalPort == 3389);
+            SmbHits = events.Count(x => x.LocalPort is 445 or 139);
+            SshHits = events.Count(x => x.LocalPort == 22);
+            ShortLivedLike = events.Count(x =>
+                x.State is TcpConnectionState.SynSent or TcpConnectionState.SynReceived
+                    or TcpConnectionState.TimeWait or TcpConnectionState.FinWait1
+                    or TcpConnectionState.FinWait2 or TcpConnectionState.CloseWait);
+        }
+
+        public int Count { get; }
+        public int DistinctLocalPorts { get; }
+        public int SensitiveHits { get; }
+        public int RdpHits { get; }
+        public int SmbHits { get; }
+        public int SshHits { get; }
+        public int ShortLivedLike { get; }
     }
 
     private void PruneEmitHistory(DateTime now)
@@ -341,10 +421,32 @@ public sealed class IntrusionDetector
         return true;
     }
 
+    /// <summary>
+    /// One new session. <see cref="Confirmed"/> is mutable because a session first seen
+    /// half-open is confirmed on whichever later poll finds it past the handshake.
+    /// </summary>
+    private sealed class SessionEvent
+    {
+        public SessionEvent(DateTime time, int localPort, TcpConnectionState state, bool inbound)
+        {
+            Time = time;
+            LocalPort = localPort;
+            State = state;
+            Inbound = inbound;
+        }
+
+        public DateTime Time { get; }
+        public int LocalPort { get; }
+        public TcpConnectionState State { get; }
+        public bool Inbound { get; }
+        public bool Confirmed { get; set; }
+    }
+
     private sealed class HostActivity
     {
-        public Queue<(DateTime Time, int LocalPort, TcpConnectionState State, bool Inbound)> Events { get; } = new();
-        public Queue<(DateTime Time, int LocalPort)> LongInbound { get; } = new();
+        public Queue<SessionEvent> Events { get; } = new();
+        public Queue<SessionEvent> LongInbound { get; } = new();
+        public Dictionary<string, SessionEvent> AwaitingHandshake { get; } = new(StringComparer.Ordinal);
         public Queue<(DateTime Time, int RemotePort, string ProcessName)> OutboundNew { get; } = new();
         public HashSet<string> ActiveKeys { get; set; } = new(StringComparer.Ordinal);
         public DateTime LastSeen { get; set; } = DateTime.Now;

@@ -353,26 +353,13 @@ public sealed class WireGuardMonitor : IDisposable
     }
 
     /// <summary>
-    /// Where WireGuard for Windows puts wg.exe. It is not added to PATH by the installer,
-    /// so the install directory is checked first and a bare name is only the fallback for
-    /// someone who put it on PATH themselves.
+    /// Where WireGuard for Windows puts wg.exe — its install directory, and nowhere else.
+    /// There used to be a bare "wg.exe" fallback for someone who had put it on PATH
+    /// themselves; this runs as Administrator, and a bare name is searched for in the
+    /// current directory and along PATH, where an ordinary account can plant one. See
+    /// <see cref="SystemTools"/>.
     /// </summary>
-    private static string ResolveWgPath()
-    {
-        var candidates = new[]
-        {
-            Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles), "WireGuard", "wg.exe"),
-            Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFilesX86), "WireGuard", "wg.exe")
-        };
-
-        foreach (var candidate in candidates)
-        {
-            try { if (File.Exists(candidate)) return candidate; }
-            catch { /* unreadable path, try the next */ }
-        }
-
-        return "wg.exe";
-    }
+    private static string? ResolveWgPath() => SystemTools.WireGuard;
 
     /// <summary>
     /// Runs `wg show all dump`. Static and internal because <see cref="WireGuardEndpointGuard"/>
@@ -384,9 +371,16 @@ public sealed class WireGuardMonitor : IDisposable
         error = "";
         try
         {
+            var wgExe = ResolveWgPath();
+            if (wgExe == null)
+            {
+                error = "wg.exe not found — install WireGuard for Windows to monitor peers";
+                return false;
+            }
+
             var psi = new ProcessStartInfo
             {
-                FileName = ResolveWgPath(),
+                FileName = wgExe,
                 RedirectStandardOutput = true,
                 RedirectStandardError = true,
                 UseShellExecute = false,

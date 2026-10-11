@@ -230,11 +230,13 @@ public sealed class FirewallService
 
         var inName = IpRuleName(normalized, true);
         var outName = IpRuleName(normalized, false);
-        var r1 = RemoveRuleByName(inName);
-        var r2 = RemoveRuleByName(outName);
+        var r1 = RemoveRuleByName(inName, out var o1);
+        var r2 = RemoveRuleByName(outName, out var o2);
         InvalidateRuleCache();
 
-        if (!r1.Success && !r2.Success)
+        if (o1 == RemovalOutcome.Failed || o2 == RemovalOutcome.Failed)
+            return o1 == RemovalOutcome.Failed ? r1 : r2;
+        if (o1 == RemovalOutcome.Absent && o2 == RemovalOutcome.Absent)
             return FirewallOperationResult.Fail($"No Network Sentinel block rules found for {normalized}.");
 
         return FirewallOperationResult.Ok($"Unblocked {normalized}. Removed managed inbound/outbound rules when present.");
@@ -282,10 +284,12 @@ public sealed class FirewallService
         if (!IsAdministrator)
             return FirewallOperationResult.Fail("Administrator rights are required to modify the Windows Firewall.");
 
-        var r1 = RemoveRuleByName(PortRuleName(port, protocol, true));
-        var r2 = RemoveRuleByName(PortRuleName(port, protocol, false));
+        var r1 = RemoveRuleByName(PortRuleName(port, protocol, true), out var o1);
+        var r2 = RemoveRuleByName(PortRuleName(port, protocol, false), out var o2);
         InvalidateRuleCache();
-        if (!r1.Success && !r2.Success)
+        if (o1 == RemovalOutcome.Failed || o2 == RemovalOutcome.Failed)
+            return o1 == RemovalOutcome.Failed ? r1 : r2;
+        if (o1 == RemovalOutcome.Absent && o2 == RemovalOutcome.Absent)
             return FirewallOperationResult.Fail($"No managed port rules for {protocol}/{port}.");
 
         return FirewallOperationResult.Ok($"Removed managed rules for {protocol}/{port}.");
@@ -318,16 +322,24 @@ public sealed class FirewallService
 
             var removed = new List<string>();
             string? firstError = null;
+            string? stillInForce = null;
             foreach (var sibling in siblings)
             {
-                var r = RemoveRuleByName(sibling);
-                if (r.Success)
+                var r = RemoveRuleByName(sibling, out var outcome);
+                if (outcome == RemovalOutcome.Removed)
                     removed.Add(sibling);
+                else if (outcome == RemovalOutcome.Failed)
+                    stillInForce ??= r.Message;
                 else if (sibling == name)
                     firstError = r.Message;
             }
 
             InvalidateRuleCache();
+
+            // Half a pair still in place is still a block: say so rather than report
+            // the half that went.
+            if (stillInForce != null)
+                return FirewallOperationResult.Fail(stillInForce);
 
             if (removed.Count == 0)
                 return FirewallOperationResult.Fail(firstError ?? $"No rule named \"{name}\".");
@@ -417,6 +429,7 @@ public sealed class FirewallService
         var rules = GetManagedRules();
         int removed = 0;
         int kept = 0;
+        int failed = 0;
         foreach (var rule in rules)
         {
             if (skip != null && skip(rule))
@@ -424,14 +437,17 @@ public sealed class FirewallService
                 kept++;
                 continue;
             }
-            if (RemoveRuleByName(rule.Name).Success)
-                removed++;
+            RemoveRuleByName(rule.Name, out var outcome);
+            if (outcome == RemovalOutcome.Removed) removed++;
+            else if (outcome == RemovalOutcome.Failed) failed++;
         }
 
         InvalidateRuleCache();
         var msg = $"Removed {removed} Network Sentinel firewall rule(s).";
         if (kept > 0)
             msg += $" Kept {kept} (web console access).";
+        if (failed > 0)
+            return FirewallOperationResult.Fail(msg + $" {failed} could not be removed and may still be in force — see the rule list.");
         return FirewallOperationResult.Ok(msg);
     }
 
@@ -862,28 +878,90 @@ public sealed class FirewallService
             : FirewallOperationResult.Fail($"Failed to add rule {name}: {netsh.Message}");
     }
 
+    /// <summary>What a removal found: the rule taken out, never there, or still in place.</summary>
+    internal enum RemovalOutcome { Removed, Absent, Failed }
+
+    /// <summary>
+    /// Removes one managed rule. For callers that only want the name free (replacing a
+    /// rule before writing it again); anything that reports the removal to the operator,
+    /// or forgets the rule on the strength of it, uses the overload that says what
+    /// really happened.
+    /// </summary>
     private FirewallOperationResult RemoveRuleByName(string name)
+        => RemoveRuleByName(name, out _, confirmAbsence: false);
+
+    /// <summary>
+    /// Removes one managed rule and says what really happened. A delete netsh would not
+    /// carry out used to be indistinguishable from a rule that was never there: both
+    /// came back as a plain failure, so unblock answered "no block rules found" for an
+    /// address that was still blocked, and the expiry sweep forgot a rule it had failed
+    /// to remove — leaving a block in force that nothing would ever look for again.
+    /// </summary>
+    /// <param name="confirmAbsence">
+    /// netsh's "no rules match" text is localized, so a failure it does not word that
+    /// way is checked against the live rule list before it is called either thing.
+    /// False skips that listing, and reports such a failure as <see cref="RemovalOutcome.Failed"/>.
+    /// </param>
+    private FirewallOperationResult RemoveRuleByName(string name, out RemovalOutcome outcome, bool confirmAbsence = true)
     {
         // netsh ONLY — never HNetCfg COM. COM remove/enumerate from MTA thread-pool
         // workers (web UI) can AccessViolation and kill NetworkSentinel.exe.
         var safeName = name.Replace("\"", "").Trim();
         if (string.IsNullOrEmpty(safeName))
+        {
+            outcome = RemovalOutcome.Absent;
             return FirewallOperationResult.Fail("Rule name is empty.");
+        }
 
         var netsh = RunNetsh($"advfirewall firewall delete rule name=\"{safeName}\"");
         if (netsh.Success)
-            return FirewallOperationResult.Ok($"Removed \"{safeName}\".");
-
-        if (netsh.Message.Contains("No rules match", StringComparison.OrdinalIgnoreCase) ||
-            netsh.Message.Contains("cannot find", StringComparison.OrdinalIgnoreCase))
         {
+            outcome = RemovalOutcome.Removed;
+            return FirewallOperationResult.Ok($"Removed \"{safeName}\".");
+        }
+
+        var absent = LooksLikeNoMatchingRule(netsh.Message);
+        if (!absent && confirmAbsence)
+        {
+            var listing = RunNetsh("advfirewall firewall show rule name=all");
+            absent = listing.Success && !string.IsNullOrWhiteSpace(listing.Message)
+                     && !ListingNamesRule(listing.Message, safeName);
+        }
+
+        if (absent)
+        {
+            outcome = RemovalOutcome.Absent;
             return FirewallOperationResult.Fail($"No rule named \"{safeName}\" (it may already be gone).");
         }
 
+        outcome = RemovalOutcome.Failed;
         return FirewallOperationResult.Fail(
-            string.IsNullOrWhiteSpace(netsh.Message)
-                ? $"Failed to remove \"{safeName}\" (netsh error)."
-                : netsh.Message);
+            $"Could not remove \"{safeName}\" — it may still be in force. {netsh.Message}".TrimEnd());
+    }
+
+    /// <summary>netsh's answer (as <see cref="RunNetsh"/> relays it) for a delete that matched nothing.</summary>
+    internal static bool LooksLikeNoMatchingRule(string message)
+        => message.Contains("No rules match", StringComparison.OrdinalIgnoreCase)
+           || message.Contains("No matching rule", StringComparison.OrdinalIgnoreCase);
+
+    /// <summary>
+    /// Whether a <c>netsh advfirewall firewall show rule name=all</c> dump lists a rule
+    /// with exactly this name. The field label in front of it is localized, so the test
+    /// is on the value: a line that ends with the whole name, after the label's padding.
+    /// Whole-name matters — "…-Rule-SSH" must not be found in "…-Rule-SSH-2".
+    /// </summary>
+    internal static bool ListingNamesRule(string listing, string name)
+    {
+        foreach (var raw in listing.Split('\n'))
+        {
+            var line = raw.TrimEnd();
+            if (!line.EndsWith(name, StringComparison.OrdinalIgnoreCase)) continue;
+
+            var before = line.Length - name.Length - 1;
+            if (before >= 0 && char.IsWhiteSpace(line[before]))
+                return true;
+        }
+        return false;
     }
 
     /// <summary>
@@ -1288,12 +1366,12 @@ public sealed class FirewallService
         try
         {
             // Use full path + separate process. Never load firewall COM into this process
-            // for delete/list when called from the web UI.
-            var netshExe = Path.Combine(
-                Environment.GetFolderPath(Environment.SpecialFolder.System),
-                "netsh.exe");
-            if (!File.Exists(netshExe))
-                netshExe = "netsh";
+            // for delete/list when called from the web UI. There is no fallback to a bare
+            // "netsh": that would be searched for in the current directory before
+            // System32, and this runs elevated — see SystemTools.
+            var netshExe = SystemTools.Netsh;
+            if (netshExe == null)
+                return FirewallOperationResult.Fail("netsh.exe was not found in the Windows system directory.");
 
             var psi = new ProcessStartInfo
             {
@@ -1496,8 +1574,14 @@ public sealed class FirewallService
         }
     }
 
+    private int _sweeping;
+
     private void TrySweepExpired()
     {
+        // A Timer fires on the thread pool whether or not the last tick has finished, and
+        // a sweep can outlast the minute (each removal is a netsh call under a 60 s
+        // process timeout). Two at once raced on the same rules.
+        if (Interlocked.Exchange(ref _sweeping, 1) == 1) return;
         try
         {
             var expired = ExpiryLedger.ExpiredNames();
@@ -1506,14 +1590,23 @@ public sealed class FirewallService
 
             foreach (var name in expired)
             {
-                RemoveRuleByName(name);
-                ExpiryLedger.Remove(name);
+                // The expiry entry is the only record that this rule is due to go, so it
+                // is dropped only once the rule is confirmed gone. Dropping it after a
+                // delete that failed left the block in force for good, with nothing
+                // left to retry it.
+                RemoveRuleByName(name, out var outcome);
+                if (outcome != RemovalOutcome.Failed)
+                    ExpiryLedger.Remove(name);
             }
             InvalidateRuleCache();
         }
         catch
         {
             // sweep is best-effort; it simply retries next minute
+        }
+        finally
+        {
+            Interlocked.Exchange(ref _sweeping, 0);
         }
     }
 

@@ -312,6 +312,16 @@ public sealed class ThreatEvent : INotifyPropertyChanged
     public string Detail { get; init; } = "";
     public string Method { get; init; } = "";
 
+    /// <summary>
+    /// Set when the evidence does not prove <see cref="SourceIp"/> is the actor, so the
+    /// threat is shown and alerted on but never auto-blocked. The text finishes the
+    /// sentence "Not blocked — …". Two cases: a source address the sender could have
+    /// forged (SYNs that never completed a handshake, UDP), which would otherwise let
+    /// anyone firewall this host away from an address of their choosing; and alerts that
+    /// name a resolver this machine queried rather than anything that attacked it.
+    /// </summary>
+    public string? AutoBlockHoldReason { get; init; }
+
     /// <summary>Mutable so async geo lookups can patch it in place after creation.</summary>
     public string Origin
     {

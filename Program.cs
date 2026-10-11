@@ -289,6 +289,18 @@ internal static class Program
                 Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData),
                 "NetworkSentinel");
 
+            if (IsLink(dataDir))
+            {
+                // Any account may create folders under %ProgramData%, and a junction
+                // needs no privilege: one planted under this name before the install
+                // would aim everything this elevated command writes at a directory of
+                // that account's choosing. A real install never has one here.
+                Console.Error.WriteLine($"Refusing to continue: {dataDir} is a junction or symbolic link.");
+                Console.Error.WriteLine("Remove it (it should be a plain directory) and run this again.");
+                Environment.Exit(1);
+                return;
+            }
+
             if (!TryPrepareSharedDirectory(dataDir, out var prepareError))
             {
                 Console.Error.WriteLine($"Cannot write to the shared data directory: {dataDir}");
@@ -339,6 +351,24 @@ internal static class Program
             Console.Error.WriteLine("Failed to set master password:");
             Console.Error.WriteLine(ex.Message);
             Environment.Exit(1);
+        }
+    }
+
+    /// <summary>
+    /// Whether <paramref name="dir"/> exists as a junction or symbolic link rather than a
+    /// real directory. A path that is not there yet is not a link; one that cannot be
+    /// examined is treated as one, since "cannot tell" is not safe to write through.
+    /// </summary>
+    internal static bool IsLink(string dir)
+    {
+        try
+        {
+            var info = new DirectoryInfo(dir);
+            return info.Exists && (info.Attributes & FileAttributes.ReparsePoint) != 0;
+        }
+        catch
+        {
+            return true;
         }
     }
 

@@ -140,7 +140,14 @@ public static class DnsFilterSetup
             if (!string.IsNullOrWhiteSpace(tunnelAddress))
                 arguments += $" -TunnelAddress \"{tunnelAddress.Trim()}\"";
 
-            var start = new ProcessStartInfo("powershell.exe")
+            // The absolute path, never a bare "powershell.exe": with UseShellExecute the
+            // current directory is searched first, and whatever is found there is what
+            // the consent prompt below elevates. See SystemTools.
+            var powerShell = SystemTools.PowerShell;
+            if (powerShell == null)
+                return new Result { Message = "Windows PowerShell was not found in the Windows system directory, so setup cannot run." };
+
+            var start = new ProcessStartInfo(powerShell)
             {
                 Arguments = arguments,
                 // Both are required together for elevation, and together they rule out

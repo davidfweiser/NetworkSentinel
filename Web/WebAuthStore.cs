@@ -38,12 +38,21 @@ public sealed class WebAuthStore
         Load();
     }
 
+    /// <summary>
+    /// Why an existing web-master.json could not be used, or null. A damaged file counts
+    /// as configured — nobody can sign in, and nobody can run first-visit setup over it.
+    /// It used to read as "no password yet", which reopened setup to the first visitor
+    /// and let them overwrite the file with a password of their own.
+    /// </summary>
+    public string? LoadError { get; private set; }
+
     public bool IsConfigured
     {
         get
         {
             lock (_fileGate)
-                return _auth != null && !string.IsNullOrEmpty(_auth.Hash) && !string.IsNullOrEmpty(_auth.Salt);
+                return LoadError != null ||
+                       (_auth != null && !string.IsNullOrEmpty(_auth.Hash) && !string.IsNullOrEmpty(_auth.Salt));
         }
     }
 
@@ -51,6 +60,12 @@ public sealed class WebAuthStore
 
     public bool TrySetup(string password, string confirm, out string message)
     {
+        if (LoadError != null)
+        {
+            message = LoadError;
+            return false;
+        }
+
         if (IsConfigured)
         {
             message = "Master password is already set. Use login.";
@@ -112,6 +127,7 @@ public sealed class WebAuthStore
                 ChangedUtc = DateTime.UtcNow
             };
             SaveUnlocked();
+            LoadError = null;
         }
 
         _sessions.Clear();
@@ -280,40 +296,29 @@ public sealed class WebAuthStore
             var file = JsonSerializer.Deserialize<AuthFile>(json, JsonOptions);
             if (file != null && !string.IsNullOrEmpty(file.Hash) && !string.IsNullOrEmpty(file.Salt))
                 _auth = file;
+            else
+                LoadError = DamagedText("it holds no password hash");
         }
-        catch
+        catch (Exception ex)
         {
             _auth = null;
+            LoadError = DamagedText(ex.Message);
         }
     }
+
+    private static string DamagedText(string why) =>
+        $"The master password file (web-master.json) exists but cannot be used — {why}. Nobody can sign in " +
+        "until it is reset on the server, from an elevated prompt: NetworkSentinel --set-master-password";
 
     private void SaveUnlocked()
     {
         Directory.CreateDirectory(_dataDirectory);
-        var path = AuthPath;
-        var tmp = path + ".tmp";
-        File.WriteAllText(tmp, JsonSerializer.Serialize(_auth, JsonOptions));
-        try
-        {
-            // Owner read/write only when the OS supports it (Linux).
-            if (OperatingSystem.IsLinux() || OperatingSystem.IsMacOS())
-                File.SetUnixFileMode(tmp, UnixFileMode.UserRead | UnixFileMode.UserWrite);
-        }
-        catch
-        {
-            // best-effort
-        }
-
-        File.Move(tmp, path, overwrite: true);
-        try
-        {
-            if (OperatingSystem.IsLinux() || OperatingSystem.IsMacOS())
-                File.SetUnixFileMode(path, UnixFileMode.UserRead | UnixFileMode.UserWrite);
-        }
-        catch
-        {
-            // best-effort
-        }
+        // Unique temp name, created with CreateNew so it can never open something already
+        // there. The old fixed "<path>.tmp" was written straight through whatever sat
+        // under that name — a link planted in the data directory, which ordinary accounts
+        // can write to, aimed an elevated `--set-master-password` at the link's target.
+        AppPaths.WriteAtomic(AuthPath, JsonSerializer.Serialize(_auth, JsonOptions),
+            UnixFileMode.UserRead | UnixFileMode.UserWrite);
     }
 
     private sealed class AuthFile

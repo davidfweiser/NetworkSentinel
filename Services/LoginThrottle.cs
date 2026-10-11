@@ -67,6 +67,29 @@ public sealed class LoginThrottle
         }
     }
 
+    /// <summary>
+    /// Checks the lockout and counts this attempt as a failure in one step, before the
+    /// password is even looked at; <see cref="RecordSuccess"/> wipes the count again if
+    /// the guess turns out right. Checking with <see cref="IsLocked"/> and counting with
+    /// <see cref="RecordFailure"/> afterwards left the slow part — a 200k-iteration
+    /// PBKDF2 and the brake delay — between the two, so a burst of parallel requests all
+    /// passed the check before the first failure landed: as many guesses per lockout as
+    /// there were threads to serve them, instead of <see cref="MaxFailures"/>.
+    /// </summary>
+    /// <returns>False while locked out (<paramref name="retryAfter"/> is the wait left).</returns>
+    /// <param name="lockoutIfWrong">The lockout this attempt has put in force if the guess is wrong.</param>
+    public bool TryBeginAttempt(string client, out TimeSpan retryAfter, out TimeSpan lockoutIfWrong)
+    {
+        lockoutIfWrong = TimeSpan.Zero;
+        lock (_gate)
+        {
+            if (IsLocked(client, out retryAfter))
+                return false;
+            lockoutIfWrong = RecordFailure(client);
+            return true;
+        }
+    }
+
     /// <summary>Record a wrong password. Returns the lockout now in force (zero if still under the limit).</summary>
     public TimeSpan RecordFailure(string client)
     {
