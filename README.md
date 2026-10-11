@@ -12,7 +12,7 @@ Three ways to run it:
 
 > **Host-based** intrusion detection and prevention. It detects on its own heuristics and, with Suricata attached (0.6.0), on signature/payload inspection — then enforces in the kernel via `nftables`. It is not an inline network appliance: it protects the machine it runs on, not a segment, and it does not sit in the forwarding path.
 
-Linux port of the original Windows WPF Network Sentinel. Platform layers use `/proc/net`, `ss`, conntrack netlink, `nftables`/`iptables` (elevated via **pkexec**), and XDG data paths. Version **0.7.17**.
+Linux port of the original Windows WPF Network Sentinel. Platform layers use `/proc/net`, `ss`, conntrack netlink, `nftables`/`iptables` (elevated via **pkexec**), and XDG data paths. Version **0.7.18**.
 
 ---
 
@@ -465,7 +465,7 @@ gradient rather than an outline.
 | **Firewall Config** (0.7.1, rebuilt 0.7.4) | The whole host firewall — UFW's rules, Network Sentinel's, and everyone else's — plus listening services and their firewall verdict; add / edit / delete any of them |
 | **Allowlist** | Add/remove trusted domains and IPs; refresh the feed |
 | **Blocked Sites** (0.7.16) | What the filtering resolver refused — name, client, reason and rule, newest first. Present only while a resolver is configured; read on arrival and on **Refresh**, never on the live poll |
-| **Settings** | Monitoring on/off, poll interval, geo lookups, auth-log and closed-port scan detection, the 0.4.0 detectors (threat intel, new-listener alerts, process reputation, ARP/gateway watch, startup-item watch, exfiltration threshold, honeypot ports), **kernel flow events**, **DNS hygiene** (with approved resolvers), **DNS filtering** (on/off, resolver address, and the user and password to reach it), **WireGuard peer monitoring** (with a live peer table), **Suricata signature ingestion** (EVE path, maximum severity, muted sids), **auto-block dry run**, **HTTPS + DuckDNS remote access** (including **Issue certificate**), webhook URL, auto-block + minimum severity + expiry, block direction (in/out), allowlist feed, **API tokens** for a bot — read-only or control (0.7.17), **change master password**, **Remove all rules** |
+| **Settings** | Monitoring on/off, poll interval, geo lookups, auth-log and closed-port scan detection, the 0.4.0 detectors (threat intel, new-listener alerts, process reputation, ARP/gateway watch, startup-item watch, exfiltration threshold, honeypot ports), **kernel flow events**, **DNS hygiene** (with approved resolvers), **DNS filtering** (on/off, resolver address, and the user and password to reach it), **WireGuard peer monitoring** (with a live peer table), **Suricata signature ingestion** (EVE path, maximum severity, muted sids), **auto-block dry run**, **HTTPS + DuckDNS remote access** (including **Issue certificate**), webhook URL, auto-block + minimum severity + expiry, block direction (in/out), allowlist feed, **API tokens** for a bot — read-only or control (0.7.18), **change master password**, **Remove all rules** |
 
 **The dashboard boxes the desktop had (0.7.7).** Two panels the desktop window
 carried and the console did not: **Threat intensity**, the high/critical count on
@@ -501,7 +501,7 @@ The first button in the web console's hero action row is a single **Sleep ⇄ Wa
 - Session cookie until sign-out, browser close, or 12 hours idle
 - Failed attempts are throttled **per client IP**: five wrong guesses trigger a lockout that doubles with each further attempt (1 minute up to 1 hour), answered with `429` and a `Retry-After`. A fixed delay alone only slows one connection at a time — this caps a parallel guesser
 
-### API tokens — monitoring and control for a bot (0.7.17)
+### API tokens — monitoring and control for a bot (0.7.18)
 
 A bot or script that works with this console should not hold the master password. A session is the whole console, Settings and credentials included, so every place an unattended client keeps its configuration would become a route to all of it. Tokens are the bot's own credential, in two strengths:
 
@@ -712,17 +712,17 @@ first. The build is self-contained — the server needs no .NET runtime.
 
 ```bash
 # build machine
-scp dist/networksentinel-0.7.17-linux-x64.install.sh user@server:
+scp dist/networksentinel-0.7.18-linux-x64.install.sh user@server:
 
 # server
-chmod +x networksentinel-0.7.17-linux-x64.install.sh
-sudo ./networksentinel-0.7.17-linux-x64.install.sh --web-service
+chmod +x networksentinel-0.7.18-linux-x64.install.sh
+sudo ./networksentinel-0.7.18-linux-x64.install.sh --web-service
 ```
 
 Confirm the installer is current before using root:
 
 ```bash
-./networksentinel-0.7.17-linux-x64.install.sh --help
+./networksentinel-0.7.18-linux-x64.install.sh --help
 # Should list: --web-service
 ```
 
@@ -774,8 +774,8 @@ sudo ./….install.sh --web-service --port 18765
 ./….install.sh --user --desktop-shortcut    # ~/.local + icon on the Desktop
 
 # classic tarball
-tar xzf networksentinel-0.7.17-linux-x64.tar.gz
-cd networksentinel-0.7.17-linux-x64
+tar xzf networksentinel-0.7.18-linux-x64.tar.gz
+cd networksentinel-0.7.18-linux-x64
 sudo ./install.sh --web-service
 ```
 

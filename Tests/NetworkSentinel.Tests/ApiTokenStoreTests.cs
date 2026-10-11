@@ -295,7 +295,7 @@ public class ApiTokenStoreTests
         var dir = NewDataDir();
         var token = Create(new ApiTokenStore(dir), "legacy");
 
-        // What 0.7.17's first store wrote: no Access field at all.
+        // What the store wrote before access levels existed: no Access field at all.
         var json = File.ReadAllText(StoreFile(dir));
         var lines = json.Split('\n').Where(l => !l.Contains("\"Access\"")).ToArray();
         File.WriteAllText(StoreFile(dir), string.Join('\n', lines));
