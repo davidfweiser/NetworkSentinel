@@ -72,6 +72,24 @@ public class ApiAuditLogTests
     }
 
     [Fact]
+    public void AFloodCannotPushEarlierEntriesOutInOneRotation()
+    {
+        var log = NewLog();
+        log.Write("what happened first");
+
+        // Several megabytes of later noise, however it was produced.
+        for (var round = 0; round < ApiAuditLog.KeptGenerations - 1; round++)
+        {
+            File.AppendAllText(log.FilePath, new string('x', (int)ApiAuditLog.MaxBytes + 1));
+            log.Write($"noise {round}");
+        }
+
+        var kept = Directory.GetFiles(Path.GetDirectoryName(log.FilePath)!, "api-audit.log*");
+        Assert.Contains(kept, f => File.ReadAllText(f).Contains("what happened first"));
+        Assert.True(kept.Length <= ApiAuditLog.KeptGenerations + 1);
+    }
+
+    [Fact]
     public void UnwritableDirectoryDoesNotThrow()
     {
         // The request being described has already been decided; logging must not undo it.

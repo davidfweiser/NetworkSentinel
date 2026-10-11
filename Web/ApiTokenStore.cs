@@ -55,6 +55,16 @@ public sealed class ApiTokenStore
     /// <summary>What the file looked like when this process last read or wrote it.</summary>
     private (bool Exists, DateTime WrittenUtc, long Length) _diskStamp;
 
+    /// <summary>
+    /// Tokens revoked here whose removal has not reached the disk yet. Until it does,
+    /// the file still lists them — so they are struck out again after every reload,
+    /// and the write is retried, rather than a revocation lasting only until the next
+    /// time something else touches the file.
+    /// </summary>
+    private readonly HashSet<string> _unsavedRevocations = new(StringComparer.Ordinal);
+    private DateTime _lastSaveAttemptUtc = DateTime.MinValue;
+    private static readonly TimeSpan SaveRetryInterval = TimeSpan.FromSeconds(10);
+
     /// <summary>Replaced by the tests, which cannot wait out an expiry or a rate window.</summary>
     internal Func<DateTime> UtcNow { get; set; } = () => DateTime.UtcNow;
 
@@ -119,6 +129,7 @@ public sealed class ApiTokenStore
 
         lock (_gate)
         {
+            using var fileLock = AcquireFileLock();
             SyncFromDiskUnlocked();
 
             if (_tokens.Count >= MaxTokens)
@@ -180,6 +191,7 @@ public sealed class ApiTokenStore
 
         lock (_gate)
         {
+            using var fileLock = AcquireFileLock();
             SyncFromDiskUnlocked();
 
             var record = _tokens.FirstOrDefault(t => string.Equals(t.Id, key, StringComparison.OrdinalIgnoreCase));
@@ -197,12 +209,13 @@ public sealed class ApiTokenStore
             catch (Exception ex)
             {
                 // Refused from this moment regardless — requests are checked against
-                // memory. But the file still lists it, so a restart would bring it back;
-                // that must not pass for a clean revocation. The next write retries.
-                _lastPersistUtc = DateTime.MinValue;
+                // memory, and the id is remembered so a reload cannot bring it back. But
+                // the file still lists it and a restart would; that must not pass for a
+                // clean revocation. The write is retried until it lands.
+                _unsavedRevocations.Add(record.Id);
                 message = $"API token \"{record.Name}\" is refused from now on, but the change could not be saved " +
-                          $"({ex.Message}). It would come back when the console restarts — fix the token file's " +
-                          "permissions or disk space and check this list again.";
+                          $"({ex.Message}). This console keeps retrying; until it succeeds the token would come back " +
+                          "on a restart — fix the token file's permissions or disk space and check this list again.";
                 return false;
             }
 
@@ -221,11 +234,12 @@ public sealed class ApiTokenStore
     {
         lock (_gate)
         {
+            using var fileLock = AcquireFileLock();
             SyncFromDiskUnlocked();
 
             saved = true;
-            var count = _tokens.Count;
-            if (count == 0)
+            var revoked = _tokens.Select(t => t.Id).ToList();
+            if (revoked.Count == 0)
                 return 0;
 
             _tokens.Clear();
@@ -235,11 +249,11 @@ public sealed class ApiTokenStore
             }
             catch
             {
-                _lastPersistUtc = DateTime.MinValue;
+                _unsavedRevocations.UnionWith(revoked);
                 saved = false;
             }
 
-            return count;
+            return revoked.Count;
         }
     }
 
@@ -331,7 +345,11 @@ public sealed class ApiTokenStore
     /// this finds; the point is that the operator hears about it too. Telling only the
     /// caller leaves the one person who can revoke the token unaware it was on the wire.
     /// </summary>
-    /// <returns>The token that was exposed, or null when what was sent is not one of ours.</returns>
+    /// <returns>
+    /// The token, the first time it is seen exposed. Null when what was sent is not one
+    /// of ours — or is one already flagged: this path is reached before any throttle,
+    /// so it must not be something a caller can make write a log line per request.
+    /// </returns>
     public ApiTokenInfo? NoteExposure(string? presented, IPAddress? remote)
     {
         var candidate = (presented ?? "").Trim();
@@ -346,9 +364,16 @@ public sealed class ApiTokenStore
             if (!CryptographicOperations.FixedTimeEquals(candidateHash, StoredHash(record)) || record == null)
                 return null;
 
+            if (record.ExposedUtc != null)
+                return null;
+
             var now = UtcNow();
-            Refuse(record, now, Normalize(remote),
-                "it was sent over plain HTTP and crossed the network unencrypted — revoke it and create a new one");
+            record.ExposedUtc = now;
+            record.ExposedFrom = Normalize(remote)?.ToString();
+            // Written now, not on the bookkeeping schedule: this is the one note that
+            // has to survive a restart, or the token goes back to looking safe.
+            _lastPersistUtc = DateTime.MinValue;
+            PersistIfStaleUnlocked(now);
             return Describe(record, now);
         }
     }
@@ -379,7 +404,9 @@ public sealed class ApiTokenStore
         LastRefusedFrom = t.LastRefusedFrom,
         LastRefusedWhy = t.LastRefusedWhy,
         LastActionUtc = t.LastActionUtc,
-        LastAction = t.LastAction
+        LastAction = t.LastAction,
+        ExposedUtc = t.ExposedUtc,
+        ExposedFrom = t.ExposedFrom
     };
 
     private static byte[] HashToken(string token) => SHA256.HashData(Encoding.UTF8.GetBytes(token));
@@ -540,6 +567,8 @@ public sealed class ApiTokenStore
         var previous = _tokens;
         _tokens = ReadFile();
         _diskStamp = stamp;
+        if (_unsavedRevocations.Count > 0)
+            _tokens.RemoveAll(t => _unsavedRevocations.Contains(t.Id));
 
         // Rate windows and bookkeeping not yet written carry over — but only onto the
         // same credential. An id that came back with a different hash is another token.
@@ -558,16 +587,69 @@ public sealed class ApiTokenStore
                     (old.LastRefusedUtc, old.LastRefusedFrom, old.LastRefusedWhy);
             if (old.LastActionUtc > (record.LastActionUtc ?? DateTime.MinValue))
                 (record.LastActionUtc, record.LastAction) = (old.LastActionUtc, old.LastAction);
+            if (old.ExposedUtc != null && record.ExposedUtc == null)
+                (record.ExposedUtc, record.ExposedFrom) = (old.ExposedUtc, old.ExposedFrom);
         }
+    }
+
+    /// <summary>
+    /// Held across every read-modify-write of the file. Re-reading before a write makes
+    /// one process see another's changes, but not the one that lands between that read
+    /// and the write — where a bookkeeping save here could still overwrite a revocation
+    /// made there a moment earlier. Two consoles on one data directory take turns.
+    /// </summary>
+    /// <returns>
+    /// Null when the lock cannot be had — a read-only directory, or a holder that never
+    /// lets go. The caller goes ahead regardless: a revocation written without the lock
+    /// is better than one not written.
+    /// </returns>
+    private FileStream? AcquireFileLock()
+    {
+        var path = Path.Combine(_dataDirectory, FileName + ".lock");
+        for (var attempt = 0; attempt < 40; attempt++)
+        {
+            try
+            {
+                var options = new FileStreamOptions
+                {
+                    Mode = FileMode.OpenOrCreate,
+                    Access = FileAccess.ReadWrite,
+                    Share = FileShare.None
+                };
+                if (!OperatingSystem.IsWindows())
+                    options.UnixCreateMode = UnixFileMode.UserRead | UnixFileMode.UserWrite;
+                return new FileStream(path, options);
+            }
+            catch (IOException)
+            {
+                Thread.Sleep(25);
+            }
+            catch
+            {
+                return null;
+            }
+        }
+
+        return null;
     }
 
     private void PersistIfStaleUnlocked(DateTime now)
     {
-        if (now - _lastPersistUtc < UsePersistInterval)
+        // A revocation waiting to reach the disk is retried far sooner than bookkeeping
+        // is written, but not on every request while the disk stays broken.
+        var due = _unsavedRevocations.Count > 0
+            ? now - _lastSaveAttemptUtc >= SaveRetryInterval
+            : now - _lastPersistUtc >= UsePersistInterval;
+        if (!due)
             return;
 
+        _lastSaveAttemptUtc = now;
         try
         {
+            using var fileLock = AcquireFileLock();
+            // Whatever another process wrote since this request began is taken first,
+            // so this write adds bookkeeping to the current list instead of replacing it.
+            SyncFromDiskUnlocked();
             SaveUnlocked();
         }
         catch
@@ -586,6 +668,7 @@ public sealed class ApiTokenStore
             UnixFileMode.UserRead | UnixFileMode.UserWrite);
         _lastPersistUtc = UtcNow();
         _diskStamp = ReadStamp();
+        _unsavedRevocations.Clear();
     }
 
     private sealed class TokenFile
@@ -612,6 +695,10 @@ public sealed class ApiTokenStore
         public string? LastRefusedWhy { get; set; }
         public DateTime? LastActionUtc { get; set; }
         public string? LastAction { get; set; }
+
+        /// <summary>When it was first seen on plain HTTP. Never cleared — only revoking answers it.</summary>
+        public DateTime? ExposedUtc { get; set; }
+        public string? ExposedFrom { get; set; }
 
         [JsonIgnore] public DateTime WindowStartUtc { get; set; }
         [JsonIgnore] public int WindowCount { get; set; }
@@ -648,4 +735,6 @@ public sealed class ApiTokenInfo
     public string? LastRefusedWhy { get; init; }
     public DateTime? LastActionUtc { get; init; }
     public string? LastAction { get; init; }
+    public DateTime? ExposedUtc { get; init; }
+    public string? ExposedFrom { get; init; }
 }

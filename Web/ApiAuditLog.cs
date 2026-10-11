@@ -13,8 +13,18 @@ namespace NetworkSentinel.Web;
 /// </summary>
 public sealed class ApiAuditLog
 {
-    /// <summary>The file is rotated once past this, keeping one previous generation.</summary>
+    /// <summary>The file is rotated once past this.</summary>
     public const long MaxBytes = 1024 * 1024;
+
+    /// <summary>
+    /// Older files kept beside the current one. One was too few: whoever can make
+    /// entries can make a megabyte of them, and with a single spare generation that
+    /// was all it took to push what they did first off the end. This does not make
+    /// the log impossible to flood — nothing of bounded size can be — but every line
+    /// of the flood names the token and address making it, and the journal keeps its
+    /// own copy on its own schedule.
+    /// </summary>
+    public const int KeptGenerations = 8;
 
     private const int MaxEntryLength = 600;
 
@@ -50,7 +60,14 @@ public sealed class ApiAuditLog
 
                 var info = new FileInfo(path);
                 if (info.Exists && info.Length > MaxBytes)
+                {
+                    for (var n = KeptGenerations - 1; n >= 1; n--)
+                    {
+                        if (File.Exists($"{path}.{n}"))
+                            File.Move($"{path}.{n}", $"{path}.{n + 1}", overwrite: true);
+                    }
                     File.Move(path, path + ".1", overwrite: true);
+                }
 
                 var options = new FileStreamOptions
                 {

@@ -774,6 +774,21 @@ public sealed class WebApp : IDisposable
             return;
         }
 
+        // The rule the token API enforces on use, applied where the token is born. A
+        // token shown to a browser on another machine over plain HTTP has crossed the
+        // network unencrypted before it was ever sent to a bot — burned at birth, with
+        // nothing later to say so.
+        if (!ctx.Request.IsHttps && !IsLoopbackClient(ctx))
+        {
+            WriteJson(res, 403, new
+            {
+                ok = false,
+                message = "A token cannot be created over plain HTTP from another machine — it would cross the network " +
+                          "unencrypted the moment it was shown. Open this console over HTTPS, or create the token on the machine it runs on."
+            });
+            return;
+        }
+
         if (IsLockedOut(ctx, res))
             return;
 
@@ -2526,7 +2541,9 @@ public sealed class WebApp : IDisposable
                 lastRefusedFrom = t.LastRefusedFrom,
                 lastRefusedWhy = t.LastRefusedWhy,
                 lastActionUtc = t.LastActionUtc is { } acted ? UtcStamp(acted) : null,
-                lastAction = t.LastAction
+                lastAction = t.LastAction,
+                exposedUtc = t.ExposedUtc is { } exposed ? UtcStamp(exposed) : null,
+                exposedFrom = t.ExposedFrom
             }),
             connections = ConnectionRows(),
             hosts = HostRows(blocked),
@@ -5120,6 +5137,10 @@ public sealed class WebApp : IDisposable
       const refused = t.lastRefusedUtc
         ? `<div class="warn">Refused ${esc(when(t.lastRefusedUtc))}${t.lastRefusedFrom ? ' from ' + esc(t.lastRefusedFrom) : ''} — ${esc(t.lastRefusedWhy || '')}</div>`
         : '';
+      // Stays until the token is revoked: later refusals overwrite each other, this must not.
+      const exposed = t.exposedUtc
+        ? `<div class="warn">Sent over plain HTTP ${esc(when(t.exposedUtc))}${t.exposedFrom ? ' from ' + esc(t.exposedFrom) : ''} — it crossed the network unencrypted. Revoke it and create a new one.</div>`
+        : '';
       const expires = t.expiresUtc
         ? `<span class="${t.expired ? 'warn' : ''}">${t.expired ? 'Expired ' : ''}${esc(when(t.expiresUtc))}</span>`
         : 'Never';
@@ -5129,7 +5150,7 @@ public sealed class WebApp : IDisposable
         <td>${esc(when(t.createdUtc))}</td>
         <td>${expires}</td>
         <td class="mono">${esc(t.allowedSources || 'any')}</td>
-        <td>${used}${acted}${refused}</td>
+        <td>${used}${acted}${exposed}${refused}</td>
         <td class="row-actions"><button type="button" class="rm" data-revoke-token="${esc(t.id)}" data-token-name="${esc(t.name)}">Revoke</button></td>
       </tr>`;
     }).join('');

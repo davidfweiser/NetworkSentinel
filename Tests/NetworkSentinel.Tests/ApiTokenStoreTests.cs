@@ -456,6 +456,66 @@ public class ApiTokenStoreTests
     }
 
     [Fact]
+    public void UnsavedRevocationSticksAcrossAReloadAndIsWrittenWhenItCan()
+    {
+        if (!CanMakeDirectoryReadOnly) return;
+
+        var now = new DateTime(2026, 1, 1, 0, 0, 0, DateTimeKind.Utc);
+        var dir = NewDataDir();
+        var store = new ApiTokenStore(dir) { UtcNow = () => now };
+        var doomed = Create(store, "doomed");
+        var other = Create(store, "other");
+        var doomedId = store.List().Single(t => t.Name == "doomed").Id;
+
+        File.SetUnixFileMode(dir, UnixFileMode.UserRead | UnixFileMode.UserExecute);
+        try
+        {
+            Assert.False(store.Revoke(doomedId, out _));
+        }
+        finally
+        {
+            File.SetUnixFileMode(dir, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
+        }
+
+        // Something else rewrites the file, which still lists the token. Reloading it
+        // used to be all it took to make the revocation un-happen.
+        File.SetLastWriteTimeUtc(StoreFile(dir), DateTime.UtcNow.AddSeconds(5));
+        Assert.Contains(doomedId, File.ReadAllText(StoreFile(dir)));
+        Assert.Equal(ApiTokenOutcome.Rejected, store.Verify(doomed, Bot).Outcome);
+
+        // And once the disk can be written again, the next request finishes the job.
+        now = now.AddSeconds(30);
+        Assert.Equal(ApiTokenOutcome.Accepted, store.Verify(other, Bot).Outcome);
+        Assert.DoesNotContain(doomedId, File.ReadAllText(StoreFile(dir)));
+        Assert.Equal(ApiTokenOutcome.Rejected, new ApiTokenStore(dir).Verify(doomed, Bot).Outcome);
+    }
+
+    [Fact]
+    public void ConcurrentStoresDoNotLoseEachOthersChanges()
+    {
+        var dir = NewDataDir();
+        var seed = new ApiTokenStore(dir);
+        var keep = Create(seed, "keep");
+        var ids = Enumerable.Range(0, 6).Select(i => { Create(seed, $"doomed-{i}"); return i; }).ToList();
+        var doomed = seed.List().Where(t => t.Name.StartsWith("doomed-")).Select(t => t.Id).ToList();
+
+        // One store per "process": half revoke, half only do bookkeeping writes.
+        var revokers = doomed.Select(_ => new ApiTokenStore(dir)).ToList();
+        var pollers = Enumerable.Range(0, 6).Select(_ => new ApiTokenStore(dir)).ToList();
+
+        Parallel.Invoke(
+            () => Parallel.For(0, doomed.Count, i => Assert.True(revokers[i].Revoke(doomed[i], out _))),
+            () => Parallel.For(0, pollers.Count, i =>
+            {
+                for (var n = 0; n < 20; n++)
+                    pollers[i].Verify(keep, Bot);
+            }));
+
+        var after = new ApiTokenStore(dir).List();
+        Assert.Equal("keep", Assert.Single(after).Name);
+    }
+
+    [Fact]
     public void TokenThatCannotBeSavedIsNeverHandedOut()
     {
         if (!CanMakeDirectoryReadOnly) return;
@@ -482,18 +542,36 @@ public class ApiTokenStoreTests
     [Fact]
     public void TokenSentInTheClearIsMarkedForTheOperator()
     {
-        var store = new ApiTokenStore(NewDataDir());
+        var dir = NewDataDir();
+        var store = new ApiTokenStore(dir);
         var token = Create(store);
 
         var exposed = store.NoteExposure(token, IPAddress.Parse("198.51.100.9"));
 
         Assert.Equal("GrokBot", exposed!.Name);
         var row = store.List().Single();
-        Assert.Contains("plain HTTP", row.LastRefusedWhy);
-        Assert.Equal("198.51.100.9", row.LastRefusedFrom);
+        Assert.NotNull(row.ExposedUtc);
+        Assert.Equal("198.51.100.9", row.ExposedFrom);
+
+        // The one note that must outlive a restart, and a later refusal must not erase it.
+        store.Verify(token, null);
+        Assert.NotNull(new ApiTokenStore(dir).List().Single().ExposedUtc);
 
         Assert.Null(store.NoteExposure("nsm_000000000000_notatoken", Bot));
         Assert.Null(store.NoteExposure(null, Bot));
+    }
+
+    [Fact]
+    public void ExposureIsReportedOnceNotPerRequest()
+    {
+        var store = new ApiTokenStore(NewDataDir());
+        var token = Create(store);
+
+        // Reached before any throttle, so a caller must not be able to turn it into a
+        // log line — and a megabyte of them — per request.
+        Assert.NotNull(store.NoteExposure(token, Bot));
+        for (var i = 0; i < 50; i++)
+            Assert.Null(store.NoteExposure(token, Bot));
     }
 
     [Fact]
