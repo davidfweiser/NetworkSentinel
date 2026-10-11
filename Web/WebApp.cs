@@ -169,8 +169,17 @@ public sealed class WebApp : IDisposable
     /// Bad-token lockout for the token API. Its own instance, not the login one: a
     /// bot left running with a revoked token would otherwise lock the operator out of
     /// the sign-in page from every address the two share.
+    ///
+    /// And capped at a minute, where the sign-in page doubles to an hour. That page
+    /// guards a password a person chose; this guards 256 random bits, which five tries
+    /// a minute will not find. The longer lockout only ever caught the bot itself —
+    /// still retrying a token that had just been replaced, and then shut out for an
+    /// hour after the new one was pasted in.
     /// </summary>
-    private readonly LoginThrottle _apiThrottle = new();
+    private readonly LoginThrottle _apiThrottle = new(maxLockout: TimeSpan.FromMinutes(1));
+
+    /// <summary>Where every token event is written — see <see cref="ApiAuditLog"/>.</summary>
+    private readonly ApiAuditLog _audit = new();
 
     private readonly DateTime _startedUtc = DateTime.UtcNow;
     private readonly DuckDnsUpdater _duckDns = new();
@@ -673,10 +682,17 @@ public sealed class WebApp : IDisposable
             _loginThrottle.RecordSuccess(ClientAddress(ctx));
 
             // A password is usually changed because something leaked. Other sessions
-            // die with it; API tokens do not, and a token minted from a stolen session
-            // would outlive the change unless the operator is pointed at the list.
-            if (_apiTokens.List().Count > 0)
-                changeMsg += " API tokens are unchanged — revoke any you do not recognise.";
+            // die with it, and so do API tokens: one minted under the old password is
+            // exactly the credential that must not survive the change.
+            var revokedTokens = _apiTokens.RevokeAll(out var tokensSaved);
+            if (revokedTokens > 0)
+            {
+                _audit.Write($"console session from {ClientAddress(ctx)} changed the master password; " +
+                             $"{revokedTokens} API token(s) revoked with it{(tokensSaved ? "" : " — but the token file could not be rewritten")}.");
+                changeMsg += $" {revokedTokens} API token{(revokedTokens == 1 ? " was" : "s were")} revoked with it — create new ones for your bots.";
+                if (!tokensSaved)
+                    changeMsg += " The token file could not be rewritten, so check Settings → API tokens after the next restart.";
+            }
 
             WriteJson(res, 200, new { ok = true, message = changeMsg });
             return;
@@ -718,12 +734,90 @@ public sealed class WebApp : IDisposable
                 return;
             }
 
+            if (actionReq.Action.Trim().ToLowerInvariant() is "api_token_create" or "api_token_revoke")
+            {
+                ManageApiTokens(ctx, actionReq);
+                return;
+            }
+
             var result = RunAction(actionReq);
             WriteJson(res, result.Ok ? 200 : 400, result);
             return;
         }
 
         WriteJson(res, 404, new { ok = false, message = "Not found." });
+    }
+
+    /// <summary>
+    /// Creates and revokes API tokens for a signed-in operator.
+    ///
+    /// Deliberately not a case in <see cref="RunAction"/>. That is what the control
+    /// route runs, and keeping token management out of it means no caller of RunAction
+    /// — present or future — can mint a credential, rather than each one having to be
+    /// told not to.
+    ///
+    /// Creating one also asks for the master password again. A token outlives the
+    /// session that made it, so a session alone — an unlocked browser, a stolen cookie
+    /// — must not be enough to leave a permanent credential behind.
+    /// </summary>
+    private void ManageApiTokens(HttpContext ctx, ActionRequest req)
+    {
+        var res = ctx.Response;
+        var client = ClientAddress(ctx);
+
+        if (req.Action.Trim().ToLowerInvariant() == "api_token_revoke")
+        {
+            var revoked = _apiTokens.Revoke(req.Value, out var revokeMsg);
+            _statusMessage = revokeMsg;
+            _audit.Write($"console session from {client}: {revokeMsg}");
+            WriteJson(res, revoked ? 200 : 400, new ActionResultDto { Ok = revoked, Message = revokeMsg });
+            return;
+        }
+
+        if (IsLockedOut(ctx, res))
+            return;
+
+        if (!_auth.VerifyPassword(req.Password ?? ""))
+        {
+            // Same brakes as the sign-in page, and the same counter: this is the same guess.
+            Thread.Sleep(600);
+            _loginThrottle.RecordFailure(client);
+            _audit.Write($"console session from {client} tried to create a token without the right master password.");
+            // 403, not 401: the page reads 401 as "the session has expired".
+            WriteJson(res, 403, new
+            {
+                ok = false,
+                message = string.IsNullOrEmpty(req.Password)
+                    ? "Enter your master password to create a token. A token outlives this session, so the session alone is not enough to make one."
+                    : "Incorrect master password — no token was created."
+            });
+            return;
+        }
+
+        _loginThrottle.RecordSuccess(client);
+
+        if (!int.TryParse((req.Value ?? "0").Trim(), out var days))
+        {
+            WriteJson(res, 400, ActionResultDto.Fail("Expiry must be a number of days."));
+            return;
+        }
+
+        var control = string.Equals((req.Kind ?? "").Trim(), "control", StringComparison.OrdinalIgnoreCase);
+        if (!_apiTokens.TryCreate(req.Name, days, req.Addresses, control, out var apiToken, out var createMsg))
+        {
+            WriteJson(res, 400, ActionResultDto.Fail(createMsg));
+            return;
+        }
+
+        var made = _apiTokens.List().First(t => apiToken.StartsWith(ApiTokenStore.TokenPrefix + t.Id + "_", StringComparison.Ordinal));
+        _audit.Write($"console session from {client} created {(control ? "control" : "read-only")} token \"{made.Name}\" ({made.Id}), " +
+                     $"{(made.ExpiresUtc is { } until ? $"expiring {until:yyyy-MM-dd}" : "never expiring")}, " +
+                     $"allowed from {(made.AllowedSources.Length > 0 ? made.AllowedSources : "any address")}.");
+
+        // The token rides on this one response and nowhere else — not the status line,
+        // which every later state poll repeats, and not the audit log.
+        _statusMessage = "API token created.";
+        WriteJson(res, 200, new ActionResultDto { Ok = true, Message = createMsg, Token = apiToken });
     }
 
     // ── Token API ──────────────────────────────────────────────────────────────
@@ -748,15 +842,23 @@ public sealed class WebApp : IDisposable
     private const int MonitorThreatLimit = 200;
     private const int MonitorBlockedLimit = 1000;
 
+    /// <summary>Read routes that describe the host itself rather than its alerts.</summary>
+    private static readonly HashSet<string> HostMapRoutes = new(StringComparer.Ordinal)
+    {
+        MonitorApiRoot + "/connections", MonitorApiRoot + "/hosts", MonitorApiRoot + "/ports",
+        MonitorApiRoot + "/firewall", MonitorApiRoot + "/allowlist", MonitorApiRoot + "/dns-blocked"
+    };
+
     /// <summary>
     /// Every console action a control token may run — a list of what is allowed, not of
     /// what is refused, so an action added to <see cref="RunAction"/> later stays closed
     /// to tokens until someone decides otherwise here.
     ///
     /// Left out on purpose: <c>set_setting</c> (the Settings page; see
-    /// <see cref="ControlRefusal"/> for its one exception), <c>issue_cert</c> (a button
-    /// on that page), and <c>api_token_create</c> / <c>api_token_revoke</c> — a token
-    /// that could mint tokens would outlive its own expiry, pinning and revocation.
+    /// <see cref="ControlRefusal"/> for its one exception) and <c>issue_cert</c> (a
+    /// button on that page). Creating and revoking tokens is not on any list — it is
+    /// not something RunAction can do at all (see <see cref="ManageApiTokens"/>): a
+    /// token that could mint tokens would outlive its own expiry, pinning and revocation.
     /// </summary>
     internal static readonly HashSet<string> ControlActions = new(StringComparer.Ordinal)
     {
@@ -786,7 +888,7 @@ public sealed class WebApp : IDisposable
             ? "Settings are not available to API tokens — change them in the console."
             : action is "api_token_create" or "api_token_revoke"
                 ? "API tokens are managed in the console, not by another token."
-                : $"Unknown action: {SingleLine(requestedAction ?? "", 40)}";
+                : $"Unknown action: {ApiAuditLog.SingleLine(requestedAction, 40)}";
     }
 
     private void HandleTokenApi(HttpContext ctx, string path)
@@ -799,6 +901,13 @@ public sealed class WebApp : IDisposable
         // plain HTTP has already put the token on the wire by the time it gets here.
         if (!req.IsHttps && !IsLoopbackClient(ctx))
         {
+            // The answer is the same whether or not the token is real, so this cannot
+            // be used to test one. It only decides whether there is something to record.
+            var exposed = presented == null ? null : _apiTokens.NoteExposure(presented, ctx.Connection.RemoteIpAddress);
+            if (exposed != null)
+                _audit.Write($"token \"{exposed.Name}\" ({exposed.Id}) was sent over plain HTTP from {ClientAddress(ctx)} — " +
+                             "it crossed the network unencrypted and should be revoked.");
+
             WriteJson(res, 403, new
             {
                 ok = false,
@@ -834,8 +943,11 @@ public sealed class WebApp : IDisposable
             // Failures age out on their own. Clearing them on the next good request
             // would let a guesser behind the bot's own address go unthrottled forever.
             var lockout = presented == null ? TimeSpan.Zero : _apiThrottle.RecordFailure(client);
+            // Bounded by the lockout: a locked-out address is answered above, unlogged.
+            if (presented != null)
+                _audit.Write($"refused {verdict.Note ?? "an unknown or malformed token"} — from {client}.");
             if (lockout > TimeSpan.Zero)
-                Console.Error.WriteLine($"Token API: {client} locked out for {LoginThrottle.Describe(lockout)} after repeated rejected tokens.");
+                _audit.Write($"{client} locked out for {LoginThrottle.Describe(lockout)} after repeated rejected tokens.");
 
             res.Headers["WWW-Authenticate"] = "Bearer";
             WriteJson(res, 401, new { ok = false, message = "A valid API token is required (Authorization: Bearer <token>)." });
@@ -844,6 +956,8 @@ public sealed class WebApp : IDisposable
 
         if (verdict.Outcome == ApiTokenOutcome.RateLimited)
         {
+            if (verdict.Note != null)
+                _audit.Write($"{verdict.Note} — from {client}.");
             res.Headers["Retry-After"] = ((int)Math.Ceiling(verdict.RetryAfter.TotalSeconds)).ToString();
             WriteJson(res, 429, new
             {
@@ -873,6 +987,22 @@ public sealed class WebApp : IDisposable
         {
             res.Headers["Allow"] = "GET";
             WriteJson(res, 405, new { ok = false, message = $"The monitoring routes are read-only: GET only. Actions go to POST {ControlApiPath}." });
+            return;
+        }
+
+        // Status, threats and what is blocked are what any token may poll. The tables
+        // below them are a map of the host — every connection and listener, the firewall
+        // as written, what tunnel clients tried to resolve — and a read-only token may
+        // be valid from anywhere. So the map goes only to a token that names where it
+        // is used from, which a control token always does.
+        if (HostMapRoutes.Contains(path) && token.AllowedSources.Length == 0)
+        {
+            WriteJson(res, 403, new
+            {
+                ok = false,
+                message = "This route is served only to a token limited to source addresses. " +
+                          "Create one with Allowed source addresses filled in, under Settings → API tokens."
+            });
             return;
         }
 
@@ -960,6 +1090,7 @@ public sealed class WebApp : IDisposable
 
         if (!token.CanControl)
         {
+            _audit.Write($"read-only token \"{token.Name}\" ({token.Id}) from {client} tried the control route.");
             WriteJson(res, 403, new
             {
                 ok = false,
@@ -987,8 +1118,8 @@ public sealed class WebApp : IDisposable
         var refusal = ControlRefusal(actionReq.Action, actionReq.Name);
         if (refusal != null)
         {
-            Console.WriteLine($"Control API: token \"{token.Name}\" ({token.Id}) from {client} was refused " +
-                              $"{DescribeControl(actionReq, refused: true)}.");
+            _audit.Write($"control token \"{token.Name}\" ({token.Id}) from {client} was refused " +
+                         $"{DescribeControl(actionReq, refused: true)}.");
             WriteJson(res, 403, new { ok = false, message = refusal });
             return;
         }
@@ -1002,10 +1133,26 @@ public sealed class WebApp : IDisposable
         // at the keyboard has to be traceable to the credential that did it.
         _statusMessage = $"{token.Name} (API): {result.Message}";
         _apiTokens.NoteAction(token.Id, what);
-        Console.WriteLine($"Control API: token \"{token.Name}\" ({token.Id}) from {client} ran {what} — " +
-                          $"{(result.Ok ? "ok" : "failed")}: {SingleLine(result.Message, 300)}");
+        _audit.Write($"control token \"{token.Name}\" ({token.Id}) from {client} ran {what} — " +
+                     $"{(result.Ok ? "ok" : "failed")}: {ApiAuditLog.SingleLine(result.Message, 300)}");
 
-        WriteJson(res, result.Ok ? 200 : 400, new { ok = result.Ok, message = result.Message });
+        WriteJson(res, result.Ok ? 200 : 400, new { ok = result.Ok, message = MessageForToken(result) });
+    }
+
+    /// <summary>
+    /// What a token is told about a result. The operator gets the whole message, on the
+    /// status line and in the audit log; the caller gets its first paragraph. What
+    /// follows that paragraph on a failed write is the recipe for granting this service
+    /// sudo — the account it runs as and where its firewall binaries are — and exception
+    /// text, which can name paths and backends, is replaced outright.
+    /// </summary>
+    private static string MessageForToken(ActionResultDto result)
+    {
+        if (result.PublicMessage != null)
+            return result.PublicMessage;
+
+        var cut = result.Message.IndexOf("\n\n", StringComparison.Ordinal);
+        return cut < 0 ? result.Message : result.Message[..cut];
     }
 
     /// <summary>
@@ -1048,18 +1195,12 @@ public sealed class WebApp : IDisposable
 
         var detail = string.Join(" ", parts
             .Where(v => !string.IsNullOrWhiteSpace(v))
-            .Select(v => SingleLine(v!, 100))
+            .Select(v => ApiAuditLog.SingleLine(v, 100))
             .Distinct());
-        var action = SingleLine(req.Action.Trim().ToLowerInvariant(), 40);
-        return SingleLine(detail.Length == 0 ? action : $"{action} {detail}", 240);
+        var action = ApiAuditLog.SingleLine(req.Action.Trim().ToLowerInvariant(), 40);
+        return ApiAuditLog.SingleLine(detail.Length == 0 ? action : $"{action} {detail}", 240);
     }
 
-    /// <summary>Caller-supplied text bound for the journal: one line, bounded, no control characters.</summary>
-    private static string SingleLine(string text, int max)
-    {
-        var flat = new string(text.Select(c => char.IsControl(c) ? ' ' : c).ToArray()).Trim();
-        return flat.Length <= max ? flat : flat[..max] + "…";
-    }
 
     /// <summary>
     /// The header only. A token in a query string ends up in proxy logs, shell history
@@ -1582,31 +1723,6 @@ public sealed class WebApp : IDisposable
                     _statusMessage = "Threat alerts cleared.";
                     return ActionResultDto.Success(_statusMessage);
 
-                case "api_token_create":
-                {
-                    if (!int.TryParse((req.Value ?? "0").Trim(), out var days))
-                        return ActionResultDto.Fail("Expiry must be a number of days.");
-                    var control = string.Equals((req.Kind ?? "").Trim(), "control", StringComparison.OrdinalIgnoreCase);
-                    if (!_apiTokens.TryCreate(req.Name, days, req.Addresses, control, out var apiToken, out var createMsg))
-                        return ActionResultDto.Fail(createMsg);
-
-                    // The token rides on this one response and nowhere else — not the
-                    // status line, which every later state poll repeats, and not the journal.
-                    Console.WriteLine($"Token API: {(control ? "control" : "read-only")} token \"{(req.Name ?? "").Trim()}\" created.");
-                    _statusMessage = "API token created.";
-                    return new ActionResultDto { Ok = true, Message = createMsg, Token = apiToken };
-                }
-
-                case "api_token_revoke":
-                {
-                    if (!_apiTokens.Revoke(req.Value, out var revokeMsg))
-                        return ActionResultDto.Fail(revokeMsg);
-
-                    Console.WriteLine($"Token API: {revokeMsg}");
-                    _statusMessage = revokeMsg;
-                    return ActionResultDto.Success(revokeMsg);
-                }
-
                 case "set_setting":
                 {
                     var key = (req.Name ?? "").Trim();
@@ -2121,8 +2237,9 @@ public sealed class WebApp : IDisposable
                     }
                     catch (Exception ex)
                     {
-                        _statusMessage = $"Allowlist refresh failed: {ex.Message}";
-                        return ActionResultDto.Fail(_statusMessage);
+                        var fault = ActionResultDto.Fault("Allowlist refresh failed", ex);
+                        _statusMessage = fault.Message;
+                        return fault;
                     }
                 }
 
@@ -2222,8 +2339,9 @@ public sealed class WebApp : IDisposable
                     try { dropped = _firewall.DeleteHostRule(target); }
                     catch (Exception ex)
                     {
-                        _statusMessage = $"Remove failed: {ex.Message}";
-                        return ActionResultDto.Fail(_statusMessage);
+                        var fault = ActionResultDto.Fault("Remove failed", ex);
+                        _statusMessage = fault.Message;
+                        return fault;
                     }
 
                     _statusMessage = dropped.Message;
@@ -2257,8 +2375,9 @@ public sealed class WebApp : IDisposable
                     }
                     catch (Exception ex)
                     {
-                        _statusMessage = $"Remove failed: {ex.Message}";
-                        return ActionResultDto.Fail(_statusMessage);
+                        var fault = ActionResultDto.Fault("Remove failed", ex);
+                        _statusMessage = fault.Message;
+                        return fault;
                     }
 
                     _statusMessage = r.Message;
@@ -2281,8 +2400,9 @@ public sealed class WebApp : IDisposable
         }
         catch (Exception ex)
         {
-            _statusMessage = $"Action failed: {ex.Message}";
-            return ActionResultDto.Fail(_statusMessage);
+            var fault = ActionResultDto.Fault("Action failed", ex);
+            _statusMessage = fault.Message;
+            return fault;
         }
     }
 
@@ -2936,6 +3056,9 @@ public sealed class WebApp : IDisposable
         /// names repeat across a host, so a delete names the shape, not the label.
         /// </summary>
         public string? Key { get; set; }
+
+        /// <summary>The master password again, asked for when a token is created.</summary>
+        public string? Password { get; set; }
     }
 
     private sealed class AuthBody
@@ -2952,8 +3075,22 @@ public sealed class WebApp : IDisposable
         public bool Ok { get; init; }
         public string Message { get; init; } = "";
 
-        /// <summary>A newly minted monitoring-API token, on the one response that creates it.</summary>
+        /// <summary>A newly minted API token, on the one response that creates it.</summary>
         public string? Token { get; init; }
+
+        /// <summary>
+        /// What a token caller is told in place of <see cref="Message"/> when that one
+        /// carries exception text. Never serialized — the page always gets Message.
+        /// </summary>
+        [JsonIgnore]
+        public string? PublicMessage { get; init; }
+
+        public static ActionResultDto Fault(string summary, Exception ex) => new()
+        {
+            Ok = false,
+            Message = $"{summary}: {ex.Message}",
+            PublicMessage = $"{summary}. The console's status line and audit log have the detail."
+        };
 
         public static ActionResultDto Success(string message) => new() { Ok = true, Message = message };
         public static ActionResultDto Fail(string message) => new() { Ok = false, Message = message };
@@ -3813,7 +3950,7 @@ public sealed class WebApp : IDisposable
     <div class="settings-group">
       <h3>API tokens</h3>
       <form id="apiTokenForm" class="pw-change" autocomplete="off">
-        <p class="desc">Tokens for a bot or script. A <strong>read-only</strong> token sees what this console shows at <code>/api/v1/monitor/…</code> and can change nothing. A <strong>control</strong> token can also run the console's actions through <code>/api/v1/control</code> — block and unblock, firewall rules, the allowlist, sleep and wake, auto-block on or off. Neither kind can sign in here, open Settings, or create or revoke tokens. Only a hash is stored, so each token is shown once, when it is created.</p>
+        <p class="desc">Tokens for a bot or script. A <strong>read-only</strong> token reads this console at <code>/api/v1/monitor/…</code> and can change nothing. A <strong>control</strong> token can also run the console's actions through <code>/api/v1/control</code> — block and unblock, firewall rules, the allowlist, sleep and wake, auto-block on or off. Neither kind can sign in here, open Settings, or create or revoke tokens. Only a hash is stored, so each token is shown once, when it is created.</p>
         <p class="desc" id="apiTokenTransport"></p>
         <label for="apiTokenName">Name</label>
         <input id="apiTokenName" type="text" name="tokenName" maxlength="48" placeholder="GrokBot" required />
@@ -3831,7 +3968,10 @@ public sealed class WebApp : IDisposable
         </select>
         <label for="apiTokenSources">Allowed source addresses</label>
         <input id="apiTokenSources" type="text" name="tokenSources" spellcheck="false" placeholder="203.0.113.7, 10.8.0.0/24 — empty allows any address" />
-        <p class="desc" id="apiTokenSourcesHint">Optional for a read-only token. Required for a control token: it is refused from anywhere else, so a copy that leaks is useless on its own.</p>
+        <p class="desc" id="apiTokenSourcesHint">Optional for a read-only token, which then sees status, threats and blocked addresses only — the connection, firewall and allowlist tables are served to a token limited to addresses. Required for a control token: it is refused from anywhere else, so a copy that leaks is useless on its own.</p>
+        <label for="apiTokenPassword">Your master password</label>
+        <input id="apiTokenPassword" type="password" name="tokenPassword" autocomplete="current-password" required />
+        <p class="desc">Asked for again because a token outlives this session — being signed in is not enough to create one.</p>
         <div class="pw-actions">
           <button type="submit" id="btnApiTokenCreate">Create token</button>
           <p class="pw-msg" id="apiTokenMsg" aria-live="polite"></p>
@@ -3849,7 +3989,7 @@ public sealed class WebApp : IDisposable
     <div class="settings-group">
       <h3>Master password</h3>
       <form id="changePasswordForm" class="pw-change" autocomplete="off">
-        <p class="desc">Change the password required to open this web console. It is stored only as a one-way PBKDF2-SHA256 hash with a random salt on this machine — never as plain text.</p>
+        <p class="desc">Change the password required to open this web console. It is stored only as a one-way PBKDF2-SHA256 hash with a random salt on this machine — never as plain text. Changing it signs out every other session and revokes every API token, so bots need new ones afterwards.</p>
         <label for="pwCurrent">Current master password</label>
         <input id="pwCurrent" type="password" name="current" autocomplete="current-password" required minlength="8" />
         <label for="pwNew">New master password</label>
@@ -5225,8 +5365,11 @@ public sealed class WebApp : IDisposable
         name: $('apiTokenName').value.trim(),
         value: $('apiTokenExpiry').value,
         kind: $('apiTokenAccess').value,
-        addresses: $('apiTokenSources').value.trim()
+        addresses: $('apiTokenSources').value.trim(),
+        password: $('apiTokenPassword').value
       });
+      // Typed for this one request; it does not stay in the page either way.
+      $('apiTokenPassword').value = '';
       if (!data.ok || !data.token) {
         msg.textContent = data.message || 'Could not create the token.';
         msg.classList.add('err');

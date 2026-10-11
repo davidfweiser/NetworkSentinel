@@ -86,11 +86,16 @@ public class ControlApiTests
             .ToHashSet();
         Assert.True(consoleActions.Count > 20, "The action list looks wrong — did RunAction's layout change?");
 
-        var keptFromTokens = new[] { "set_setting", "issue_cert", "api_token_create", "api_token_revoke" };
+        var keptFromTokens = new[] { "issue_cert", "set_setting" };
 
         Assert.Equal(
             keptFromTokens.OrderBy(a => a),
             consoleActions.Except(WebApp.ControlActions).OrderBy(a => a));
+
+        // Token management is not on either list because it is not here at all: what
+        // RunAction cannot do, no caller of RunAction can be talked into doing.
+        Assert.DoesNotContain("api_token_", source[start..end]);
+        Assert.DoesNotContain("_apiTokens.TryCreate", source[start..end]);
 
         // And nothing on the list that the console does not actually implement.
         Assert.Empty(WebApp.ControlActions.Except(consoleActions));

@@ -397,7 +397,17 @@ internal static class Program
             if (target.NeedsChown)
                 TryChown(Path.Combine(dataDir, "web-master.json"), target.Uid, target.Gid);
 
+            // What changing the password in the browser does: API tokens minted under
+            // the old password go with it. Deleting the file is enough — a running
+            // console checks it before every request, so they stop working at once.
+            var tokenFile = Path.Combine(dataDir, Web.ApiTokenStore.FileName);
+            var tokensRevoked = File.Exists(tokenFile);
+            if (tokensRevoked)
+                File.Delete(tokenFile);
+
             Console.WriteLine(message);
+            if (tokensRevoked)
+                Console.WriteLine("API tokens were revoked with the old password — create new ones under Settings → API tokens.");
             Console.WriteLine();
             Console.WriteLine("If the web service is currently running, restart it to pick up the change:");
             Console.WriteLine("  sudo systemctl restart networksentinel-web   # system install");

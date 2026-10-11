@@ -52,6 +52,9 @@ public sealed class ApiTokenStore
     private List<TokenRecord> _tokens = new();
     private DateTime _lastPersistUtc = DateTime.MinValue;
 
+    /// <summary>What the file looked like when this process last read or wrote it.</summary>
+    private (bool Exists, DateTime WrittenUtc, long Length) _diskStamp;
+
     /// <summary>Replaced by the tests, which cannot wait out an expiry or a rate window.</summary>
     internal Func<DateTime> UtcNow { get; set; } = () => DateTime.UtcNow;
 
@@ -65,7 +68,9 @@ public sealed class ApiTokenStore
         Load();
     }
 
-    private string StorePath => Path.Combine(_dataDirectory, "web-api-tokens.json");
+    public const string FileName = "web-api-tokens.json";
+
+    private string StorePath => Path.Combine(_dataDirectory, FileName);
 
     /// <summary>
     /// Mints a token and returns it — the only time it exists in the clear on this side.
@@ -114,6 +119,8 @@ public sealed class ApiTokenStore
 
         lock (_gate)
         {
+            SyncFromDiskUnlocked();
+
             if (_tokens.Count >= MaxTokens)
             {
                 message = $"There are already {MaxTokens} tokens — revoke one that is no longer used first.";
@@ -147,7 +154,20 @@ public sealed class ApiTokenStore
                 AllowedSources = sources,
                 Access = control ? AccessControl : AccessRead
             });
-            SaveUnlocked();
+
+            try
+            {
+                SaveUnlocked();
+            }
+            catch (Exception ex)
+            {
+                // A token that exists only in memory would work until the next restart
+                // and then vanish, with nothing on disk to revoke in the meantime.
+                _tokens.RemoveAll(t => t.Id == id);
+                token = "";
+                message = $"The token could not be saved, so none was created: {ex.Message}";
+                return false;
+            }
         }
 
         message = $"{(control ? "Control" : "Read-only")} API token \"{label}\" created. Copy it now — only its hash is stored, so it cannot be shown again.";
@@ -160,6 +180,8 @@ public sealed class ApiTokenStore
 
         lock (_gate)
         {
+            SyncFromDiskUnlocked();
+
             var record = _tokens.FirstOrDefault(t => string.Equals(t.Id, key, StringComparison.OrdinalIgnoreCase));
             if (record == null)
             {
@@ -168,9 +190,56 @@ public sealed class ApiTokenStore
             }
 
             _tokens.Remove(record);
-            SaveUnlocked();
+            try
+            {
+                SaveUnlocked();
+            }
+            catch (Exception ex)
+            {
+                // Refused from this moment regardless — requests are checked against
+                // memory. But the file still lists it, so a restart would bring it back;
+                // that must not pass for a clean revocation. The next write retries.
+                _lastPersistUtc = DateTime.MinValue;
+                message = $"API token \"{record.Name}\" is refused from now on, but the change could not be saved " +
+                          $"({ex.Message}). It would come back when the console restarts — fix the token file's " +
+                          "permissions or disk space and check this list again.";
+                return false;
+            }
+
             message = $"API token \"{record.Name}\" revoked — it stops working immediately.";
             return true;
+        }
+    }
+
+    /// <summary>
+    /// Revokes every token. What a master-password change does: a password is usually
+    /// changed because something leaked, other sessions die with it, and a token minted
+    /// under the old password is exactly the credential that should not survive.
+    /// </summary>
+    /// <param name="saved">False when the tokens are refused but the file could not be rewritten.</param>
+    public int RevokeAll(out bool saved)
+    {
+        lock (_gate)
+        {
+            SyncFromDiskUnlocked();
+
+            saved = true;
+            var count = _tokens.Count;
+            if (count == 0)
+                return 0;
+
+            _tokens.Clear();
+            try
+            {
+                SaveUnlocked();
+            }
+            catch
+            {
+                _lastPersistUtc = DateTime.MinValue;
+                saved = false;
+            }
+
+            return count;
         }
     }
 
@@ -179,6 +248,7 @@ public sealed class ApiTokenStore
     {
         lock (_gate)
         {
+            SyncFromDiskUnlocked();
             var now = UtcNow();
             return _tokens.OrderBy(t => t.CreatedUtc).Select(t => Describe(t, now)).ToList();
         }
@@ -200,6 +270,8 @@ public sealed class ApiTokenStore
 
         lock (_gate)
         {
+            SyncFromDiskUnlocked();
+
             var record = id == null ? null : _tokens.FirstOrDefault(t => t.Id == id);
             if (!CryptographicOperations.FixedTimeEquals(candidateHash, StoredHash(record)) || record == null)
                 return ApiTokenVerdict.Rejected;
@@ -222,7 +294,11 @@ public sealed class ApiTokenStore
             {
                 var wait = record.WindowStartUtc + RateWindow - now;
                 return new ApiTokenVerdict(ApiTokenOutcome.RateLimited, null,
-                    wait > TimeSpan.Zero ? wait : TimeSpan.FromSeconds(1));
+                    wait > TimeSpan.Zero ? wait : TimeSpan.FromSeconds(1),
+                    // Once per window: a runaway loop must not also fill the audit log.
+                    record.WindowCount == RequestsPerMinute + 1
+                        ? $"token \"{record.Name}\" ({record.Id}) reached the rate limit"
+                        : null);
             }
 
             record.LastUsedUtc = now;
@@ -238,6 +314,7 @@ public sealed class ApiTokenStore
     {
         lock (_gate)
         {
+            SyncFromDiskUnlocked();
             var record = _tokens.FirstOrDefault(t => t.Id == id);
             if (record == null)
                 return;
@@ -249,13 +326,41 @@ public sealed class ApiTokenStore
         }
     }
 
+    /// <summary>
+    /// Marks a live token that arrived over plain HTTP. The request is refused whatever
+    /// this finds; the point is that the operator hears about it too. Telling only the
+    /// caller leaves the one person who can revoke the token unaware it was on the wire.
+    /// </summary>
+    /// <returns>The token that was exposed, or null when what was sent is not one of ours.</returns>
+    public ApiTokenInfo? NoteExposure(string? presented, IPAddress? remote)
+    {
+        var candidate = (presented ?? "").Trim();
+        var candidateHash = HashToken(candidate);
+        var id = ParseId(candidate);
+
+        lock (_gate)
+        {
+            SyncFromDiskUnlocked();
+
+            var record = id == null ? null : _tokens.FirstOrDefault(t => t.Id == id);
+            if (!CryptographicOperations.FixedTimeEquals(candidateHash, StoredHash(record)) || record == null)
+                return null;
+
+            var now = UtcNow();
+            Refuse(record, now, Normalize(remote),
+                "it was sent over plain HTTP and crossed the network unencrypted — revoke it and create a new one");
+            return Describe(record, now);
+        }
+    }
+
     private ApiTokenVerdict Refuse(TokenRecord record, DateTime now, IPAddress? from, string why)
     {
         record.LastRefusedUtc = now;
         record.LastRefusedFrom = from?.ToString();
         record.LastRefusedWhy = why;
         PersistIfStaleUnlocked(now);
-        return ApiTokenVerdict.Rejected;
+        // The caller gets the bare refusal; the note is for the operator's audit log.
+        return ApiTokenVerdict.Rejected with { Note = $"token \"{record.Name}\" ({record.Id}): {why}" };
     }
 
     private static ApiTokenInfo Describe(TokenRecord t, DateTime now) => new()
@@ -379,20 +484,80 @@ public sealed class ApiTokenStore
 
     private void Load()
     {
+        _tokens = ReadFile();
+        _diskStamp = ReadStamp();
+    }
+
+    private List<TokenRecord> ReadFile()
+    {
         try
         {
             var path = StorePath;
             if (!File.Exists(path))
-                return;
+                return new List<TokenRecord>();
 
             var file = JsonSerializer.Deserialize<TokenFile>(File.ReadAllText(path), JsonOptions);
             if (file?.Tokens != null)
-                _tokens = file.Tokens.Where(t => t.Id.Length == IdLength && t.Hash.Length > 0).ToList();
+                return file.Tokens.Where(t => t.Id.Length == IdLength && t.Hash.Length > 0).ToList();
         }
         catch
         {
             // Unreadable means no token is valid: a damaged file must fail closed.
-            _tokens = new List<TokenRecord>();
+        }
+
+        return new List<TokenRecord>();
+    }
+
+    private (bool, DateTime, long) ReadStamp()
+    {
+        try
+        {
+            var info = new FileInfo(StorePath);
+            return info.Exists ? (true, info.LastWriteTimeUtc, info.Length) : default;
+        }
+        catch
+        {
+            return default;
+        }
+    }
+
+    /// <summary>
+    /// Takes the file as the truth whenever it has changed underneath this process.
+    ///
+    /// The list in memory is only a copy of it. Left alone, a token revoked by another
+    /// console on the same data directory — or by an operator deleting the file in a
+    /// hurry — stayed valid here until a restart, and the next last-used write then put
+    /// this process's whole stale list back on disk, un-revoking it for everyone. So
+    /// this runs before every decision and every write: a revocation made anywhere is
+    /// seen by the next request, and nothing saved from here can resurrect one.
+    /// </summary>
+    private void SyncFromDiskUnlocked()
+    {
+        var stamp = ReadStamp();
+        if (stamp == _diskStamp)
+            return;
+
+        var previous = _tokens;
+        _tokens = ReadFile();
+        _diskStamp = stamp;
+
+        // Rate windows and bookkeeping not yet written carry over — but only onto the
+        // same credential. An id that came back with a different hash is another token.
+        foreach (var record in _tokens)
+        {
+            var old = previous.FirstOrDefault(t => t.Id == record.Id && t.Hash == record.Hash);
+            if (old == null)
+                continue;
+
+            record.WindowStartUtc = old.WindowStartUtc;
+            record.WindowCount = old.WindowCount;
+            if (old.LastUsedUtc > (record.LastUsedUtc ?? DateTime.MinValue))
+                (record.LastUsedUtc, record.LastUsedFrom) = (old.LastUsedUtc, old.LastUsedFrom);
+            if (old.LastRefusedUtc > (record.LastRefusedUtc ?? DateTime.MinValue))
+                (record.LastRefusedUtc, record.LastRefusedFrom, record.LastRefusedWhy) =
+                    (old.LastRefusedUtc, old.LastRefusedFrom, old.LastRefusedWhy);
+            if (old.LastActionUtc > (record.LastActionUtc ?? DateTime.MinValue))
+                (record.LastActionUtc, record.LastAction) = (old.LastActionUtc, old.LastAction);
         }
     }
 
@@ -420,6 +585,7 @@ public sealed class ApiTokenStore
             JsonSerializer.Serialize(new TokenFile { Tokens = _tokens }, JsonOptions),
             UnixFileMode.UserRead | UnixFileMode.UserWrite);
         _lastPersistUtc = UtcNow();
+        _diskStamp = ReadStamp();
     }
 
     private sealed class TokenFile
@@ -459,7 +625,9 @@ public enum ApiTokenOutcome
     Accepted
 }
 
-public readonly record struct ApiTokenVerdict(ApiTokenOutcome Outcome, ApiTokenInfo? Token, TimeSpan RetryAfter)
+/// <param name="Note">For the operator's audit log only — never sent to the caller.</param>
+public readonly record struct ApiTokenVerdict(ApiTokenOutcome Outcome, ApiTokenInfo? Token, TimeSpan RetryAfter,
+    string? Note = null)
 {
     public static readonly ApiTokenVerdict Rejected = new(ApiTokenOutcome.Rejected, null, TimeSpan.Zero);
 }

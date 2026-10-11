@@ -14,7 +14,18 @@ public sealed class LoginThrottle
     private static readonly TimeSpan FailureWindow = TimeSpan.FromMinutes(15);
 
     /// <summary>Lockout doubles with each further failure, up to this.</summary>
-    private static readonly TimeSpan MaxLockout = TimeSpan.FromHours(1);
+    private static readonly TimeSpan DefaultMaxLockout = TimeSpan.FromHours(1);
+
+    private readonly TimeSpan _maxLockout;
+
+    /// <param name="maxLockout">
+    /// Ceiling for the doubling. An hour suits a password a person chose; a caller
+    /// guessing something unguessable can be given a shorter one.
+    /// </param>
+    public LoginThrottle(TimeSpan? maxLockout = null)
+    {
+        _maxLockout = maxLockout is { } max && max >= FirstLockout ? max : DefaultMaxLockout;
+    }
 
     private static readonly TimeSpan FirstLockout = TimeSpan.FromMinutes(1);
 
@@ -84,7 +95,7 @@ public sealed class LoginThrottle
             var steps = entry.Failures - MaxFailures;
             var lockout = TimeSpan.FromTicks(Math.Min(
                 FirstLockout.Ticks * (long)Math.Pow(2, Math.Min(steps, 8)),
-                MaxLockout.Ticks));
+                _maxLockout.Ticks));
             entry.LockedUntilUtc = now + lockout;
             return lockout;
         }

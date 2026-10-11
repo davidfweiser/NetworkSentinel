@@ -319,6 +319,217 @@ public class ApiTokenStoreTests
         Assert.NotNull(row.LastActionUtc);
     }
 
+    // ── The file is the truth, not this process's copy of it ─────────────────
+
+    [Fact]
+    public void RevocationMadeElsewhereIsSeenByARunningStore()
+    {
+        var dir = NewDataDir();
+        var first = new ApiTokenStore(dir);
+        var token = Create(first);
+        var second = new ApiTokenStore(dir);
+        Assert.Equal(ApiTokenOutcome.Accepted, second.Verify(token, Bot).Outcome);
+
+        // Another console on the same data directory revokes it.
+        Assert.True(first.Revoke(first.List().Single().Id, out _));
+
+        Assert.Equal(ApiTokenOutcome.Rejected, second.Verify(token, Bot).Outcome);
+        Assert.Empty(second.List());
+    }
+
+    [Fact]
+    public void StaleCopyCannotPutARevokedTokenBackOnDisk()
+    {
+        var dir = NewDataDir();
+        var first = new ApiTokenStore(dir);
+        var doomed = Create(first, "doomed");
+        var survivor = Create(first, "survivor");
+
+        // Loaded while both tokens existed, and has never written yet — so its next
+        // accepted request is due a bookkeeping save of whatever it holds.
+        var stale = new ApiTokenStore(dir);
+
+        var doomedId = first.List().Single(t => t.Name == "doomed").Id;
+        Assert.True(first.Revoke(doomedId, out _));
+
+        // This used to write the stale two-token list over the revocation.
+        Assert.Equal(ApiTokenOutcome.Accepted, stale.Verify(survivor, Bot).Outcome);
+
+        Assert.DoesNotContain(doomedId, File.ReadAllText(StoreFile(dir)));
+        Assert.Equal(ApiTokenOutcome.Rejected, new ApiTokenStore(dir).Verify(doomed, Bot).Outcome);
+        Assert.Equal(ApiTokenOutcome.Accepted, new ApiTokenStore(dir).Verify(survivor, Bot).Outcome);
+    }
+
+    [Fact]
+    public void DeletingTheFileRevokesEverythingAtOnce()
+    {
+        var dir = NewDataDir();
+        var store = new ApiTokenStore(dir);
+        var token = Create(store);
+        Assert.Equal(ApiTokenOutcome.Accepted, store.Verify(token, Bot).Outcome);
+
+        // The operator's emergency brake, and what the CLI password reset does.
+        File.Delete(StoreFile(dir));
+
+        Assert.Equal(ApiTokenOutcome.Rejected, store.Verify(token, Bot).Outcome);
+        Assert.Empty(store.List());
+        Assert.False(File.Exists(StoreFile(dir)));
+    }
+
+    [Fact]
+    public void TokenCreatedElsewhereWorksWithoutARestart()
+    {
+        var dir = NewDataDir();
+        var running = new ApiTokenStore(dir);
+
+        var token = Create(new ApiTokenStore(dir));
+
+        Assert.Equal(ApiTokenOutcome.Accepted, running.Verify(token, Bot).Outcome);
+    }
+
+    [Fact]
+    public void UnwrittenBookkeepingSurvivesAReloadButOnlyOntoTheSameCredential()
+    {
+        var now = new DateTime(2026, 1, 1, 0, 0, 0, DateTimeKind.Utc);
+        var dir = NewDataDir();
+        var store = new ApiTokenStore(dir) { UtcNow = () => now };
+        var token = Create(store, "GrokBot");
+        Create(store, "other");
+
+        // Used, but inside the interval in which bookkeeping is not written back.
+        now = now.AddMinutes(1);
+        Assert.Equal(ApiTokenOutcome.Accepted, store.Verify(token, Bot).Outcome);
+
+        // Something else rewrites the file.
+        var elsewhere = new ApiTokenStore(dir);
+        Assert.True(elsewhere.Revoke(elsewhere.List().Single(t => t.Name == "other").Id, out _));
+
+        var row = store.List().Single();
+        Assert.Equal("GrokBot", row.Name);
+        Assert.Equal(now, row.LastUsedUtc);
+    }
+
+    [Fact]
+    public void RevokeAllLeavesNothingValidHereOrAfterARestart()
+    {
+        var dir = NewDataDir();
+        var store = new ApiTokenStore(dir);
+        var reader = Create(store, "reader");
+        var operatorToken = Create(store, "operator", sources: "203.0.113.7", control: true);
+
+        Assert.Equal(2, store.RevokeAll(out var saved));
+        Assert.True(saved);
+
+        foreach (var token in new[] { reader, operatorToken })
+        {
+            Assert.Equal(ApiTokenOutcome.Rejected, store.Verify(token, Bot).Outcome);
+            Assert.Equal(ApiTokenOutcome.Rejected, new ApiTokenStore(dir).Verify(token, Bot).Outcome);
+        }
+        Assert.Equal(0, store.RevokeAll(out _));
+    }
+
+    private static bool CanMakeDirectoryReadOnly => !OperatingSystem.IsWindows() && Environment.UserName != "root";
+
+    [Fact]
+    public void RevocationThatCannotBeSavedIsNotReportedAsClean()
+    {
+        if (!CanMakeDirectoryReadOnly) return;
+
+        var dir = NewDataDir();
+        var store = new ApiTokenStore(dir);
+        var token = Create(store);
+        var id = store.List().Single().Id;
+
+        File.SetUnixFileMode(dir, UnixFileMode.UserRead | UnixFileMode.UserExecute);
+        try
+        {
+            // Memory says revoked, the file still says valid: a restart would bring it
+            // back, so this must not come back as a plain success.
+            Assert.False(store.Revoke(id, out var message));
+            Assert.Contains("could not be saved", message);
+            Assert.Equal(ApiTokenOutcome.Rejected, store.Verify(token, Bot).Outcome);
+        }
+        finally
+        {
+            File.SetUnixFileMode(dir, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
+        }
+    }
+
+    [Fact]
+    public void TokenThatCannotBeSavedIsNeverHandedOut()
+    {
+        if (!CanMakeDirectoryReadOnly) return;
+
+        var dir = NewDataDir();
+        var store = new ApiTokenStore(dir);
+
+        File.SetUnixFileMode(dir, UnixFileMode.UserRead | UnixFileMode.UserExecute);
+        try
+        {
+            Assert.False(store.TryCreate("GrokBot", 30, null, control: false, out var token, out var message));
+            Assert.Equal("", token);
+            Assert.Contains("could not be saved", message);
+            Assert.Empty(store.List());
+        }
+        finally
+        {
+            File.SetUnixFileMode(dir, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
+        }
+    }
+
+    // ── What the operator is told that the caller is not ─────────────────────
+
+    [Fact]
+    public void TokenSentInTheClearIsMarkedForTheOperator()
+    {
+        var store = new ApiTokenStore(NewDataDir());
+        var token = Create(store);
+
+        var exposed = store.NoteExposure(token, IPAddress.Parse("198.51.100.9"));
+
+        Assert.Equal("GrokBot", exposed!.Name);
+        var row = store.List().Single();
+        Assert.Contains("plain HTTP", row.LastRefusedWhy);
+        Assert.Equal("198.51.100.9", row.LastRefusedFrom);
+
+        Assert.Null(store.NoteExposure("nsm_000000000000_notatoken", Bot));
+        Assert.Null(store.NoteExposure(null, Bot));
+    }
+
+    [Fact]
+    public void RefusalReasonIsCarriedForTheAuditLogNotForTheCaller()
+    {
+        var store = new ApiTokenStore(NewDataDir());
+        var token = Create(store, "pinned", sources: "203.0.113.7");
+
+        var wrongPlace = store.Verify(token, IPAddress.Parse("198.51.100.9"));
+        var unknown = store.Verify("nsm_000000000000_notatoken", Bot);
+
+        // Identical to the caller...
+        Assert.Equal(ApiTokenOutcome.Rejected, wrongPlace.Outcome);
+        Assert.Equal(ApiTokenOutcome.Rejected, unknown.Outcome);
+        Assert.Null(wrongPlace.Token);
+        // ...and told apart only in what the server keeps.
+        Assert.Contains("\"pinned\"", wrongPlace.Note);
+        Assert.Contains("allowed sources", wrongPlace.Note);
+        Assert.Null(unknown.Note);
+    }
+
+    [Fact]
+    public void RateLimitIsNotedOncePerWindow()
+    {
+        var now = new DateTime(2026, 1, 1, 0, 0, 0, DateTimeKind.Utc);
+        var store = new ApiTokenStore(NewDataDir()) { UtcNow = () => now };
+        var token = Create(store);
+
+        for (var i = 0; i < ApiTokenStore.RequestsPerMinute; i++)
+            store.Verify(token, Bot);
+
+        Assert.NotNull(store.Verify(token, Bot).Note);
+        Assert.Null(store.Verify(token, Bot).Note);
+        Assert.Null(store.Verify(token, Bot).Note);
+    }
+
     [Fact]
     public void DamagedStoreFailsClosed()
     {
