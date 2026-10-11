@@ -159,8 +159,12 @@ public sealed class AppSettings
     /// Minutes before auto-created block rules expire (0 = never). An expired rule stops
     /// counting as blocking immediately; the kernel rule itself is dropped by the background
     /// sweep as soon as it can elevate without a prompt (root or cached sudo).
+    ///
+    /// Defaults to 24 hours: a permanent default turned every misattributed block into an
+    /// outage that lasted until someone noticed. Existing settings files keep whatever
+    /// value they already hold, including 0.
     /// </summary>
-    public int AutoBlockExpiryMinutes { get; set; }
+    public int AutoBlockExpiryMinutes { get; set; } = 1440;
 
     /// <summary>
     /// Serve the web console over HTTPS in addition to HTTP. Needs <see cref="WebTlsCertPath"/>;

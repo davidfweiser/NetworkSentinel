@@ -83,13 +83,16 @@ Gates, in order — a threat must clear all of them before a rule is written:
 |------|-----|
 | Severity ≥ minimum | The configured `Medium`/`High`/`Critical` threshold |
 | Not `New Remote Host` | First contact is not evidence of anything |
+| Source proven | Auto-block acts on the address a threat names, so that address must not be one an attacker could pick. Evidence that never completed a TCP handshake — half-open SYN-RECEIVED sockets, closed-port probes from the kernel log, Suricata alerts on UDP/ICMP or on TCP with no app-layer protocol — carries a forgeable source, and is alerted on but never blocked: otherwise six forged SYNs "from" your own address would lock you out. A stealth SYN scan is therefore reported, not auto-blocked; a connect scan or a brute-force over real sessions still is. DNS-hygiene alerts name a resolver this host queried, not an attacker, and are never blocked either |
 | Routable public address | LAN, loopback, CGNAT (100.64/10 — Tailscale and many VPN tunnels) and multicast are never auto-blocked. CGNAT can still be blocked **manually**, behind a confirmation — a hostile tunnel peer is a real case, and only LAN/loopback/link-local/multicast are refused outright |
 | Not allowlisted | Known-good stays reachable |
 | Not this machine | A detector that attributes a threat to the wrong end of a flow can never firewall the host off from itself — matters most on a VPS whose own address is public |
+| Not a configured resolver | A `nameserver` in `/etc/resolv.conf` (or systemd-resolved's upstream list) is never auto-blocked — the block would take name resolution with it |
 | Not a WireGuard tunnel endpoint | A peer's public endpoint is where its tunnel packets come from; blocking it does not drop an attacker, it drops the tunnel and everything reached through it. Independent of the WireGuard *monitoring* setting, and remembered for 24 h — see [tunnel endpoints are never auto-blocked](#tunnel-endpoints-are-never-auto-blocked) |
 | Not protected | See lockout protection below |
 | Not already blocked | No duplicate rules |
 | Not suppressed | An address you deliberately released stays released for 24 h |
+| Under the rate cap | At most 20 auto-blocks in any rolling minute. A real attack is a handful of addresses; dozens a minute means a detector is being fed, and past the cap threats are reported but not acted on |
 | Not retried too soon | An address is claimed for 10 minutes once a batch acts on it. A block that fails for a reason other than elevation (a timed-out `nft`, xtables lock contention) retries after **45 s** instead — one transient error should not leave an active attacker alone for ten minutes. Elevation failures pause auto-block globally for 5 minutes, lifted as soon as you authorize elevation |
 
 - **Dry run** (**Settings → Auto-block → Dry run**) runs every gate and reports what it *would* have dropped, without writing a single rule. Blocking turns a false positive from noise into an outage, so a new detection source — a fresh Suricata ruleset especially — belongs here first. The console shows `Would block …` lines exactly where it would otherwise show `Auto-blocked …`.
@@ -1179,7 +1182,7 @@ All three UIs write the same `~/.local/share/NetworkSentinel/settings.json`, so 
 | `AutoBlockEnabled` | `false` | Create firewall rules automatically |
 | `AutoBlockMinLevel` | `"High"` | Minimum severity for auto-block |
 | `AutoBlockInbound` / `AutoBlockOutbound` | `true` / `true` | Direction of auto-created rules |
-| `AutoBlockExpiryMinutes` | `0` (off) | Auto-block lifetime; manual blocks are always permanent |
+| `AutoBlockExpiryMinutes` | `1440` (24 h) | Auto-block lifetime (0 = never expire); manual blocks are always permanent |
 | `AllowlistUseRemoteFeed` | `true` | Refresh the known-good list from the online feed |
 
 ### Auto-block

@@ -266,7 +266,10 @@ public sealed class SuricataService : IDisposable
                 SourceIp = remoteIp,
                 Title = signature,
                 Method = $"Suricata rule match ({direction})",
-                Detail = string.Join(" · ", details)
+                Detail = string.Join(" · ", details),
+                AutoBlockHoldReason = SourceMayBeForged(proto, appProto)
+                    ? "the alert is on a flow with no completed TCP handshake (UDP, ICMP or half-open), so the source address may be forged"
+                    : null
             };
 
             lock (_gate) _pending.Add(threat);
@@ -295,6 +298,18 @@ public sealed class SuricataService : IDisposable
         // Both remote or both local (LAN-to-LAN): the packet source is the actor.
         return (srcIp, srcPort, true);
     }
+
+    /// <summary>
+    /// True when nothing in the alert proves the remote address is real. Suricata only
+    /// assigns an app-layer protocol to a TCP flow after the handshake, so TCP with an
+    /// app_proto is a conversation the remote end really took part in. UDP and ICMP
+    /// have no handshake at all — a reply going out proves nothing, since it goes to
+    /// whoever the forged packet named.
+    /// </summary>
+    internal static bool SourceMayBeForged(string proto, string appProto)
+        => !proto.Equals("TCP", StringComparison.OrdinalIgnoreCase)
+           || string.IsNullOrWhiteSpace(appProto)
+           || appProto.Equals("failed", StringComparison.OrdinalIgnoreCase);
 
     private static bool IsThisMachineOrLan(string ip)
         => FirewallService.IsPrivateOrLocal(ip) || LocalAddresses.IsOwnAddress(ip);
