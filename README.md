@@ -1338,4 +1338,4 @@ Run it from an **elevated** prompt. Read-only, takes about 25 s, changes nothing
 
 ## License
 
-Private project — all rights reserved unless you add a license file later.
+[MIT](LICENSE) — Copyright (c) 2026 David Weiser.
