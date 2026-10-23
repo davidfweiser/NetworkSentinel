@@ -426,6 +426,7 @@ Restart=on-failure
 RestartSec=5
 TimeoutStopSec=20
 PrivateTmp=true
+Environment=DOTNET_GCgen0size=0x1A00000
 ReadWritePaths=${DATA_DIR}
 
 [Install]

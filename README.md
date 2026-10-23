@@ -809,6 +809,8 @@ WorkingDirectory=/usr/local/lib/networksentinel
 ExecStart=/usr/local/bin/networksentinel -w ${WEB_PORT}
 Restart=on-failure
 RestartSec=5
+# Caps the GC's young-generation budget; see the note below
+Environment=DOTNET_GCgen0size=0x1A00000
 
 [Install]
 WantedBy=multi-user.target
@@ -818,6 +820,8 @@ sudo systemctl daemon-reload
 sudo systemctl enable --now networksentinel-web
 systemctl status networksentinel-web
 ```
+
+**Why `DOTNET_GCgen0size`.** .NET sizes its youngest heap generation from the CPU's L3 cache, and VPS guests often see a server-class cache of hundreds of MB. On such a host the console sits at ~230 MB resident before its first collection, while only ~10 MB of it is live data. Pinning the budget at 26 MB — what a typical desktop CPU gets on its own — keeps it near 130 MB, at the cost of more frequent collections (measured: one every ~9 s, ~2 ms each). The packaged unit sets it too; a `DOTNET_GCgen0size` line in `web.env` overrides it.
 
 User install (no root for the service) after `./install.sh --user --web-service`:
 
