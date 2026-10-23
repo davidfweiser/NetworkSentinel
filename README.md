@@ -73,6 +73,44 @@ Every status line that reports auto-block state — the GUI hero subtitle and tr
 ### Remote alerting (webhook)
 Set **Settings → Webhook URL** to push Critical threats off the machine — the payload adapts automatically: **ntfy** (plain text + `Title`/`Priority` headers), **Slack** (`{"text": …}`), **Discord** (`{"content": …}`), anything else gets a generic JSON document. Per-source/type cooldown stops a burst from flooding the channel.
 
+### A bot on watch around the clock (GrokBot)
+
+Nobody watches a console all night. A bot you run yourself, such as GrokBot, can. It checks Network Sentinel every minute or so, messages you when someone tries to break in, and tells you whether the attempt was blocked. If it wasn't, the bot can block the address once you say so:
+
+> **03:12** · Brute-Force Pattern from 203.0.113.9 (Critical): BLOCKED — auto-block rule added.
+>
+> **03:40** · Port Scan from 198.51.100.4 (Medium): Not blocked — below the auto-block level (≥High). Block it?
+
+How the bot works with the console:
+
+1. **It gets a token, never your password.** Create one under **Settings → API tokens**. *Read only* is enough to watch and report. *Read and control* also lets it block and unblock, and must be pinned to the address the bot calls from.
+2. **It asks only for what's new.** `GET /api/v1/monitor/threats?since=<latestTs>` returns just the threats that arrived after the last one it saw. Add `&minLevel=High` to skip the small stuff.
+3. **Each threat carries its verdict.** `blocked` is `true` or `false`, and `blockStatus` is the same sentence the console shows (see [Every warning says whether the address is blocked](#every-warning-says-whether-the-address-is-blocked-065)). Both are empty for a threat that names no address, such as a new listener. The bot never has to guess whether anything was done.
+4. **You stay in charge.** When you say "block it", the bot sends `{"action":"block","ip":"198.51.100.4"}` to `POST /api/v1/control`. The console runs it through the same checks it applies to you, so the bot can't block an allowlisted or LAN address or lock you out of the console.
+5. **It notices when the watch itself is in trouble.** `GET /api/v1/monitor/health` says whether monitoring is running and when the token expires, so the bot can warn you before it loses access.
+
+One poll, trimmed to the fields a bot reports on:
+
+```bash
+curl -H "Authorization: Bearer nsm_…" \
+     "https://myhost.duckdns.org:18443/api/v1/monitor/threats?since=2026-10-23T03:00:00Z"
+```
+
+```json
+{
+  "ok": true, "count": 1, "latestTs": "2026-10-23T03:12:44Z",
+  "threats": [{
+    "ts": "2026-10-23T03:12:44Z", "level": "Critical", "type": "Brute-Force Pattern",
+    "sourceIp": "203.0.113.9", "blocked": true,
+    "blockStatus": "BLOCKED — auto-block rule added"
+  }]
+}
+```
+
+Everything the bot does carries the token's name: on the console's status line (`GrokBot (API): …`), and in the API audit log. The webhook above is the simpler choice when you only want Critical alerts posted to a channel. A bot adds the conversation: it can answer "what got blocked tonight?", follow up on what wasn't, and act when you tell it to.
+
+Give a control token only to a bot you run yourself. If the bot passes threats to a language model, it should treat `title` and `detail` as untrusted text, since an attacker chooses parts of them, and act only on what *you* tell it. The full security model is in [API tokens](#api-tokens--monitoring-and-control-for-a-bot-0718).
+
 ### Prevention engine (0.6.0)
 
 Every automatic block — from any detector, in any of the three frontends — goes through **one** enforcement engine (`PreventionService`). It used to be three near-identical copies of the same logic in the GUI, TUI and web console, and they had drifted: only the web console honoured the manual-unblock suppression list, so releasing an address in the GUI or TUI could be silently undone by the next detection. Detection sources keep multiplying; the decision to drop traffic must not.
