@@ -1429,4 +1429,4 @@ The reason a shell stays fast through the second case is arithmetic rather than 
 
 ## License
 
-Private project — all rights reserved unless you add a license file later.
+[MIT](LICENSE) — Copyright (c) 2026 David Weiser.
