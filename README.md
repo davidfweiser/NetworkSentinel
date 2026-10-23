@@ -10,9 +10,22 @@ Three ways to run it (same idea as the Linux build):
 | **Terminal UI (`--tui`)** | Server Core, RDP console, SSH-style workflows |
 | **Headless web UI (`-w`)** | Browser dashboard on a server (master-password protected) |
 
-> Awareness / monitoring tooling — not a full IDS/IPS replacement. Version **0.7.19**.
+> Awareness / monitoring tooling — not a full IDS/IPS replacement. Version **0.7.20**.
 
 ---
+
+## What's new in 0.7.20
+
+One fix, for the server installer: it works from a shell that is not elevated, as it always claimed to. Windows only — the installer scripts are this build's alone. No application code changed.
+
+| Area | What changed |
+|------|--------------|
+| **The UAC prompt leads to an install** | Started without elevation, the installer raises a UAC prompt and runs itself again elevated. Until now that elevated copy failed before installing anything: it was started with `-File`, under which Windows PowerShell 5.1 hands every argument over as a string, and the `[bool]` `-StartNow` accepts no string at all. Its window closed with the error, so approving the prompt seemed to do nothing. The one-file `.install.cmd` reaches the same code, so it could only install from an elevated shell. The relaunch now goes through `-EncodedCommand`, which passes `-StartNow` as a real boolean. |
+| **Every parameter reaches the elevated copy** | The relaunch never passed `-HttpsPort` on, so the firewall would have opened 18443 whatever port you asked for. All five parameters now go across. |
+| **A failure says so** | The elevated window closes as soon as it finishes, so when the install fails there, the window you started from now reports it with the exit code instead of exiting silently. |
+| **`INSTALL.cmd` keeps its arguments** | It elevated on its own and passed nothing on, so double-clicking worked but `-Port` and `-HttpsPort` were lost, and it reported success whatever the install did. It now hands its arguments to the script, which does the elevating. |
+
+**An installed server is unaffected.** This changes only how an install starts, so there is nothing to re-run unless you were waiting on it.
 
 ## What's new in 0.7.19
 
@@ -652,7 +665,7 @@ Environment variables: `NETWORKSENTINEL_TUI=1`, `NETWORKSENTINEL_WEB=1`.
 Prebuilt packages are attached to each Windows release on [GitHub Releases](https://github.com/davidfweiser/NetworkSentinel/releases), under tags named `windows-v<version>`. Plain `v<version>` tags are Linux builds. Each file comes with a `.sha256`, so check the download before running it:
 
 ```powershell
-Get-FileHash .\NetworkSentinel-windows-server-x64-0.7.19.install.cmd -Algorithm SHA256
+Get-FileHash .\NetworkSentinel-windows-server-x64-0.7.20.install.cmd -Algorithm SHA256
 ```
 
 To build your own instead, do it **on a dev PC** that has the .NET 8 SDK:
@@ -676,11 +689,11 @@ Self-contained by default — the server does **not** need the .NET SDK or a com
 
 ```powershell
 # Copy the .install.cmd to the server, then run it (UAC prompt if not elevated):
-.\NetworkSentinel-windows-server-x64-0.7.19.install.cmd
+.\NetworkSentinel-windows-server-x64-0.7.20.install.cmd
 # optional port:
-.\NetworkSentinel-windows-server-x64-0.7.19.install.cmd -Port 18765
+.\NetworkSentinel-windows-server-x64-0.7.20.install.cmd -Port 18765
 # unpack without installing:
-.\NetworkSentinel-windows-server-x64-0.7.19.install.cmd --extract-only
+.\NetworkSentinel-windows-server-x64-0.7.20.install.cmd --extract-only
 ```
 
 The one-file installer is a `.cmd`, not a `.ps1`: `cmd.exe` stops reading the script at `exit /b`, so the ZIP appended to it is never parsed. PowerShell tokenizes an entire `-File` script before running any of it, and the cost on appended binary is quadratic (16 MB ≈ 5½ minutes) before it fails to parse at all — so the shell-style "payload after exit" trick only works with a `cmd` entry point.
@@ -693,7 +706,7 @@ powershell -ExecutionPolicy Bypass -File .\install-from-package.ps1
 powershell -ExecutionPolicy Bypass -File .\install-from-package.ps1 -Port 18765
 ```
 
-> **Packages up to 0.7.19: run the installer from an Administrator PowerShell.** Started without elevation, `install-from-package.ps1` (which the one-file installer runs too) raises its own UAC prompt and runs itself again elevated. In those packages the elevated copy fails before it installs anything, and its window closes with the error: it was started with `-File`, under which Windows PowerShell 5.1 cannot pass a `[bool]` like `-StartNow`. Even without that failure, it was never handed `-HttpsPort`. Double-clicking `INSTALL.cmd` did install, because it elevated on its own, but it dropped any arguments given to it. Later packages pass the elevated copy every parameter and say so when it fails.
+> **Packages up to 0.7.19: run the installer from an Administrator PowerShell.** Started without elevation, `install-from-package.ps1` (which the one-file installer runs too) raises its own UAC prompt and runs itself again elevated. In those packages the elevated copy fails before it installs anything, and its window closes with the error: it was started with `-File`, under which Windows PowerShell 5.1 cannot pass a `[bool]` like `-StartNow`. Even without that failure, it was never handed `-HttpsPort`. Double-clicking `INSTALL.cmd` did install, because it elevated on its own, but it dropped any arguments given to it. 0.7.20 and later pass the elevated copy every parameter and say so when it fails.
 
 That copies files to `%ProgramData%\NetworkSentinel\`, opens the firewall port, and registers **Scheduled Task** `NetworkSentinel-Web`:
 
