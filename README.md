@@ -12,6 +12,33 @@ Three ways to run it (same idea as the Linux build):
 
 > Awareness / monitoring tooling — not a full IDS/IPS replacement. Version **0.7.20**.
 
+## Screenshots
+
+The web console on a Windows server. Every address in these is from a range reserved for documentation, and every name is invented.
+
+**Dashboard:** live counts, activity, data flow, and the latest threats with whether each one was blocked.
+
+![Dashboard](docs/screenshots/dashboard.png)
+
+**Break-in Attempts:** RDP and SMB brute force, failed logons from the Security log, scans and persistence changes, each with its block verdict.
+
+![Break-in Attempts](docs/screenshots/threats.png)
+
+<table>
+  <tr>
+    <td width="50%"><a href="docs/screenshots/hosts.png"><img src="docs/screenshots/hosts.png" alt="Remote Computers"></a><br><b>Remote Computers</b>: every address seen, its threat level, and Block or Unblock</td>
+    <td width="50%"><a href="docs/screenshots/connections.png"><img src="docs/screenshots/connections.png" alt="Live Connections"></a><br><b>Live Connections</b>: who is connected right now, to which process</td>
+  </tr>
+  <tr>
+    <td><a href="docs/screenshots/ports.png"><img src="docs/screenshots/ports.png" alt="Open Ports"></a><br><b>Open Ports</b>: what is listening, and a Block port button for each</td>
+    <td><a href="docs/screenshots/firewall.png"><img src="docs/screenshots/firewall.png" alt="Firewall &amp; Block"></a><br><b>Firewall &amp; Block</b>: the Windows Firewall rules Network Sentinel wrote, one row per block</td>
+  </tr>
+  <tr>
+    <td><a href="docs/screenshots/fwconfig.png"><img src="docs/screenshots/fwconfig.png" alt="Firewall Config"></a><br><b>Firewall Config</b>: the whole of Windows Defender Firewall, built-in rule groups included</td>
+    <td><a href="docs/screenshots/settings.png"><img src="docs/screenshots/settings.png" alt="Settings"></a><br><b>Settings</b>: every detector, each with its own switch and status</td>
+  </tr>
+</table>
+
 ---
 
 ## What's new in 0.7.20
