@@ -16,10 +16,11 @@ Three ways to run it (same idea as the Linux build):
 
 ## What's new in 0.7.19
 
-The Windows side of the Linux security audit: four fixes, each for a way the app could be turned against the machine it protects.
+Two ports from the Linux line: API tokens, so a bot can read and control the console without holding the master password, and the Windows side of the Linux security audit — four fixes, each for a way the app could be turned against the machine it protects. The first Windows build published as a GitHub release (`windows-v0.7.19`).
 
 | Area | What changed |
 |------|--------------|
+| **API tokens** | A bot or script gets its own credential instead of the master password, made under **Settings → API tokens**. **Read only** (the default) reads status, threats and blocked addresses under `/api/v1/monitor/`; **read and control** also runs the console's actions through `POST /api/v1/control`, but can never open Settings, issue a certificate, manage tokens or touch the password. A control token must be pinned to the addresses the bot calls from. Tokens are HTTPS-only, header-only, stored as SHA-256, throttled, logged to `logs\api-audit.log`, and all revoked when the master password changes. See [API tokens](#api-tokens--monitoring-and-control-for-a-bot). |
 | **Auto-block cannot be aimed** | Auto-block acts on the address a threat names, so that address must not be one an attacker can pick. A threat whose evidence never completed a TCP handshake — half-open sessions, SYNs the firewall dropped, Suricata alerts on UDP/ICMP or on TCP with no app-layer protocol — is now shown and alerted on but **never auto-blocked**, and its alert says why. Six forged SYNs to port 3389 "from" your own address used to be enough to lock you out. A half-open session is confirmed as soon as it is seen past the handshake, so a connect scan or a real brute-force still blocks. DNS-hygiene alerts name a resolver this machine queried, not an attacker, and are never blocked either. |
 | **Three more gates** | A DNS server an adapter is configured with is never auto-blocked. Auto-blocks are capped at **20 per rolling minute** — past that a detector is being fed, and threats are reported but not acted on. A block held back by a gate is described by its own message (a held-back tunnel endpoint used to read as "the firewall refused the rule"). |
 | **Auto-blocks expire by default** | New installs expire auto-blocks after **24 h** instead of never. An existing `settings.json` keeps the value it already holds, including "never". |
@@ -605,7 +606,7 @@ Auto-block never touches allowlisted IPs. A **manual** block of an allowlisted I
 - [.NET 8 SDK](https://dotnet.microsoft.com/download) to build
 - **Administrator** rights to create or delete Windows Defender Firewall rules
 
-> **Linux servers:** use the `linux` branch and `./scripts/package.sh` → one-file installer
+> **Linux servers:** use the `main` branch and `./scripts/package.sh` → one-file installer
 > `networksentinel-*-linux-x64.install.sh` with `sudo ./….install.sh --web-service`.
 
 ---
@@ -648,7 +649,13 @@ Environment variables: `NETWORKSENTINEL_TUI=1`, `NETWORKSENTINEL_WEB=1`.
 
 ### Server package (no compile on the server)
 
-Build artifacts **on a dev PC** that has the .NET 8 SDK:
+Prebuilt packages are attached to each Windows release on [GitHub Releases](https://github.com/davidfweiser/NetworkSentinel/releases), under tags named `windows-v<version>`. Plain `v<version>` tags are Linux builds. Each file comes with a `.sha256`, so check the download before running it:
+
+```powershell
+Get-FileHash .\NetworkSentinel-windows-server-x64-0.7.19.install.cmd -Algorithm SHA256
+```
+
+To build your own instead, do it **on a dev PC** that has the .NET 8 SDK:
 
 ```powershell
 git checkout windows
@@ -685,6 +692,8 @@ The one-file installer is a `.cmd`, not a `.ps1`: `cmd.exe` stops reading the sc
 powershell -ExecutionPolicy Bypass -File .\install-from-package.ps1
 powershell -ExecutionPolicy Bypass -File .\install-from-package.ps1 -Port 18765
 ```
+
+> **Known issue: pass `-HttpsPort` from an Administrator PowerShell.** Started without elevation, `install-from-package.ps1` (which the one-file installer runs too) raises its own UAC prompt and runs itself again. It forwards `-Port` to that elevated copy but drops `-HttpsPort`, which then falls back to 18443, so the firewall opens 18443 instead of your port. Started already elevated, both are honoured. Present since 0.5.0, still open in 0.7.19.
 
 That copies files to `%ProgramData%\NetworkSentinel\`, opens the firewall port, and registers **Scheduled Task** `NetworkSentinel-Web`:
 
