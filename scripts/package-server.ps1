@@ -131,20 +131,17 @@ if (Test-Path $dnsFilterSrc) {
     Copy-Item $dnsFilterSrc (Join-Path $stage "setup-dns-filter.ps1") -Force
 }
 
-# Double-click friendly launcher inside the zip
+# Double-click friendly launcher inside the zip. It leaves elevation to the script,
+# which passes its parameters on to the elevated copy; elevating here dropped every
+# argument (-Port, -HttpsPort) and reported success whatever the install did.
 $cmdLauncher = @"
 @echo off
 setlocal
 cd /d "%~dp0"
 echo Network Sentinel - Windows server installer
 echo.
-net session >nul 2>&1
-if errorlevel 1 (
-  echo Requesting Administrator rights...
-  powershell -NoProfile -ExecutionPolicy Bypass -Command "Start-Process -FilePath 'powershell.exe' -Verb RunAs -ArgumentList '-NoProfile -ExecutionPolicy Bypass -File \"%~dp0install-from-package.ps1\"' -Wait"
-  exit /b %ERRORLEVEL%
-)
 powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0install-from-package.ps1" %*
+exit /b %ERRORLEVEL%
 "@
 Set-Content -Path (Join-Path $stage "INSTALL.cmd") -Value $cmdLauncher -Encoding ASCII
 

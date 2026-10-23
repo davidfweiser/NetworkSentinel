@@ -61,25 +61,35 @@ if (-not (Test-IsAdministrator)) {
         throw "Could not resolve script path for elevation. Right-click PowerShell -> Run as administrator, then re-run."
     }
 
+    # The elevated copy gets a command, not -File arguments. Under -File, Windows
+    # PowerShell 5.1 passes every argument as a string, and a [bool] parameter takes no
+    # string at all: "-StartNow $True" failed to bind, so the elevated copy stopped
+    # before installing anything. Every parameter in the param block has to be passed
+    # on here - the elevated copy starts from the defaults, so one left out is silently
+    # reset (as -HttpsPort was).
+    function ConvertTo-Literal([string]$Value) { "'" + $Value.Replace("'", "''") + "'" }
+    $command = "& $(ConvertTo-Literal $scriptPath) -Port $Port -HttpsPort $HttpsPort" +
+        " -TaskName $(ConvertTo-Literal $TaskName) -StartNow `$$StartNow"
+    if (-not [string]::IsNullOrWhiteSpace($PackagePath)) {
+        $command += " -PackagePath $(ConvertTo-Literal $PackagePath)"
+    }
     $argList = @(
         "-NoProfile"
         "-ExecutionPolicy", "Bypass"
-        "-File", "`"$scriptPath`""
-        "-Port", "$Port"
-        "-TaskName", "`"$TaskName`""
-        "-StartNow", "`$$StartNow"
+        "-EncodedCommand", [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($command))
     )
-    if (-not [string]::IsNullOrWhiteSpace($PackagePath)) {
-        $argList += @("-PackagePath", "`"$PackagePath`"")
-    }
 
     try {
         $p = Start-Process -FilePath "powershell.exe" -Verb RunAs -ArgumentList $argList -Wait -PassThru
-        exit $p.ExitCode
     }
     catch {
         throw "UAC elevation was cancelled or failed. Start PowerShell as Administrator and run the script again. $($_.Exception.Message)"
     }
+    # The elevated window closes as soon as it finishes, taking any error with it.
+    if ($p.ExitCode -ne 0) {
+        Write-Host "The elevated install failed (exit code $($p.ExitCode)). Run this from an Administrator PowerShell to see why." -ForegroundColor Red
+    }
+    exit $p.ExitCode
 }
 
 if ($Port -lt 1 -or $Port -gt 65535) {

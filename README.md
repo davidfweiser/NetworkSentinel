@@ -693,7 +693,7 @@ powershell -ExecutionPolicy Bypass -File .\install-from-package.ps1
 powershell -ExecutionPolicy Bypass -File .\install-from-package.ps1 -Port 18765
 ```
 
-> **Known issue: pass `-HttpsPort` from an Administrator PowerShell.** Started without elevation, `install-from-package.ps1` (which the one-file installer runs too) raises its own UAC prompt and runs itself again. It forwards `-Port` to that elevated copy but drops `-HttpsPort`, which then falls back to 18443, so the firewall opens 18443 instead of your port. Started already elevated, both are honoured. Present since 0.5.0, still open in 0.7.19.
+> **Packages up to 0.7.19: run the installer from an Administrator PowerShell.** Started without elevation, `install-from-package.ps1` (which the one-file installer runs too) raises its own UAC prompt and runs itself again elevated. In those packages the elevated copy fails before it installs anything, and its window closes with the error: it was started with `-File`, under which Windows PowerShell 5.1 cannot pass a `[bool]` like `-StartNow`. Even without that failure, it was never handed `-HttpsPort`. Double-clicking `INSTALL.cmd` did install, because it elevated on its own, but it dropped any arguments given to it. Later packages pass the elevated copy every parameter and say so when it fails.
 
 That copies files to `%ProgramData%\NetworkSentinel\`, opens the firewall port, and registers **Scheduled Task** `NetworkSentinel-Web`:
 
