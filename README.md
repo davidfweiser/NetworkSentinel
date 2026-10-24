@@ -14,6 +14,8 @@ Three ways to run it:
 
 Linux port of the original Windows WPF Network Sentinel. Platform layers use `/proc/net`, `ss`, conntrack netlink, `nftables`/`iptables` (elevated via **pkexec**), and XDG data paths. Version **0.7.21**.
 
+> **Use at your own risk.** Network Sentinel changes your firewall, and with auto-block turned on it blocks addresses by itself. Try it first on a machine you can reach some other way — a local screen or your provider's web console — before you rely on it over SSH. It comes as is, without warranty: see the [MIT license](LICENSE).
+
 ## Screenshots
 
 The web console on a server. Every address in these is from a range reserved for documentation, and every name is invented.

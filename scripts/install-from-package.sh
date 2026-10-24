@@ -335,6 +335,9 @@ chmod +x "${BINDIR}/networksentinel-uninstall"
 if [[ -f "${PKG_ROOT}/README-INSTALL.txt" ]]; then
   cp "${PKG_ROOT}/README-INSTALL.txt" "${DOCDIR}/"
 fi
+if [[ -f "${PKG_ROOT}/LICENSE" ]]; then
+  cp "${PKG_ROOT}/LICENSE" "${DOCDIR}/"
+fi
 
 # Desktop entry (optional; harmless on servers)
 if [[ "$NO_DESKTOP" -eq 0 ]]; then

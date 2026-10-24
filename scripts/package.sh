@@ -77,6 +77,10 @@ if [[ -f "$ROOT/networksentinel.desktop" ]]; then
   cp "$ROOT/networksentinel.desktop" "$STAGE/"
 fi
 
+# The license is where the no-warranty terms live, and it asks to travel with
+# every copy — a server installed from this tarball has no source tree to read it in.
+cp "$ROOT/LICENSE" "$STAGE/LICENSE"
+
 # Normalize line endings — a Windows checkout ships CRLF, which breaks
 # shebangs ("/usr/bin/env: bash\r") and systemd unit parsing on the server.
 #
@@ -189,6 +193,11 @@ Data / settings / master password hash
 --------------------------------------
   ~/.local/share/NetworkSentinel/
   web-master.json   # delete this file to reset the web master password
+
+License
+-------
+  MIT — see LICENSE. Provided as is, without warranty: this app changes the
+  firewall, so try it on a machine you can reach without SSH first.
 EOF
 
 # Checksum of the app binary for sanity
