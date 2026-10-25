@@ -10,6 +10,8 @@ Three ways to run it (same idea as the Linux build):
 | **Terminal UI (`--tui`)** | Server Core, RDP console, SSH-style workflows |
 | **Headless web UI (`-w`)** | Browser dashboard on a server (master-password protected) |
 
+> **iPhone and iPad: optional.** [Network Sentinel for iOS](https://github.com/davidfweiser/NetworkSentinel-iOS) is a companion app that signs in to a server running the web UI and shows and controls it from your phone. Network Sentinel does not need it to operate: everything it monitors, detects and blocks runs on the host, and each of the three modes above works on its own.
+
 > Awareness / monitoring tooling — not a full IDS/IPS replacement. Version **0.7.20**.
 
 ## Screenshots
