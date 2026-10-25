@@ -602,8 +602,8 @@ internal sealed class TuiSettings
                 {
                     if (on && string.IsNullOrWhiteSpace(_settings.WebTlsCertPath))
                         throw new SettingRejectedException(
-                            "No certificate yet — use Issue certificate below to get a free Let's Encrypt one " +
-                            "(it fills the paths in), or set the certificate path if you already have one.");
+                            "No certificate yet — set the certificate path to any certificate for a name you own, " +
+                            "or use Issue certificate below for a free Let's Encrypt one on a duckdns.org name (it fills the paths in).");
                     _settings.WebHttpsEnabled = on;
                     return on
                         ? $"HTTPS enabled on port {_settings.WebHttpsPort} — restart the web console to apply."
@@ -618,6 +618,23 @@ internal sealed class TuiSettings
                     _settings.WebHttpsPort = port;
                     return $"HTTPS port set to {port} — restart the web console to apply.";
                 }, "1-65535"),
+
+            Value(remote, "Public hostname",
+                "Name this console is reached by from outside. Empty falls back to the DuckDNS name. Cosmetic — never matched against requests.",
+                SettingKind.Text,
+                () => _settings.WebPublicHostname.Length == 0
+                    ? (_duckDns.Hostname.Length == 0 ? "(not set)" : $"(DuckDNS: {_duckDns.Hostname})")
+                    : _settings.WebPublicHostname,
+                raw =>
+                {
+                    var normalized = AppSettings.NormalizeHostname(raw);
+                    if (raw.Length > 0 && normalized.Length == 0)
+                        throw new SettingRejectedException("Enter a hostname, e.g. sentinel.example.com.");
+                    _settings.WebPublicHostname = normalized;
+                    return normalized.Length == 0
+                        ? "Public hostname cleared — the DuckDNS name is used when one is set."
+                        : $"Public hostname set to {normalized}.";
+                }, "e.g. sentinel.example.com, empty to clear"),
 
             Value(remote, "Certificate path", "PEM or PFX the console serves. Validated now, so a bad path is not found at restart.",
                 SettingKind.Text,

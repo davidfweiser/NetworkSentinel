@@ -875,7 +875,7 @@ The console is laid out like the desktop window (0.7.4), because they are the sa
 | **Firewall & Block** | Managed rules grouped as In/Out pairs; manual IP and port blocking; **Restore allowlisted** |
 | **Firewall Config** (rebuilt 0.7.4) | The whole host firewall — Windows' own rules, Network Sentinel's, and everyone else's — plus listening services and their firewall verdict; add / edit / delete any of them |
 | **Allowlist** | Add/remove trusted domains and IPs; refresh the feed |
-| **Settings** | Monitoring on/off, page refresh speed, geo lookups, failed-logon monitoring, closed-port scan detection, the intrusion detectors (threat intel, new-listener, process reputation, ARP watch, startup-item watch, exfiltration, honeypot), **kernel flow events**, **DNS hygiene** (with approved resolvers), **DNS filtering** (resolver address, user and password), **WireGuard peer monitoring**, **Suricata signature ingestion** (EVE path), **auto-block dry run**, **HTTPS + DuckDNS remote access** (including **Issue certificate**), webhook alerts, auto-block + minimum severity + expiry, block direction (in/out), allowlist feed, **API tokens** for a bot — read-only or control, **change master password**, **Remove all rules** |
+| **Settings** | Monitoring on/off, page refresh speed, geo lookups, failed-logon monitoring, closed-port scan detection, the intrusion detectors (threat intel, new-listener, process reputation, ARP watch, startup-item watch, exfiltration, honeypot), **kernel flow events**, **DNS hygiene** (with approved resolvers), **DNS filtering** (resolver address, user and password), **WireGuard peer monitoring**, **Suricata signature ingestion** (EVE path), **auto-block dry run**, **HTTPS + remote access** (public hostname, DuckDNS, and **Issue certificate**), webhook alerts, auto-block + minimum severity + expiry, block direction (in/out), allowlist feed, **API tokens** for a bot — read-only or control, **change master password**, **Remove all rules** |
 
 The console protects itself: it refuses to remove its own firewall access rule, block its own port, or write a Firewall Config rule that would do the same (doing so would cut off your browser mid-request and look exactly like a crash).
 
@@ -1091,15 +1091,33 @@ Once HTTPS works, **Settings → Remote access → HTTPS only** (0.7.7) turns th
 | `--tls-cert PATH` | PEM fullchain, or a `.pfx` / `.p12` bundle |
 | `--tls-key PATH` | PEM private key (omit for `.pfx`) |
 | `--tls-password PW` | Password for a `.pfx` / `.p12` |
+| `--public-hostname NAME` | Name the console is reached by, for the banner and status lines. Defaults to the DuckDNS name when one is configured |
 | `--no-https` | Force plain HTTP for this run |
 
 Flags win over `settings.json` for that run **without overwriting it**, so `--https` is safe to try. The same values live under **Settings → Remote access** in *both* front-ends — the desktop app and the web console — so you never have to hand-edit a config file; endpoint changes take effect at the console's next restart. Certificate files are re-read when they change on disk (checked every 5 minutes), so an **ACME renewal applies without restarting** the console. Session cookies gain the `Secure` flag automatically when the request arrives over TLS.
 
 Already have a `.pfx` (an internal CA, or one exported from the certificate store)? Point `--tls-cert` at it, leave `--tls-key` empty, and pass `--tls-password` if it has one — none of the DuckDNS or Let's Encrypt machinery below is required.
 
+#### Using your own registered domain
+
+**DuckDNS is optional.** Nothing in the HTTPS path is tied to it: the console serves whatever certificate the two path settings point at, and the HTTP→HTTPS redirect fires for *any* request that arrives by hostname rather than by bare IP. DuckDNS is here for people who have neither a name nor a certificate — it supplies a free hostname that follows a changing IP, and a free Let's Encrypt certificate for it. With a domain of your own you need neither half:
+
+1. Point a record at the machine — an `A`/`AAAA` record for a static address, or your registrar's or DNS provider's own dynamic-DNS updater for a changing one.
+2. Get a certificate for that name however you normally do — win-acme, Posh-ACME with your DNS provider's plugin, a certificate from your CA, or a `.pfx` exported from the certificate store.
+3. Point the console at it and name the host:
+
+```powershell
+.\NetworkSentinel.exe -w --https --public-hostname sentinel.example.com `
+    --tls-cert "C:\certs\sentinel.example.com.pfx" --tls-password "…"
+```
+
+The same three fields — **Public hostname**, **Certificate**, **Private key** — are under **Settings → Remote access** in all three front-ends; leave the DuckDNS rows empty. Certificate files are re-read when they change on disk (checked every 5 minutes), so a win-acme renewal applies **without restarting** the console, exactly as a Posh-ACME one does.
+
+**Public hostname** is cosmetic: it names the console in the startup banner and in the status line's `Console URL`, and is **never matched against incoming requests** — so a wrong or empty value cannot lock anyone out, and requests arriving under any name are served as usual. Leave it empty and the DuckDNS name is used when one is configured. **Issue certificate** is the one DuckDNS-only control: it proves domain control through the DuckDNS API, so it cannot issue for a name DuckDNS does not host.
+
 #### Free trusted certificate for a duckdns.org name
 
-[DuckDNS](https://www.duckdns.org) gives a free hostname that follows your public IP. The certificate comes from Let's Encrypt via a **DNS-01** challenge — proving control by writing a TXT record through the DuckDNS API, so **nothing has to be reachable on port 80**.
+The route for anyone *without* a domain of their own — with one, see the section above and skip this one. [DuckDNS](https://www.duckdns.org) gives a free hostname that follows your public IP. The certificate comes from Let's Encrypt via a **DNS-01** challenge — proving control by writing a TXT record through the DuckDNS API, so **nothing has to be reachable on port 80**.
 
 Easiest route is either front-end: fill in the subdomain and token under **Settings → Remote access** (desktop app or web console), then press **Issue certificate**. It runs the same script below and fills the two path fields in for you. From a terminal:
 
@@ -1201,7 +1219,7 @@ Like changing the password in the browser, this revokes every [API token](#api-t
 | **Break-in Attempts** | Heuristic alerts with origin and method |
 | **Open Ports** | Listening TCP/UDP; optional inbound port block |
 | **Firewall & Block** | Manual IP/port rules, auto-block toggle, managed rule list |
-| **Settings** | **Text size** (how large this window draws), monitor poll interval, geo lookups, failed-logon monitoring, closed-port scan detection, **remote access (HTTPS + DuckDNS)**, allowlist feed, data folder |
+| **Settings** | **Text size** (how large this window draws), monitor poll interval, geo lookups, failed-logon monitoring, closed-port scan detection, **remote access (HTTPS, public hostname, DuckDNS)**, allowlist feed, data folder |
 
 ### Settings from the terminal (0.7.9)
 
@@ -1211,8 +1229,8 @@ a Server Core box or an RDP console you only ever meet remotely. **Settings** is
 eighth view — press `8` — and it carries the same catalogue the web console's
 Settings tab does: monitoring and poll interval, every detector and its thresholds,
 auto-block and its severity, direction, dry run and rule expiry, the webhook, and
-the whole remote-access group — HTTPS, port, TLS paths, redirect, HTTPS-only,
-DuckDNS, and Let's Encrypt issuance.
+the whole remote-access group — HTTPS, port, public hostname, TLS paths, redirect,
+HTTPS-only, DuckDNS, and Let's Encrypt issuance.
 
 **It is locked unless the TUI is elevated.** The screen shows nothing — not even
 current values — to an unelevated run: it writes the same `settings.json` the
@@ -1256,7 +1274,8 @@ was the only way to change them.
 | **DuckDNS subdomain** | Just the label — `myhost`, not `myhost.duckdns.org`. The checkbox arms the 5-minute refresh. |
 | **DuckDNS token** | Your token from duckdns.org, masked as you type. **Update now** tests it immediately and reports the result. |
 | **Serve the console over HTTPS** | On/off, with the TLS port beside it |
-| **Issue certificate** | Gets a free Let's Encrypt certificate for the DuckDNS name above and **fills in the two paths below**. The email box beside it is only used the first time, to register the account when Posh-ACME is installed. |
+| **Public hostname** | The name the console is reached by — fill this in when the name is your own. Empty falls back to the DuckDNS name. Cosmetic: it names the console in status lines and the banner, and is never matched against requests. |
+| **Issue certificate** | Gets a free Let's Encrypt certificate for the DuckDNS name above and **fills in the two paths below**. The email box beside it is only used the first time, to register the account when Posh-ACME is installed. DuckDNS names only — with your own domain, issue the certificate yourself and fill the paths in. |
 | **Certificate** / **Private key** | Filled in by **Issue certificate**; still editable if your certificate lives elsewhere. Validated as you enter them |
 | **Redirect HTTP to HTTPS** | On by default |
 
