@@ -184,6 +184,47 @@ public sealed class AppSettings
     /// <summary>TCP port for the HTTPS endpoint. Ports below 1024 need elevation.</summary>
     public int WebHttpsPort { get; set; } = 18443;
 
+    /// <summary>
+    /// Hostname the console is reached by from outside — the name the certificate covers.
+    /// Set this when the name comes from your own registered domain; DuckDNS users can leave
+    /// it empty, since the DuckDNS hostname is used as the fallback. Purely cosmetic: it names
+    /// the console in banners and status lines and is never matched against incoming requests,
+    /// so a wrong value cannot lock anyone out.
+    /// </summary>
+    public string WebPublicHostname { get; set; } = "";
+
+    /// <summary>
+    /// Accepts "sentinel.example.com", "https://sentinel.example.com:18443/" or anything in
+    /// between and returns the bare hostname. Empty when nothing usable is left, which is how
+    /// the front-ends tell a typo apart from a deliberate clear.
+    /// </summary>
+    public static string NormalizeHostname(string raw)
+    {
+        var value = (raw ?? "").Trim().ToLowerInvariant();
+        if (value.StartsWith("https://", StringComparison.Ordinal)) value = value["https://".Length..];
+        else if (value.StartsWith("http://", StringComparison.Ordinal)) value = value["http://".Length..];
+
+        var slash = value.IndexOf('/');
+        if (slash >= 0) value = value[..slash];
+
+        // Trailing ":port" — only when there is a single colon, so an IPv6 literal is rejected
+        // below rather than silently truncated. A certificate covers a name, not an address.
+        var colon = value.LastIndexOf(':');
+        if (colon >= 0 && value.IndexOf(':') == colon) value = value[..colon];
+
+        value = value.Trim('.');
+        return value.Length > 0 && value.All(c => char.IsAsciiLetterOrDigit(c) || c is '-' or '.')
+            ? value
+            : "";
+    }
+
+    /// <summary>
+    /// Name to show this console under: the explicit hostname when one is set, otherwise the
+    /// DuckDNS name the caller passes in. Empty when neither is configured.
+    /// </summary>
+    public string PublicHostnameOr(string duckDnsHostname)
+        => WebPublicHostname.Length > 0 ? WebPublicHostname : (duckDnsHostname ?? "");
+
     /// <summary>PEM fullchain (Let's Encrypt fullchain.cer) or a .pfx / .p12 bundle.</summary>
     public string WebTlsCertPath { get; set; } = "";
 
