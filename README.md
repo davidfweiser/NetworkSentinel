@@ -10,6 +10,8 @@ Three ways to run it:
 | **Terminal UI (`--tui`)** | SSH / keyboard-first |
 | **Headless web UI (`-w`)** | Browser on a server (master-password protected) |
 
+> **iPhone and iPad: optional.** [Network Sentinel for iOS](https://github.com/davidfweiser/NetworkSentinel-iOS) is a companion app that signs in to a server running the web UI and shows and controls it from your phone. Network Sentinel does not need it to operate: everything it monitors, detects and blocks runs on the host, and each of the three modes above works on its own.
+
 > **Host-based** intrusion detection and prevention. It detects on its own heuristics and, with Suricata attached (0.6.0), on signature/payload inspection — then enforces in the kernel via `nftables`. It is not an inline network appliance: it protects the machine it runs on, not a segment, and it does not sit in the forwarding path.
 
 Linux port of the original Windows WPF Network Sentinel. Platform layers use `/proc/net`, `ss`, conntrack netlink, `nftables`/`iptables` (elevated via **pkexec**), and XDG data paths. Version **0.7.21**.
