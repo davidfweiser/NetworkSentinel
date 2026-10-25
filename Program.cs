@@ -247,6 +247,9 @@ internal static class Program
                 case "--tls-password":
                     o.PfxPassword = Next() ?? Fail("--tls-password needs the .pfx password");
                     continue;
+                case "--public-hostname":
+                    o.PublicHostname = Next() ?? Fail("--public-hostname needs a hostname, e.g. --public-hostname sentinel.example.com");
+                    continue;
             }
 
             if (Inline("--https-port") is { } hpInline)
@@ -273,6 +276,10 @@ internal static class Program
             else if (Inline("--tls-password") is { } pw)
             {
                 o.PfxPassword = pw;
+            }
+            else if (Inline("--public-hostname") is { } host)
+            {
+                o.PublicHostname = host;
             }
         }
 
@@ -705,10 +712,13 @@ internal static class Program
               --tls-cert PATH    PEM fullchain, or a .pfx / .p12 bundle
               --tls-key PATH     PEM private key (omit for .pfx)
               --tls-password PW  Password for a .pfx / .p12 certificate
+              --public-hostname NAME
+                                 Name the console is reached by, for the banner and
+                                 status lines; defaults to the DuckDNS name when set
               --no-https         Force plain HTTP for this run
                                  Flags override settings.json without overwriting it.
-                                 Get a trusted certificate for a duckdns.org name with:
-                                 scripts/issue-duckdns-cert.sh
+                                 Any certificate for a name you own works. For a free one
+                                 on a duckdns.org name: scripts/issue-duckdns-cert.sh
 
             Environment:
               NETWORKSENTINEL_TUI=1              Force TUI
@@ -730,6 +740,9 @@ internal static class Program
               ./NetworkSentinel -w --https \
                   --tls-cert ~/.local/share/NetworkSentinel/tls/myhost.duckdns.org.fullchain.cer \
                   --tls-key  ~/.local/share/NetworkSentinel/tls/myhost.duckdns.org.key
+              ./NetworkSentinel -w --https --public-hostname sentinel.example.com \
+                  --tls-cert /etc/letsencrypt/live/sentinel.example.com/fullchain.pem \
+                  --tls-key  /etc/letsencrypt/live/sentinel.example.com/privkey.pem
             """);
     }
 

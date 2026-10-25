@@ -234,6 +234,8 @@ public sealed class WebApp : IDisposable
         if (!string.IsNullOrWhiteSpace(o.CertPath)) _settings.WebTlsCertPath = o.CertPath!.Trim();
         if (!string.IsNullOrWhiteSpace(o.KeyPath)) _settings.WebTlsKeyPath = o.KeyPath!.Trim();
         if (!string.IsNullOrWhiteSpace(o.PfxPassword)) _settings.WebTlsPfxPassword = o.PfxPassword!;
+        if (!string.IsNullOrWhiteSpace(o.PublicHostname))
+            _settings.WebPublicHostname = AppSettings.NormalizeHostname(o.PublicHostname!);
     }
 
     public async Task RunAsync()
@@ -424,7 +426,7 @@ public sealed class WebApp : IDisposable
         {
             Console.WriteLine();
             Console.WriteLine($"  HTTPS on port {_httpsPort}");
-            var hostname = _duckDns.Hostname;
+            var hostname = _settings.PublicHostnameOr(_duckDns.Hostname);
             if (!string.IsNullOrEmpty(hostname))
                 Console.WriteLine($"  Secure:  https://{hostname}:{_httpsPort}/");
             Console.WriteLine($"  {_tls?.Status}");
@@ -1496,6 +1498,19 @@ public sealed class WebApp : IDisposable
         });
     }
 
+    /// <summary>
+    /// The URL this console answers on from outside, or empty when no hostname is configured.
+    /// The name is whatever the certificate covers — an own domain when one is set, else the
+    /// DuckDNS one — so this is the same line whichever route the user took.
+    /// </summary>
+    private string PublicConsoleUrl()
+    {
+        var hostname = _settings.PublicHostnameOr(_duckDns.Hostname);
+        if (hostname.Length == 0 || !_settings.WebHttpsEnabled)
+            return "";
+        return $"https://{hostname}:{_settings.WebHttpsPort}/";
+    }
+
     private string HttpsStatusText()
     {
         if (_httpsActive)
@@ -2019,7 +2034,7 @@ public sealed class WebApp : IDisposable
                         case "httpsEnabled":
                             if (on && string.IsNullOrWhiteSpace(_settings.WebTlsCertPath))
                                 return ActionResultDto.Fail(
-                                    "Set the certificate path first — see scripts/issue-duckdns-cert.sh for a Let's Encrypt certificate.");
+                                    "Set the certificate path first — any certificate for your own domain works, or see scripts/issue-duckdns-cert.sh for a free one on a duckdns.org name.");
                             _settings.WebHttpsEnabled = on;
                             label = on
                                 ? $"HTTPS enabled on port {_settings.WebHttpsPort} — restart the web console to apply."
@@ -2033,6 +2048,17 @@ public sealed class WebApp : IDisposable
                             _settings.WebHttpsPort = httpsPort;
                             label = $"HTTPS port set to {httpsPort} — restart the web console to apply.";
                             break;
+                        case "publicHostname":
+                        {
+                            var normalized = AppSettings.NormalizeHostname(raw);
+                            if (raw.Length > 0 && normalized.Length == 0)
+                                return ActionResultDto.Fail("Enter a hostname, e.g. sentinel.example.com.");
+                            _settings.WebPublicHostname = normalized;
+                            label = normalized.Length == 0
+                                ? "Public hostname cleared — the DuckDNS name is used when one is set."
+                                : $"Public hostname set to {normalized}.";
+                            break;
+                        }
                         case "tlsCertPath":
                         case "tlsKeyPath":
                         {
@@ -2524,6 +2550,8 @@ public sealed class WebApp : IDisposable
                 httpsStatus = HttpsStatusText(),
                 tlsCertPath = _settings.WebTlsCertPath,
                 tlsKeyPath = _settings.WebTlsKeyPath,
+                publicHostname = _settings.WebPublicHostname,
+                consoleUrl = PublicConsoleUrl(),
                 duckDnsEnabled = _duckDns.Config.Enabled,
                 duckDnsDomain = _duckDns.Config.Domain,
                 // The token itself is never sent to the browser — only whether one is stored.
@@ -5098,11 +5126,13 @@ public sealed class WebApp : IDisposable
         ${row('Webhook URL', 'POST Critical threats to a webhook — ntfy, Slack, and Discord formats are detected automatically; anything else gets generic JSON. Empty = off. ' + (s.webhookStatus && s.webhookUrl ? s.webhookStatus : ''), txt('webhookUrl', s.webhookUrl || '', 'https://ntfy.sh/your-topic'))}
       </div>
       <div class="settings-group"><h3>Remote access</h3>
-        <div class="settings-note">${esc(s.httpsStatus || '')}${s.duckDnsStatus ? ' · ' + esc(s.duckDnsStatus) : ''}</div>
+        <div class="settings-note">${esc(s.httpsStatus || '')}${s.duckDnsStatus ? ' · ' + esc(s.duckDnsStatus) : ''}${s.consoleUrl ? ' · Console URL: ' + esc(s.consoleUrl) : ''}</div>
+        <div class="settings-note">DuckDNS is only one way to get a name. If you already own a domain, point a record at this machine, use any certificate you like for it, and leave the DuckDNS rows empty.</div>
         ${row('HTTPS', 'Serve this console over TLS as well as plain HTTP. Needs a certificate below. Takes effect when the web console restarts.', sw('httpsEnabled', s.httpsEnabled))}
         ${row('HTTPS port', 'TCP port for the TLS endpoint (ports below 1024 need root). Forward this port on your router if you want access from outside the LAN.', txt('httpsPort', s.httpsPort ?? 18443, '18443'))}
+        ${row('Public hostname', 'The name this console is reached by from outside — the name your certificate covers. Set it when the name is your own; leave it empty to use the DuckDNS name below. Cosmetic only: it names the console in status lines and is never matched against incoming requests.', txt('publicHostname', s.publicHostname || '', 'sentinel.example.com'))}
         ${row('Issue certificate',
-          'Get a free trusted Let\'s Encrypt certificate for the DuckDNS name above and fill in the two paths below. Proves control through the saved token, so nothing needs to be reachable on port 80. Takes a few minutes waiting on DNS. The email is used only the first time, to register the account when acme.sh is installed. '
+          'DuckDNS route only: gets a free trusted Let\'s Encrypt certificate for the DuckDNS name below and fills in the two path fields. With your own domain, issue a certificate however you normally do and fill those paths in yourself. Proves control through the saved token, so nothing needs to be reachable on port 80. Takes a few minutes waiting on DNS. The email is used only the first time, to register the account when acme.sh is installed. '
             + (s.certIssueMessage || ''),
           `<input type="text" data-setting-text="acmeEmail" value="${esc(String(s.acmeEmail ?? ''))}" placeholder="you@example.com" style="min-width:180px"/>
            <button type="button" data-issue-cert ${s.certIssueBusy ? 'disabled' : ''}>${s.certIssueBusy ? 'Issuing…' : 'Issue certificate'}</button>`)}
