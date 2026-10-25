@@ -151,6 +151,15 @@ public static class UfwWriter
     private static bool SameRule(FirewallRuleInfo target, FirewallRuleInfo listed)
     {
         if (target.Direction != listed.Direction) return false;
+
+        // Shape alone is not identity: an operator's own "allow 22/tcp" has the same
+        // shape as a config rule this app wrote for port 22, and deleting ours took
+        // theirs too. Where the target knows its comment, the row must carry it.
+        if (ExpectedComment(target) is { } expected &&
+            !FirewallRuleSpecs.CleanLabel(expected).Equals(
+                FirewallRuleSpecs.CleanLabel(listed.Comment), StringComparison.OrdinalIgnoreCase))
+            return false;
+
         if (!target.ActionText.Equals(listed.ActionText, StringComparison.OrdinalIgnoreCase)) return false;
         if (!target.ProtocolText.Equals(listed.ProtocolText, StringComparison.OrdinalIgnoreCase)) return false;
 
@@ -173,5 +182,18 @@ public static class UfwWriter
         }
 
         return targetAddresses.SequenceEqual(listedAddresses, StringComparer.OrdinalIgnoreCase);
+    }
+
+    /// <summary>
+    /// The comment a row must carry to be <paramref name="target"/>, or null when the
+    /// target cannot say. A rule from this app's ledger was written with its label as
+    /// the UFW comment; a row read from <c>ufw status</c> carries its own (possibly
+    /// empty) one. A row seen only through the kernel dump of UFW's chains has no
+    /// comment to compare — UFW keeps comments in its rules files, not the kernel.
+    /// </summary>
+    private static string? ExpectedComment(FirewallRuleInfo target)
+    {
+        if (!target.IsForeign) return target.Label.Length > 0 ? target.Label : target.Name;
+        return target.Origin.Equals("UFW", StringComparison.OrdinalIgnoreCase) ? target.Comment : null;
     }
 }

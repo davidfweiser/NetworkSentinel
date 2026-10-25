@@ -14,8 +14,11 @@ internal static class Program
     [DllImport("libc")]
     private static extern uint geteuid();
 
+    // lchown, never chown: everything chowned below sits in a directory the target user
+    // owns, so they can swap any path in it for a symlink between our write and our
+    // chown — and chown would follow it to /etc/shadow.
     [DllImport("libc", SetLastError = true)]
-    private static extern int chown(string pathname, uint owner, uint group);
+    private static extern int lchown(string pathname, uint owner, uint group);
 
     /// <summary>Why this OS cannot run it, in the words the GUI also uses.</summary>
     private static string UnsupportedOsMessage() =>
@@ -380,6 +383,16 @@ internal static class Program
         {
             var target = ResolveMasterPasswordTarget();
             var dataDir = Path.Combine(target.Home, ".local", "share", "NetworkSentinel");
+            if (target.NeedsChown && FindSymlinkUnder(target.Home, dataDir) is { } link)
+            {
+                // Running as root inside a directory tree the target user controls: a
+                // planted link would aim root's writes and chowns at a file of the
+                // user's choosing. A real install never has one here.
+                Console.Error.WriteLine($"Refusing to continue: {link} is a symbolic link.");
+                Console.Error.WriteLine("Remove it (it should be a plain directory) and run this again.");
+                Environment.Exit(1);
+                return;
+            }
             Directory.CreateDirectory(dataDir);
             if (target.NeedsChown)
                 TryChown(dataDir, target.Uid, target.Gid);
@@ -404,7 +417,17 @@ internal static class Program
             if (target.NeedsChown)
                 TryChown(Path.Combine(dataDir, "web-master.json"), target.Uid, target.Gid);
 
+            // What changing the password in the browser does: API tokens minted under
+            // the old password go with it. Deleting the file is enough — a running
+            // console checks it before every request, so they stop working at once.
+            var tokenFile = Path.Combine(dataDir, Web.ApiTokenStore.FileName);
+            var tokensRevoked = File.Exists(tokenFile);
+            if (tokensRevoked)
+                File.Delete(tokenFile);
+
             Console.WriteLine(message);
+            if (tokensRevoked)
+                Console.WriteLine("API tokens were revoked with the old password — create new ones under Settings → API tokens.");
             Console.WriteLine();
             Console.WriteLine("If the web service is currently running, restart it to pick up the change:");
             Console.WriteLine("  sudo systemctl restart networksentinel-web   # system install");
@@ -417,6 +440,35 @@ internal static class Program
             Console.Error.WriteLine(ex.Message);
             Environment.Exit(1);
         }
+    }
+
+    /// <summary>
+    /// The first path from just below <paramref name="home"/> down to
+    /// <paramref name="dir"/> that exists as a symbolic link, or null. The home itself is
+    /// not checked: its parent belongs to root, so the user cannot swap it, and some
+    /// systems legitimately link it.
+    /// </summary>
+    internal static string? FindSymlinkUnder(string home, string dir)
+    {
+        var relative = Path.GetRelativePath(home, dir);
+        var current = home;
+        foreach (var part in relative.Split(Path.DirectorySeparatorChar, StringSplitOptions.RemoveEmptyEntries))
+        {
+            current = Path.Combine(current, part);
+            try
+            {
+                var info = new FileInfo(current);
+                if (info.LinkTarget != null)
+                    return current;
+                if (!info.Exists && !Directory.Exists(current))
+                    return null;   // nothing below a missing component can be a link yet
+            }
+            catch
+            {
+                return current;    // cannot tell — treat it as unsafe
+            }
+        }
+        return null;
     }
 
     /// <summary>
@@ -481,7 +533,7 @@ internal static class Program
     {
         try
         {
-            chown(path, uid, gid);
+            lchown(path, uid, gid);
         }
         catch
         {

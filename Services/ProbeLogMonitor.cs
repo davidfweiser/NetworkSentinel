@@ -291,7 +291,11 @@ public sealed class ProbeLogMonitor : IDisposable
             Detail = $"{src} sent TCP SYNs to ports this machine is NOT listening on (e.g. {samplePorts}). " +
                      "These probes never show up as connections — they were caught by the firewall probe log.",
             Origin = "Origin resolving…",
-            Method = method
+            Method = method,
+            // A SYN to a closed port is answered with a RST and goes no further, so nothing
+            // here proves the logged SRC sent it: blocking on it would hand anyone who can
+            // forge a source address the power to cut this host off from that address.
+            AutoBlockHoldReason = "SYNs to closed ports never complete a handshake, so the source address may be forged"
         });
     }
 

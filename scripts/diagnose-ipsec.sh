@@ -9,11 +9,15 @@
 #   2. is the peer's traffic arriving at all, and from which address?
 #   3. what does the IKE daemon say about why the tunnel is down?
 #
-# Usage:  sudo bash scripts/diagnose-ipsec.sh [peer-ip]
+# Usage:  sudo bash scripts/diagnose-ipsec.sh <peer-ip>
 
 set -u
 
-PEER="${1:-76.230.144.67}"
+PEER="${1:-}"
+if [ -z "$PEER" ]; then
+    echo "Usage: sudo bash $0 <peer-ip>   (the far end's public address)" >&2
+    exit 2
+fi
 CAPTURE_SECONDS="${CAPTURE_SECONDS:-20}"
 
 say() { printf '\n=== %s ===\n' "$1"; }

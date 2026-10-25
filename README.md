@@ -10,9 +10,40 @@ Three ways to run it:
 | **Terminal UI (`--tui`)** | SSH / keyboard-first |
 | **Headless web UI (`-w`)** | Browser on a server (master-password protected) |
 
+> **iPhone and iPad: optional.** [Network Sentinel for iOS](https://github.com/davidfweiser/NetworkSentinel-iOS) is a companion app that signs in to a server running the web UI and shows and controls it from your phone. Network Sentinel does not need it to operate: everything it monitors, detects and blocks runs on the host, and each of the three modes above works on its own.
+
 > **Host-based** intrusion detection and prevention. It detects on its own heuristics and, with Suricata attached (0.6.0), on signature/payload inspection — then enforces in the kernel via `nftables`. It is not an inline network appliance: it protects the machine it runs on, not a segment, and it does not sit in the forwarding path.
 
-Linux port of the original Windows WPF Network Sentinel. Platform layers use `/proc/net`, `ss`, conntrack netlink, `nftables`/`iptables` (elevated via **pkexec**), and XDG data paths. Version **0.7.16**.
+Linux port of the original Windows WPF Network Sentinel. Platform layers use `/proc/net`, `ss`, conntrack netlink, `nftables`/`iptables` (elevated via **pkexec**), and XDG data paths. Version **0.7.21**.
+
+> **Use at your own risk.** Network Sentinel changes your firewall, and with auto-block turned on it blocks addresses by itself. Try it first on a machine you can reach some other way — a local screen or your provider's web console — before you rely on it over SSH. It comes as is, without warranty: see the [MIT license](LICENSE).
+
+## Screenshots
+
+The web console on a server. Every address in these is from a range reserved for documentation, and every name is invented.
+
+**Dashboard:** live counts, activity, data flow, and the latest threats with whether each one was blocked.
+
+![Dashboard](docs/screenshots/dashboard.png)
+
+**Break-in Attempts:** each threat with its detail, where it came from, and the block verdict.
+
+![Break-in Attempts](docs/screenshots/threats.png)
+
+<table>
+  <tr>
+    <td width="50%"><a href="docs/screenshots/hosts.png"><img src="docs/screenshots/hosts.png" alt="Remote Computers"></a><br><b>Remote Computers</b>: every address seen, its threat level, and Block or Unblock</td>
+    <td width="50%"><a href="docs/screenshots/connections.png"><img src="docs/screenshots/connections.png" alt="Live Connections"></a><br><b>Live Connections</b>: who is connected right now, to which process</td>
+  </tr>
+  <tr>
+    <td><a href="docs/screenshots/ports.png"><img src="docs/screenshots/ports.png" alt="Open Ports"></a><br><b>Open Ports</b>: what is listening, and a Block port button for each</td>
+    <td><a href="docs/screenshots/firewall.png"><img src="docs/screenshots/firewall.png" alt="Firewall &amp; Block"></a><br><b>Firewall &amp; Block</b>: the rules Network Sentinel wrote, one row per block</td>
+  </tr>
+  <tr>
+    <td><a href="docs/screenshots/fwconfig.png"><img src="docs/screenshots/fwconfig.png" alt="Firewall Config"></a><br><b>Firewall Config</b>: the whole host firewall, UFW's and Docker's rules included</td>
+    <td><a href="docs/screenshots/settings.png"><img src="docs/screenshots/settings.png" alt="Settings"></a><br><b>Settings</b>: every detector, each with its own switch and status</td>
+  </tr>
+</table>
 
 ---
 
@@ -73,6 +104,44 @@ Every status line that reports auto-block state — the GUI hero subtitle and tr
 ### Remote alerting (webhook)
 Set **Settings → Webhook URL** to push Critical threats off the machine — the payload adapts automatically: **ntfy** (plain text + `Title`/`Priority` headers), **Slack** (`{"text": …}`), **Discord** (`{"content": …}`), anything else gets a generic JSON document. Per-source/type cooldown stops a burst from flooding the channel.
 
+### A bot on watch around the clock (GrokBot)
+
+Nobody watches a console all night. A bot you run yourself, such as GrokBot, can. It checks Network Sentinel every minute or so, messages you when someone tries to break in, and tells you whether the attempt was blocked. If it wasn't, the bot can block the address once you say so:
+
+> **03:12** · Brute-Force Pattern from 203.0.113.9 (Critical): BLOCKED — auto-block rule added.
+>
+> **03:40** · Port Scan from 198.51.100.4 (Medium): Not blocked — below the auto-block level (≥High). Block it?
+
+How the bot works with the console:
+
+1. **It gets a token, never your password.** Create one under **Settings → API tokens**. *Read only* is enough to watch and report. *Read and control* also lets it block and unblock, and must be pinned to the address the bot calls from.
+2. **It asks only for what's new.** `GET /api/v1/monitor/threats?since=<latestTs>` returns just the threats that arrived after the last one it saw. Add `&minLevel=High` to skip the small stuff.
+3. **Each threat carries its verdict.** `blocked` is `true` or `false`, and `blockStatus` is the same sentence the console shows (see [Every warning says whether the address is blocked](#every-warning-says-whether-the-address-is-blocked-065)). Both are empty for a threat that names no address, such as a new listener. The bot never has to guess whether anything was done.
+4. **You stay in charge.** When you say "block it", the bot sends `{"action":"block","ip":"198.51.100.4"}` to `POST /api/v1/control`. The console runs it through the same checks it applies to you, so the bot can't block an allowlisted or LAN address or lock you out of the console.
+5. **It notices when the watch itself is in trouble.** `GET /api/v1/monitor/health` says whether monitoring is running and when the token expires, so the bot can warn you before it loses access.
+
+One poll, trimmed to the fields a bot reports on:
+
+```bash
+curl -H "Authorization: Bearer nsm_…" \
+     "https://myhost.duckdns.org:18443/api/v1/monitor/threats?since=2026-10-23T03:00:00Z"
+```
+
+```json
+{
+  "ok": true, "count": 1, "latestTs": "2026-10-23T03:12:44Z",
+  "threats": [{
+    "ts": "2026-10-23T03:12:44Z", "level": "Critical", "type": "Brute-Force Pattern",
+    "sourceIp": "203.0.113.9", "blocked": true,
+    "blockStatus": "BLOCKED — auto-block rule added"
+  }]
+}
+```
+
+Everything the bot does carries the token's name: on the console's status line (`GrokBot (API): …`), and in the API audit log. The webhook above is the simpler choice when you only want Critical alerts posted to a channel. A bot adds the conversation: it can answer "what got blocked tonight?", follow up on what wasn't, and act when you tell it to.
+
+Give a control token only to a bot you run yourself. If the bot passes threats to a language model, it should treat `title` and `detail` as untrusted text, since an attacker chooses parts of them, and act only on what *you* tell it. The full security model is in [API tokens](#api-tokens--monitoring-and-control-for-a-bot-0718).
+
 ### Prevention engine (0.6.0)
 
 Every automatic block — from any detector, in any of the three frontends — goes through **one** enforcement engine (`PreventionService`). It used to be three near-identical copies of the same logic in the GUI, TUI and web console, and they had drifted: only the web console honoured the manual-unblock suppression list, so releasing an address in the GUI or TUI could be silently undone by the next detection. Detection sources keep multiplying; the decision to drop traffic must not.
@@ -83,13 +152,16 @@ Gates, in order — a threat must clear all of them before a rule is written:
 |------|-----|
 | Severity ≥ minimum | The configured `Medium`/`High`/`Critical` threshold |
 | Not `New Remote Host` | First contact is not evidence of anything |
+| Source proven (0.7.19) | Auto-block acts on the address a threat names, so that address must not be one an attacker could pick. Evidence that never completed a TCP handshake — half-open SYN-RECEIVED sockets, closed-port probes from the kernel log, Suricata alerts on UDP/ICMP or on TCP with no app-layer protocol — carries a forgeable source, and is alerted on but never blocked: otherwise six forged SYNs "from" your own address would lock you out. A stealth SYN scan is therefore reported, not auto-blocked; a connect scan or a brute-force over real sessions still is. DNS-hygiene alerts name a resolver this host queried, not an attacker, and are never blocked either |
 | Routable public address | LAN, loopback, CGNAT (100.64/10 — Tailscale and many VPN tunnels) and multicast are never auto-blocked. CGNAT can still be blocked **manually**, behind a confirmation — a hostile tunnel peer is a real case, and only LAN/loopback/link-local/multicast are refused outright |
 | Not allowlisted | Known-good stays reachable |
 | Not this machine | A detector that attributes a threat to the wrong end of a flow can never firewall the host off from itself — matters most on a VPS whose own address is public |
+| Not a configured resolver (0.7.19) | A `nameserver` in `/etc/resolv.conf` (or systemd-resolved's upstream list) is never auto-blocked — the block would take name resolution with it |
 | Not a WireGuard tunnel endpoint | A peer's public endpoint is where its tunnel packets come from; blocking it does not drop an attacker, it drops the tunnel and everything reached through it. Independent of the WireGuard *monitoring* setting, and remembered for 24 h — see [tunnel endpoints are never auto-blocked](#tunnel-endpoints-are-never-auto-blocked) |
 | Not protected | See lockout protection below |
 | Not already blocked | No duplicate rules |
 | Not suppressed | An address you deliberately released stays released for 24 h |
+| Under the rate cap (0.7.19) | At most 20 auto-blocks in any rolling minute. A real attack is a handful of addresses; dozens a minute means a detector is being fed, and past the cap threats are reported but not acted on |
 | Not retried too soon | An address is claimed for 10 minutes once a batch acts on it. A block that fails for a reason other than elevation (a timed-out `nft`, xtables lock contention) retries after **45 s** instead — one transient error should not leave an active attacker alone for ten minutes. Elevation failures pause auto-block globally for 5 minutes, lifted as soon as you authorize elevation |
 
 - **Dry run** (**Settings → Auto-block → Dry run**) runs every gate and reports what it *would* have dropped, without writing a single rule. Blocking turns a false positive from noise into an outage, so a new detection source — a fresh Suricata ruleset especially — belongs here first. The console shows `Would block …` lines exactly where it would otherwise show `Auto-blocked …`.
@@ -336,7 +408,7 @@ Polling `/proc/net` can only ever describe the moment the file was read — on t
 - **App-minted blocks always win** (0.7.0): auto-block and manual blocks are *inserted at the head* of their chain while config rules are *appended*, so a config `Allow` can never reopen an address auto-block just shut
 - **Auto-block** on/off with minimum severity (`Medium` / `High` / `Critical`)
 - Removing/unblocking a rule **suppresses auto-block for that IP for 24 h** (persisted), so removed rules stay gone across restarts
-- **Auto-block expiry** (1 h … 7 days, off by default) — an expired address stops counting as blocked immediately; the `nft`/`iptables` rule itself is dropped by a background sweep as soon as it can elevate without a prompt (running as root, or cached/passwordless sudo). Manual blocks are always permanent
+- **Auto-block expiry** (1 h … 7 days; 24 h on a new install from 0.7.19 — an existing `settings.json` keeps its value, including off) — an expired address stops counting as blocked immediately; the `nft`/`iptables` rule itself is dropped by a background sweep as soon as it can elevate without a prompt (running as root, or cached/passwordless sudo). Manual blocks are always permanent
 - The web console **refuses to block its own port** — that would cut off your browser mid-request and look like a crash
 - Settings in `~/.local/share/NetworkSentinel/settings.json` (or `$XDG_DATA_HOME/NetworkSentinel`)
 - **Authorize firewall** — elevates only `nft`/`iptables` via **pkexec** (password dialog). The GUI always runs as your user
@@ -465,7 +537,7 @@ gradient rather than an outline.
 | **Firewall Config** (0.7.1, rebuilt 0.7.4) | The whole host firewall — UFW's rules, Network Sentinel's, and everyone else's — plus listening services and their firewall verdict; add / edit / delete any of them |
 | **Allowlist** | Add/remove trusted domains and IPs; refresh the feed |
 | **Blocked Sites** (0.7.16) | What the filtering resolver refused — name, client, reason and rule, newest first. Present only while a resolver is configured; read on arrival and on **Refresh**, never on the live poll |
-| **Settings** | Monitoring on/off, poll interval, geo lookups, auth-log and closed-port scan detection, the 0.4.0 detectors (threat intel, new-listener alerts, process reputation, ARP/gateway watch, startup-item watch, exfiltration threshold, honeypot ports), **kernel flow events**, **DNS hygiene** (with approved resolvers), **DNS filtering** (on/off, resolver address, and the user and password to reach it), **WireGuard peer monitoring** (with a live peer table), **Suricata signature ingestion** (EVE path, maximum severity, muted sids), **auto-block dry run**, **HTTPS + remote access** (public hostname, DuckDNS, and **Issue certificate**), webhook URL, auto-block + minimum severity + expiry, block direction (in/out), allowlist feed, **change master password**, **Remove all rules** |
+| **Settings** | Monitoring on/off, poll interval, geo lookups, auth-log and closed-port scan detection, the 0.4.0 detectors (threat intel, new-listener alerts, process reputation, ARP/gateway watch, startup-item watch, exfiltration threshold, honeypot ports), **kernel flow events**, **DNS hygiene** (with approved resolvers), **DNS filtering** (on/off, resolver address, and the user and password to reach it), **WireGuard peer monitoring** (with a live peer table), **Suricata signature ingestion** (EVE path, maximum severity, muted sids), **auto-block dry run**, **HTTPS + remote access** (public hostname, DuckDNS, and **Issue certificate**), webhook URL, auto-block + minimum severity + expiry, block direction (in/out), allowlist feed, **API tokens** for a bot — read-only or control (0.7.18), **change master password**, **Remove all rules** |
 
 **The dashboard boxes the desktop had (0.7.7).** Two panels the desktop window
 carried and the console did not: **Threat intensity**, the high/critical count on
@@ -494,12 +566,95 @@ The first button in the web console's hero action row is a single **Sleep ⇄ Wa
 
 ### Web UI security
 - First browser visit **creates a master password** (min. 8 characters)
-- Creating it from **another machine** additionally asks for a one-time **setup code**, printed where the console runs (the terminal, or `journalctl -u networksentinel-web`). Without this, whoever reached the port first — the console binds all interfaces before any password exists — could claim the master password and with it firewall control. Setup from localhost needs no code
-- Every later visit **requires that password**; change it under **Settings → Master password**
+- Creating it asks for a one-time **setup code**, printed where the console runs (the terminal, or `journalctl -u networksentinel-web`). Without this, whoever reached the port first — the console binds all interfaces before any password exists — could claim the master password and with it firewall control. Setup from localhost needs the code too (from 0.7.19): "local" includes every account on the machine, any web page open in a browser on it (a cross-site form post reaches setup without a cookie), and — behind `tailscale serve` or any reverse proxy on the same host — every visitor. `sudo networksentinel --set-master-password` remains the no-browser alternative
+- Every later visit **requires that password**; change it under **Settings → Master password**. Changing it signs out every other session and revokes every API token
 - Can't reach a browser yet (e.g. still opening the port in a cloud firewall)? Set/reset it from the terminal instead: `sudo networksentinel --set-master-password`
 - Hash stored as PBKDF2-SHA256 (random salt, 200k iterations) in `~/.local/share/NetworkSentinel/web-master.json` — never plain text
 - Session cookie until sign-out, browser close, or 12 hours idle
 - Failed attempts are throttled **per client IP**: five wrong guesses trigger a lockout that doubles with each further attempt (1 minute up to 1 hour), answered with `429` and a `Retry-After`. A fixed delay alone only slows one connection at a time — this caps a parallel guesser
+
+### API tokens — monitoring and control for a bot (0.7.18)
+
+A bot or script that works with this console should not hold the master password. A session is the whole console, Settings and credentials included, so every place an unattended client keeps its configuration would become a route to all of it. Tokens are the bot's own credential, in two strengths:
+
+| Access | Can | Cannot |
+|--------|-----|--------|
+| **Read only** (default) | Read status, threats and blocked addresses under `/api/v1/monitor/` — and, if the token is limited to source addresses, the connection, firewall and allowlist tables too | Change anything |
+| **Read and control** | All of the above, plus run the console's actions through `POST /api/v1/control` | Open or change **Settings**, issue a certificate, create or revoke tokens, sign in, change the master password |
+
+Create one under **Settings → API tokens**: a name, the access level, an expiry (30 days, 90 days, a year, or never), the addresses it may be used from — optional for a read-only token, **required for a control token** — and your **master password again**. The token is shown **once**; only its SHA-256 is stored, in `web-api-tokens.json` (mode `0600`). Send it as a bearer header:
+
+```bash
+curl -H "Authorization: Bearer nsm_…" https://myhost.duckdns.org:18443/api/v1/monitor/summary
+```
+
+#### Reading — `GET /api/v1/monitor/…`
+
+| Endpoint | Returns |
+|----------|---------|
+| `health` | Version, host name, uptime, whether monitoring is running, and this token's own name and expiry — so the bot can warn before it is locked out |
+| `summary` | The dashboard's counters, threat counts by level, blocked-address count, auto-block state (including dry run), whether the firewall can be written, current in/out byte rates |
+| `threats` | Threat events, newest first, each with its block verdict. `?since=` takes the `ts` of the last event already seen and returns only newer ones (`latestTs` is the cursor); `?minLevel=High`; `?limit=` 1–200, default 50 |
+| `blocked` | Addresses currently blocked by Network Sentinel's rules |
+| `traffic` | The data-flow card: live rates, this month, daily and monthly history |
+| `connections` / `hosts` / `ports` † | The Live Connections, Remote Computers and Open Ports tables |
+| `firewall` † | Managed block rules (`firewallRules`), the whole host firewall (`configRules`, each with its `key`), firewall status, and listening services with their verdict |
+| `allowlist` † | The never-block list and its status |
+| `dns-blocked` † | What the filtering resolver refused (`?limit=`), where one is configured |
+
+† Served only to a token limited to source addresses (`403` otherwise). These are a map of the host — every connection and listener, the firewall as written, what tunnel clients tried to resolve — and a read-only token may otherwise be valid from anywhere. A control token is always limited, so it always has them.
+
+The table rows are the console's own, built by the same code, so the identifiers in them are exactly what the control route takes back. Timestamps in `health`, `summary`, `threats` and `firewall.hostFirewall` are ISO 8601 UTC. Every response is JSON with `ok`; a failure carries a `message`.
+
+#### Controlling — `POST /api/v1/control`
+
+The body is the console's own action format — the same JSON the page posts — so anything the bot does is something the console could have done, through the same checks:
+
+```bash
+curl -X POST -H "Authorization: Bearer nsm_…" -H "Content-Type: application/json" \
+     -d '{"action":"block","ip":"203.0.113.9"}' https://myhost.duckdns.org:18443/api/v1/control
+```
+
+| Action | Fields | Does |
+|--------|--------|------|
+| `block` / `unblock` | `ip` | Block or unblock an address (direction follows the auto-block setting) |
+| `block_port` / `unblock_port` | `value` (port), `kind` (`TCP`/`UDP`), `direction` (`Inbound`/`Outbound`/`Both`) | Block or unblock a local port |
+| `remove_rule` | `value` (a `name` from `firewallRules`) | Remove one managed block |
+| `remove_all_rules` | — | Remove every Network Sentinel block rule; auto-block will not re-add them for 24 h |
+| `restore_allowlisted` | — | Unblock anything on the allowlist |
+| `save_config_rule` | `label`, `ruleAction` (`Allow`/`Block`), `direction`, `protocol`, `ports`, `addresses`; `key` to replace a scanned rule | Add or edit a host firewall rule |
+| `delete_host_rule` | `key` (from `configRules`) | Delete a host firewall rule — UFW's and other software's included |
+| `rescan_firewall` | — | Re-read the host firewall now |
+| `add_allowlist` / `remove_allowlist` | `value` (domain or IP), `kind` (`Domain`/`IP`) for removal | Edit the never-block list |
+| `refresh_allowlist` | — | Refresh the allowlist feed |
+| `sleep` / `wake` | — | Stop or resume all monitoring (blocks stay in force) |
+| `clear_threats` | — | Clear the threat list |
+| `set_setting` with `name: "autoBlockEnabled"` | `value` (`true`/`false`) | Auto-block on or off, stated explicitly — the only setting a token can write |
+| `set_min_level` | `value` (`Medium`/`High`/`Critical`) | Auto-block minimum severity |
+| `authorize` | — | The header's **Authorize firewall** |
+
+`toggle_autoblock`, `toggle_sleep` and `cycle_min_level` are accepted too, since the page has them, but a bot should say which state it wants: two toggles in a row cancel out. The answer is `{"ok": true, "message": …}` with the console's own wording, `400` when the action was tried and failed (the message says why), and `403` for an action tokens may not run. A failure message is the first paragraph of what the page would show: the page follows it with how to grant this service sudo, which names the account it runs as, and that part stays in the console.
+
+Everything that is a row on the **Settings** page stays there — detectors, webhook, HTTPS, DuckDNS, DNS filtering, and of auto-block: dry run, direction and expiry. On/off and minimum severity are open because they are buttons in the console's header rather than settings.
+
+#### What makes it safe to hand to a bot
+
+- **Separate from the console in both directions.** A token is not a session, so `/api/state` (which carries the settings page), `/api/action` and the password endpoints answer `401` to it however it is presented. A browser session does not open the token routes either, so there is no cookie here for another site to ride on, and no CORS header is sent
+- **Minting takes the password, not just the session.** Creating a token asks for the master password again, throttled like the sign-in page. A token outlives the session that made it, so an unlocked browser or a stolen cookie must not be enough to leave a permanent credential behind
+- **A control token only exists pinned.** It is refused unless it names the addresses the bot calls from, so a copy that leaks — from a config file, a backup, a log — is useless from anywhere else. Read-only tokens can be pinned the same way (`203.0.113.7, 10.8.0.0/24`). Pin only when the bot connects directly: behind a local reverse proxy (`tailscale serve` included) every caller arrives as `127.0.0.1`
+- **Actions are listed, not excluded.** The control route runs the actions in the table above and nothing else, so an action added to the console later is closed to tokens until it is deliberately opened — a test fails until someone decides. A token cannot create or revoke tokens — one that could would outlive its own expiry, pinning and revocation — and that is not a rule the control route has to remember: token management is not among the things the action runner can do at all
+- **The console's own guards still apply.** A token cannot block the port the console is served on, write a rule that blocks all inbound traffic, remove the console's own access rule, or block an allowlisted or LAN address — the same refusals the page gets
+- **Everything is in the audit log.** Tokens created and revoked (and from which address), every control action with the token's name, id, caller and result, every refused token and why, a read-only token trying the control route, lockouts, and a token seen on plain HTTP — one line each in `~/.local/share/NetworkSentinel/logs/api-audit.log` (mode `0600`, rotated at 1 MB with eight older files kept, so a burst of entries cannot push what came before it straight off the end) and in the journal (`journalctl -u networksentinel-web | grep 'Token API'`). An action also shows on the console's status line as `GrokBot (API): …` and on the token's row as its last action, and block rules it writes are described as `API block · …` rather than `Web UI block · …`. A refused request is logged by name only, never with the value it tried to set
+- **Nothing from Settings is exposed.** Read responses are built table by table, not from the page's state — no webhook URL, resolver login, TLS paths or token list
+- **HTTPS only.** A request over plain HTTP is refused with `403` unless it comes from localhost, and refused *before* the HTTPS redirect: a client that followed the redirect would work while sending its token in the clear on every call. If the console serves plain HTTP only, the API answers this machine alone. A live token that does arrive in the clear is flagged on its row — and stays flagged until it is revoked — and written to the audit log once, so you hear that it was exposed and not only the bot. The same rule holds where a token is born: one cannot be *created* over plain HTTP from another machine, since it would cross the network unencrypted the moment it was shown
+- **Header only.** A token in a query string ends up in proxy logs and shell history, so that spelling is not accepted
+- **A pinned caller is shielded from auto-block** the way a signed-in operator is — you vouched for that address, and a frequent poller is what the reconnect heuristics would otherwise learn to block. An unpinned token gets no such shield, or a stolen one would buy immunity from the firewall
+- **Refusals say nothing.** Unknown, wrong, expired, revoked and wrong-address all return the same `401`, so the answer cannot confirm that a stolen token is real. The reason goes to you instead: the token's row in Settings shows when it was last used and from where, and the last refusal with its cause — which is also how use of a leaked token shows up
+- **Throttled twice.** Five rejected tokens from one address lock it out for a minute (`429` + `Retry-After`), on a separate counter so a misconfigured bot cannot lock you out of the console. It does not double to an hour the way the sign-in page does: that guards a password a person chose, this guards 256 random bits, and the long lockout only ever caught the bot itself still retrying a token you had just replaced. A request with no token at all is not counted. A valid token is limited to 120 requests a minute
+- **Revocable alone, and all at once.** **Revoke** takes effect on the next request and touches nothing else. **Changing the master password revokes every token**, as it signs out every other session: a password is usually changed because something leaked, and a token minted under the old one is exactly the credential that must not survive. `sudo networksentinel --set-master-password` does the same
+- **The file is the truth.** The running console re-reads `web-api-tokens.json` whenever it changes, before every request. A token revoked by another console on the same data directory stops working here at once, and deleting the file revokes everything — the emergency brake. Writers take turns under a lock file, so one console's bookkeeping write cannot land on top of another's revocation. If a revocation cannot be saved (disk full, permissions) the token is still refused, stays refused however the file changes, and the save is retried until it lands — and the console says the change would not yet survive a restart instead of reporting success
+
+A control token is close to the firewall half of the master password, so give one only to a bot you run yourself. If the bot feeds what it reads to a language model, treat `title`, `detail`, `origin` and host and process names as untrusted text: they quote things an attacker chooses — user names from failed logons, reverse-DNS names. With a control token that matters more: the bot should act on what *you* tell it, never on instructions it finds in those fields, and confirming with you before each change is the right default.
 
 ### HTTPS and remote access (0.5.0)
 
@@ -582,7 +737,7 @@ The token is stored in `~/.local/share/NetworkSentinel/duckdns.json` with mode `
 - Desktop libraries for Avalonia GUI (usual X11/Wayland desktop)
 - **Text size (0.7.12, a setting in 0.7.13).** Every size in the GUI is an absolute device-independent pixel, so on a 4K panel whose desktop session does not scale, the window opened ~2000px wide with 11px labels. The content is drawn through a `LayoutTransformControl`, which scales during layout rather than at paint, so wrapping, trimming and the table columns all stay correct — the window gets bigger rather than clipped. Choose the step under **Settings → Display → Text size**: 100% is the original sizing, 175% the default (sized for an unscaled 4K panel), up to 250%. It applies straight away and persists as `UiScale` in `settings.json`, clamped to 1.0–2.5 on read. GUI only — the TUI is sized by the terminal and the web console by the browser
 - **policykit-1** (`pkexec`) recommended for firewall password prompts. Failing that, the app drives an **askpass** dialog through `sudo -A` (`ssh-askpass`, `ksshaskpass`, `gnome-ssh-askpass`, or whatever `SUDO_ASKPASS` names), and failing that it needs passwordless sudo — see [Firewall elevation on a headless server](#firewall-elevation-on-a-headless-server-no-pkexec)
-- No `which` binary is needed: `sudo`, `pkexec`, `ufw`, `nft`, `iptables` and `ss` are resolved in-process against `PATH` plus `/usr/local/sbin`, `/usr/sbin` and `/sbin` — a desktop session's `PATH` omits the sbin directories on Debian and its derivatives
+- No `which` binary is needed: `sudo`, `pkexec`, `ufw`, `nft`, `iptables` and `ss` are resolved in-process against the system directories only (`/usr/local/sbin`, `/usr/local/bin`, `/usr/sbin`, `/usr/bin`, `/sbin`, `/bin`, and NixOS's `/run/wrappers/bin` and `/run/current-system/sw/bin`), never `PATH` (0.7.19) — these binaries run as root, and `PATH` often includes `~/.local/bin`, where anything running as you could plant a fake `nft` or `pkexec`. A binary (or its directory) that a group or other users can write to is refused
 - `ufw` when the host uses it — Firewall Config reads it and writes through it; the app never enables it for you (that can lock you out of SSH)
 - `nft` (nftables) or `iptables` for host firewall changes, and for reading the ruleset where UFW is not in use
 - `ss` (iproute2) for the exfiltration monitor and the Firewall Config listening-services table — present on essentially every distro; without it those report themselves unavailable
@@ -648,17 +803,17 @@ first. The build is self-contained — the server needs no .NET runtime.
 
 ```bash
 # build machine
-scp dist/networksentinel-0.7.16-linux-x64.install.sh user@server:
+scp dist/networksentinel-0.7.21-linux-x64.install.sh user@server:
 
 # server
-chmod +x networksentinel-0.7.16-linux-x64.install.sh
-sudo ./networksentinel-0.7.16-linux-x64.install.sh --web-service
+chmod +x networksentinel-0.7.21-linux-x64.install.sh
+sudo ./networksentinel-0.7.21-linux-x64.install.sh --web-service
 ```
 
 Confirm the installer is current before using root:
 
 ```bash
-./networksentinel-0.7.16-linux-x64.install.sh --help
+./networksentinel-0.7.21-linux-x64.install.sh --help
 # Should list: --web-service
 ```
 
@@ -710,8 +865,8 @@ sudo ./….install.sh --web-service --port 18765
 ./….install.sh --user --desktop-shortcut    # ~/.local + icon on the Desktop
 
 # classic tarball
-tar xzf networksentinel-0.7.16-linux-x64.tar.gz
-cd networksentinel-0.7.16-linux-x64
+tar xzf networksentinel-0.7.21-linux-x64.tar.gz
+cd networksentinel-0.7.21-linux-x64
 sudo ./install.sh --web-service
 ```
 
@@ -790,7 +945,7 @@ sudo networksentinel-uninstall
 | `/usr/local/bin/networksentinel-web` | Web UI helper |
 | `/etc/systemd/system/networksentinel-web.service` | Auto-start unit |
 | `/etc/networksentinel/web.env` | `WEB_PORT` for systemd |
-| `~/.local/share/NetworkSentinel/` | Settings, allowlist, master-password hash, firewall ledger, `host-history.json` (known peers + listener baseline), `threat-log.jsonl`, `threat-intel-cache.json`, `wireguard-peers.json` + `wireguard-endpoints.json` (peer baseline and the never-block tunnel endpoints — public keys and addresses only), `duckdns.json` (`0600`), `tls/` (certificate + key) |
+| `~/.local/share/NetworkSentinel/` | Settings, allowlist, master-password hash, firewall ledger, `host-history.json` (known peers + listener baseline), `threat-log.jsonl`, `threat-intel-cache.json`, `wireguard-peers.json` + `wireguard-endpoints.json` (peer baseline and the never-block tunnel endpoints — public keys and addresses only), `duckdns.json` (`0600`), `web-api-tokens.json` (`0600` — API token hashes, never the tokens), `logs/api-audit.log` (`0600` — what tokens did and what was done to them), `tls/` (certificate + key) |
 
 Set or reset the web master password (requires root — resolves the real service user via `SUDO_USER`, not root's own home):
 
@@ -1117,7 +1272,7 @@ All three UIs write the same `~/.local/share/NetworkSentinel/settings.json`, so 
 | `AutoBlockEnabled` | `false` | Create firewall rules automatically |
 | `AutoBlockMinLevel` | `"High"` | Minimum severity for auto-block |
 | `AutoBlockInbound` / `AutoBlockOutbound` | `true` / `true` | Direction of auto-created rules |
-| `AutoBlockExpiryMinutes` | `0` (off) | Auto-block lifetime; manual blocks are always permanent |
+| `AutoBlockExpiryMinutes` | `1440` (24 h) | Auto-block lifetime (0 = never expire); manual blocks are always permanent. The default was `0` before 0.7.19, and a `settings.json` written by an earlier version keeps the value it holds |
 | `AllowlistUseRemoteFeed` | `true` | Refresh the known-good list from the online feed |
 
 ### Auto-block
@@ -1186,7 +1341,7 @@ All three UIs write the same `~/.local/share/NetworkSentinel/settings.json`, so 
 | `Services/TlsCertificateProvider.cs` | Loads the console's PEM/PFX certificate; hot-reloads on renewal |
 | `Services/DuckDnsUpdater.cs` | DuckDNS dynamic-DNS refresh; token stored `0600` |
 | `Services/CertIssuanceService.cs` | Runs the issuance script for the Settings **Issue certificate** button |
-| `Services/LoginThrottle.cs` | Per-IP lockout for the console's password endpoints |
+| `Services/LoginThrottle.cs` | Per-IP lockout for the console's password endpoints and, on its own counter, the token API |
 | `Services/WireGuardEndpointGuard.cs` / `IpsecEndpointGuard.cs` | Tunnel endpoints that must never be auto-blocked |
 | `Services/DnsFilterService.cs` | The filtering resolver's switch and its blocked-query log |
 | `scripts/setup-dns-filter.sh` | Installs AdGuard Home as the resolver for tunnel clients; `--uninstall` reverses it |
@@ -1195,6 +1350,8 @@ All three UIs write the same `~/.local/share/NetworkSentinel/settings.json`, so 
 | `scripts/diagnose-site-access.sh` | Read-only triage for one site a tunnel client cannot reach (YouTube by default) |
 | `scripts/diagnose-sftp-slowness.sh` | Read-only triage for SFTP that crawls while SSH to the same host is fast |
 | `Web/WebAuthStore.cs` | Master password hash + session tokens |
+| `Web/ApiTokenStore.cs` | API tokens for a bot (read-only or control): hashed at rest, expiry, source pinning, per-token rate limit; re-read from disk whenever the file changes |
+| `Web/ApiAuditLog.cs` | One line per token event — minted, revoked, refused, every control action — to the journal and `logs/api-audit.log` |
 | `scripts/package.sh` | Build self-contained tarball + `.install.sh` |
 | `scripts/install-from-package.sh` | Server/desktop installer (shipped as `install.sh`) |
 | `scripts/systemd/` | `networksentinel-web` unit + `web.env` example |
@@ -1268,6 +1425,14 @@ On GNOME / Pop!_OS the indicator appears in the top bar (StatusNotifier / AppInd
 | A rule added here does not appear in `ufw status` | Only rules written **while UFW is active** go through UFW; the rest go into nftables, where they are still enforced but are not UFW's. Before 0.7.10 that included hosts where UFW *was* active: the probe ran `ufw status` as you, root-only, and read the refusal as "inactive". It now falls back to `ENABLED` in `/etc/ufw/ufw.conf` — the same flag `ufw status` reports — so on 0.7.10 and later the message on a rule that went into nftables says which of the three reasons it was. For a rule added by an older build, delete it and add it again. |
 | No tray icon | DE must support StatusNotifier/AppIndicator; window title still updates when minimized. |
 | Web UI asks for password every time | Expected after sign-out, browser close, or 12h idle. Reset: delete `web-master.json`. |
+| Token API answers `403` | The message says which: the request came over **plain HTTP** from another machine (point the bot at the `https://` port — and revoke that token, it has been on the wire unencrypted); a **read-only** token was used on `/api/v1/control`; a token **not limited to source addresses** asked for the connection, firewall, allowlist or blocked-sites tables; or the action is one tokens may not run (Settings, certificates, token management). |
+| Creating a token answers that it "cannot be created over plain HTTP" | You are using the console over plain HTTP from another machine, and the new token would be shown to you unencrypted. Open the console on its `https://` port, or create the token on the machine it runs on. |
+| Creating a token answers "Incorrect master password" | Creating one asks for the master password again — being signed in is not enough. Five wrong tries lock that address out of the sign-in page too; it is the same guess. |
+| Every token stopped working at once | The master password was changed (in the page or with `--set-master-password`), which revokes them all, or `web-api-tokens.json` was removed. Create new ones. |
+| Token API answers `401` with a token that used to work | Every refusal looks the same to the caller on purpose. The reason is on the token's row under **Settings → API tokens**: expired, or called from an address outside its allowed sources. A token missing from the list was revoked. |
+| Token API answers `429` | Either five rejected tokens from that address (a one-minute lockout, with `Retry-After`) or more than 120 requests a minute on one token. Fix the token or slow the poll — every 30–60 seconds is plenty. |
+| A control action answers `400` "Cannot …" | The token was accepted; the console itself cannot write the firewall on this host. Same cause and fix as the page's — see [Firewall elevation on a headless server](#firewall-elevation-on-a-headless-server-no-pkexec). |
+| An allowlist entry removed by the bot is still listed for a while | The list is redrawn when the allowlist's DNS re-resolve finishes, and a change made while one is already running waits for the next. The removal itself is immediate. |
 | `networksentinel-web` won’t start | `journalctl -u networksentinel-web -e`; check port in `/etc/networksentinel/web.env`; confirm binary exists at `/usr/local/bin/networksentinel`. |
 | Port already in use | Change `WEB_PORT` or run `networksentinel -w` to auto-pick a free high port. |
 | Port shows `LISTEN` locally but unreachable from outside | On a cloud VPS (Linode, AWS, DigitalOcean, …), the process listening (`sudo ss -ltnp \| grep 18765`) only proves the app is up — the provider's network firewall/security group can still drop inbound traffic before it reaches the box. Open the port in the provider's dashboard. |
@@ -1354,4 +1519,4 @@ The reason a shell stays fast through the second case is arithmetic rather than 
 
 ## License
 
-Private project — all rights reserved unless you add a license file later.
+[MIT](LICENSE) — Copyright (c) 2026 David Weiser.

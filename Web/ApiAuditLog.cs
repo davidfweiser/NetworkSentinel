@@ -1,0 +1,103 @@
+using NetworkSentinel.Services;
+
+namespace NetworkSentinel.Web;
+
+/// <summary>
+/// One line for every security-relevant thing an API token did or had done to it:
+/// minted, revoked, refused, locked out, sent in the clear, and each control action.
+///
+/// The journal gets the same line, and for the systemd service that would be enough.
+/// The file is for every other way this console is started — from a terminal, its
+/// output goes with the terminal — and for the question that is asked days later:
+/// which token removed that rule, and from where.
+/// </summary>
+public sealed class ApiAuditLog
+{
+    /// <summary>The file is rotated once past this.</summary>
+    public const long MaxBytes = 1024 * 1024;
+
+    /// <summary>
+    /// Older files kept beside the current one. One was too few: whoever can make
+    /// entries can make a megabyte of them, and with a single spare generation that
+    /// was all it took to push what they did first off the end. This does not make
+    /// the log impossible to flood — nothing of bounded size can be — but every line
+    /// of the flood names the token and address making it, and the journal keeps its
+    /// own copy on its own schedule.
+    /// </summary>
+    public const int KeptGenerations = 8;
+
+    private const int MaxEntryLength = 600;
+
+    private readonly object _gate = new();
+    private readonly string _directory;
+    private readonly bool _echo;
+
+    public ApiAuditLog() : this(Path.Combine(AppPaths.DataDirectory, "logs"))
+    {
+    }
+
+    /// <param name="echo">Also write each entry to stdout, which is the journal under systemd.</param>
+    public ApiAuditLog(string directory, bool echo = true)
+    {
+        _directory = directory;
+        _echo = echo;
+    }
+
+    public string FilePath => Path.Combine(_directory, "api-audit.log");
+
+    public void Write(string entry)
+    {
+        var line = SingleLine(entry, MaxEntryLength);
+        if (_echo)
+            Console.WriteLine($"Token API: {line}");
+
+        try
+        {
+            lock (_gate)
+            {
+                Directory.CreateDirectory(_directory);
+                var path = FilePath;
+
+                var info = new FileInfo(path);
+                if (info.Exists && info.Length > MaxBytes)
+                {
+                    for (var n = KeptGenerations - 1; n >= 1; n--)
+                    {
+                        if (File.Exists($"{path}.{n}"))
+                            File.Move($"{path}.{n}", $"{path}.{n + 1}", overwrite: true);
+                    }
+                    File.Move(path, path + ".1", overwrite: true);
+                }
+
+                var options = new FileStreamOptions
+                {
+                    Mode = FileMode.Append,
+                    Access = FileAccess.Write,
+                    Share = FileShare.Read
+                };
+                // Names tokens, callers and rules: owner-only from the moment it exists.
+                if (!OperatingSystem.IsWindows())
+                    options.UnixCreateMode = UnixFileMode.UserRead | UnixFileMode.UserWrite;
+
+                using var stream = new FileStream(path, options);
+                using var writer = new StreamWriter(stream);
+                writer.WriteLine($"{DateTime.UtcNow:o} {line}");
+            }
+        }
+        catch
+        {
+            // The request this describes has already been decided. A full disk must not
+            // turn a refusal into an error page, or an allowed action into a failed one.
+        }
+    }
+
+    /// <summary>
+    /// Caller-supplied text on its way into a log: one line, bounded, no control
+    /// characters — so a crafted action name cannot forge an entry of its own.
+    /// </summary>
+    public static string SingleLine(string? text, int max)
+    {
+        var flat = new string((text ?? "").Select(c => char.IsControl(c) ? ' ' : c).ToArray()).Trim();
+        return flat.Length <= max ? flat : flat[..max] + "…";
+    }
+}

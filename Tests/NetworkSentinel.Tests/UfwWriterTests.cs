@@ -160,17 +160,52 @@ Status: active
         Assert.Equal(new[] { 1 }, UfwWriter.MatchNumbers(target, rows));
     }
 
+    /// <summary>
+    /// The operator's own uncommented 22/tcp rule (rows 1 and 4) alongside the same
+    /// shape written by this app, which UFW lists with its label as the comment.
+    /// </summary>
+    private const string NumberedWithOurs = """
+Status: active
+
+     To                         Action      From
+     --                         ------      ----
+[ 1] 22/tcp                     ALLOW IN    Anywhere
+[ 2] 22/tcp                     ALLOW IN    Anywhere                   # allow-inbound-ssh
+[ 3] 22/tcp (v6)                ALLOW IN    Anywhere (v6)
+[ 4] 22/tcp (v6)                ALLOW IN    Anywhere (v6)              # allow-inbound-ssh
+""";
+
     [Fact]
     public void Numbered_ARuleCoveringBothFamiliesTakesBothTwins()
     {
         // A rule described as covering everything — the form's "All IPv4, All IPv6"
         // — is both rows. Deleting one and leaving the other still admits the
         // traffic, and looks from the list like the delete worked.
-        var rows = UfwWriter.ParseNumbered(Numbered);
+        var rows = UfwWriter.ParseNumbered(NumberedWithOurs);
         var target = FirewallRuleSpecs.ToRule(Spec(), "NetworkSentinel-Rule-ssh");
 
         Assert.Equal(FirewallRuleSpecs.AnyAddressText, target.AddressListText);
-        Assert.Equal(new[] { 1, 4 }, UfwWriter.MatchNumbers(target, rows));
+        Assert.Equal(new[] { 2, 4 }, UfwWriter.MatchNumbers(target, rows));
+    }
+
+    [Fact]
+    public void Numbered_OurRuleNeverTakesTheOperatorsSameShapedRule()
+    {
+        // Shape-only matching took the operator's uncommented "allow 22/tcp" with ours —
+        // an SSH lockout on a default-deny host.
+        var rows = UfwWriter.ParseNumbered(Numbered);
+        var target = FirewallRuleSpecs.ToRule(Spec(), "NetworkSentinel-Rule-ssh");
+
+        Assert.Empty(UfwWriter.MatchNumbers(target, rows));
+    }
+
+    [Fact]
+    public void Numbered_AnUncommentedOperatorRowLeavesOurCommentedTwinAlone()
+    {
+        var rows = UfwWriter.ParseNumbered(NumberedWithOurs);
+        var target = HostFirewallScanner.ParseUfwStatusLine("22/tcp  ALLOW IN  Anywhere")!;
+
+        Assert.Equal(new[] { 1 }, UfwWriter.MatchNumbers(target, rows));
     }
 
     [Fact]

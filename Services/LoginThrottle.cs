@@ -14,7 +14,18 @@ public sealed class LoginThrottle
     private static readonly TimeSpan FailureWindow = TimeSpan.FromMinutes(15);
 
     /// <summary>Lockout doubles with each further failure, up to this.</summary>
-    private static readonly TimeSpan MaxLockout = TimeSpan.FromHours(1);
+    private static readonly TimeSpan DefaultMaxLockout = TimeSpan.FromHours(1);
+
+    private readonly TimeSpan _maxLockout;
+
+    /// <param name="maxLockout">
+    /// Ceiling for the doubling. An hour suits a password a person chose; a caller
+    /// guessing something unguessable can be given a shorter one.
+    /// </param>
+    public LoginThrottle(TimeSpan? maxLockout = null)
+    {
+        _maxLockout = maxLockout is { } max && max >= FirstLockout ? max : DefaultMaxLockout;
+    }
 
     private static readonly TimeSpan FirstLockout = TimeSpan.FromMinutes(1);
 
@@ -56,6 +67,29 @@ public sealed class LoginThrottle
         }
     }
 
+    /// <summary>
+    /// Checks the lockout and counts this attempt as a failure in one step, before the
+    /// password is even looked at; <see cref="RecordSuccess"/> wipes the count again if
+    /// the guess turns out right. Checking with <see cref="IsLocked"/> and counting with
+    /// <see cref="RecordFailure"/> afterwards left the slow part — a 200k-iteration
+    /// PBKDF2 and the brake delay — between the two, so a burst of parallel requests all
+    /// passed the check before the first failure landed: as many guesses per lockout as
+    /// there were threads to serve them, instead of <see cref="MaxFailures"/>.
+    /// </summary>
+    /// <returns>False while locked out (<paramref name="retryAfter"/> is the wait left).</returns>
+    /// <param name="lockoutIfWrong">The lockout this attempt has put in force if the guess is wrong.</param>
+    public bool TryBeginAttempt(string client, out TimeSpan retryAfter, out TimeSpan lockoutIfWrong)
+    {
+        lockoutIfWrong = TimeSpan.Zero;
+        lock (_gate)
+        {
+            if (IsLocked(client, out retryAfter))
+                return false;
+            lockoutIfWrong = RecordFailure(client);
+            return true;
+        }
+    }
+
     /// <summary>Record a wrong password. Returns the lockout now in force (zero if still under the limit).</summary>
     public TimeSpan RecordFailure(string client)
     {
@@ -84,7 +118,7 @@ public sealed class LoginThrottle
             var steps = entry.Failures - MaxFailures;
             var lockout = TimeSpan.FromTicks(Math.Min(
                 FirstLockout.Ticks * (long)Math.Pow(2, Math.Min(steps, 8)),
-                MaxLockout.Ticks));
+                _maxLockout.Ticks));
             entry.LockedUntilUtc = now + lockout;
             return lockout;
         }
