@@ -47,6 +47,52 @@ dotnet publish NetworkSentinel.csproj \
   -p:DebugSymbols=false \
   -o "$PUBLISH_DIR"
 
+# Self-contained means the package carries its own .NET, frozen at whatever runtime
+# this machine's SDK bundled — patching .NET on a server never reaches it. So a stale
+# SDK here ships a stale Kestrel to everyone: 0.7.22 went out on 8.0.29, after 8.0.32
+# had fixed two critical Kestrel request-smuggling flaws (CVE-2026-88092,
+# CVE-2026-70188). Refuse to package anything older than the latest .NET 8 security
+# release, and raise MIN_RUNTIME whenever Microsoft ships a new one.
+MIN_RUNTIME="8.0.33"
+
+# True when $1 < $2, comparing major.minor.patch as numbers (a -preview suffix is dropped).
+version_lt() {
+  local a b i
+  IFS=. read -r -a a <<< "${1%%-*}"
+  IFS=. read -r -a b <<< "${2%%-*}"
+  for i in 0 1 2; do
+    (( ${a[i]:-0} < ${b[i]:-0} )) && return 0
+    (( ${a[i]:-0} > ${b[i]:-0} )) && return 1
+  done
+  return 1
+}
+
+echo "==> Checking the bundled .NET runtime…"
+# The SDK pretty-prints this file (with CRLF on Windows); flatten it so one grep reads it.
+RUNTIMECONFIG="$(tr -d ' \t\r\n' < "$PUBLISH_DIR/NetworkSentinel.runtimeconfig.json")"
+for fw in Microsoft.NETCore.App Microsoft.AspNetCore.App; do
+  ver="$(printf '%s' "$RUNTIMECONFIG" \
+    | grep -o "\"name\":\"${fw}\",\"version\":\"[^\"]*\"" \
+    | sed 's/.*"version":"//; s/"$//' || true)"
+  if [[ -z "$ver" ]]; then
+    echo "error: no ${fw} version in NetworkSentinel.runtimeconfig.json — cannot tell whether the bundled runtime is patched" >&2
+    exit 1
+  fi
+  # A retarget to another .NET line would otherwise sail past an 8.0 floor unchecked.
+  if [[ "${ver%%.*}" != "${MIN_RUNTIME%%.*}" ]]; then
+    echo "error: bundled ${fw} is ${ver}, but MIN_RUNTIME (${MIN_RUNTIME}) tracks the .NET ${MIN_RUNTIME%%.*} line —" >&2
+    echo "       set MIN_RUNTIME to the latest .NET ${ver%%.*} security release" >&2
+    exit 1
+  fi
+  if version_lt "$ver" "$MIN_RUNTIME"; then
+    echo "error: bundled ${fw} is ${ver}; a release needs ${MIN_RUNTIME} or newer for its security fixes." >&2
+    echo "       The SDK bundles the newest runtime it knows, so update this machine's .NET ${MIN_RUNTIME%%.*} SDK" >&2
+    echo "       (see: dotnet --list-sdks) and package again." >&2
+    exit 1
+  fi
+  echo "    ${fw} ${ver} (minimum ${MIN_RUNTIME})"
+done
+
 chmod +x "$PUBLISH_DIR/NetworkSentinel"
 
 # Install / uninstall helpers shipped inside the tarball
