@@ -752,6 +752,8 @@ dist\*.sha256
 
 Self-contained by default — the server does **not** need the .NET SDK or a compiler (runtime is inside the package).
 
+Because the runtime travels inside the package, it is only as current as the build machine's SDK. The script reads the runtime it just published and **stops before building anything** if it is older than the latest .NET 8 security release (`$MinRuntime` in the script, 8.0.33 as of 0.7.23): update the SDK on the build machine (`dotnet --list-sdks`) and package again. Raise `$MinRuntime` with each .NET 8 security release.
+
 **On the Windows server — one-file installer (recommended):**
 
 ```powershell
