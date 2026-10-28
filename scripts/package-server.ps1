@@ -104,6 +104,36 @@ if (-not (Test-Path $exe)) {
     throw "Publish did not produce NetworkSentinel.exe"
 }
 
+# Self-contained means the package carries its own .NET, frozen at whatever runtime
+# this machine's SDK bundled - patching .NET on a server never reaches it. So a stale
+# SDK here ships a stale Kestrel to everyone: 0.7.20 went out on 8.0.26, after 8.0.32
+# had fixed two critical Kestrel request-smuggling flaws (CVE-2026-88092,
+# CVE-2026-70188) that the web console is exposed to. Refuse to package anything older
+# than the latest .NET 8 security release, and raise $MinRuntime whenever Microsoft
+# ships a new one. A framework-dependent package runs on the server's own .NET, so
+# there it is the server that has to be patched.
+$MinRuntime = [version]"8.0.33"
+if ($selfContained) {
+    Write-Host "Checking the bundled .NET runtime..." -ForegroundColor Yellow
+    $runtimeConfig = Get-Content (Join-Path $stage "NetworkSentinel.runtimeconfig.json") -Raw | ConvertFrom-Json
+    $included = @($runtimeConfig.runtimeOptions.includedFrameworks)
+    foreach ($fw in "Microsoft.NETCore.App", "Microsoft.WindowsDesktop.App", "Microsoft.AspNetCore.App") {
+        $entry = $included | Where-Object { $_.name -eq $fw } | Select-Object -First 1
+        if (-not $entry) {
+            throw "No $fw version in NetworkSentinel.runtimeconfig.json - cannot tell whether the bundled runtime is patched."
+        }
+        $ver = [version](($entry.version -split '-')[0])
+        # A retarget to another .NET line would otherwise sail past an 8.0 floor unchecked.
+        if ($ver.Major -ne $MinRuntime.Major) {
+            throw "Bundled $fw is $ver, but `$MinRuntime ($MinRuntime) tracks the .NET $($MinRuntime.Major) line - set it to the latest .NET $($ver.Major) security release."
+        }
+        if ($ver -lt $MinRuntime) {
+            throw "Bundled $fw is $ver; a release needs $MinRuntime or newer for its security fixes. The SDK bundles the newest runtime it knows, so update this machine's .NET SDK (see: dotnet --list-sdks) and package again."
+        }
+        Write-Host "  $fw $ver (minimum $MinRuntime)"
+    }
+}
+
 # Ship install / uninstall with the package
 $installSrc = Join-Path $PSScriptRoot "install-from-package.ps1"
 $uninstallSrc = Join-Path $PSScriptRoot "uninstall-web-service.ps1"
