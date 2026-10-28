@@ -14,6 +14,8 @@ Three ways to run it (same idea as the Linux build):
 
 > Awareness / monitoring tooling — not a full IDS/IPS replacement. Version **0.7.23**.
 
+> **Use at your own risk.** Network Sentinel changes your firewall, and with auto-block turned on it blocks addresses by itself. Try it first on a machine you can reach some other way — a local screen or your provider's or hypervisor's console — before you rely on it over Remote Desktop. It comes as is, without warranty: see the [MIT license](LICENSE).
+
 ## Screenshots
 
 The web console on a Windows server. Every address in these is from a range reserved for documentation, and every name is invented.
@@ -1105,7 +1107,7 @@ Once HTTPS works, **Settings → Remote access → HTTPS only** (0.7.7) turns th
 | `--tls-cert PATH` | PEM fullchain, or a `.pfx` / `.p12` bundle |
 | `--tls-key PATH` | PEM private key (omit for `.pfx`) |
 | `--tls-password PW` | Password for a `.pfx` / `.p12` |
-| `--public-hostname NAME` | Name the console is reached by, for the banner and status lines. Defaults to the DuckDNS name when one is configured |
+| `--public-hostname NAME` | Name the console is reached by, for the banner and status lines (0.7.23). Defaults to the DuckDNS name when one is configured |
 | `--no-https` | Force plain HTTP for this run |
 
 Flags win over `settings.json` for that run **without overwriting it**, so `--https` is safe to try. The same values live under **Settings → Remote access** in *both* front-ends — the desktop app and the web console — so you never have to hand-edit a config file; endpoint changes take effect at the console's next restart. Certificate files are re-read when they change on disk (checked every 5 minutes), so an **ACME renewal applies without restarting** the console. Session cookies gain the `Secure` flag automatically when the request arrives over TLS.
@@ -1288,7 +1290,7 @@ was the only way to change them.
 | **DuckDNS subdomain** | Just the label — `myhost`, not `myhost.duckdns.org`. The checkbox arms the 5-minute refresh. |
 | **DuckDNS token** | Your token from duckdns.org, masked as you type. **Update now** tests it immediately and reports the result. |
 | **Serve the console over HTTPS** | On/off, with the TLS port beside it |
-| **Public hostname** | The name the console is reached by — fill this in when the name is your own. Empty falls back to the DuckDNS name. Cosmetic: it names the console in status lines and the banner, and is never matched against requests. |
+| **Public hostname** | The name the console is reached by — fill this in when the name is your own (0.7.23). Empty falls back to the DuckDNS name. Cosmetic: it names the console in status lines and the banner, and is never matched against requests. |
 | **Issue certificate** | Gets a free Let's Encrypt certificate for the DuckDNS name above and **fills in the two paths below**. The email box beside it is only used the first time, to register the account when Posh-ACME is installed. DuckDNS names only — with your own domain, issue the certificate yourself and fill the paths in. |
 | **Certificate** / **Private key** | Filled in by **Issue certificate**; still editable if your certificate lives elsewhere. Validated as you enter them |
 | **Redirect HTTP to HTTPS** | On by default |
