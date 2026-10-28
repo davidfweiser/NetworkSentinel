@@ -12,7 +12,7 @@ Three ways to run it (same idea as the Linux build):
 
 > **iPhone and iPad: optional.** [Network Sentinel for iOS](https://github.com/davidfweiser/NetworkSentinel-iOS) is a companion app that signs in to a server running the web UI and shows and controls it from your phone. Network Sentinel does not need it to operate: everything it monitors, detects and blocks runs on the host, and each of the three modes above works on its own.
 
-> Awareness / monitoring tooling — not a full IDS/IPS replacement. Version **0.7.20**.
+> Awareness / monitoring tooling — not a full IDS/IPS replacement. Version **0.7.23**.
 
 ## Screenshots
 
@@ -42,6 +42,18 @@ The web console on a Windows server. Every address in these is from a range rese
 </table>
 
 ---
+
+## What's new in 0.7.23
+
+Windows catches up with Linux 0.7.21–0.7.23 and takes its number, so there is no Windows 0.7.21 or 0.7.22: a package built on the patched .NET runtime, and remote access under a domain of your own.
+
+| Area | What changed |
+|------|--------------|
+| **Patched .NET inside the package** | The server package is self-contained: it carries its own .NET, frozen at whatever runtime the build machine's SDK bundled, so patching .NET on the server never reaches it. 0.7.20 shipped 8.0.26, which predates 8.0.32's fixes for two critical Kestrel request-smuggling flaws (CVE-2026-88092, CVE-2026-70188) that the web console is exposed to. 0.7.23 carries 8.0.33, the October 25 security release, and `scripts\package-server.ps1` now refuses to package a runtime older than that. |
+| **Your own domain is enough** | DuckDNS was never what HTTPS needed: the console serves whatever certificate it is pointed at. A new **Public hostname** setting (`--public-hostname` on the command line, a row under **Settings → Remote access** in all three front-ends) names the console in the startup banner, the desktop status line and the web console's Remote access card, so a setup under your own name gets a console URL without touching DuckDNS. Left empty, the DuckDNS name is used as before. It is cosmetic and never matched against an incoming request, so a wrong value cannot lock anyone out. See [Using your own registered domain](#using-your-own-registered-domain). |
+| **README** | Screenshots of the web console, made from invented data; how a bot can keep watch around the clock and report what was blocked; and the iOS app described as what it is, an optional companion. |
+
+**An installed server is still on the old runtime.** Updating .NET on the server does not reach a self-contained install; installing the 0.7.23 package does.
 
 ## What's new in 0.7.20
 
@@ -729,10 +741,10 @@ Environment variables: `NETWORKSENTINEL_TUI=1`, `NETWORKSENTINEL_WEB=1`.
 
 ### Server package (no compile on the server)
 
-Prebuilt packages are attached to each Windows release on [GitHub Releases](https://github.com/davidfweiser/NetworkSentinel/releases), under tags named `windows-v<version>`. Plain `v<version>` tags are Linux builds. Each file comes with a `.sha256`, so check the download before running it:
+Prebuilt packages are attached to each Windows release on [GitHub Releases](https://github.com/davidfweiser/NetworkSentinel/releases), under tags named `windows-v<version>`. Tags named `linux-v<version>` (and the older plain `v<version>`) are Linux builds. Each file comes with a `.sha256`, so check the download before running it:
 
 ```powershell
-Get-FileHash .\NetworkSentinel-windows-server-x64-0.7.20.install.cmd -Algorithm SHA256
+Get-FileHash .\NetworkSentinel-windows-server-x64-0.7.23.install.cmd -Algorithm SHA256
 ```
 
 To build your own instead, do it **on a dev PC** that has the .NET 8 SDK:
@@ -758,11 +770,11 @@ Because the runtime travels inside the package, it is only as current as the bui
 
 ```powershell
 # Copy the .install.cmd to the server, then run it (UAC prompt if not elevated):
-.\NetworkSentinel-windows-server-x64-0.7.20.install.cmd
+.\NetworkSentinel-windows-server-x64-0.7.23.install.cmd
 # optional port:
-.\NetworkSentinel-windows-server-x64-0.7.20.install.cmd -Port 18765
+.\NetworkSentinel-windows-server-x64-0.7.23.install.cmd -Port 18765
 # unpack without installing:
-.\NetworkSentinel-windows-server-x64-0.7.20.install.cmd --extract-only
+.\NetworkSentinel-windows-server-x64-0.7.23.install.cmd --extract-only
 ```
 
 The one-file installer is a `.cmd`, not a `.ps1`: `cmd.exe` stops reading the script at `exit /b`, so the ZIP appended to it is never parsed. PowerShell tokenizes an entire `-File` script before running any of it, and the cost on appended binary is quadratic (16 MB ≈ 5½ minutes) before it fails to parse at all — so the shell-style "payload after exit" trick only works with a `cmd` entry point.
