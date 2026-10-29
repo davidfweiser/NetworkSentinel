@@ -16,6 +16,14 @@ RestartSec=5
 TimeoutStopSec=20
 PrivateTmp=true
 
+# .NET sizes its youngest-generation heap budget from the CPU's L3 cache, and a VPS
+# guest often sees a server-class cache of hundreds of MB. There the console's
+# resident memory climbs to ~230 MB before the first collection runs, although it
+# holds only ~10 MB of live data. 26 MB is the budget a typical desktop CPU gets on
+# its own, and keeps the console near 130 MB. A DOTNET_GCgen0size (hex bytes) set
+# in the env file overrides this; delete the line to go back to the runtime default.
+Environment=DOTNET_GCgen0size=0x1A00000
+
 # Connection tables come from /proc, but writing a rule needs CAP_NET_ADMIN, and a
 # headless service has no way to obtain it on demand: pkexec needs a polkit session
 # and sudo needs somewhere to ask for a password, neither of which exists here. So
