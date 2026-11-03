@@ -427,6 +427,8 @@ Three details decide whether the numbers are right, and each has a test:
 
 Daily totals and the last raw counters persist to `traffic-history.json`, so the diff continues across a restart — but that first catch-up delta spans however long the app was shut, so it counts toward the day and is deliberately **not** charted as a rate.
 
+The saved counters only continue the diff within the boot that wrote them. They are stamped with the kernel's boot ID (`/proc/sys/kernel/random/boot_id`), and after a reboot each interface restarts from zero instead. Waiting for the counter to go backwards is not enough on its own: if it has already climbed past the saved value by the time the app opens, the saved value would be subtracted from real traffic and the day undercounted. A history file written before the boot ID was recorded keeps its counters for that one launch and is stamped on the next save.
+
 Turn it off with `TrafficMeterEnabled` (Settings → Traffic metering); the history is kept but stops growing.
 
 The charts are on the **GUI dashboard and the web console** (0.7.1). The meter itself runs wherever the app runs, so a headless server records the daily history into `traffic-history.json` either way; the TUI is the one front-end with no chart for it.

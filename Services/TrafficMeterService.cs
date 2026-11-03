@@ -32,7 +32,9 @@ namespace NetworkSentinel.Services;
 /// The daily history persists to <c>traffic-history.json</c>, and so do the last
 /// raw counters: on the next launch the diff continues from where it left off,
 /// so traffic that crossed the wire while the console was closed still lands in
-/// the right day rather than vanishing or arriving as one huge spike.
+/// the right day rather than vanishing or arriving as one huge spike. The saved
+/// counters are stamped with the kernel's boot ID and only continue the diff
+/// within that boot — see <see cref="BaselinesFor"/>.
 /// </summary>
 public sealed class TrafficMeterService : IDisposable
 {
@@ -60,6 +62,14 @@ public sealed class TrafficMeterService : IDisposable
 
     /// <summary>The kernel's per-interface counter table.</summary>
     internal const string ProcNetDev = "/proc/net/dev";
+
+    /// <summary>
+    /// A random UUID the kernel generates at every boot. It cannot change while this
+    /// process runs, so it is read once.
+    /// </summary>
+    internal const string BootIdPath = "/proc/sys/kernel/random/boot_id";
+
+    private static readonly Lazy<string?> CurrentBootId = new(() => ReadBootId(BootIdPath));
 
     private static readonly JsonSerializerOptions JsonOptions = new()
     {
@@ -353,6 +363,46 @@ public sealed class TrafficMeterService : IDisposable
         => current >= previous ? current - previous : Math.Max(0, current);
 
     /// <summary>
+    /// The baselines saved counters hand the first sample of a run. They continue the
+    /// diff only within the boot that wrote them: the kernel restarts every counter at
+    /// zero when the machine boots, so after a reboot a saved value describes a counter
+    /// that no longer exists. Waiting for the counter to go backwards does not catch
+    /// that — one that has already climbed past the saved value by the time the console
+    /// opens reads as ordinary growth, and the saved value is silently subtracted from
+    /// real traffic. So when the file was written during a different boot, each
+    /// interface restarts from zero, exactly as a reset <see cref="Delta"/> notices
+    /// does. A file written before the boot was recorded, or a kernel that does not
+    /// expose it, keeps the saved values: nothing says they are stale.
+    /// </summary>
+    internal static Dictionary<string, InterfaceCounter> BaselinesFor(
+        IReadOnlyDictionary<string, InterfaceCounter> saved, string? savedBootId, string? currentBootId)
+    {
+        var rebooted = !string.IsNullOrEmpty(savedBootId)
+                       && !string.IsNullOrEmpty(currentBootId)
+                       && !string.Equals(savedBootId, currentBootId, StringComparison.OrdinalIgnoreCase);
+
+        return saved.ToDictionary(
+            kv => kv.Key,
+            kv => rebooted ? new InterfaceCounter(0, 0) : kv.Value,
+            StringComparer.Ordinal);
+    }
+
+    /// <summary>The boot ID in <paramref name="path"/>, or null when it cannot be read.</summary>
+    internal static string? ReadBootId(string path)
+    {
+        try
+        {
+            if (!File.Exists(path)) return null;
+            var id = File.ReadAllText(path).Trim();
+            return id.Length == 0 ? null : id;
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    /// <summary>
     /// Parses <c>/proc/net/dev</c> into one entry per physical interface. Internal
     /// so the suite can replay captured output.
     /// </summary>
@@ -462,8 +512,12 @@ public sealed class TrafficMeterService : IDisposable
                 if (string.IsNullOrWhiteSpace(day.Date)) continue;
                 _days[day.Date] = new DayTotal(Math.Max(0, day.In), Math.Max(0, day.Out));
             }
-            foreach (var (name, counter) in store.Counters)
-                _counters[name] = new InterfaceCounter(Math.Max(0, counter.In), Math.Max(0, counter.Out));
+            var saved = store.Counters.ToDictionary(
+                kv => kv.Key,
+                kv => new InterfaceCounter(Math.Max(0, kv.Value.In), Math.Max(0, kv.Value.Out)),
+                StringComparer.Ordinal);
+            foreach (var (name, counter) in BaselinesFor(saved, store.BootId, CurrentBootId.Value))
+                _counters[name] = counter;
 
             TrimHistory();
         }
@@ -481,6 +535,7 @@ public sealed class TrafficMeterService : IDisposable
             store = new TrafficStore
             {
                 UpdatedUtc = DateTime.UtcNow,
+                BootId = CurrentBootId.Value,
                 Days = _days
                     .OrderBy(kv => kv.Key, StringComparer.Ordinal)
                     .Select(kv => new TrafficDayRecord { Date = kv.Key, In = kv.Value.In, Out = kv.Value.Out })
@@ -518,6 +573,8 @@ public sealed class TrafficMeterService : IDisposable
     private sealed class TrafficStore
     {
         public DateTime UpdatedUtc { get; set; }
+        /// <summary>The boot <see cref="Counters"/> were read in; absent in files earlier versions wrote.</summary>
+        public string? BootId { get; set; }
         public List<TrafficDayRecord> Days { get; set; } = new();
         public Dictionary<string, TrafficCounterRecord> Counters { get; set; } = new(StringComparer.Ordinal);
     }

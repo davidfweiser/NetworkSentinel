@@ -104,6 +104,113 @@ public class TrafficMeterTests
         Assert.Equal(0L, TrafficMeterService.Delta(9_000_000, 0));
     }
 
+    private const string BootA = "0974462d-02d7-41b8-a046-22fb706c0143";
+    private const string BootB = "5c1f3e2a-9d84-4b6e-a0f7-3e2b91c4d8a6";
+
+    [Fact]
+    public void SavedCountersAreForgottenAfterAReboot()
+    {
+        // The last save before the reboot read 100 MB in / 40 MB out. Since boot the
+        // kernel counted 2 GB in / 900 MB out, all of it real traffic. The counter is
+        // already past the saved value, so it never went backwards: diffing against
+        // the saved baseline would quietly drop the 100 MB / 40 MB.
+        var saved = new Dictionary<string, TrafficMeterService.InterfaceCounter>
+        {
+            ["eno1"] = new(100_000_000, 40_000_000)
+        };
+
+        var baselines = TrafficMeterService.BaselinesFor(saved, savedBootId: BootA, currentBootId: BootB);
+
+        var eno1 = Assert.Contains("eno1", baselines);
+        Assert.Equal(new TrafficMeterService.InterfaceCounter(0, 0), eno1);
+        Assert.Equal(2_000_000_000L, TrafficMeterService.Delta(eno1.In, 2_000_000_000));
+        Assert.Equal(900_000_000L, TrafficMeterService.Delta(eno1.Out, 900_000_000));
+    }
+
+    [Fact]
+    public void SavedCountersContinueWithinTheSameBoot()
+    {
+        // Closing and reopening the console without a reboot: the kernel kept
+        // counting, so the saved value is the right baseline and only the growth since
+        // is new traffic.
+        var saved = new Dictionary<string, TrafficMeterService.InterfaceCounter>
+        {
+            ["eno1"] = new(100_000_000, 40_000_000),
+            ["wlp3s0"] = new(5_000, 7_000)
+        };
+
+        var baselines = TrafficMeterService.BaselinesFor(saved, savedBootId: BootA, currentBootId: BootA);
+
+        Assert.Equal(saved, baselines);
+    }
+
+    [Fact]
+    public void BootIdsCompareWithoutRegardToCase()
+    {
+        var saved = new Dictionary<string, TrafficMeterService.InterfaceCounter>
+        {
+            ["eno1"] = new(100, 40)
+        };
+
+        var baselines = TrafficMeterService.BaselinesFor(saved, BootA.ToUpperInvariant(), BootA);
+
+        Assert.Equal(saved, baselines);
+    }
+
+    [Theory]
+    // A history file from before the boot was recorded.
+    [InlineData(null, BootA)]
+    [InlineData("", BootA)]
+    // A kernel (or sandbox) that does not expose a boot ID.
+    [InlineData(BootA, null)]
+    public void WithoutBothBootIdsTheSavedCountersAreKept(string? savedBootId, string? currentBootId)
+    {
+        // Nothing says the counters are stale, and zeroing them would count the whole
+        // since-boot total again on every launch. A reset is still caught the old way,
+        // by the counter going backwards.
+        var saved = new Dictionary<string, TrafficMeterService.InterfaceCounter>
+        {
+            ["eno1"] = new(100_000_000, 40_000_000)
+        };
+
+        var baselines = TrafficMeterService.BaselinesFor(saved, savedBootId, currentBootId);
+
+        Assert.Equal(saved, baselines);
+    }
+
+    [Fact]
+    public void BootIdIsReadWithoutItsTrailingNewline()
+    {
+        var path = Path.Combine(Path.GetTempPath(), "boot_id-" + Guid.NewGuid().ToString("N"));
+        try
+        {
+            File.WriteAllText(path, BootA + "\n");
+            Assert.Equal(BootA, TrafficMeterService.ReadBootId(path));
+        }
+        finally
+        {
+            File.Delete(path);
+        }
+    }
+
+    [Fact]
+    public void AMissingOrEmptyBootIdReadsAsUnknown()
+    {
+        var missing = Path.Combine(Path.GetTempPath(), "boot_id-" + Guid.NewGuid().ToString("N"));
+        Assert.Null(TrafficMeterService.ReadBootId(missing));
+
+        var empty = Path.Combine(Path.GetTempPath(), "boot_id-" + Guid.NewGuid().ToString("N"));
+        try
+        {
+            File.WriteAllText(empty, "\n");
+            Assert.Null(TrafficMeterService.ReadBootId(empty));
+        }
+        finally
+        {
+            File.Delete(empty);
+        }
+    }
+
     [Theory]
     // Classic and predictable names for real devices.
     [InlineData("eth0", true)]
