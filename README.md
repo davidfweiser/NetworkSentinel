@@ -485,6 +485,8 @@ Two details decide whether the numbers are right, and each has a test:
 
 Daily totals and the last raw counters persist to `traffic-history.json`, so the diff continues across a restart — but that first catch-up delta spans however long the app was shut, so it counts toward the day and is deliberately **not** charted as a rate.
 
+The saved counters only continue the diff within the boot that read them (0.7.24). If the file was saved before the machine last booted, every adapter is counted from zero instead — including one the last save never saw, such as a dock plugged in while the machine was off. Waiting for the counter to go backwards is not enough on its own: if it has already climbed past the saved value by the time the app opens, the saved value would be subtracted from real traffic and the day undercounted. Windows has no boot ID to stamp the file with, as the Linux build does, so the file's save time is compared with the boot time (`Environment.TickCount64`, which counts through sleep and hibernation). A shutdown with Fast Startup on hibernates rather than reboots, so it does not count as a new boot.
+
 Turn it off with `TrafficMeterEnabled` (Settings → Traffic metering); the history is kept but stops growing. The web console's toggle takes effect immediately rather than at the next restart.
 
 ### DNS hygiene
