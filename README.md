@@ -12,7 +12,7 @@ Three ways to run it (same idea as the Linux build):
 
 > **iPhone and iPad: optional.** [Network Sentinel for iOS](https://github.com/davidfweiser/NetworkSentinel-iOS) is a companion app that signs in to a server running the web UI and shows and controls it from your phone. Network Sentinel does not need it to operate: everything it monitors, detects and blocks runs on the host, and each of the three modes above works on its own.
 
-> Awareness / monitoring tooling — not a full IDS/IPS replacement. Version **0.7.23**.
+> Awareness / monitoring tooling — not a full IDS/IPS replacement. Version **0.7.24**.
 
 > **Use at your own risk.** Network Sentinel changes your firewall, and with auto-block turned on it blocks addresses by itself. Try it first on a machine you can reach some other way — a local screen or your provider's or hypervisor's console — before you rely on it over Remote Desktop. It comes as is, without warranty: see the [MIT license](LICENSE).
 
@@ -44,6 +44,16 @@ The web console on a Windows server. Every address in these is from a range rese
 </table>
 
 ---
+
+## What's new in 0.7.24
+
+The traffic fix from Linux 0.7.24.
+
+| Area | What changed |
+|------|--------------|
+| **Traffic since boot is counted after a reboot** | The traffic meter keeps the last adapter counters across a relaunch, but it only noticed a reboot when a counter went backwards. One that had already passed the saved value by the time the app opened read as ordinary growth, and the saved value was subtracted from real traffic: saved 100 MB, 2 GB since boot, and the day was credited 1.9 GB. Counters saved before the machine last booted are now set aside, and the first sample counts every adapter from zero, including one the last save never saw. See [Data flow](#data-flow--how-much-not-just-who). |
+
+Linux 0.7.24 also caps the web service's .NET young-generation heap at 26 MB with `DOTNET_GCgen0size`. That is not ported. .NET reads the setting only from the environment, not from the app's runtime config, so a Task Scheduler task cannot pass it to the console without a wrapper process. On a desktop CPU it would also enlarge the young generation rather than shrink it.
 
 ## What's new in 0.7.23
 
@@ -748,7 +758,7 @@ Environment variables: `NETWORKSENTINEL_TUI=1`, `NETWORKSENTINEL_WEB=1`.
 Prebuilt packages are attached to each Windows release on [GitHub Releases](https://github.com/davidfweiser/NetworkSentinel/releases), under tags named `windows-v<version>`. Tags named `linux-v<version>` (and the older plain `v<version>`) are Linux builds. Each file comes with a `.sha256`, so check the download before running it:
 
 ```powershell
-Get-FileHash .\NetworkSentinel-windows-server-x64-0.7.23.install.cmd -Algorithm SHA256
+Get-FileHash .\NetworkSentinel-windows-server-x64-0.7.24.install.cmd -Algorithm SHA256
 ```
 
 To build your own instead, do it **on a dev PC** that has the .NET 8 SDK:
@@ -774,11 +784,11 @@ Because the runtime travels inside the package, it is only as current as the bui
 
 ```powershell
 # Copy the .install.cmd to the server, then run it (UAC prompt if not elevated):
-.\NetworkSentinel-windows-server-x64-0.7.23.install.cmd
+.\NetworkSentinel-windows-server-x64-0.7.24.install.cmd
 # optional port:
-.\NetworkSentinel-windows-server-x64-0.7.23.install.cmd -Port 18765
+.\NetworkSentinel-windows-server-x64-0.7.24.install.cmd -Port 18765
 # unpack without installing:
-.\NetworkSentinel-windows-server-x64-0.7.23.install.cmd --extract-only
+.\NetworkSentinel-windows-server-x64-0.7.24.install.cmd --extract-only
 ```
 
 The one-file installer is a `.cmd`, not a `.ps1`: `cmd.exe` stops reading the script at `exit /b`, so the ZIP appended to it is never parsed. PowerShell tokenizes an entire `-File` script before running any of it, and the cost on appended binary is quadratic (16 MB ≈ 5½ minutes) before it fails to parse at all — so the shell-style "payload after exit" trick only works with a `cmd` entry point.
