@@ -104,6 +104,100 @@ public class TrafficMeterTests
         Assert.Equal(0L, TrafficMeterService.Delta(9_000_000, 0));
     }
 
+    internal const string BootA = "0974462d-02d7-41b8-a046-22fb706c0143";
+    internal const string BootB = "5c1f3e2a-9d84-4b6e-a0f7-3e2b91c4d8a6";
+
+    private static readonly DateTime BootTime = new(2026, 11, 7, 8, 0, 0, DateTimeKind.Utc);
+
+    [Fact]
+    public void ADifferentBootIdIsADifferentBoot()
+    {
+        // The IDs decide even when the clock disagrees: a save stamped with another
+        // boot is stale however recent it looks.
+        Assert.True(TrafficMeterService.IsDifferentBoot(BootA, BootTime.AddHours(1), BootB, BootTime));
+        Assert.False(TrafficMeterService.IsDifferentBoot(BootA, BootTime.AddHours(-1), BootA, BootTime));
+    }
+
+    [Fact]
+    public void BootIdsCompareWithoutRegardToCase()
+        => Assert.False(TrafficMeterService.IsDifferentBoot(BootA.ToUpperInvariant(), default, BootA, null));
+
+    [Theory]
+    // A history file from before the boot ID was recorded.
+    [InlineData(null, BootA)]
+    [InlineData("", BootA)]
+    // A launch that could not read the current one.
+    [InlineData(BootA, null)]
+    public void WithoutBothBootIdsTheSaveTimeIsComparedWithTheBootTime(string? savedBootId, string? currentBootId)
+    {
+        // Saved before this boot began: the counters it holds are gone.
+        Assert.True(TrafficMeterService.IsDifferentBoot(savedBootId, BootTime.AddMinutes(-5), currentBootId, BootTime));
+        // Saved since: they are this boot's, and the diff continues.
+        Assert.False(TrafficMeterService.IsDifferentBoot(savedBootId, BootTime.AddMinutes(5), currentBootId, BootTime));
+    }
+
+    [Fact]
+    public void WithNeitherBootIdsNorABootTimeTheSavedCountersAreKept()
+    {
+        // Nothing says the counters are stale, and zeroing them would count the whole
+        // since-boot total again on every launch. A reset is still caught the old way,
+        // by the counter going backwards.
+        Assert.False(TrafficMeterService.IsDifferentBoot(null, BootTime.AddDays(-30), BootA, null));
+        Assert.False(TrafficMeterService.IsDifferentBoot(null, default, null, BootTime));
+    }
+
+    [Fact]
+    public void BootTimeIsReadFromTheBtimeLine()
+    {
+        const string stat = """
+            cpu  2255 34 2290 22625563 6290 127 456 0 0 0
+            cpu0 1132 34 1441 11311718 3675 127 438 0 0 0
+            intr 114930548 113199788 3 0 5 263 0 4 [... 32 more]
+            ctxt 1990473
+            btime 1793952000
+            processes 2915
+            procs_running 1
+            """;
+
+        Assert.Equal(new DateTime(2026, 11, 6, 8, 0, 0, DateTimeKind.Utc), TrafficMeterService.ParseBootTime(stat));
+        Assert.Null(TrafficMeterService.ParseBootTime("cpu  2255 34 2290\nctxt 1990473\n"));
+        Assert.Null(TrafficMeterService.ParseBootTime("btime garbage\n"));
+        Assert.Null(TrafficMeterService.ParseBootTime(null));
+    }
+
+    [Fact]
+    public void BootIdIsReadWithoutItsTrailingNewline()
+    {
+        var path = Path.Combine(Path.GetTempPath(), "boot_id-" + Guid.NewGuid().ToString("N"));
+        try
+        {
+            File.WriteAllText(path, BootA + "\n");
+            Assert.Equal(BootA, TrafficMeterService.ReadBootId(path));
+        }
+        finally
+        {
+            File.Delete(path);
+        }
+    }
+
+    [Fact]
+    public void AMissingOrEmptyBootIdReadsAsUnknown()
+    {
+        var missing = Path.Combine(Path.GetTempPath(), "boot_id-" + Guid.NewGuid().ToString("N"));
+        Assert.Null(TrafficMeterService.ReadBootId(missing));
+
+        var empty = Path.Combine(Path.GetTempPath(), "boot_id-" + Guid.NewGuid().ToString("N"));
+        try
+        {
+            File.WriteAllText(empty, "\n");
+            Assert.Null(TrafficMeterService.ReadBootId(empty));
+        }
+        finally
+        {
+            File.Delete(empty);
+        }
+    }
+
     [Theory]
     // Classic and predictable names for real devices.
     [InlineData("eth0", true)]

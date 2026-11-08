@@ -32,7 +32,9 @@ namespace NetworkSentinel.Services;
 /// The daily history persists to <c>traffic-history.json</c>, and so do the last
 /// raw counters: on the next launch the diff continues from where it left off,
 /// so traffic that crossed the wire while the console was closed still lands in
-/// the right day rather than vanishing or arriving as one huge spike.
+/// the right day rather than vanishing or arriving as one huge spike. The saved
+/// counters are stamped with the kernel's boot ID and only continue the diff
+/// within that boot — see <see cref="IsDifferentBoot"/>.
 /// </summary>
 public sealed class TrafficMeterService : IDisposable
 {
@@ -61,6 +63,17 @@ public sealed class TrafficMeterService : IDisposable
     /// <summary>The kernel's per-interface counter table.</summary>
     internal const string ProcNetDev = "/proc/net/dev";
 
+    /// <summary>A random UUID the kernel generates at every boot.</summary>
+    internal const string BootIdPath = "/proc/sys/kernel/random/boot_id";
+
+    /// <summary>Carries the boot time, as <c>btime</c> in Unix seconds.</summary>
+    internal const string ProcStat = "/proc/stat";
+
+    private static readonly KernelSources LiveKernel = new(
+        NetDev: () => ReadProcFile(ProcNetDev),
+        BootId: () => ReadBootId(BootIdPath),
+        BootTime: () => ParseBootTime(ReadProcFile(ProcStat)));
+
     private static readonly JsonSerializerOptions JsonOptions = new()
     {
         WriteIndented = true,
@@ -71,6 +84,30 @@ public sealed class TrafficMeterService : IDisposable
     private readonly List<TrafficSample> _live = new();
     private readonly Dictionary<string, DayTotal> _days = new(StringComparer.Ordinal);
     private readonly Dictionary<string, InterfaceCounter> _counters = new(StringComparer.Ordinal);
+    private readonly string? _historyPath;
+    private readonly KernelSources _kernel;
+
+    /// <summary>
+    /// The boot ID once it has been read. It cannot change while this process runs,
+    /// but a read that failed is tried again at the next save rather than remembered:
+    /// a save without the ID leaves the next launch only the clock to go by.
+    /// </summary>
+    private string? _bootId;
+
+    /// <summary>
+    /// Set when the saved counters turned out to be from an earlier boot, until the
+    /// first sample has used it: every counter that sample reads started at zero when
+    /// this boot began, so all of it is traffic — on every interface, not only the
+    /// ones the last save knew.
+    /// </summary>
+    private bool _countFromBoot;
+
+    /// <summary>
+    /// False until a sample has replaced the counters loaded from the file with ones
+    /// read in this boot. Until then nothing in memory is newer than the file, so it is
+    /// not rewritten — see <see cref="SaveHistory"/>.
+    /// </summary>
+    private bool _countersRead;
 
     private CancellationTokenSource? _cts;
     private Task? _loop;
@@ -86,6 +123,21 @@ public sealed class TrafficMeterService : IDisposable
     public string Status => _status;
 
     public bool IsRunning => _loop != null;
+
+    public TrafficMeterService() : this(historyPath: null, LiveKernel)
+    {
+    }
+
+    /// <summary>
+    /// A meter that keeps its history at <paramref name="historyPath"/> (null for
+    /// <see cref="DefaultHistoryPath"/>) and reads the kernel through
+    /// <paramref name="kernel"/>, so the suite can replay a reboot.
+    /// </summary>
+    internal TrafficMeterService(string? historyPath, KernelSources kernel)
+    {
+        _historyPath = historyPath;
+        _kernel = kernel;
+    }
 
     public void Start()
     {
@@ -243,9 +295,9 @@ public sealed class TrafficMeterService : IDisposable
         }
     }
 
-    private void SampleOnce(DateTime now)
+    internal void SampleOnce(DateTime now)
     {
-        var output = ReadProcNetDev();
+        var output = _kernel.NetDev();
         if (output == null)
         {
             _status = $"{ProcNetDev} unreadable — traffic metering off";
@@ -271,6 +323,15 @@ public sealed class TrafficMeterService : IDisposable
                     deltaIn += Delta(previous.In, counter.In);
                     deltaOut += Delta(previous.Out, counter.Out);
                 }
+                else if (_countFromBoot)
+                {
+                    // The machine rebooted since the last save, so this counter
+                    // started at zero with the boot. That holds for an interface the
+                    // last save never saw, too — a dock plugged in while the machine
+                    // was off is counted like the built-in NIC.
+                    deltaIn += Delta(0, counter.In);
+                    deltaOut += Delta(0, counter.Out);
+                }
                 else
                 {
                     // An interface seen for the first time in this run has no
@@ -281,6 +342,8 @@ public sealed class TrafficMeterService : IDisposable
                 }
                 _counters[name] = counter;
             }
+            _countFromBoot = false;
+            _countersRead = true;
 
             // Interfaces that disappeared (VPN down, dock unplugged) are dropped so
             // their stale counters cannot be diffed against a later, unrelated one.
@@ -351,6 +414,55 @@ public sealed class TrafficMeterService : IDisposable
     /// </summary>
     internal static long Delta(long previous, long current)
         => current >= previous ? current - previous : Math.Max(0, current);
+
+    /// <summary>
+    /// Whether saved counters were read during an earlier boot than this one. They
+    /// continue the diff only within the boot that wrote them: the kernel restarts
+    /// every counter at zero when the machine boots, so after a reboot a saved value
+    /// describes a counter that no longer exists. Waiting for the counter to go
+    /// backwards does not catch that — one that has already climbed past the saved
+    /// value by the time the console opens reads as ordinary growth, and the saved
+    /// value is silently subtracted from real traffic.
+    ///
+    /// The boot IDs answer exactly when both are known. Without them — a file from
+    /// before they were recorded, or a launch that could not read one — the save time
+    /// against the kernel's boot time answers the same question, with one caveat the
+    /// IDs do not have: a clock stepped forward after a save (an RTC-less board
+    /// catching up over NTP) can date that save before the boot. With neither, the
+    /// saved counters are kept: nothing says they are stale.
+    /// </summary>
+    internal static bool IsDifferentBoot(
+        string? savedBootId, DateTime savedUtc, string? currentBootId, DateTime? bootTimeUtc)
+    {
+        if (!string.IsNullOrEmpty(savedBootId) && !string.IsNullOrEmpty(currentBootId))
+            return !string.Equals(savedBootId, currentBootId, StringComparison.OrdinalIgnoreCase);
+
+        if (savedUtc == default || bootTimeUtc is not { } boot) return false;
+        var saved = savedUtc.Kind == DateTimeKind.Local ? savedUtc.ToUniversalTime() : savedUtc;
+        return saved < boot;
+    }
+
+    /// <summary>The boot ID in <paramref name="path"/>, or null when it cannot be read.</summary>
+    internal static string? ReadBootId(string path)
+    {
+        var id = ReadProcFile(path)?.Trim();
+        return string.IsNullOrEmpty(id) ? null : id;
+    }
+
+    /// <summary>The boot time in <c>/proc/stat</c> (its <c>btime</c> line), or null.</summary>
+    internal static DateTime? ParseBootTime(string? procStat)
+    {
+        if (string.IsNullOrEmpty(procStat)) return null;
+        foreach (var line in procStat.Split('\n'))
+        {
+            if (!line.StartsWith("btime ", StringComparison.Ordinal)) continue;
+            return long.TryParse(line.AsSpan(6).Trim(), NumberStyles.Integer, CultureInfo.InvariantCulture, out var seconds)
+                   && seconds > 0 && seconds <= DateTimeOffset.MaxValue.ToUnixTimeSeconds()
+                ? DateTimeOffset.FromUnixTimeSeconds(seconds).UtcDateTime
+                : null;
+        }
+        return null;
+    }
 
     /// <summary>
     /// Parses <c>/proc/net/dev</c> into one entry per physical interface. Internal
@@ -427,14 +539,15 @@ public sealed class TrafficMeterService : IDisposable
             || name.StartsWith("ww", StringComparison.Ordinal);
     }
 
-    private static string? ReadProcNetDev()
+    /// <summary>A procfs file's text, or null when it is missing or unreadable.</summary>
+    private static string? ReadProcFile(string path)
     {
         try
         {
             // procfs reports length 0, so File.ReadAllText's stat-then-size path
-            // still works here only because it falls back to reading to EOF; the
-            // file is a few hundred bytes either way.
-            return File.Exists(ProcNetDev) ? File.ReadAllText(ProcNetDev) : null;
+            // still works here only because it falls back to reading to EOF; these
+            // files are a few kilobytes at most.
+            return File.Exists(path) ? File.ReadAllText(path) : null;
         }
         catch
         {
@@ -442,12 +555,17 @@ public sealed class TrafficMeterService : IDisposable
         }
     }
 
+    private string? CurrentBootId => _bootId ??= _kernel.BootId();
+
     // ── Persistence ──────────────────────────────────────────────────────
 
-    internal static string HistoryPath
+    internal static string DefaultHistoryPath
         => Path.Combine(AppPaths.DataDirectory, "traffic-history.json");
 
-    private void LoadHistory()
+    private string HistoryPath => _historyPath ?? DefaultHistoryPath;
+
+    /// <summary>Caller holds <see cref="_gate"/> (the suite calls it directly).</summary>
+    internal void LoadHistory()
     {
         if (_loaded) return;
         _loaded = true;
@@ -462,8 +580,20 @@ public sealed class TrafficMeterService : IDisposable
                 if (string.IsNullOrWhiteSpace(day.Date)) continue;
                 _days[day.Date] = new DayTotal(Math.Max(0, day.In), Math.Max(0, day.Out));
             }
-            foreach (var (name, counter) in store.Counters)
-                _counters[name] = new InterfaceCounter(Math.Max(0, counter.In), Math.Max(0, counter.Out));
+
+            // This version saves only after a sample (see SaveHistory), so
+            // UpdatedUtc falls in the boot its counters were read in.
+            if (IsDifferentBoot(store.BootId, store.UpdatedUtc, CurrentBootId, _kernel.BootTime()))
+            {
+                // The saved values describe counters that no longer exist; the
+                // first sample counts each interface from zero instead.
+                _countFromBoot = true;
+            }
+            else
+            {
+                foreach (var (name, counter) in store.Counters)
+                    _counters[name] = new InterfaceCounter(Math.Max(0, counter.In), Math.Max(0, counter.Out));
+            }
 
             TrimHistory();
         }
@@ -473,14 +603,22 @@ public sealed class TrafficMeterService : IDisposable
         }
     }
 
-    private void SaveHistory()
+    internal void SaveHistory()
     {
         TrafficStore store;
         lock (_gate)
         {
+            // Before the first sample, the counters in memory are the file's own and
+            // no day has changed, so there is nothing to save — and saving would do
+            // harm: it would stamp counters from an earlier boot with this one (they
+            // would then be trusted for the rest of it), or replace a stamp that
+            // marks them stale, along with the reboot it records.
+            if (!_countersRead) return;
+
             store = new TrafficStore
             {
                 UpdatedUtc = DateTime.UtcNow,
+                BootId = CurrentBootId,
                 Days = _days
                     .OrderBy(kv => kv.Key, StringComparer.Ordinal)
                     .Select(kv => new TrafficDayRecord { Date = kv.Key, In = kv.Value.In, Out = kv.Value.Out })
@@ -513,11 +651,19 @@ public sealed class TrafficMeterService : IDisposable
 
     internal readonly record struct InterfaceCounter(long In, long Out);
 
+    /// <summary>
+    /// Where the meter reads the kernel: <c>/proc/net/dev</c>'s text, the boot ID and
+    /// the boot time, each null when it cannot be read.
+    /// </summary>
+    internal sealed record KernelSources(Func<string?> NetDev, Func<string?> BootId, Func<DateTime?> BootTime);
+
     private readonly record struct DayTotal(long In, long Out);
 
     private sealed class TrafficStore
     {
         public DateTime UpdatedUtc { get; set; }
+        /// <summary>The boot <see cref="Counters"/> were read in; absent in files earlier versions wrote.</summary>
+        public string? BootId { get; set; }
         public List<TrafficDayRecord> Days { get; set; } = new();
         public Dictionary<string, TrafficCounterRecord> Counters { get; set; } = new(StringComparer.Ordinal);
     }
