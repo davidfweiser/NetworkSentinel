@@ -35,7 +35,9 @@ namespace NetworkSentinel.Services;
 /// The daily history persists to <c>traffic-history.json</c>, and so do the last
 /// raw counters: on the next launch the diff continues from where it left off,
 /// so traffic that crossed the wire while the console was closed still lands in
-/// the right day rather than vanishing or arriving as one huge spike.
+/// the right day rather than vanishing or arriving as one huge spike. The saved
+/// counters only continue the diff within the boot that read them — see
+/// <see cref="IsDifferentBoot"/>.
 /// </summary>
 public sealed class TrafficMeterService : IDisposable
 {
@@ -61,6 +63,10 @@ public sealed class TrafficMeterService : IDisposable
     /// </summary>
     private static readonly TimeSpan SaveInterval = TimeSpan.FromMinutes(1);
 
+    private static readonly KernelSources LiveKernel = new(
+        Counters: ReadInterfaceCounters,
+        BootTime: ReadBootTime);
+
     private static readonly JsonSerializerOptions JsonOptions = new()
     {
         WriteIndented = true,
@@ -71,6 +77,23 @@ public sealed class TrafficMeterService : IDisposable
     private readonly List<TrafficSample> _live = new();
     private readonly Dictionary<string, DayTotal> _days = new(StringComparer.Ordinal);
     private readonly Dictionary<string, InterfaceCounter> _counters = new(StringComparer.Ordinal);
+    private readonly string? _historyPath;
+    private readonly KernelSources _kernel;
+
+    /// <summary>
+    /// Set when the saved counters turned out to be from an earlier boot, until the
+    /// first sample has used it: every counter that sample reads started at zero when
+    /// this boot began, so all of it is traffic — on every adapter, not only the
+    /// ones the last save knew.
+    /// </summary>
+    private bool _countFromBoot;
+
+    /// <summary>
+    /// False until a sample has replaced the counters loaded from the file with ones
+    /// read in this boot. Until then nothing in memory is newer than the file, so it is
+    /// not rewritten — see <see cref="SaveHistory"/>.
+    /// </summary>
+    private bool _countersRead;
 
     private CancellationTokenSource? _cts;
     private Task? _loop;
@@ -86,6 +109,21 @@ public sealed class TrafficMeterService : IDisposable
     public string Status => _status;
 
     public bool IsRunning => _loop != null;
+
+    public TrafficMeterService() : this(historyPath: null, LiveKernel)
+    {
+    }
+
+    /// <summary>
+    /// A meter that keeps its history at <paramref name="historyPath"/> (null for
+    /// <see cref="DefaultHistoryPath"/>) and reads the adapters and the boot time
+    /// through <paramref name="kernel"/>, so the suite can replay a reboot.
+    /// </summary>
+    internal TrafficMeterService(string? historyPath, KernelSources kernel)
+    {
+        _historyPath = historyPath;
+        _kernel = kernel;
+    }
 
     public void Start()
     {
@@ -243,9 +281,9 @@ public sealed class TrafficMeterService : IDisposable
         }
     }
 
-    private void SampleOnce(DateTime now)
+    internal void SampleOnce(DateTime now)
     {
-        var current = ReadInterfaceCounters();
+        var current = _kernel.Counters();
         if (current == null)
         {
             _status = "Adapter byte counters unreadable — traffic metering off";
@@ -270,6 +308,15 @@ public sealed class TrafficMeterService : IDisposable
                     deltaIn += Delta(previous.In, counter.In);
                     deltaOut += Delta(previous.Out, counter.Out);
                 }
+                else if (_countFromBoot)
+                {
+                    // The machine rebooted since the last save, so this counter
+                    // started at zero with the boot. That holds for an adapter the
+                    // last save never saw, too — a dock plugged in while the machine
+                    // was off is counted like the built-in NIC.
+                    deltaIn += Delta(0, counter.In);
+                    deltaOut += Delta(0, counter.Out);
+                }
                 else
                 {
                     // An adapter seen for the first time in this run has no
@@ -280,6 +327,8 @@ public sealed class TrafficMeterService : IDisposable
                 }
                 _counters[name] = counter;
             }
+            _countFromBoot = false;
+            _countersRead = true;
 
             // Adapters that disappeared (VPN down, dock unplugged) are dropped so
             // their stale counters cannot be diffed against a later, unrelated one.
@@ -350,6 +399,41 @@ public sealed class TrafficMeterService : IDisposable
     /// </summary>
     internal static long Delta(long previous, long current)
         => current >= previous ? current - previous : Math.Max(0, current);
+
+    /// <summary>
+    /// Whether saved counters were read during an earlier boot than this one. They
+    /// continue the diff only within the boot that read them: Windows restarts every
+    /// adapter counter at zero when the machine boots, so after a reboot a saved value
+    /// describes a counter that no longer exists. Waiting for the counter to go
+    /// backwards does not catch that — one that has already climbed past the saved
+    /// value by the time the console opens reads as ordinary growth, and the saved
+    /// value is silently subtracted from real traffic.
+    ///
+    /// Windows has no boot ID for the file to carry, as the Linux build's does, so the
+    /// save time is compared with the boot time — what the Linux build falls back on
+    /// for a file without one. Saves happen only after a sample (see
+    /// <see cref="SaveHistory"/>), so a save from this boot is always later than its
+    /// start. A clock stepped forward after a save, by more than the time from boot to
+    /// that save, would date it before the boot and count the traffic up to it again.
+    ///
+    /// A shutdown with Fast Startup on hibernates the kernel rather than ending it, so
+    /// the boot time does not move and the next start is not a new boot here. A counter
+    /// a driver restarted across it is still caught by going backwards, as before.
+    /// </summary>
+    internal static bool IsDifferentBoot(DateTime savedUtc, DateTime bootTimeUtc)
+    {
+        if (savedUtc == default) return false;
+        var saved = savedUtc.Kind == DateTimeKind.Local ? savedUtc.ToUniversalTime() : savedUtc;
+        return saved < bootTimeUtc;
+    }
+
+    /// <summary>
+    /// When this boot began. <see cref="Environment.TickCount64"/> counts from boot and
+    /// keeps counting through sleep and hibernation, so this is the same instant
+    /// <c>Win32_OperatingSystem.LastBootUpTime</c> reports, without a WMI query.
+    /// </summary>
+    internal static DateTime ReadBootTime()
+        => DateTime.UtcNow - TimeSpan.FromMilliseconds(Environment.TickCount64);
 
     /// <summary>
     /// Reads the octet counters of every metered adapter. Null when the adapter
@@ -473,10 +557,13 @@ public sealed class TrafficMeterService : IDisposable
 
     // ── Persistence ──────────────────────────────────────────────────────
 
-    internal static string HistoryPath
+    internal static string DefaultHistoryPath
         => Path.Combine(AppPaths.DataDirectory, "traffic-history.json");
 
-    private void LoadHistory()
+    private string HistoryPath => _historyPath ?? DefaultHistoryPath;
+
+    /// <summary>Caller holds <see cref="_gate"/> (the suite calls it directly).</summary>
+    internal void LoadHistory()
     {
         if (_loaded) return;
         _loaded = true;
@@ -491,8 +578,18 @@ public sealed class TrafficMeterService : IDisposable
                 if (string.IsNullOrWhiteSpace(day.Date)) continue;
                 _days[day.Date] = new DayTotal(Math.Max(0, day.In), Math.Max(0, day.Out));
             }
-            foreach (var (name, counter) in store.Counters)
-                _counters[name] = new InterfaceCounter(Math.Max(0, counter.In), Math.Max(0, counter.Out));
+
+            if (IsDifferentBoot(store.UpdatedUtc, _kernel.BootTime()))
+            {
+                // The saved values describe counters that no longer exist; the
+                // first sample counts each adapter from zero instead.
+                _countFromBoot = true;
+            }
+            else
+            {
+                foreach (var (name, counter) in store.Counters)
+                    _counters[name] = new InterfaceCounter(Math.Max(0, counter.In), Math.Max(0, counter.Out));
+            }
 
             TrimHistory();
         }
@@ -502,11 +599,17 @@ public sealed class TrafficMeterService : IDisposable
         }
     }
 
-    private void SaveHistory()
+    internal void SaveHistory()
     {
         TrafficStore store;
         lock (_gate)
         {
+            // Before the first sample, the counters in memory are the file's own and
+            // no day has changed, so there is nothing to save — and saving would do
+            // harm: a fresh UpdatedUtc would date counters from an earlier boot into
+            // this one, and they would be trusted for the rest of it.
+            if (!_countersRead) return;
+
             store = new TrafficStore
             {
                 UpdatedUtc = DateTime.UtcNow,
@@ -541,6 +644,13 @@ public sealed class TrafficMeterService : IDisposable
     public void Dispose() => Stop();
 
     internal readonly record struct InterfaceCounter(long In, long Out);
+
+    /// <summary>
+    /// Where the meter reads the system: the metered adapters' counters (null when the
+    /// adapter table cannot be read) and the time this boot began.
+    /// </summary>
+    internal sealed record KernelSources(
+        Func<Dictionary<string, InterfaceCounter>?> Counters, Func<DateTime> BootTime);
 
     private readonly record struct DayTotal(long In, long Out);
 

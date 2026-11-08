@@ -30,6 +30,49 @@ public class TrafficMeterTests
         Assert.Equal(0L, TrafficMeterService.Delta(9_000_000, 0));
     }
 
+    // ── Which boot the saved counters belong to ──────────────────────────
+
+    private static readonly DateTime BootTime = new(2026, 11, 7, 8, 0, 0, DateTimeKind.Utc);
+
+    [Fact]
+    public void ASaveFromBeforeTheBootIsFromAnEarlierOne()
+    {
+        // Saved before this boot began: the counters it holds are gone.
+        Assert.True(TrafficMeterService.IsDifferentBoot(BootTime.AddMinutes(-5), BootTime));
+        // Saved since: they are this boot's, and the diff continues.
+        Assert.False(TrafficMeterService.IsDifferentBoot(BootTime.AddMinutes(5), BootTime));
+    }
+
+    [Fact]
+    public void ASaveTimeInLocalTimeIsComparedAsTheInstantItIs()
+    {
+        // System.Text.Json reads a timestamp written with an offset as local time.
+        Assert.True(TrafficMeterService.IsDifferentBoot(BootTime.AddMinutes(-5).ToLocalTime(), BootTime));
+        Assert.False(TrafficMeterService.IsDifferentBoot(BootTime.AddMinutes(5).ToLocalTime(), BootTime));
+    }
+
+    [Fact]
+    public void AFileWithoutASaveTimeKeepsItsCounters()
+    {
+        // Nothing says the counters are stale, and zeroing them would count the whole
+        // since-boot total again on every launch. A reset is still caught the old way,
+        // by the counter going backwards.
+        Assert.False(TrafficMeterService.IsDifferentBoot(default, BootTime));
+    }
+
+    [Fact]
+    public void TheBootTimeHoldsStillAndIsInThePast()
+    {
+        var first = TrafficMeterService.ReadBootTime();
+        var second = TrafficMeterService.ReadBootTime();
+
+        Assert.Equal(DateTimeKind.Utc, first.Kind);
+        Assert.True(first <= DateTime.UtcNow);
+        // Tick resolution is ~16 ms; a boot time that moved further between two
+        // reads would misjudge a save made just after it.
+        Assert.True((second - first).Duration() < TimeSpan.FromSeconds(1));
+    }
+
     // ── Which adapters count ─────────────────────────────────────────────
 
     [Theory]
