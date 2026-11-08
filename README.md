@@ -427,7 +427,7 @@ Three details decide whether the numbers are right, and each has a test:
 
 Daily totals and the last raw counters persist to `traffic-history.json`, so the diff continues across a restart — but that first catch-up delta spans however long the app was shut, so it counts toward the day and is deliberately **not** charted as a rate.
 
-The saved counters only continue the diff within the boot that wrote them. They are stamped with the kernel's boot ID (`/proc/sys/kernel/random/boot_id`), and after a reboot each interface restarts from zero instead. Waiting for the counter to go backwards is not enough on its own: if it has already climbed past the saved value by the time the app opens, the saved value would be subtracted from real traffic and the day undercounted. A history file written before the boot ID was recorded keeps its counters for that one launch and is stamped on the next save.
+The saved counters only continue the diff within the boot that wrote them (0.7.24). They are stamped with the kernel's boot ID (`/proc/sys/kernel/random/boot_id`), and after a reboot every interface is counted from zero instead — including one the last save never saw, such as a dock plugged in while the machine was off. Waiting for the counter to go backwards is not enough on its own: if it has already climbed past the saved value by the time the app opens, the saved value would be subtracted from real traffic and the day undercounted. A file without a boot ID — written by 0.7.23 or earlier, or by a launch that could not read it — is judged by its save time against the kernel's boot time (`btime` in `/proc/stat`) instead.
 
 Turn it off with `TrafficMeterEnabled` (Settings → Traffic metering); the history is kept but stops growing.
 
