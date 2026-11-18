@@ -2382,9 +2382,11 @@ public sealed class WebApp : IDisposable
                         ? null
                         : System.Net.WebUtility.HtmlDecode(req.Replace.Trim());
 
-                    // Editing a rule the host owns rather than one of ours: remove the
-                    // original where it lives first. UFW has no in-place edit, and
-                    // writing the replacement on top would leave both in force.
+                    // Editing a rule the host owns rather than one of ours. UFW has no
+                    // in-place edit, so the original has to go — but only once the
+                    // replacement is in force: deleting first left nothing behind when
+                    // the save failed, and the rule being edited was often the SSH allow.
+                    FirewallOperationResult saved;
                     if (!string.IsNullOrWhiteSpace(req.Key))
                     {
                         var original = FindScannedRule(req.Key!.Trim(), out var lookupProblem);
@@ -2392,16 +2394,13 @@ public sealed class WebApp : IDisposable
                         if (IsOwnWebRule(original.Name))
                             return ActionResultDto.Fail(SelfRuleRefusal(original.Name));
 
-                        var dropped = _firewall.DeleteHostRule(original);
-                        if (!dropped.Success)
-                        {
-                            _statusMessage = $"The original rule could not be removed, so it was not replaced: {dropped.Message}";
-                            return ActionResultDto.Fail(_statusMessage);
-                        }
+                        saved = _firewall.ReplaceHostRule(original, spec);
                         InvalidateHostScan();
                     }
-
-                    var saved = _firewall.SaveCustomRule(spec, replace);
+                    else
+                    {
+                        saved = _firewall.SaveCustomRule(spec, replace);
+                    }
                     _statusMessage = saved.Message;
                     if (saved.Success) InvalidateHostScan();
                     return saved.Success

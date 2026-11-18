@@ -162,7 +162,7 @@ Status: active
 
     /// <summary>
     /// The operator's own uncommented 22/tcp rule (rows 1 and 4) alongside the same
-    /// shape written by this app, which UFW lists with its label as the comment.
+    /// shape written by this app, which UFW lists with its ledger name as the comment.
     /// </summary>
     private const string NumberedWithOurs = """
 Status: active
@@ -170,9 +170,9 @@ Status: active
      To                         Action      From
      --                         ------      ----
 [ 1] 22/tcp                     ALLOW IN    Anywhere
-[ 2] 22/tcp                     ALLOW IN    Anywhere                   # allow-inbound-ssh
+[ 2] 22/tcp                     ALLOW IN    Anywhere                   # NetworkSentinel-Rule-ssh
 [ 3] 22/tcp (v6)                ALLOW IN    Anywhere (v6)
-[ 4] 22/tcp (v6)                ALLOW IN    Anywhere (v6)              # allow-inbound-ssh
+[ 4] 22/tcp (v6)                ALLOW IN    Anywhere (v6)              # NetworkSentinel-Rule-ssh
 """;
 
     [Fact]
@@ -186,6 +186,43 @@ Status: active
 
         Assert.Equal(FirewallRuleSpecs.AnyAddressText, target.AddressListText);
         Assert.Equal(new[] { 2, 4 }, UfwWriter.MatchNumbers(target, rows));
+    }
+
+    [Fact]
+    public void Numbered_ARuleThisAppWroteIsFoundByTheCommentItWasWrittenWith()
+    {
+        // ApplyViaUfw writes the ledger name as the comment, not the operator's label:
+        // the name is what a rescan tells this app's rules apart by. Matching on the
+        // label instead found nothing, so the app could never remove its own UFW rules.
+        var rule = FirewallRuleSpecs.ToRule(Spec(), "NetworkSentinel-Rule-allow-inbound-ssh");
+        var written = FirewallRuleSpecs.FromRule(rule);
+        written.Label = rule.Name;
+        var argv = UfwWriter.BuildAddCommands(written)[0];
+        var comment = argv[Array.IndexOf(argv, "comment") + 1];
+
+        var rows = UfwWriter.ParseNumbered($"""
+Status: active
+
+     To                         Action      From
+     --                         ------      ----
+[ 1] 22/tcp                     ALLOW IN    Anywhere
+[ 2] 22/tcp                     ALLOW IN    Anywhere                   # {comment}
+""");
+
+        Assert.Equal(new[] { 2 }, UfwWriter.MatchNumbers(rule, rows));
+    }
+
+    [Fact]
+    public void ARelabelledRuleHasTheSameUfwShape()
+    {
+        // The case where UFW folds the replacement into the row being replaced, so the
+        // replacement has to be asked for again once the original is removed.
+        var original = FirewallRuleSpecs.ToRule(Spec(label: "ssh"), "NetworkSentinel-Rule-ssh");
+        var relabelled = FirewallRuleSpecs.ToRule(Spec(label: "ssh-from-anywhere"), "NetworkSentinel-Rule-ssh-from-anywhere");
+        var otherPort = FirewallRuleSpecs.ToRule(Spec(ports: "2222", label: "ssh"), "NetworkSentinel-Rule-ssh-2");
+
+        Assert.True(FirewallService.SameUfwShape(original, relabelled));
+        Assert.False(FirewallService.SameUfwShape(original, otherPort));
     }
 
     [Fact]
