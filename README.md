@@ -12,7 +12,7 @@ Three ways to run it (same idea as the Linux build):
 
 > **iPhone and iPad: optional.** [Network Sentinel for iOS](https://github.com/davidfweiser/NetworkSentinel-iOS) is a companion app that signs in to a server running the web UI and shows and controls it from your phone. Network Sentinel does not need it to operate: everything it monitors, detects and blocks runs on the host, and each of the three modes above works on its own.
 
-> Awareness / monitoring tooling — not a full IDS/IPS replacement. Version **0.7.24**.
+> Awareness / monitoring tooling — not a full IDS/IPS replacement. Version **0.7.25**.
 
 > **Use at your own risk.** Network Sentinel changes your firewall, and with auto-block turned on it blocks addresses by itself. Try it first on a machine you can reach some other way — a local screen or your provider's or hypervisor's console — before you rely on it over Remote Desktop. It comes as is, without warranty: see the [MIT license](LICENSE).
 
@@ -44,6 +44,17 @@ The web console on a Windows server. Every address in these is from a range rese
 </table>
 
 ---
+
+## What's new in 0.7.25
+
+Two lockout fixes from Linux, ahead of its own 0.7.25 release.
+
+| Area | What changed |
+|------|--------------|
+| **Auto-block leaves remote operators alone** | Four mistyped passwords from your own public address within ten minutes made a High failed-logon burst, and auto-block acts on High by default — in both directions, so the Remote Desktop session you were typing into went with it. An address is no longer auto-blocked while someone is logged on over Remote Desktop from it, or if it logged on remotely in the last 30 days (Security-log 4624, never ANONYMOUS LOGON or Guest), or if this process's own SSH session comes from it. A successful logon also clears the address's failure count. A threat held back this way is reported with the reason, and you can still block the address by hand. See [the gates](#prevention-engine). |
+| **Editing a firewall rule keeps the original until the new one is in force** | An edit used to delete the original rule and then write the new one, so a save that failed left nothing behind — and the rule being edited was often the one letting Remote Desktop in. The new rule is now written first. A failed save leaves the original untouched; a failed removal leaves both in force and says so. See [Firewall Config](#firewall-config--the-whole-host-firewall-rebuilt-in-074). |
+
+Linux's other half of this fix — counting one mistyped SSH password once, where sshd and PAM log it two or three times — has no Windows counterpart: a failed Windows logon is one 4625 event.
 
 ## What's new in 0.7.24
 
@@ -379,7 +390,7 @@ Gates, in order — a threat must clear all of them before a rule is written:
 | Not this machine | A detector that attributes a threat to the wrong end of a flow can never firewall the host off from itself — matters most on a cloud VM whose own address is public |
 | Not a configured resolver | A DNS server one of this machine's adapters is set to use is never auto-blocked — the block would take name resolution with it |
 | Not a WireGuard tunnel endpoint | A peer's public endpoint is where its tunnel packets come from; blocking it does not drop an attacker, it drops the tunnel and everything reached through it. Independent of the WireGuard *monitoring* setting, and remembered for 24 h — see [tunnel endpoints are never auto-blocked](#tunnel-endpoints-are-never-auto-blocked) |
-| Not a remote-logon address | An address someone is logged on to this machine from over Remote Desktop right now (IPv4 clients, read from Remote Desktop Services), or that logged on remotely in the last 30 days (Security-log 4624 of type network, unlock, network-cleartext or Remote Desktop — never ANONYMOUS LOGON or Guest — remembered in `remote-logons.json`), or that this process's own SSH session comes from. An address counts only once it has authenticated — a brute-forcer's connections are established TCP too. OpenSSH logons are otherwise not seen: the Security log records them without the client's address. A threat against one is reported with the reason, and the address can still be blocked by hand |
+| Not a remote-logon address (0.7.25) | An address someone is logged on to this machine from over Remote Desktop right now (IPv4 clients, read from Remote Desktop Services), or that logged on remotely in the last 30 days (Security-log 4624 of type network, unlock, network-cleartext or Remote Desktop — never ANONYMOUS LOGON or Guest — remembered in `remote-logons.json`), or that this process's own SSH session comes from. An address counts only once it has authenticated — a brute-forcer's connections are established TCP too. OpenSSH logons are otherwise not seen: the Security log records them without the client's address. A threat against one is reported with the reason, and the address can still be blocked by hand |
 | Not protected | See lockout protection below |
 | Not already blocked | No duplicate rules |
 | Not suppressed | An address you deliberately released stays released for 24 h |
@@ -668,7 +679,7 @@ Three things decide whether a rule counts towards that verdict, and each of them
 
 **New rule** on a listener row opens the editor with that socket's protocol and port already filled in. The bind address deliberately does *not* carry into Sources: that field matches the far end of a connection, so seeding it with `0.0.0.0`, `::` or this host's own LAN address would write a rule that matches nothing an attacker sends. The editor note says so on the spot.
 
-**Editing a rule this app did not write** replaces it with a `NetworkSentinel-Rule-*` rule carrying the new values — Windows has no edit-in-place for somebody else's rule, and rewriting one under its own name would leave two rules claiming it. **Any edit — to one of those or to one of this app's — writes the new values first and removes the original only once they are in force.** The other order lost the original whenever the save then failed, and the rule being edited was often the one letting Remote Desktop in. A save that fails now leaves the original untouched; a removal that fails leaves both in force and says so (block rules still beat allow rules while both exist). A rule with no name to delete it by is refused before anything is written. An edit that keeps its label keeps its name too: the new rule is written under a temporary `…-2` name and renamed once the original is gone. Deletes name the rule's whole shape (direction, protocol, both port fields, remote addresses, program), because Windows rule names are not unique and a delete by name alone would take the neighbours with it.
+**Editing a rule this app did not write** replaces it with a `NetworkSentinel-Rule-*` rule carrying the new values — Windows has no edit-in-place for somebody else's rule, and rewriting one under its own name would leave two rules claiming it. **Any edit — to one of those or to one of this app's — writes the new values first and removes the original only once they are in force** (0.7.25). The other order lost the original whenever the save then failed, and the rule being edited was often the one letting Remote Desktop in. A save that fails now leaves the original untouched; a removal that fails leaves both in force and says so (block rules still beat allow rules while both exist). A rule with no name to delete it by is refused before anything is written. An edit that keeps its label keeps its name too: the new rule is written under a temporary `…-2` name and renamed once the original is gone. Deletes name the rule's whole shape (direction, protocol, both port fields, remote addresses, program), because Windows rule names are not unique and a delete by name alone would take the neighbours with it.
 
 **The scan is cached.** The web console polls `/api/state` every 2.5 s, and shelling out to `netsh` twice at that rate would be absurd; the host firewall rides on its own endpoint (`/api/hostfirewall`), fetched when the tab is opened, invalidated by any write, and re-read on demand by **Rescan the host firewall**. The desktop page runs the same scan off the UI thread with a *Scanning…* indicator.
 
@@ -759,7 +770,7 @@ Environment variables: `NETWORKSENTINEL_TUI=1`, `NETWORKSENTINEL_WEB=1`.
 Prebuilt packages are attached to each Windows release on [GitHub Releases](https://github.com/davidfweiser/NetworkSentinel/releases), under tags named `windows-v<version>`. Tags named `linux-v<version>` (and the older plain `v<version>`) are Linux builds. Each file comes with a `.sha256`, so check the download before running it:
 
 ```powershell
-Get-FileHash .\NetworkSentinel-windows-server-x64-0.7.24.install.cmd -Algorithm SHA256
+Get-FileHash .\NetworkSentinel-windows-server-x64-0.7.25.install.cmd -Algorithm SHA256
 ```
 
 To build your own instead, do it **on a dev PC** that has the .NET 8 SDK:
@@ -785,11 +796,11 @@ Because the runtime travels inside the package, it is only as current as the bui
 
 ```powershell
 # Copy the .install.cmd to the server, then run it (UAC prompt if not elevated):
-.\NetworkSentinel-windows-server-x64-0.7.24.install.cmd
+.\NetworkSentinel-windows-server-x64-0.7.25.install.cmd
 # optional port:
-.\NetworkSentinel-windows-server-x64-0.7.24.install.cmd -Port 18765
+.\NetworkSentinel-windows-server-x64-0.7.25.install.cmd -Port 18765
 # unpack without installing:
-.\NetworkSentinel-windows-server-x64-0.7.24.install.cmd --extract-only
+.\NetworkSentinel-windows-server-x64-0.7.25.install.cmd --extract-only
 ```
 
 The one-file installer is a `.cmd`, not a `.ps1`: `cmd.exe` stops reading the script at `exit /b`, so the ZIP appended to it is never parsed. PowerShell tokenizes an entire `-File` script before running any of it, and the cost on appended binary is quadratic (16 MB ≈ 5½ minutes) before it fails to parse at all — so the shell-style "payload after exit" trick only works with a `cmd` entry point.
