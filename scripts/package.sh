@@ -267,11 +267,16 @@ if ! tar --version 2>/dev/null | grep -qi 'gnu tar'; then
   command -v gtar >/dev/null 2>&1 && TAR="gtar"
 fi
 
+# Entries are recorded as root-owned. Unpacked by root (the one-file installer
+# does exactly that), tar restores the owner it finds in the archive, and the
+# builder's uid would otherwise land on whichever local account happens to share
+# it. install.sh chowns the installed tree anyway; this keeps the archive honest.
 if "$TAR" --version 2>/dev/null | grep -qi 'gnu tar'; then
-  "$TAR" -C "$DIST_DIR" --mode='u+rwx,go+rx' -czf "$OUT_TGZ" "$NAME"
+  "$TAR" -C "$DIST_DIR" --mode='u+rwx,go+rx,go-w' --owner=0 --group=0 --numeric-owner \
+    -czf "$OUT_TGZ" "$NAME"
 else
   echo "    (no GNU tar — archiving with $(basename "$TAR") and the on-disk modes)"
-  "$TAR" -C "$DIST_DIR" -czf "$OUT_TGZ" "$NAME"
+  "$TAR" -C "$DIST_DIR" --uid 0 --gid 0 --uname root --gname root -czf "$OUT_TGZ" "$NAME"
 fi
 
 # Convenience checksum for the archive
@@ -324,7 +329,7 @@ if [[ -z "$ARCHIVE_LINE" ]]; then
 fi
 
 echo "==> Extracting package…"
-tail -n "+${ARCHIVE_LINE}" "$0" | tar -xz -C "$TMP"
+tail -n "+${ARCHIVE_LINE}" "$0" | tar -xz --no-same-owner -C "$TMP"
 
 # Expect a single top-level directory
 PKG_DIR="$(find "$TMP" -mindepth 1 -maxdepth 1 -type d | head -1)"

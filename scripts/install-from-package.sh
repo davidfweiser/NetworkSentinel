@@ -230,6 +230,17 @@ if [[ -f "${PKG_ROOT}/setup-dns-filter.sh" ]]; then
   chmod +x "${LIBDIR}/setup-dns-filter.sh"
 fi
 
+# Root runs code from this tree later — `sudo networksentinel --set-master-password`,
+# the uninstaller (which sources .install-meta from here), setup-dns-filter.sh — so
+# nobody but root may be able to change it. `cp -a` keeps the owner of the source:
+# whoever unpacked the tarball, or whatever uid the archive recorded. Left that way,
+# that account (by default the web service's, which faces the network) could swap
+# a file and wait for the next sudo.
+if [[ "$(id -u)" -eq 0 && "$MODE" != "user" ]]; then
+  chown -R 0:0 "$LIBDIR"
+  chmod -R go-w "$LIBDIR"
+fi
+
 # Record layout for uninstall
 cat > "$META" <<EOF
 MODE=${MODE}
