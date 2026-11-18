@@ -134,6 +134,24 @@ public class FailedLogonCountingTests
     }
 
     [Fact]
+    public void AnAuthLogLoginDoesNotClearTheCount()
+    {
+        // Any local account can write an "Accepted" line into auth.log with
+        // `logger -t sshd`; trusting it would let one keep an attacker under the threshold.
+        var monitor = new AuthLogMonitor();
+        var now = T0;
+        foreach (var line in ValidUserTypos(50000, 3)
+                     .Append($"Accepted password for alice from {Ip} port 50001 ssh2")
+                     .Concat(ValidUserTypos(50002, 1)))
+        {
+            monitor.ProcessLine($"Jan  1 12:00:00 host sshd[1]: {line}", now, fromJournal: false);
+            now = now.AddSeconds(2);
+        }
+
+        Assert.Equal("4 failed logons in 10 min", Assert.Single(monitor.DrainPending()).Title);
+    }
+
+    [Fact]
     public void SuccessfulLoginsAreReportedFromJournaldOnly()
     {
         var seen = new List<string>();

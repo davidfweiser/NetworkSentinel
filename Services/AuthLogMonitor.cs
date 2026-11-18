@@ -123,7 +123,8 @@ public sealed class AuthLogMonitor : IDisposable
     /// <summary>
     /// Called with the client address of every successful SSH login read from journald —
     /// see <see cref="SshOperatorShield"/>. Not for auth.log lines: any local account can
-    /// write those with `logger -t sshd`, and an "Accepted" line shields an address.
+    /// write those with `logger -t sshd`, and an "Accepted" line shields an address (and
+    /// clears its failure count, so auth.log ones do neither).
     /// </summary>
     public Action<string>? SuccessfulLogin { get; set; }
 
@@ -292,7 +293,8 @@ public sealed class AuthLogMonitor : IDisposable
     /// <item>A connection closed before login counts only if nothing on it was counted —
     /// a scanner trying a user name and leaving.</item>
     /// </list>
-    /// A successful login from an address clears its count.
+    /// A successful login from an address clears its count — read from journald only, where
+    /// the lines are known to come from root; an "Accepted" line in auth.log is ignored.
     /// </summary>
     internal void ProcessLine(string line, DateTime now, bool fromJournal = true)
     {
@@ -305,12 +307,14 @@ public sealed class AuthLogMonitor : IDisposable
         {
             var who = accepted.Groups["ip"].Value;
             if (!IPAddress.TryParse(who, out _)) return;
+            // From auth.log it proves nothing: any local account can write it, and clearing
+            // the count on its word would let one keep an attacker under the threshold.
+            if (!fromJournal) return;
             lock (_gate)
             {
                 _failures.Remove(who);
             }
-            if (fromJournal)
-                SuccessfulLogin?.Invoke(who);
+            SuccessfulLogin?.Invoke(who);
             return;
         }
 
