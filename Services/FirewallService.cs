@@ -792,9 +792,7 @@ public sealed class FirewallService
     private static FirewallOperationResult RunUfwBatch(IReadOnlyList<string[]> commands)
     {
         var ufw = ResolveExecutable("ufw") ?? "ufw";
-        var script = string.Join(" && ", commands.Select(argv =>
-            Sh(ufw) + " " + string.Join(" ", argv.Select(Sh))));
-        return RunPrivilegedBatch(script);
+        return RunPrivilegedSequence(commands.Select(argv => new[] { ufw }.Concat(argv).ToArray()).ToList());
     }
 
     /// <summary>
@@ -851,13 +849,15 @@ public sealed class FirewallService
             var table = rule.Table.Length > 0 ? rule.Table : "filter";
             var chain = rule.Chain.Length > 0 ? rule.Chain : (rule.IsInbound ? "input" : "output");
 
-            // Sh() is POSIX shell quoting, so the command has to reach a shell. Handed
-            // to RunPrivileged — which execs nft directly — the quotes arrived as part
-            // of the table and chain names, and nft answered "syntax error, unexpected
-            // junk" to every delete of a rule this app had not written itself.
+            // Passed as argv, not as one string: handed to RunPrivileged — which splits a
+            // string by .NET's rules — shell quotes arrived as part of the table and chain
+            // names, and nft answered "syntax error, unexpected junk" to every delete of a
+            // rule this app had not written itself.
             var nft = ResolveExecutable("nft") ?? "nft";
-            var r = RunPrivilegedBatch(
-                $"{Sh(nft)} delete rule {family} {Sh(table)} {Sh(chain)} handle {rule.Handle}");
+            var r = RunPrivilegedSequence(new[]
+            {
+                new[] { nft, "delete", "rule", family, table, chain, "handle", rule.Handle }
+            });
             return r.Success
                 ? FirewallOperationResult.Ok($"Removed “{rule.LabelText}” from nftables.")
                 : FirewallOperationResult.Fail($"nftables refused the delete: {r.Message}");
@@ -943,7 +943,17 @@ public sealed class FirewallService
                 $"limit rate 50/second log prefix {ShNftString(ProbeLogPrefix)} " +
                 $"comment {ShNftString(ProbeLogRuleName)}\n";
 
-            var r = RunPrivilegedBatch(script);
+            var r = RunPrivilegedBatch(script, step =>
+            {
+                var t = NftTable.Split(' ');
+                step([nft, "add", "table", .. t]);
+                step([nft, "add", "chain", .. t, "input", "{ type filter hook input priority 0; policy accept; }"]);
+                step([nft, "add", "chain", .. t, "output", "{ type filter hook output priority 0; policy accept; }"]);
+                DeleteNftProbeRules(step, nft, t);
+                return step([nft, "add", "rule", .. t, "input", "tcp", "flags", "&", "(syn|ack)", "==", "syn",
+                    "ct", "state", "new", "limit", "rate", "50/second",
+                    "log", "prefix", $"\"{ProbeLogPrefix}\"", "comment", $"\"{ProbeLogRuleName}\""]);
+            });
             applied = r.Success
                 ? FirewallOperationResult.Ok("Probe logging enabled (nftables).")
                 : FirewallOperationResult.Fail($"Failed to add probe log rule: {r.Message}");
@@ -960,7 +970,11 @@ public sealed class FirewallService
                 $"\"$IPT\" -D INPUT {spec} 2>/dev/null || true;\n" +
                 $"\"$IPT\" -A INPUT {spec}\n";
 
-            var r = RunPrivilegedBatch(script);
+            var r = RunPrivilegedBatch(script, step =>
+            {
+                step([ipt, "-D", "INPUT", .. ProbeLogIptablesSpec]);
+                return step([ipt, "-A", "INPUT", .. ProbeLogIptablesSpec]);
+            });
             applied = r.Success
                 ? FirewallOperationResult.Ok("Probe logging enabled (iptables).")
                 : FirewallOperationResult.Fail($"Failed to add probe log rule: {r.Message}");
@@ -1000,7 +1014,12 @@ public sealed class FirewallService
                 $"set -u; NFT={Sh(nft)}; T={Sh(NftTable)};\n" +
                 $"for h in $(\"$NFT\" -a list table $T 2>/dev/null | awk '/{ProbeLogRuleName}/{{for(i=1;i<=NF;i++) if($i==\"handle\") print $(i+1)}}'); do\n" +
                 "  \"$NFT\" delete rule $T input handle \"$h\" 2>/dev/null || true;\n" +
-                "done\n");
+                "done\n",
+                step =>
+                {
+                    DeleteNftProbeRules(step, nft, NftTable.Split(' '));
+                    return FirewallOperationResult.Ok("");
+                });
         }
         else
         {
@@ -1008,7 +1027,15 @@ public sealed class FirewallService
             r = RunPrivilegedBatch(
                 $"set -u; IPT={Sh(ipt)};\n" +
                 $"\"$IPT\" -D INPUT -p tcp --syn -m conntrack --ctstate NEW -m limit --limit 50/sec " +
-                $"-j LOG --log-prefix {Sh(ProbeLogPrefix)} -m comment --comment {Sh(ProbeLogRuleName)} 2>/dev/null || true\n");
+                $"-j LOG --log-prefix {Sh(ProbeLogPrefix)} -m comment --comment {Sh(ProbeLogRuleName)} 2>/dev/null || true\n",
+                step =>
+                {
+                    // "|| true" in the script: an absent rule is the state we wanted.
+                    var deleted = step([ipt, "-D", "INPUT", .. ProbeLogIptablesSpec]);
+                    return deleted.Success || !LooksLikeSudoRefusal(deleted.Message)
+                        ? FirewallOperationResult.Ok("")
+                        : deleted;
+                });
         }
 
         // Only forget the rule once the privileged run went through; a dismissed prompt
@@ -1017,6 +1044,35 @@ public sealed class FirewallService
             return r;
         RemoveFromLedger(ProbeLogRuleName);
         return FirewallOperationResult.Ok("Probe logging disabled.");
+    }
+
+    /// <summary>The probe-log rule's iptables match and target, as argv.</summary>
+    private static readonly string[] ProbeLogIptablesSpec =
+    {
+        "-p", "tcp", "--syn", "-m", "conntrack", "--ctstate", "NEW", "-m", "limit", "--limit", "50/sec",
+        "-j", "LOG", "--log-prefix", ProbeLogPrefix, "-m", "comment", "--comment", ProbeLogRuleName
+    };
+
+    /// <summary>
+    /// Deletes every probe-log rule in the managed table by handle — the stepwise twin
+    /// of the script's list | awk | delete loop. Failures are ignored as they are there:
+    /// no table, or no such rule, is the state being asked for.
+    /// </summary>
+    internal static void DeleteNftProbeRules(PrivilegedStep step, string nft, string[] table)
+    {
+        var listing = step([nft, "-a", "list", "table", .. table]);
+        if (!listing.Success) return;
+
+        foreach (var line in listing.Message.Split('\n'))
+        {
+            if (!line.Contains(ProbeLogRuleName, StringComparison.Ordinal)) continue;
+            var words = line.Split(' ', StringSplitOptions.RemoveEmptyEntries);
+            var at = Array.IndexOf(words, "handle");
+            if (at < 0 || at + 1 >= words.Length) continue;
+            var handle = words[at + 1];
+            if (!long.TryParse(handle, NumberStyles.None, CultureInfo.InvariantCulture, out _)) continue;
+            step([nft, "delete", "rule", .. table, "input", "handle", handle]);
+        }
     }
 
     public bool IsProbeLoggingInstalled()
@@ -1328,9 +1384,7 @@ public sealed class FirewallService
             return (RemovalOutcome.Absent, "");
 
         var exe = ResolveExecutable(tool) ?? tool;
-        var script = string.Join(" && ", specs.Select(argv =>
-            Sh(exe) + " " + string.Join(" ", argv.Select(Sh))));
-        var deleted = RunPrivilegedBatch(script);
+        var deleted = RunPrivilegedSequence(specs.Select(argv => new[] { exe }.Concat(argv).ToArray()).ToList());
         return deleted.Success
             ? (RemovalOutcome.Removed, "")
             : (RemovalOutcome.Failed, deleted.Message);
@@ -1685,7 +1739,21 @@ public sealed class FirewallService
                 : FirewallOperationResult.Fail("No silent elevation available.");
         }
 
-        // 1) pkexec — graphical polkit dialog, works under Wayland
+        // 1) sudo -n, when it is already known to work (passwordless grant or cached
+        // credentials). It used to come after pkexec, and on a headless server that has
+        // polkit installed pkexec has no agent to ask: its refusal is not a "missing
+        // helper", so it ended the search and the NOPASSWD grant was never tried. Gated on
+        // the cached probe because a refused sudo -n lands in the auth log this app reads.
+        FirewallOperationResult? cached = null;
+        if (CommandExists("sudo") && CanElevateSilently())
+        {
+            cached = RunDirect("sudo", $"-n {Quote(resolved)} {args}");
+            // The tool ran and failed: that is the answer, not a reason to prompt.
+            if (cached.Success || !LooksLikeSudoRefusal(cached.Message))
+                return cached;
+        }
+
+        // 2) pkexec — graphical polkit dialog, works under Wayland
         if (CommandExists("pkexec"))
         {
             var r = RunDirect("pkexec", $"{Quote(resolved)} {args}", InteractiveProcessTimeoutMs);
@@ -1693,12 +1761,14 @@ public sealed class FirewallService
                 return r;
         }
 
-        // 2) sudo -n first (passwordless / already cached)
         if (CommandExists("sudo"))
         {
-            var cached = RunDirect("sudo", $"-n {Quote(resolved)} {args}");
-            if (cached.Success)
-                return cached;
+            if (cached == null)
+            {
+                cached = RunDirect("sudo", $"-n {Quote(resolved)} {args}");
+                if (cached.Success)
+                    return cached;
+            }
 
             // 3) sudo -A — a password dialog on a host that has sudo but no pkexec.
             // A cancelled or wrong password comes back as sudo's own refusal, which is
@@ -1745,6 +1815,28 @@ public sealed class FirewallService
         return string.IsNullOrWhiteSpace(sudoMessage) ? text : $"{text}\n\nsudo said: {sudoMessage.Trim()}";
     }
 
+    /// <summary>One privileged command, as argv with the resolved tool path first.</summary>
+    internal delegate FirewallOperationResult PrivilegedStep(string[] argv);
+
+    /// <summary>
+    /// Runs commands in order under one elevation, stopping at the first that fails —
+    /// the <c>a &amp;&amp; b &amp;&amp; c</c> shape most batches have.
+    /// </summary>
+    private static FirewallOperationResult RunPrivilegedSequence(IReadOnlyList<string[]> commands)
+    {
+        var script = string.Join(" && ", commands.Select(argv => string.Join(" ", argv.Select(Sh))));
+        return RunPrivilegedBatch(script, step =>
+        {
+            var last = FirewallOperationResult.Ok("");
+            foreach (var argv in commands)
+            {
+                last = step(argv);
+                if (!last.Success) return last;
+            }
+            return last;
+        });
+    }
+
     /// <summary>
     /// Runs a whole sequence of privileged commands under a SINGLE elevation prompt.
     /// polkit's org.freedesktop.policykit.exec is <c>auth_admin</c> (not
@@ -1752,8 +1844,19 @@ public sealed class FirewallService
     /// pkexec call raises its own password dialog. An operation built from several
     /// RunPrivileged calls therefore asked for the password several times, and
     /// answering only the first looked exactly like authentication failing.
+    ///
+    /// Every batch comes in two forms. <paramref name="script"/> is the one-prompt
+    /// shell form, run by root, by a capability holder, or under pkexec / an askpass
+    /// sudo. <paramref name="stepwise"/> does the same work one command at a time, and
+    /// is what passwordless sudo runs: the grant the README documents names
+    /// ufw/nft/iptables/ip6tables, not <c>/bin/sh</c> — and must not, since
+    /// <c>NOPASSWD: /bin/sh</c> is root for anything. Under that grant every batched
+    /// write (UFW adds and deletes, iptables expiry deletes, probe logging) failed with
+    /// "a password is required" while the console reported silent elevation as working.
+    /// No prompt is involved there, so running the commands one by one costs nothing.
     /// </summary>
-    private static FirewallOperationResult RunPrivilegedBatch(string script)
+    private static FirewallOperationResult RunPrivilegedBatch(
+        string script, Func<PrivilegedStep, FirewallOperationResult> stepwise)
     {
         if (!PlatformSupported)
             return FirewallOperationResult.Fail(UnsupportedPlatformText);
@@ -1768,6 +1871,22 @@ public sealed class FirewallService
         if (HasDirectKernelAccess() && !MentionsUfw(script))
             return RunDirectArgs("/bin/sh", new[] { "-c", script });
 
+        var hasSudo = CommandExists("sudo");
+        var sudoSaid = "";
+        if (hasSudo && CanElevateSilently())
+        {
+            var silent = RunStepwiseUnderSudo(stepwise, out sudoSaid);
+            if (silent != null)
+                return silent;
+        }
+
+        // Background sweeps never raise a dialog. This path used to fall through to
+        // pkexec regardless, so the expiry timer could put a polkit prompt on screen.
+        if (_silentElevationOnly)
+            return FirewallOperationResult.Fail(sudoSaid.Length > 0
+                ? $"No silent elevation available. sudo said: {sudoSaid}"
+                : "No silent elevation available.");
+
         if (CommandExists("pkexec"))
         {
             var r = RunDirectArgs("pkexec", new[] { "/bin/sh", "-c", script }, InteractiveProcessTimeoutMs);
@@ -1775,12 +1894,8 @@ public sealed class FirewallService
                 return r;
         }
 
-        if (CommandExists("sudo"))
+        if (hasSudo)
         {
-            var cached = RunDirectArgs("sudo", new[] { "-n", "/bin/sh", "-c", script });
-            if (cached.Success)
-                return cached;
-
             var askpass = FindAskpassHelper();
             if (askpass != null)
             {
@@ -1793,10 +1908,55 @@ public sealed class FirewallService
             if (HasTerminal())
                 return RunDirectArgs("sudo", new[] { "/bin/sh", "-c", script }, InteractiveProcessTimeoutMs);
 
-            return FirewallOperationResult.Fail(NoPasswordPromptText(cached.Message));
+            return FirewallOperationResult.Fail(NoPasswordPromptText(sudoSaid));
         }
 
         return FirewallOperationResult.Fail("No elevation helper (pkexec/sudo) available.");
+    }
+
+    /// <summary>
+    /// Runs <paramref name="stepwise"/> with each command under <c>sudo -n</c>. Null when
+    /// sudo refused the very first command — nothing has run, so the caller can still
+    /// try a prompt — with sudo's words in <paramref name="refusal"/>. Once one command
+    /// has gone through, the result is final whatever happens after it, since running
+    /// the batch again under a prompt would apply its first half twice.
+    /// </summary>
+    private static FirewallOperationResult? RunStepwiseUnderSudo(
+        Func<PrivilegedStep, FirewallOperationResult> stepwise, out string refusal)
+    {
+        string? refused = null;
+        var ranAny = false;
+
+        FirewallOperationResult Step(string[] argv)
+        {
+            if (refused != null) return FirewallOperationResult.Fail(refused);
+            var r = RunDirectArgs("sudo", new[] { "-n" }.Concat(argv).ToArray());
+            if (!r.Success && !ranAny && LooksLikeSudoRefusal(r.Message))
+            {
+                refused = r.Message;
+                return r;
+            }
+            ranAny = true;
+            return r;
+        }
+
+        var result = stepwise(Step);
+        refusal = refused ?? "";
+        return refused != null ? null : result;
+    }
+
+    /// <summary>
+    /// Whether a failed <c>sudo</c> run was sudo declining to run the command — no
+    /// password to give it, or a sudoers file that does not list it — rather than the
+    /// command itself failing. Tools do not prefix their errors with "sudo:".
+    /// </summary>
+    internal static bool LooksLikeSudoRefusal(string message)
+    {
+        var m = message.TrimStart();
+        return m.StartsWith("sudo:", StringComparison.Ordinal)
+               || m.Contains("is not allowed to execute", StringComparison.Ordinal)
+               || m.Contains("may not run sudo", StringComparison.Ordinal)
+               || m.Contains("not in the sudoers", StringComparison.Ordinal);
     }
 
     /// <summary>
