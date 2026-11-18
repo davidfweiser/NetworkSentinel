@@ -186,14 +186,17 @@ public static class UfwWriter
 
     /// <summary>
     /// The comment a row must carry to be <paramref name="target"/>, or null when the
-    /// target cannot say. A rule from this app's ledger was written with its label as
-    /// the UFW comment; a row read from <c>ufw status</c> carries its own (possibly
-    /// empty) one. A row seen only through the kernel dump of UFW's chains has no
-    /// comment to compare — UFW keeps comments in its rules files, not the kernel.
+    /// target cannot say. A rule from this app's ledger was written with its ledger name
+    /// as the UFW comment (ApplyViaUfw — the name is how a rescan tells this app's rules
+    /// apart); this used to expect the operator's label instead, matched nothing, and so
+    /// the app could not remove a UFW rule it had written. A row read from
+    /// <c>ufw status</c> carries its own (possibly empty) one. A row seen only through
+    /// the kernel dump of UFW's chains has no comment to compare — UFW keeps comments in
+    /// its rules files, not the kernel.
     /// </summary>
     private static string? ExpectedComment(FirewallRuleInfo target)
     {
-        if (!target.IsForeign) return target.Label.Length > 0 ? target.Label : target.Name;
+        if (!target.IsForeign) return target.Name;
         return target.Origin.Equals("UFW", StringComparison.OrdinalIgnoreCase) ? target.Comment : null;
     }
 }

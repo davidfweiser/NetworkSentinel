@@ -63,7 +63,7 @@ Heuristics flag patterns such as:
 - Multi-port scans / reconnaissance — fast (45 s window) **and slow/paced** (10 min window, catches `nmap -T1`-style scans)
 - **Scans of closed ports** (opt-in) — a rate-limited firewall SYN-log rule makes probes visible that never appear as connections (the kernel answers closed-port SYNs with a RST before `/proc/net` ever sees them); a kernel-log watcher turns them into alerts within seconds
 - SSH and SMB hammering
-- **Failed logon bursts** from the system auth log (journald or `/var/log/auth.log`) — catches SSH/PAM brute-force even when it reuses one TCP session or paces below the connection-rate thresholds
+- **Failed logon bursts** from the system auth log (journald or `/var/log/auth.log`) — catches SSH/PAM brute-force even when it reuses one TCP session or paces below the connection-rate thresholds. Each failed attempt counts once (0.7.25): PAM's "authentication failure", sshd's "Failed password" and the disconnect after them are one attempt, where they used to be three — so two mistyped passwords no longer reach High. A successful login clears the count
 - Sensitive-port probing (admin, DB, remote access)
 - Short-lived / transitional TCP bursts
 - **Outbound beaconing** — regular-interval new sessions to an uncommon remote port (C2 "calling home" signature); common client ports and LAN peers are excluded
@@ -158,6 +158,7 @@ Gates, in order — a threat must clear all of them before a rule is written:
 | Not this machine | A detector that attributes a threat to the wrong end of a flow can never firewall the host off from itself — matters most on a VPS whose own address is public |
 | Not a configured resolver (0.7.19) | A `nameserver` in `/etc/resolv.conf` (or systemd-resolved's upstream list) is never auto-blocked — the block would take name resolution with it |
 | Not a WireGuard tunnel endpoint | A peer's public endpoint is where its tunnel packets come from; blocking it does not drop an attacker, it drops the tunnel and everything reached through it. Independent of the WireGuard *monitoring* setting, and remembered for 24 h — see [tunnel endpoints are never auto-blocked](#tunnel-endpoints-are-never-auto-blocked) |
+| Not an SSH operator (0.7.25) | An address someone is logged in over SSH from right now (read from `/run/utmp`), or that logged in successfully in the last 30 days (sshd's `Accepted …` lines in journald, remembered in `ssh-logins.json`), or that this process's own SSH session comes from. An address counts only once it has authenticated — a brute-forcer's connections are established TCP too. A threat against one is reported with the reason, and the address can still be blocked by hand |
 | Not protected | See lockout protection below |
 | Not already blocked | No duplicate rules |
 | Not suppressed | An address you deliberately released stays released for 24 h |
@@ -465,7 +466,7 @@ The listeners come from `ss`, which needs no privilege, so they are listed even 
 
 **Deciding which of the two it is must not need a password** (0.7.10). The probe sits on the write path, and a rule that raised its own extra pkexec dialog before the one that writes it is a rule most people cancel. But `ufw status` is root-only: run as the desktop user it prints `ERROR: You need to be root to run this script` and exits 1, and the probe read that refusal as *inactive*. On the ordinary Ubuntu desktop — UFW enabled, no passwordless sudo — every rule you added therefore went into nftables while UFW owned the firewall: applied, reported added, and absent from `ufw status numbered`, which reads exactly like the write having failed. Worse for an **Allow**, which needs to be in UFW's chain to open anything, since a separate nftables table cannot accept a packet UFW's chain drops. A refused read now falls back to `ENABLED` in `/etc/ufw/ufw.conf` — not a guess at UFW's state but the same flag `ufw status` itself reports, in a file that is world-readable. Where the read *does* work (root, or the `sudo -n` grant below) its answer still wins. And a rule that ends up in nftables on a host that has UFW installed now says so in the message under the form, with which of the three reasons it was.
 
-Deletes go back out the way the rule went in — `ufw status numbered` then `ufw delete N`, highest number first so the renumbering cannot bite; or `nft delete rule … handle N` for a bare nftables rule. Editing a rule the host owns deletes it where it lives and writes the new values, because UFW has no in-place edit; if the delete fails the save stops rather than leaving both rules in force.
+Deletes go back out the way the rule went in — `ufw status numbered` then `ufw delete N`, highest number first so the renumbering cannot bite; or `nft delete rule … handle N` for a bare nftables rule. Editing a rule — one the host owns or one of this app's — writes the new values **first** and removes the original only once they are in force (0.7.25). The other order lost the original whenever the save then failed, and the rule being edited was often the one letting SSH in. A save that fails now leaves the original untouched; a removal that fails leaves both in force and says so. A rule with no handle to delete it by is refused up front. When the new rule has the same shape as the old (a relabel), UFW folds it into the existing row rather than adding a second, and the app checks the result is still there.
 
 Rules this app writes still carry a `NetworkSentinel-*` comment and a ledger entry, which is how a rescan tells them apart from everyone else's.
 
@@ -572,7 +573,10 @@ The first button in the web console's hero action row is a single **Sleep ⇄ Wa
 - Every later visit **requires that password**; change it under **Settings → Master password**. Changing it signs out every other session and revokes every API token
 - Can't reach a browser yet (e.g. still opening the port in a cloud firewall)? Set/reset it from the terminal instead: `sudo networksentinel --set-master-password`
 - Hash stored as PBKDF2-SHA256 (random salt, 200k iterations) in `~/.local/share/NetworkSentinel/web-master.json` — never plain text
-- Session cookie until sign-out, browser close, or 12 hours idle
+- Session cookie until sign-out, browser close, 12 hours idle, or **7 days after sign-in** however busy the tab is (0.7.25 — an open tab polls every few seconds, so the idle limit alone never ended it)
+- **Cross-site writes are refused** (0.7.25). A state-changing request a browser marks as coming from another origin (`Sec-Fetch-Site`, or `Origin` from older browsers) gets `403`. The cookie is `SameSite=Strict`, but same-*site* ignores ports, so any other web app on the same host could otherwise drive `/api/action`. Clients that are not browsers send neither header and are unaffected
+- A **Content-Security-Policy** admits only the page's own script, by hash, and lets it talk only to the console (0.7.25). Every value the page shows is escaped already; this is the second layer
+- **Where it listens:** every IPv4 interface by default. `--bind 127.0.0.1` (or `NETWORKSENTINEL_WEB_BIND=127.0.0.1` in `web.env` for the service) keeps it to this machine — the right setting behind `tailscale serve`, a reverse proxy or an SSH tunnel. `--bind ::` listens on IPv6 as well, and `--bind <address>` on one interface (0.7.25)
 - Failed attempts are throttled **per client IP**: five wrong guesses trigger a lockout that doubles with each further attempt (1 minute up to 1 hour), answered with `429` and a `Retry-After`. A fixed delay alone only slows one connection at a time — this caps a parallel guesser
 
 ### API tokens — monitoring and control for a bot (0.7.18)
@@ -734,7 +738,7 @@ The token is stored in `~/.local/share/NetworkSentinel/duckdns.json` with mode `
 ## Requirements
 
 - **Linux only** (kernel `/proc` networking; tested on Pop!_OS / Ubuntu-class systems). There is no Windows or macOS build: the monitor reads `/proc/net` and conntrack netlink, and the firewall is `ufw`/`nft`/`iptables`. Under WSL2 it runs, but its rules belong to the Linux VM, not to Windows Defender Firewall
-- For **dev / `dotnet run`**: [.NET 8 SDK](https://dotnet.microsoft.com/download)
+- For **dev / `dotnet run`**: [.NET 10 SDK](https://dotnet.microsoft.com/download) (0.7.25 moved from .NET 8, which reached end of support in November 2026; `global.json` pins the 10.0 line)
 - For **server package**: nothing on the target — self-contained binary (no .NET install)
 - Desktop libraries for Avalonia GUI (usual X11/Wayland desktop)
 - **Text size (0.7.12, a setting in 0.7.13).** Every size in the GUI is an absolute device-independent pixel, so on a 4K panel whose desktop session does not scale, the window opened ~2000px wide with 11px labels. The content is drawn through a `LayoutTransformControl`, which scales during layout rather than at paint, so wrapping, trimming and the table columns all stay correct — the window gets bigger rather than clipped. Choose the step under **Settings → Display → Text size**: 100% is the original sizing, 175% the default (sized for an unscaled 4K panel), up to 250%. It applies straight away and persists as `UiScale` in `settings.json`, clamped to 1.0–2.5 on read. GUI only — the TUI is sized by the terminal and the web console by the browser
@@ -1237,7 +1241,7 @@ Each toggle shows a live status line underneath (e.g. why auth-log monitoring is
 
 Pressing the button again when the certificate is still valid is safe: acme.sh skips a renewal that is not due (it reports *Domains not changed / Skipping*), and the existing certificate is installed and the paths filled in as usual. To re-issue early — rarely needed, and rate-limited by Let's Encrypt — run the script with `NS_FORCE_RENEW=1`.
 
-The same button is in the **web console's** Settings tab. There it runs in the background and the page polls for the result, because holding an HTTP request open for the length of an ACME run would time out the browser. It needs an authenticated session like every other action, and only one run happens at a time — concurrent ACME runs for the same name fight over the same TXT record. Be aware of what the button is: an authenticated browser session can start a shell script that, on first use, downloads and runs the acme.sh installer and registers a Let's Encrypt account. That is a real capability to expose remotely — the master password is the only thing in front of it, so make it a long unique one, and prefer a VPN or Tailscale over a forwarded port.
+The same button is in the **web console's** Settings tab. There it runs in the background and the page polls for the result, because holding an HTTP request open for the length of an ACME run would time out the browser. It needs an authenticated session like every other action, and only one run happens at a time — concurrent ACME runs for the same name fight over the same TXT record. Be aware of what the button is: an authenticated browser session can start a shell script that, on first use, downloads acme.sh (a pinned release, checked against known SHA-256 hashes before it runs — 0.7.25; it used to pipe `get.acme.sh` into `sh`), installs it, and registers a Let's Encrypt account. That is a real capability to expose remotely — the master password is the only thing in front of it, so make it a long unique one, and prefer a VPN or Tailscale over a forwarded port.
 
 A status line at the top of the card shows certificate expiry, the live DuckDNS result, and the full console URL once both halves are configured. Certificate and port changes apply the next time the **web console** starts — the desktop app doesn't serve anything itself — but the **DuckDNS refresh runs in the desktop app too**, so the hostname stays current whenever either front-end is open.
 
@@ -1372,7 +1376,7 @@ All three UIs write the same `~/.local/share/NetworkSentinel/settings.json`, so 
 
 | Windows | Linux |
 |---------|--------|
-| WPF (`net8.0-windows`) | Avalonia 11 (`net8.0`) |
+| WPF (`net8.0-windows`) | Avalonia 11 (`net10.0`) |
 | `iphlpapi` GetExtendedTcpTable | `/proc/net/tcp{,6}` + `/proc/*/fd` |
 | Windows Firewall COM / netsh | `nft` table `inet networksentinel` or `iptables` |
 | `%LocalAppData%\NetworkSentinel` | `~/.local/share/NetworkSentinel` |
@@ -1394,7 +1398,7 @@ All three UIs write the same `~/.local/share/NetworkSentinel/settings.json`, so 
 - If the app ever exits unexpectedly, check `~/.local/share/NetworkSentinel/logs/crash.log` — unhandled errors are logged there with a stack trace.
 - Non-root runs still monitor connections for processes you can see; other users’ sockets may show as `Kernel / unknown`.
 - Existing TCP sessions may remain until they reconnect after a block; new matching traffic is stopped by the firewall.
-- The web UI binds all interfaces when started with `-w`; protect it with the master password and host firewall if exposed.
+- The web UI binds every IPv4 interface when started with `-w`; protect it with the master password and host firewall if exposed, or use `--bind 127.0.0.1` behind a proxy or tunnel.
 - Override (rare): `NETWORKSENTINEL_ALLOW_ROOT_GUI=1` forces allowing a root GUI (only useful on some X11 setups with `xhost`).
 
 ---
@@ -1430,7 +1434,7 @@ On GNOME / Pop!_OS the indicator appears in the top bar (StatusNotifier / AppInd
 | Firewall Config is empty and says no backend returned rules | Neither `ufw`, `nft` nor `iptables` answered. On a container or a minimal image none may be installed; `command -v ufw nft iptables` says which. |
 | A rule added here does not appear in `ufw status` | Only rules written **while UFW is active** go through UFW; the rest go into nftables, where they are still enforced but are not UFW's. Before 0.7.10 that included hosts where UFW *was* active: the probe ran `ufw status` as you, root-only, and read the refusal as "inactive". It now falls back to `ENABLED` in `/etc/ufw/ufw.conf` — the same flag `ufw status` reports — so on 0.7.10 and later the message on a rule that went into nftables says which of the three reasons it was. For a rule added by an older build, delete it and add it again. |
 | No tray icon | DE must support StatusNotifier/AppIndicator; window title still updates when minimized. |
-| Web UI asks for password every time | Expected after sign-out, browser close, or 12h idle. Reset: delete `web-master.json`. |
+| Web UI asks for password every time | Expected after sign-out, browser close, 12h idle, or 7 days after sign-in. Reset: delete `web-master.json`. |
 | Token API answers `403` | The message says which: the request came over **plain HTTP** from another machine (point the bot at the `https://` port — and revoke that token, it has been on the wire unencrypted); a **read-only** token was used on `/api/v1/control`; a token **not limited to source addresses** asked for the connection, firewall, allowlist or blocked-sites tables; or the action is one tokens may not run (Settings, certificates, token management). |
 | Creating a token answers that it "cannot be created over plain HTTP" | You are using the console over plain HTTP from another machine, and the new token would be shown to you unencrypted. Open the console on its `https://` port, or create the token on the machine it runs on. |
 | Creating a token answers "Incorrect master password" | Creating one asks for the master password again — being signed in is not enough. Five wrong tries lock that address out of the sign-in page too; it is the same guess. |

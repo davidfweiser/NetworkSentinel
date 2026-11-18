@@ -155,6 +155,13 @@ public sealed class NetworkMonitorService : IDisposable
     /// <summary>State of the auth-log source (journald / auth.log / unavailable reason).</summary>
     public string AuthLogStatus => _authLog.Status;
 
+    /// <summary>Called with the client address of each successful SSH login (journald only).</summary>
+    public Action<string>? SshLoginSucceeded
+    {
+        get => _authLog.SuccessfulLogin;
+        set => _authLog.SuccessfulLogin = value;
+    }
+
     private bool _probeMonitoringEnabled;
 
     /// <summary>

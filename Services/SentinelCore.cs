@@ -23,6 +23,7 @@ public sealed class SentinelCore : IDisposable
     public PreventionService Prevention { get; }
     public TrafficMeterService Traffic { get; } = new();
     public DnsFilterService DnsFilter { get; } = new();
+    public SshOperatorShield SshShield { get; } = new();
 
     public SentinelCore(AppSettings? settings = null)
     {
@@ -75,6 +76,11 @@ public sealed class SentinelCore : IDisposable
         // A VPN peer's public endpoint must never be auto-blocked — that kills the tunnel.
         // Covers WireGuard peers and IPSec (site-to-site included) alike.
         Prevention.IsProtectedAddress = Monitor.IsVpnTunnelEndpoint;
+        // Nor the address someone administers this machine from over SSH: logged in now
+        // (utmp), logged in recently (sshd's "Accepted" lines), or this very session.
+        Prevention.IsSshOperator = SshShield.IsShielded;
+        Monitor.SshLoginSucceeded = SshShield.RecordLogin;
+        SshShield.RecordCurrentProcessSession();
         // Every batch is enforced before any warning about it goes out, so an alert that
         // names an address can also say whether that address is being blocked.
         Monitor.Enforce = Prevention.Apply;

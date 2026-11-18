@@ -20,10 +20,18 @@ jobs:
 
       - uses: actions/setup-dotnet@v4
         with:
-          dotnet-version: 8.0.x
+          dotnet-version: 10.0.x
 
       - name: Build app
         run: dotnet build NetworkSentinel.csproj -c Release
 
       - name: Run tests
         run: dotnet test Tests/NetworkSentinel.Tests -c Release
+
+      # The release bundles its dependencies, so a known-vulnerable one ships to every
+      # install. 0.7.24 carried Tmds.DBus.Protocol 0.20.0 (GHSA-xrw6-gwf8-vvr9) in
+      # through Avalonia without anything noticing.
+      - name: Check for vulnerable packages
+        run: |
+          dotnet list NetworkSentinel.csproj package --vulnerable --include-transitive | tee vulnerable.txt
+          if grep -q "has the following vulnerable packages" vulnerable.txt; then exit 1; fi

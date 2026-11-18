@@ -51,9 +51,11 @@ dotnet publish NetworkSentinel.csproj \
 # this machine's SDK bundled — patching .NET on a server never reaches it. So a stale
 # SDK here ships a stale Kestrel to everyone: 0.7.22 went out on 8.0.29, after 8.0.32
 # had fixed two critical Kestrel request-smuggling flaws (CVE-2026-88092,
-# CVE-2026-70188). Refuse to package anything older than the latest .NET 8 security
-# release, and raise MIN_RUNTIME whenever Microsoft ships a new one.
-MIN_RUNTIME="8.0.33"
+# CVE-2026-70188). Refuse to package anything older than the latest .NET security
+# release on the line the app targets, and raise MIN_RUNTIME whenever Microsoft ships
+# a new one. .NET 8 reached end of support on 10 November 2026, so the app moved to
+# .NET 10 (LTS, supported to November 2028) in 0.7.25.
+MIN_RUNTIME="10.0.15"
 
 # True when $1 < $2, comparing major.minor.patch as numbers (a -preview suffix is dropped).
 version_lt() {
@@ -78,7 +80,7 @@ for fw in Microsoft.NETCore.App Microsoft.AspNetCore.App; do
     echo "error: no ${fw} version in NetworkSentinel.runtimeconfig.json — cannot tell whether the bundled runtime is patched" >&2
     exit 1
   fi
-  # A retarget to another .NET line would otherwise sail past an 8.0 floor unchecked.
+  # A retarget to another .NET line would otherwise sail past the floor unchecked.
   if [[ "${ver%%.*}" != "${MIN_RUNTIME%%.*}" ]]; then
     echo "error: bundled ${fw} is ${ver}, but MIN_RUNTIME (${MIN_RUNTIME}) tracks the .NET ${MIN_RUNTIME%%.*} line —" >&2
     echo "       set MIN_RUNTIME to the latest .NET ${ver%%.*} security release" >&2
@@ -267,11 +269,16 @@ if ! tar --version 2>/dev/null | grep -qi 'gnu tar'; then
   command -v gtar >/dev/null 2>&1 && TAR="gtar"
 fi
 
+# Entries are recorded as root-owned. Unpacked by root (the one-file installer
+# does exactly that), tar restores the owner it finds in the archive, and the
+# builder's uid would otherwise land on whichever local account happens to share
+# it. install.sh chowns the installed tree anyway; this keeps the archive honest.
 if "$TAR" --version 2>/dev/null | grep -qi 'gnu tar'; then
-  "$TAR" -C "$DIST_DIR" --mode='u+rwx,go+rx' -czf "$OUT_TGZ" "$NAME"
+  "$TAR" -C "$DIST_DIR" --mode='u+rwx,go+rx,go-w' --owner=0 --group=0 --numeric-owner \
+    -czf "$OUT_TGZ" "$NAME"
 else
   echo "    (no GNU tar — archiving with $(basename "$TAR") and the on-disk modes)"
-  "$TAR" -C "$DIST_DIR" -czf "$OUT_TGZ" "$NAME"
+  "$TAR" -C "$DIST_DIR" --uid 0 --gid 0 --uname root --gname root -czf "$OUT_TGZ" "$NAME"
 fi
 
 # Convenience checksum for the archive
@@ -324,7 +331,7 @@ if [[ -z "$ARCHIVE_LINE" ]]; then
 fi
 
 echo "==> Extracting package…"
-tail -n "+${ARCHIVE_LINE}" "$0" | tar -xz -C "$TMP"
+tail -n "+${ARCHIVE_LINE}" "$0" | tar -xz --no-same-owner -C "$TMP"
 
 # Expect a single top-level directory
 PKG_DIR="$(find "$TMP" -mindepth 1 -maxdepth 1 -type d | head -1)"

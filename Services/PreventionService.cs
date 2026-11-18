@@ -235,6 +235,14 @@ public sealed class PreventionService
     /// </summary>
     public Func<string, bool>? IsProtectedAddress { get; set; }
 
+    /// <summary>
+    /// Whether an address is logged in over SSH now, or logged in recently — see
+    /// <see cref="SshOperatorShield"/>. Such an address is not auto-blocked: a burst of
+    /// mistyped passwords from the operator's own address used to be enough to firewall
+    /// them off the machine for a day.
+    /// </summary>
+    public Func<string, bool>? IsSshOperator { get; set; }
+
     /// <summary>Addresses currently blocked by rules this app owns.</summary>
     public IReadOnlySet<string> BlockedIps
     {
@@ -487,6 +495,9 @@ public sealed class PreventionService
         if (IsProtectedAddress is { } externallyProtected && externallyProtected(ip))
             return new EnforcementStatus(BlockState.NotBlocked, "Not blocked — protected endpoint (blocking it would cut a VPN tunnel)");
 
+        if (IsSshOperator is { } sshOperator && sshOperator(ip))
+            return new EnforcementStatus(BlockState.NotBlocked, "Not blocked — someone logs in over SSH from this address");
+
         lock (_gate)
         {
             var now = DateTime.UtcNow;
@@ -586,6 +597,25 @@ public sealed class PreventionService
                     Action = PreventionAction.Skipped,
                     Message = $"Not blocking {normalized} ({threat.LevelText}: {threat.Title}) — " +
                               "it is a VPN tunnel endpoint; blocking it would cut that tunnel. Block it manually if you mean to.",
+                    Threat = threat
+                };
+            }
+            return false;
+        }
+
+        if (IsSshOperator is { } sshOperator && sshOperator(normalized))
+        {
+            // Said out loud for the same reason as the tunnel shield: a threat was raised and
+            // nothing was done about it, and the operator should know why.
+            if (ShouldNote(normalized))
+            {
+                heldBack = new PreventionDecision
+                {
+                    Ip = normalized,
+                    Action = PreventionAction.Skipped,
+                    Message = $"Not blocking {normalized} ({threat.LevelText}: {threat.Title}) — someone is logged in over " +
+                              $"SSH from it, or logged in within the last {SshOperatorShield.RememberFor.TotalDays:0} days. " +
+                              "Blocking it could lock you out. Block it manually if you mean to.",
                     Threat = threat
                 };
             }

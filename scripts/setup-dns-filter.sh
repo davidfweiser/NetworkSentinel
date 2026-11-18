@@ -155,18 +155,40 @@ if [[ "$UNINSTALL" == "1" ]]; then
     done < "${STATE_DIR}/iptables-rules"
   fi
 
+  # The persisted copy of the nft rules. Left behind, the next boot loads them again:
+  # VPN clients' DNS is DNAT'd to a resolver that is no longer running.
+  if [[ -f /etc/nftables.d/ns-dns-filter.nft ]]; then
+    run rm -f /etc/nftables.d/ns-dns-filter.nft
+    info "removed /etc/nftables.d/ns-dns-filter.nft"
+  fi
+
+  # Install chains systemd-resolved behind AdGuard with a drop-in rather than by
+  # editing resolved.conf, so the drop-in is what has to go. Restoring resolved.conf
+  # alone left DNS=127.0.0.1 with no fallback in force: the host lost name resolution
+  # the moment AdGuard stopped.
+  RESOLVED_DROPIN=/etc/systemd/resolved.conf.d/ns-dns-filter.conf
+  RESTART_RESOLVED=0
+  if [[ -f "$RESOLVED_DROPIN" ]]; then
+    run rm -f "$RESOLVED_DROPIN"
+    run rmdir /etc/systemd/resolved.conf.d 2>/dev/null || true
+    info "removed ${RESOLVED_DROPIN}"
+    RESTART_RESOLVED=1
+  fi
+
   if [[ -n "$RESTORE_FROM" && -d "$RESTORE_FROM" ]]; then
     for f in /etc/systemd/resolved.conf /etc/resolv.conf; do
       if [[ -e "${RESTORE_FROM}${f}" ]]; then
         run cp -a "${RESTORE_FROM}${f}" "$f"
         info "restored ${f}"
+        RESTART_RESOLVED=1
       fi
     done
-    if systemctl is-active --quiet systemd-resolved 2>/dev/null; then
-      run systemctl restart systemd-resolved || true
-    fi
-  else
+  elif [[ "$RESTART_RESOLVED" == "0" ]]; then
     warn "no backup record found — check ${BACKUP_ROOT} and restore /etc/resolv.conf by hand if name resolution is broken"
+  fi
+
+  if [[ "$RESTART_RESOLVED" == "1" ]] && systemctl is-active --quiet systemd-resolved 2>/dev/null; then
+    run systemctl restart systemd-resolved || true
   fi
 
   say ""

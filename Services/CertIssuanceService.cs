@@ -35,7 +35,7 @@ public sealed class CertIssuanceService
 
     /// <summary>
     /// Where the helper can be: beside the binary after an install, or in the repo
-    /// when running from a source checkout (bin/Debug/net8.0 → three levels up).
+    /// when running from a source checkout (bin/Debug/net10.0 → three levels up).
     /// </summary>
     public static string? FindScript()
     {
