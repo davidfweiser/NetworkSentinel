@@ -63,7 +63,7 @@ Heuristics flag patterns such as:
 - Multi-port scans / reconnaissance — fast (45 s window) **and slow/paced** (10 min window, catches `nmap -T1`-style scans)
 - **Scans of closed ports** (opt-in) — a rate-limited firewall SYN-log rule makes probes visible that never appear as connections (the kernel answers closed-port SYNs with a RST before `/proc/net` ever sees them); a kernel-log watcher turns them into alerts within seconds
 - SSH and SMB hammering
-- **Failed logon bursts** from the system auth log (journald or `/var/log/auth.log`) — catches SSH/PAM brute-force even when it reuses one TCP session or paces below the connection-rate thresholds
+- **Failed logon bursts** from the system auth log (journald or `/var/log/auth.log`) — catches SSH/PAM brute-force even when it reuses one TCP session or paces below the connection-rate thresholds. Each failed attempt counts once (0.7.25): PAM's "authentication failure", sshd's "Failed password" and the disconnect after them are one attempt, where they used to be three — so two mistyped passwords no longer reach High. A successful login clears the count
 - Sensitive-port probing (admin, DB, remote access)
 - Short-lived / transitional TCP bursts
 - **Outbound beaconing** — regular-interval new sessions to an uncommon remote port (C2 "calling home" signature); common client ports and LAN peers are excluded
@@ -158,6 +158,7 @@ Gates, in order — a threat must clear all of them before a rule is written:
 | Not this machine | A detector that attributes a threat to the wrong end of a flow can never firewall the host off from itself — matters most on a VPS whose own address is public |
 | Not a configured resolver (0.7.19) | A `nameserver` in `/etc/resolv.conf` (or systemd-resolved's upstream list) is never auto-blocked — the block would take name resolution with it |
 | Not a WireGuard tunnel endpoint | A peer's public endpoint is where its tunnel packets come from; blocking it does not drop an attacker, it drops the tunnel and everything reached through it. Independent of the WireGuard *monitoring* setting, and remembered for 24 h — see [tunnel endpoints are never auto-blocked](#tunnel-endpoints-are-never-auto-blocked) |
+| Not an SSH operator (0.7.25) | An address someone is logged in over SSH from right now (read from `/run/utmp`), or that logged in successfully in the last 30 days (sshd's `Accepted …` lines in journald, remembered in `ssh-logins.json`), or that this process's own SSH session comes from. An address counts only once it has authenticated — a brute-forcer's connections are established TCP too. A threat against one is reported with the reason, and the address can still be blocked by hand |
 | Not protected | See lockout protection below |
 | Not already blocked | No duplicate rules |
 | Not suppressed | An address you deliberately released stays released for 24 h |

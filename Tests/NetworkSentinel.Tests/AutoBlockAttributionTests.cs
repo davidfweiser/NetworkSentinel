@@ -1,3 +1,4 @@
+using System.Text.RegularExpressions;
 using NetworkSentinel.Models;
 using NetworkSentinel.Native;
 using NetworkSentinel.Services;
@@ -14,11 +15,17 @@ public class AutoBlockAttributionTests
 {
     // ---- SSH / PAM log injection ------------------------------------------------
 
+    /// <summary>
+    /// Feeds <paramref name="line"/> once per connection. Each repeat gets its own client
+    /// port, as it would in a real log: sshd names the port on every line, and one failed
+    /// attempt is counted once per connection, not once per line about it.
+    /// </summary>
     private static IReadOnlyList<ThreatEvent> Feed(AuthLogMonitor monitor, string line, int times)
     {
         var now = new DateTime(2026, 1, 1, 12, 0, 0);
+        var lastPort = new Regex(@"port \d+(?!.*port \d+)");
         for (int i = 0; i < times; i++)
-            monitor.ProcessLine(line, now.AddSeconds(i));
+            monitor.ProcessLine(lastPort.Replace(line, $"port {41000 + i}"), now.AddSeconds(i));
         return monitor.DrainPending();
     }
 
@@ -84,7 +91,6 @@ public class AutoBlockAttributionTests
     [InlineData("Connection closed by invalid user a 203.0.113.7 port 50110 [preauth]")]
     [InlineData("Connection reset by authenticating user root 203.0.113.7 port 50110 [preauth]")]
     [InlineData("pam_unix(sshd:auth): authentication failure; logname= uid=0 euid=0 tty=ssh ruser= rhost=203.0.113.7  user=root")]
-    [InlineData("pam_unix(sshd:auth): authentication failure; logname= uid=0 euid=0 tty=ssh ruser= rhost=203.0.113.7")]
     // auth.log lines carry a syslog prefix in front of the message.
     [InlineData("Jan  1 12:00:00 host sshd[1234]: Failed password for root from 203.0.113.7 port 51022 ssh2")]
     [InlineData("2026-01-01T12:00:00.123456+00:00 host sshd-session[1234]: Failed password for root from 203.0.113.7 port 51022 ssh2")]

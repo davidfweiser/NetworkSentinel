@@ -46,24 +46,32 @@ public sealed class AuthLogMonitor : IDisposable
 
     // "Failed password for invalid user admin from 203.0.113.7 port 51022 ssh2"
     private static readonly Regex FailedPassword = new(
-        @"^Failed (?:password|publickey|keyboard-interactive(?:/pam)?|none) for (?<invalid>invalid user )?(?<user>.*) from (?<ip>\S+) port \d+" + Tail,
+        @"^Failed (?:password|publickey|keyboard-interactive(?:/pam)?|none) for (?<invalid>invalid user )?(?<user>.*) from (?<ip>\S+) port (?<port>\d+)" + Tail,
         RegexOptions.Compiled);
 
     // "Invalid user oracle from 203.0.113.7 port 40122"
     private static readonly Regex InvalidUser = new(
-        @"^Invalid user (?<user>.*) from (?<ip>\S+) port \d+" + Tail,
+        @"^Invalid user (?<user>.*) from (?<ip>\S+) port (?<port>\d+)" + Tail,
         RegexOptions.Compiled);
 
     // "Connection closed by invalid user a 203.0.113.7 port 50110 [preauth]"
+    // "Disconnected from authenticating user root 203.0.113.7 port 50110 [preauth]"
+    // Either one ends a connection that never logged in.
     private static readonly Regex PreauthAbandon = new(
-        @"^Connection (?:closed|reset) by (?:invalid |authenticating )user (?<user>.*) (?<ip>\S+) port \d+" + Tail,
+        @"^(?:Connection (?:closed|reset) by|Disconnected from) (?:invalid |authenticating )user (?<user>.*) (?<ip>\S+) port (?<port>\d+)" + Tail,
+        RegexOptions.Compiled);
+
+    // "Accepted publickey for alice from 203.0.113.7 port 51022 ssh2: ED25519 SHA256:…"
+    // The account authenticated, so its name is a real one: no spaces, nothing smuggled.
+    private static readonly Regex Accepted = new(
+        @"^Accepted (?:password|publickey|keyboard-interactive(?:/pam)?|gssapi-with-mic|gssapi-keyex|hostbased) for (?<user>\S+) from (?<ip>\S+) port \d+ ssh2(?:: .*)?$",
         RegexOptions.Compiled);
 
     // PAM: "pam_unix(sshd:auth): authentication failure; logname= uid=0 euid=0 tty=ssh ruser= rhost=203.0.113.7  user=root"
     // Here the username comes *after* the address, so the fields before rhost= are spelled
     // out: a greedy ".*rhost=" would take an "rhost=" smuggled into the trailing user=.
     private static readonly Regex PamFailure = new(
-        @"^pam_\w+\([\w-]+:auth\): authentication failure; logname=\S* uid=\d+ euid=\d+ tty=\S* ruser=\S* rhost=(?<ip>\S+)(?:\s+user=(?<user>.*))?$",
+        @"^pam_\w+\((?<service>[\w-]+):auth\): authentication failure; logname=\S* uid=\d+ euid=\d+ tty=\S* ruser=\S* rhost=(?<ip>\S+)(?:\s+user=(?<user>.*))?$",
         RegexOptions.Compiled);
 
     // "error: maximum authentication attempts exceeded for root from 203.0.113.7 port 33990 ssh2 [preauth]"
@@ -102,6 +110,22 @@ public sealed class AuthLogMonitor : IDisposable
     private readonly Dictionary<string, IpFailures> _failures = new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<string, DateTime> _lastEmit = new(StringComparer.OrdinalIgnoreCase);
     private readonly List<ThreatEvent> _pending = new();
+
+    /// <summary>
+    /// How close together sshd's "Failed …" line follows PAM's "authentication failure"
+    /// for the same attempt. PAM's fail delay (2 s on Debian/Ubuntu) sits between them.
+    /// </summary>
+    private static readonly TimeSpan PamPairWindow = TimeSpan.FromSeconds(10);
+
+    /// <summary>sshd's default LoginGraceTime: a connection that has not logged in by then is dropped.</summary>
+    private static readonly TimeSpan LoginGrace = TimeSpan.FromMinutes(2);
+
+    /// <summary>
+    /// Called with the client address of every successful SSH login read from journald —
+    /// see <see cref="SshOperatorShield"/>. Not for auth.log lines: any local account can
+    /// write those with `logger -t sshd`, and an "Accepted" line shields an address.
+    /// </summary>
+    public Action<string>? SuccessfulLogin { get; set; }
 
     private Process? _journal;
     private CancellationTokenSource? _cts;
@@ -189,7 +213,7 @@ public sealed class AuthLogMonitor : IDisposable
             _journal = proc;
             proc.OutputDataReceived += (_, e) =>
             {
-                if (e.Data != null) ProcessLine(e.Data, DateTime.Now);
+                if (e.Data != null) ProcessLine(e.Data, DateTime.Now, fromJournal: true);
             };
             proc.BeginOutputReadLine();
             _status = "Watching journald (sshd/sudo/login)";
@@ -231,7 +255,7 @@ public sealed class AuthLogMonitor : IDisposable
                     await Task.Delay(1000, ct);
                     continue;
                 }
-                ProcessLine(line, DateTime.Now);
+                ProcessLine(line, DateTime.Now, fromJournal: false);
             }
         }
         catch (OperationCanceledException)
@@ -248,51 +272,145 @@ public sealed class AuthLogMonitor : IDisposable
         }
     }
 
-    /// <summary>Parses one log line; internal for tests / manual replay.</summary>
-    internal void ProcessLine(string line, DateTime now)
+    /// <summary>
+    /// Parses one log line; internal for tests / manual replay.
+    ///
+    /// One failed attempt counts once. sshd and PAM both log a failed password — PAM's
+    /// "authentication failure … user=root", then sshd's "Failed password for root" — and
+    /// sshd adds "Connection closed by authenticating user …" when the client gives up.
+    /// Each used to be an attempt of its own, so two mistyped passwords came to four or
+    /// five and crossed the High threshold, which auto-block acts on by default. Now:
+    /// <list type="bullet">
+    /// <item>sshd's "Failed …" line is the attempt. A PAM failure for the same address a
+    /// moment earlier is the same attempt, already counted, and is paired off.</item>
+    /// <item>A PAM failure with no sshd line after it still counts: sshd logs failed
+    /// keyboard-interactive attempts by a valid account only at VERBOSE.</item>
+    /// <item>A PAM failure with no user= is an unknown account; sshd always logs those
+    /// itself ("Failed password for invalid user"), so the PAM line adds nothing.</item>
+    /// <item>"Invalid user" counts once for its connection, and the first "Failed" line on
+    /// that connection is the same attempt.</item>
+    /// <item>A connection closed before login counts only if nothing on it was counted —
+    /// a scanner trying a user name and leaving.</item>
+    /// </list>
+    /// A successful login from an address clears its count.
+    /// </summary>
+    internal void ProcessLine(string line, DateTime now, bool fromJournal = true)
     {
         var message = MessageOf(line);
         if (message == null) return;
         line = message;
 
-        string? ip = null, user = null;
-        bool immediate = false;
+        var accepted = Accepted.Match(line);
+        if (accepted.Success)
+        {
+            var who = accepted.Groups["ip"].Value;
+            if (!IPAddress.TryParse(who, out _)) return;
+            lock (_gate)
+            {
+                _failures.Remove(who);
+            }
+            if (fromJournal)
+                SuccessfulLogin?.Invoke(who);
+            return;
+        }
 
-        var m = MaxAttempts.Match(line);
-        if (m.Success)
-        {
-            ip = m.Groups["ip"].Value;
-            user = m.Groups["user"].Value;
-            immediate = true;
-        }
-        else if ((m = FailedPassword.Match(line)).Success ||
-                 (m = PreauthAbandon.Match(line)).Success ||
-                 (m = InvalidUser.Match(line)).Success)
-        {
-            ip = m.Groups["ip"].Value;
-            user = m.Groups["user"].Value;
-        }
-        else if ((m = PamFailure.Match(line)).Success)
-        {
-            ip = m.Groups["ip"].Value;
-            user = m.Groups["user"].Success ? m.Groups["user"].Value : "";
-        }
+        string? ip = null, user = null;
+        int? port = null;
+        var kind = LineKind.None;
+
+        Match m;
+        if ((m = MaxAttempts.Match(line)).Success) kind = LineKind.MaxAttempts;
+        else if ((m = FailedPassword.Match(line)).Success) kind = LineKind.Failed;
+        else if ((m = PreauthAbandon.Match(line)).Success) kind = LineKind.Abandoned;
+        else if ((m = InvalidUser.Match(line)).Success) kind = LineKind.InvalidUser;
+        else if ((m = PamFailure.Match(line)).Success) kind = LineKind.Pam;
+        if (kind == LineKind.None) return;
+
+        ip = m.Groups["ip"].Value;
+        user = m.Groups["user"].Success ? m.Groups["user"].Value : "";
+        if (m.Groups["port"].Success && int.TryParse(m.Groups["port"].Value, out var p)) port = p;
 
         if (string.IsNullOrWhiteSpace(ip) || !IPAddress.TryParse(ip, out _)) return;
         if (ip is "127.0.0.1" or "::1") return;
 
+        // An unknown account's PAM line under sshd: sshd's own line for the attempt follows.
+        if (kind == LineKind.Pam && string.IsNullOrWhiteSpace(user) && m.Groups["service"].Value == "sshd") return;
+
         lock (_gate)
         {
+            PruneLocked(now);
+
             if (!_failures.TryGetValue(ip, out var f))
             {
                 f = new IpFailures();
                 _failures[ip] = f;
             }
+            f.LastSeen = now;
+            while (f.UnpairedPam.Count > 0 && now - f.UnpairedPam.Peek() > PamPairWindow)
+                f.UnpairedPam.Dequeue();
+            foreach (var old in f.Connections.Where(kv => now - kv.Value.Seen > Window).Select(kv => kv.Key).ToList())
+                f.Connections.Remove(old);
 
-            f.Attempts.Enqueue(now);
-            if (!string.IsNullOrWhiteSpace(user) && user != "from") f.Users.Add(user);
+            var counts = false;
+            var immediate = false;
+            switch (kind)
+            {
+                case LineKind.MaxAttempts:
+                    // The attempts themselves were counted as they failed; this is the verdict.
+                    immediate = true;
+                    break;
+
+                case LineKind.Pam:
+                    counts = true;
+                    f.UnpairedPam.Enqueue(now);
+                    f.LastPamAt = now;
+                    break;
+
+                case LineKind.Failed:
+                {
+                    var conn = f.Connection(port, now);
+                    if (conn.InvalidUserPending)
+                        conn.InvalidUserPending = false;      // counted by its "Invalid user" line
+                    else if (f.UnpairedPam.Count > 0)
+                        f.UnpairedPam.Dequeue();              // counted by its PAM line
+                    else
+                        counts = true;
+                    conn.Counted = true;
+                    break;
+                }
+
+                case LineKind.InvalidUser:
+                {
+                    var conn = f.Connection(port, now);
+                    if (!conn.Counted)
+                    {
+                        counts = true;
+                        conn.Counted = true;
+                        conn.InvalidUserPending = true;
+                    }
+                    break;
+                }
+
+                case LineKind.Abandoned:
+                {
+                    var counted = port is { } closed && f.Connections.Remove(closed, out var conn) && conn.Counted;
+                    // PAM lines carry no port; a recent one from this address is this
+                    // connection's attempt, already counted.
+                    if (!counted && now - f.LastPamAt > LoginGrace)
+                        counts = true;
+                    break;
+                }
+            }
+
+            if (counts)
+            {
+                f.Attempts.Enqueue(now);
+                if (!string.IsNullOrWhiteSpace(user) && user != "from") f.Users.Add(user);
+            }
             while (f.Attempts.Count > 0 && now - f.Attempts.Peek() > Window)
                 f.Attempts.Dequeue();
+
+            if (!counts && !immediate) return;
 
             var count = f.Attempts.Count;
             ThreatLevel? level = null;
@@ -322,34 +440,73 @@ public sealed class AuthLogMonitor : IDisposable
                 Origin = "Origin resolving…",
                 Method = "System auth log (sshd / PAM)"
             });
+        }
+    }
 
-            // Keep the per-IP tables from growing without bound.
-            if (_failures.Count > 2000)
+    /// <summary>
+    /// Keeps the per-address tables bounded. This used to run only after an alert was
+    /// raised, so a slow, wide brute force — a few attempts from each of thousands of
+    /// addresses, none reaching a threshold — grew the tables without limit.
+    /// </summary>
+    private void PruneLocked(DateTime now)
+    {
+        if (_failures.Count > 2000)
+        {
+            foreach (var stale in _failures
+                         .Where(kv => now - kv.Value.LastSeen > Window)
+                         .Select(kv => kv.Key).ToList())
             {
-                foreach (var stale in _failures
-                             .Where(kv => kv.Value.Attempts.Count == 0 ||
-                                          now - kv.Value.Attempts.Last() > Window)
-                             .Select(kv => kv.Key).ToList())
-                {
-                    _failures.Remove(stale);
-                }
+                _failures.Remove(stale);
             }
-            if (_lastEmit.Count > 4000)
+        }
+        if (_lastEmit.Count > 4000)
+        {
+            foreach (var stale in _lastEmit.Where(kv => now - kv.Value > EmitCooldown)
+                         .Select(kv => kv.Key).ToList())
             {
-                foreach (var stale in _lastEmit.Where(kv => now - kv.Value > EmitCooldown)
-                             .Select(kv => kv.Key).ToList())
-                {
-                    _lastEmit.Remove(stale);
-                }
+                _lastEmit.Remove(stale);
             }
         }
     }
 
     public void Dispose() => Stop();
 
+    private enum LineKind { None, Failed, Pam, InvalidUser, Abandoned, MaxAttempts }
+
     private sealed class IpFailures
     {
         public Queue<DateTime> Attempts { get; } = new();
         public HashSet<string> Users { get; } = new(StringComparer.Ordinal);
+        public DateTime LastSeen { get; set; }
+
+        /// <summary>PAM failures not yet matched to the sshd line for the same attempt.</summary>
+        public Queue<DateTime> UnpairedPam { get; } = new();
+        public DateTime LastPamAt { get; set; } = DateTime.MinValue;
+
+        /// <summary>Connections by client port: sshd names the port on every line it logs.</summary>
+        public Dictionary<int, ConnectionState> Connections { get; } = new();
+
+        public ConnectionState Connection(int? port, DateTime now)
+        {
+            if (port is not { } p) return new ConnectionState { Seen = now };
+            if (!Connections.TryGetValue(p, out var c))
+            {
+                c = new ConnectionState();
+                // A brute force can open a connection a second; a cap keeps one address
+                // from holding thousands of them for the whole window.
+                if (Connections.Count >= 256)
+                    Connections.Remove(Connections.MinBy(kv => kv.Value.Seen).Key);
+                Connections[p] = c;
+            }
+            c.Seen = now;
+            return c;
+        }
+    }
+
+    private sealed class ConnectionState
+    {
+        public DateTime Seen { get; set; }
+        public bool Counted { get; set; }
+        public bool InvalidUserPending { get; set; }
     }
 }
