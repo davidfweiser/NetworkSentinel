@@ -357,33 +357,21 @@ public partial class MainViewModel
         if (!ConfirmRuleImpact(spec))
             return;
 
-        // Editing a rule this app did not write: remove the original where it lives
-        // first. If that fails the save stops, because writing the replacement on top
-        // would leave both rules in force — and on Windows the block of the two wins,
-        // whichever the operator meant.
+        // Editing a rule this app did not write: the replacement is written first and
+        // the original removed once it is in force. The old order deleted the original
+        // and, if the save then failed, left nothing — often the Remote Desktop allow.
         var foreign = _editingForeignRule;
-        if (foreign != null)
-        {
-            var removed = await Task.Run(() => _firewall.DeleteHostRule(foreign));
-            if (!removed.Success)
-            {
-                RuleEditorError = $"The original rule could not be removed, so it was not replaced: {removed.Message}";
-                FirewallConfigMessage = RuleEditorError;
-                return;
-            }
-        }
-
         var replace = string.IsNullOrEmpty(_editingRuleName) ? null : _editingRuleName;
-        var result = await Task.Run(() => _firewall.SaveCustomRule(spec, replace));
+        var result = foreign != null
+            ? await Task.Run(() => _firewall.ReplaceHostRule(foreign, spec))
+            : await Task.Run(() => _firewall.SaveCustomRule(spec, replace));
 
-        FirewallConfigMessage = foreign != null && result.Success
-            ? $"{result.Message} The rule it replaced was removed from {foreign.OriginText}."
-            : result.Message;
+        FirewallConfigMessage = result.Message;
         if (!result.Success)
         {
-            RuleEditorError = foreign != null
-                ? $"{result.Message} The original rule was already removed."
-                : result.Message;
+            RuleEditorError = result.Message;
+            // A failed removal still wrote the replacement, so the list has changed.
+            await RefreshFirewallConfigAsync();
             return;
         }
 

@@ -237,6 +237,14 @@ public sealed class PreventionService
     /// </summary>
     public Func<string, bool>? IsProtectedAddress { get; set; }
 
+    /// <summary>
+    /// Whether someone is logged on to this machine from an address now, or logged on from
+    /// it recently — see <see cref="RemoteLogonShield"/>. Such an address is not
+    /// auto-blocked: a burst of mistyped passwords from the operator's own address used to
+    /// be enough to firewall them off the machine for a day.
+    /// </summary>
+    public Func<string, bool>? IsRemoteLogonAddress { get; set; }
+
     /// <summary>Addresses currently blocked by rules this app owns.</summary>
     public IReadOnlySet<string> BlockedIps
     {
@@ -489,6 +497,9 @@ public sealed class PreventionService
         if (IsProtectedAddress is { } externallyProtected && externallyProtected(ip))
             return new EnforcementStatus(BlockState.NotBlocked, "Not blocked — protected endpoint (blocking it would cut a VPN tunnel)");
 
+        if (IsRemoteLogonAddress is { } remoteLogon && remoteLogon(ip))
+            return new EnforcementStatus(BlockState.NotBlocked, "Not blocked — someone logs on to this machine remotely from this address");
+
         lock (_gate)
         {
             var now = DateTime.UtcNow;
@@ -532,7 +543,7 @@ public sealed class PreventionService
     /// to block it. Dry run passes false — it decides but never acts.
     ///
     /// <paramref name="heldBack"/> is set when a gate refused something the operator needs to
-    /// know about (currently only the tunnel-endpoint shield), so the refusal surfaces instead
+    /// know about (the tunnel-endpoint and remote-logon shields), so the refusal surfaces instead
     /// of looking like a block that silently never happened.
     /// </summary>
     private bool ShouldConsider(ThreatEvent threat, bool claimSlot, out string ip, out PreventionDecision? heldBack)
@@ -586,6 +597,26 @@ public sealed class PreventionService
                     Action = PreventionAction.Skipped,
                     Message = $"Not blocking {normalized} ({threat.LevelText}: {threat.Title}) — " +
                               "it is a VPN tunnel endpoint; blocking it would cut that tunnel. Block it manually if you mean to.",
+                    Threat = threat
+                };
+            }
+            return false;
+        }
+
+        if (IsRemoteLogonAddress is { } remoteLogon && remoteLogon(normalized))
+        {
+            // Said out loud for the same reason as the tunnel shield: a threat was raised and
+            // nothing was done about it, and the operator should know why.
+            if (ShouldNote(normalized))
+            {
+                heldBack = new PreventionDecision
+                {
+                    Ip = normalized,
+                    Action = PreventionAction.Skipped,
+                    Message = $"Not blocking {normalized} ({threat.LevelText}: {threat.Title}) — someone is logged on to " +
+                              $"this machine from it (Remote Desktop, SMB, WinRM or SSH), or logged on within the last " +
+                              $"{RemoteLogonShield.RememberFor.TotalDays:0} days. Blocking it could lock you out. " +
+                              "Block it manually if you mean to.",
                     Threat = threat
                 };
             }
