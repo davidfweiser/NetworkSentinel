@@ -363,14 +363,22 @@ public sealed class FirewallService
     /// with buttons that lie.
     /// </summary>
     public FirewallOperationResult DeleteHostRule(FirewallRuleInfo? rule)
+        => DeleteHostRule(rule, out _);
+
+    private FirewallOperationResult DeleteHostRule(FirewallRuleInfo? rule, out RemovalOutcome outcome)
     {
+        outcome = RemovalOutcome.Failed;
         if (rule == null)
             return FirewallOperationResult.Fail("No rule to remove.");
 
         // One of ours: through the managed path, which clears the expiry ledger and
         // takes the rule's -In/-Out sibling with it.
         if (!rule.IsForeign)
-            return RemoveRule(rule.Name);
+        {
+            var own = RemoveRule(rule.Name);
+            outcome = own.Success ? RemovalOutcome.Removed : RemovalOutcome.Failed;
+            return own;
+        }
 
         if (!IsAdministrator)
             return FirewallOperationResult.Fail("Administrator rights are required to modify the Windows Firewall.");
@@ -404,9 +412,15 @@ public sealed class FirewallService
         InvalidateRuleCache();
 
         if (!result.Success)
+        {
+            // Gone already is not "still in force": an edit that replaced it has nothing
+            // left over to warn about.
+            outcome = LooksLikeNoMatchingRule(result.Message) ? RemovalOutcome.Absent : RemovalOutcome.Failed;
             return FirewallOperationResult.Fail(
                 $"Windows Defender Firewall refused the delete: {result.Message}");
+        }
 
+        outcome = RemovalOutcome.Removed;
         // netsh answers "Deleted N rule(s)." — worth repeating, because one row can
         // stand for a set of identical rules and N is how many really went.
         var count = Regex.Match(result.Message, @"Deleted\s+(\d+)\s+rule", RegexOptions.IgnoreCase);
@@ -531,9 +545,17 @@ public sealed class FirewallService
             .ToList();
 
     /// <summary>
-    /// Creates or replaces one operator-authored rule. Passing
-    /// <paramref name="replaceName"/> edits in place: the old firewall rule is
-    /// dropped and the new one written in its place.
+    /// Creates one operator-authored rule, or replaces the one named
+    /// <paramref name="replaceName"/>.
+    ///
+    /// A replacement is written before the rule it replaces is removed. The other order
+    /// lost the original whenever the new one failed — a value netsh rejected, a
+    /// firewall service that refused the write — and the rule being edited was usually
+    /// the one letting Remote Desktop or SSH in. Now a failed save leaves the original
+    /// exactly as it was, and the worst a failed removal can do is leave both in force,
+    /// which the result says. While both exist, Windows evaluates block rules ahead of
+    /// allow rules (see <see cref="PrecedenceNote"/>), so the overlap never opens
+    /// anything the stricter of the two closes.
     /// </summary>
     public FirewallOperationResult SaveCustomRule(FirewallRuleSpec spec, string? replaceName = null)
     {
@@ -545,22 +567,29 @@ public sealed class FirewallService
         if (!IsAdministrator)
             return FirewallOperationResult.Fail("Administrator rights are required to modify the Windows Firewall.");
 
+        var managed = GetManagedRules();
+        FirewallRuleInfo? replacing = null;
         if (!string.IsNullOrWhiteSpace(replaceName))
         {
-            var existing = GetManagedRules().FirstOrDefault(r =>
+            replacing = managed.FirstOrDefault(r =>
                 string.Equals(r.Name, replaceName, StringComparison.OrdinalIgnoreCase));
-            if (existing == null)
+            if (replacing == null)
                 return FirewallOperationResult.Fail($"No rule named \"{replaceName}\" to edit — it may have been removed.");
-            if (existing.Kind != FirewallRuleKind.Custom)
+            if (replacing.Kind != FirewallRuleKind.Custom)
                 return FirewallOperationResult.Fail("Only Firewall Config rules can be edited here.");
-
-            RemoveRuleByName(replaceName!);
-            // The replaced name has to be free again before the new one is minted,
-            // or an edit that keeps the label would come back as "…-2".
-            InvalidateRuleCache();
         }
 
-        var name = UniqueCustomRuleName(normalized.Label, GetManagedRules());
+        // The rule being replaced is still in force while the new one is written, so the
+        // new one is minted a name of its own ("…-2"): a delete by name takes every rule
+        // carrying it, and the removal of the old one must not take the new one too. The
+        // name it settles on is the one it would have had with the old rule already gone.
+        var name = UniqueCustomRuleName(normalized.Label, managed);
+        var finalName = replacing == null
+            ? name
+            : UniqueCustomRuleName(normalized.Label, managed
+                .Where(r => !string.Equals(r.Name, replacing.Name, StringComparison.OrdinalIgnoreCase))
+                .ToList());
+
         var rule = FirewallRuleSpecs.ToRule(normalized, name);
         var applied = ApplyCustomRule(rule);
         InvalidateRuleCache();
@@ -572,12 +601,88 @@ public sealed class FirewallService
             // half-applied rule cannot survive as a silent partial block.
             RemoveRuleByName(name);
             InvalidateRuleCache();
-            return FirewallOperationResult.Fail($"The rule was rejected, so it was not kept: {applied.Message}");
+            return FirewallOperationResult.Fail($"The rule was rejected, so it was not kept: {applied.Message}" +
+                                                (replacing != null ? " The rule you were editing is unchanged." : ""));
         }
 
-        return FirewallOperationResult.Ok(string.IsNullOrWhiteSpace(replaceName)
-            ? $"Added rule \"{normalized.Label}\"."
-            : $"Saved rule \"{normalized.Label}\".");
+        if (replacing == null)
+            return FirewallOperationResult.Ok($"Added rule \"{normalized.Label}\".");
+
+        var removed = RemoveRuleByName(replacing.Name, out var outcome);
+        InvalidateRuleCache();
+        if (outcome == RemovalOutcome.Failed)
+            return FirewallOperationResult.Fail(
+                $"Saved rule \"{normalized.Label}\", but the version it replaces could not be removed: {removed.Message} " +
+                "Both are in force now; delete the old one from the list.");
+
+        var renameNote = RenameCustomRule(name, finalName);
+        return FirewallOperationResult.Ok($"Saved rule \"{normalized.Label}\".{renameNote}");
+    }
+
+    /// <summary>
+    /// Replaces a rule this app did not write — one Windows shipped, or one an installer
+    /// or wf.msc wrote — with a Firewall Config rule. The new rule is written first and
+    /// the original removed after, for the same reason as <see cref="SaveCustomRule"/>:
+    /// the old order deleted the original and then, if the save failed, had nothing to
+    /// put back. An original the delete has no way to reach is refused up front, so an
+    /// edit never ends with two rules where one was asked for.
+    /// </summary>
+    public FirewallOperationResult ReplaceHostRule(FirewallRuleInfo original, FirewallRuleSpec spec)
+    {
+        if (!IsAdministrator)
+            return FirewallOperationResult.Fail("Administrator rights are required to modify the Windows Firewall.");
+
+        if (original.IsForeign && string.IsNullOrWhiteSpace(original.Name))
+            return FirewallOperationResult.Fail(
+                $"“{original.LabelText}” has no name to delete it by, so it cannot be replaced from here — " +
+                "change it in Windows Defender Firewall (wf.msc).");
+
+        var saved = SaveCustomRule(spec);
+        if (!saved.Success)
+            return FirewallOperationResult.Fail($"{saved.Message} The original rule was left in place.");
+
+        var removed = DeleteHostRule(original, out var outcome);
+        if (outcome == RemovalOutcome.Failed)
+            return FirewallOperationResult.Fail(
+                $"{saved.Message} But the original rule could not be removed: {removed.Message} " +
+                "Both are in force now; delete the original from the list.");
+
+        return FirewallOperationResult.Ok($"{saved.Message} The rule it replaced was removed from {original.OriginText}.");
+    }
+
+    /// <summary>
+    /// Gives a just-saved config rule the name it was minted aside from. On Windows the
+    /// label a config rule shows is read back out of its name, so without this an edit
+    /// that kept the label "SSH" came back listed as "SSH-2". netsh renames every
+    /// fragment carrying the name in one call. A name something else has taken in the
+    /// meantime is left alone — Windows allows two rules one name, and a later delete by
+    /// that name would take both. Returns a note for the result when the rule keeps its
+    /// interim name.
+    /// </summary>
+    private string RenameCustomRule(string from, string to)
+    {
+        if (string.Equals(from, to, StringComparison.Ordinal))
+            return "";
+
+        var interimLabel = from.StartsWith(ConfigRulePrefix, StringComparison.Ordinal) ? from[ConfigRulePrefix.Length..] : from;
+
+        // netsh's "no rules match" is localized; anything else it says is checked against
+        // the full listing, the same way RemoveRuleByName confirms an absence.
+        var probe = RunNetsh($"advfirewall firewall show rule name=\"{to}\"");
+        var free = !probe.Success && LooksLikeNoMatchingRule(probe.Message);
+        if (!probe.Success && !free)
+        {
+            var listing = RunNetsh("advfirewall firewall show rule name=all");
+            free = listing.Success && !string.IsNullOrWhiteSpace(listing.Message) && !ListingNamesRule(listing.Message, to);
+        }
+        if (!free)
+            return $" It is listed as “{interimLabel}”, because another rule holds its usual name.";
+
+        var renamed = RunNetsh($"advfirewall firewall set rule name=\"{from}\" new name=\"{to}\"");
+        InvalidateRuleCache();
+        return renamed.Success
+            ? ""
+            : $" It is listed as “{interimLabel}”: giving it back its usual name failed ({renamed.Message}).";
     }
 
     /// <summary>

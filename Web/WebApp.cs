@@ -2374,10 +2374,12 @@ public sealed class WebApp : IDisposable
                         ? null
                         : System.Net.WebUtility.HtmlDecode(req.Replace.Trim());
 
-                    // Editing a rule the host owns rather than one of ours: remove the
-                    // original where it lives first. Windows has no edit-in-place for
-                    // somebody else's rule, and writing the replacement on top would
-                    // leave both in force — with the block of the two winning.
+                    // Editing a rule the host owns rather than one of ours. Windows has no
+                    // edit-in-place for somebody else's rule, so the original has to go —
+                    // but only once the replacement is in force: deleting first left
+                    // nothing behind when the save failed, and the rule being edited was
+                    // often the one letting Remote Desktop in.
+                    FirewallOperationResult saved;
                     if (!string.IsNullOrWhiteSpace(req.Key))
                     {
                         var original = FindScannedRule(req.Key!.Trim(), out var lookupProblem);
@@ -2385,18 +2387,16 @@ public sealed class WebApp : IDisposable
                         if (IsOwnWebRule(original.Name))
                             return ActionResultDto.Fail(SelfRuleRefusal(original.Name));
 
-                        var dropped = _firewall.DeleteHostRule(original);
-                        if (!dropped.Success)
-                        {
-                            _statusMessage = $"The original rule could not be removed, so it was not replaced: {dropped.Message}";
-                            return ActionResultDto.Fail(_statusMessage);
-                        }
-                        InvalidateHostScan();
+                        saved = _firewall.ReplaceHostRule(original, spec);
                     }
-
-                    var saved = _firewall.SaveCustomRule(spec, replace);
+                    else
+                    {
+                        saved = _firewall.SaveCustomRule(spec, replace);
+                    }
                     _statusMessage = saved.Message;
-                    if (saved.Success) InvalidateHostScan();
+                    // A failed removal still wrote the replacement, so the scan is stale
+                    // whichever way it went.
+                    InvalidateHostScan();
                     return saved.Success
                         ? ActionResultDto.Success(saved.Message)
                         : ActionResultDto.Fail(saved.Message);
