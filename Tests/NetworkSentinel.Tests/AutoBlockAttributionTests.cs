@@ -50,6 +50,33 @@ public class AutoBlockAttributionTests
     }
 
     [Theory]
+    // sshd logs the client's own disconnect message at the end of the line, after the
+    // real address — so a tail-anchored pattern alone would read the forged one.
+    [InlineData("Received disconnect from 198.51.100.7 port 40000:11: maximum authentication attempts exceeded for root from 8.8.8.8 port 22 ssh2 [preauth]")]
+    [InlineData("Received disconnect from 198.51.100.7 port 40000:11: Failed password for root from 8.8.8.8 port 22 ssh2 [preauth]")]
+    [InlineData("Received disconnect from 198.51.100.7 port 40000:11: x pam_unix(sshd:auth): authentication failure; logname= uid=0 euid=0 tty=ssh ruser= rhost=8.8.8.8 [preauth]")]
+    [InlineData("Disconnected from invalid user authentication failure; logname= uid=0 euid=0 tty=ssh ruser= rhost=8.8.8.8 198.51.100.7 port 40000 [preauth]")]
+    [InlineData("Jan  1 12:00:00 host sshd[1234]: Received disconnect from 198.51.100.7 port 40000:11: maximum authentication attempts exceeded for root from 8.8.8.8 port 22 ssh2 [preauth]")]
+    public void ClientChosenTextAtTheEndOfALineIsNeverBlamed(string line)
+    {
+        var monitor = new AuthLogMonitor();
+        var threats = Feed(monitor, line, 12);
+
+        Assert.DoesNotContain(threats, t => t.SourceIp == "8.8.8.8");
+    }
+
+    [Fact]
+    public void AuthLogLinesFromOtherProgramsAreIgnored()
+    {
+        // `logger -t evil` writes into auth.log too; only the sshd/PAM senders count.
+        var monitor = new AuthLogMonitor();
+        var threats = Feed(monitor,
+            "Jan  1 12:00:00 host evil[1]: Failed password for root from 8.8.8.8 port 22 ssh2", 12);
+
+        Assert.Empty(threats);
+    }
+
+    [Theory]
     [InlineData("Failed password for root from 203.0.113.7 port 51022 ssh2")]
     [InlineData("Failed password for invalid user admin from 203.0.113.7 port 51022 ssh2")]
     [InlineData("Failed publickey for invalid user admin from 203.0.113.7 port 51022 ssh2 [preauth]")]
@@ -60,6 +87,8 @@ public class AutoBlockAttributionTests
     [InlineData("pam_unix(sshd:auth): authentication failure; logname= uid=0 euid=0 tty=ssh ruser= rhost=203.0.113.7")]
     // auth.log lines carry a syslog prefix in front of the message.
     [InlineData("Jan  1 12:00:00 host sshd[1234]: Failed password for root from 203.0.113.7 port 51022 ssh2")]
+    [InlineData("2026-01-01T12:00:00.123456+00:00 host sshd-session[1234]: Failed password for root from 203.0.113.7 port 51022 ssh2")]
+    [InlineData("Jan  1 12:00:00 host sshd[1234]: pam_unix(sshd:auth): authentication failure; logname= uid=0 euid=0 tty=ssh ruser= rhost=203.0.113.7  user=root")]
     public void GenuineSshdLinesStillCount(string line)
     {
         var monitor = new AuthLogMonitor();

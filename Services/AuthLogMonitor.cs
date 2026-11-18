@@ -32,34 +32,71 @@ public sealed class AuthLogMonitor : IDisposable
     // pattern is therefore anchored on the tail sshd itself writes — "from <ip> port <n>",
     // then its fixed suffixes, then end of line — and lets the username run greedily up
     // to it, so the address is always the last one on the line.
+    //
+    // Anchoring the tail is not enough on its own: sshd also logs text the client chose
+    // at the *end* of a line. "Received disconnect from <real ip> port 1:11: <message>
+    // [preauth]" carries the client's disconnect message verbatim, and a message of
+    // "maximum authentication attempts exceeded for root from 8.8.8.8 port 22 ssh2"
+    // matched every tail-anchored pattern with 8.8.8.8 as the address — one packet, one
+    // Critical, one auto-block of a stranger. So every pattern is anchored at the start
+    // of the message too: each begins with the fixed words sshd or PAM opens that line
+    // with, and a line that opens with anything else is not one of them.
+    // See MessageOf for how the syslog prefix of an auth.log line is taken off first.
     private const string Tail = @"(?: ssh2)?(?: \[preauth\])?\s*$";
 
     // "Failed password for invalid user admin from 203.0.113.7 port 51022 ssh2"
     private static readonly Regex FailedPassword = new(
-        @"Failed (?:password|publickey|keyboard-interactive(?:/pam)?|none) for (?<invalid>invalid user )?(?<user>.*) from (?<ip>\S+) port \d+" + Tail,
+        @"^Failed (?:password|publickey|keyboard-interactive(?:/pam)?|none) for (?<invalid>invalid user )?(?<user>.*) from (?<ip>\S+) port \d+" + Tail,
         RegexOptions.Compiled);
 
     // "Invalid user oracle from 203.0.113.7 port 40122"
     private static readonly Regex InvalidUser = new(
-        @"Invalid user (?<user>.*) from (?<ip>\S+) port \d+" + Tail,
+        @"^Invalid user (?<user>.*) from (?<ip>\S+) port \d+" + Tail,
         RegexOptions.Compiled);
 
     // "Connection closed by invalid user a 203.0.113.7 port 50110 [preauth]"
     private static readonly Regex PreauthAbandon = new(
-        @"Connection (?:closed|reset) by (?:invalid |authenticating )user (?<user>.*) (?<ip>\S+) port \d+" + Tail,
+        @"^Connection (?:closed|reset) by (?:invalid |authenticating )user (?<user>.*) (?<ip>\S+) port \d+" + Tail,
         RegexOptions.Compiled);
 
-    // PAM: "authentication failure; logname= uid=0 euid=0 tty=ssh ruser= rhost=203.0.113.7  user=root"
+    // PAM: "pam_unix(sshd:auth): authentication failure; logname= uid=0 euid=0 tty=ssh ruser= rhost=203.0.113.7  user=root"
     // Here the username comes *after* the address, so the fields before rhost= are spelled
     // out: a greedy ".*rhost=" would take an "rhost=" smuggled into the trailing user=.
     private static readonly Regex PamFailure = new(
-        @"authentication failure; logname=\S* uid=\d+ euid=\d+ tty=\S* ruser=\S* rhost=(?<ip>\S+)(?:\s+user=(?<user>.*))?$",
+        @"^pam_\w+\([\w-]+:auth\): authentication failure; logname=\S* uid=\d+ euid=\d+ tty=\S* ruser=\S* rhost=(?<ip>\S+)(?:\s+user=(?<user>.*))?$",
         RegexOptions.Compiled);
 
     // "error: maximum authentication attempts exceeded for root from 203.0.113.7 port 33990 ssh2 [preauth]"
     private static readonly Regex MaxAttempts = new(
-        @"maximum authentication attempts exceeded for (?:invalid user )?(?<user>.*) from (?<ip>\S+) port \d+" + Tail,
+        @"^(?:error: )?maximum authentication attempts exceeded for (?:invalid user )?(?<user>.*) from (?<ip>\S+) port \d+" + Tail,
         RegexOptions.Compiled);
+
+    // The syslog prefix of an /var/log/auth.log line, in either format rsyslog writes:
+    //   "Jan  1 12:00:00 host sshd[1234]: <message>"
+    //   "2026-01-01T12:00:00.123456+00:00 host sshd-session[1234]: <message>"
+    // journald (--output=cat) hands over the message alone, with no prefix.
+    private static readonly Regex SyslogPrefix = new(
+        @"^(?:<\d+>)?(?:[A-Z][a-z]{2} [ \d]\d \d{2}:\d{2}:\d{2}|\d{4}-\d{2}-\d{2}T[\d:.]+(?:Z|[+-]\d{2}:?\d{2})?) \S+ (?<tag>[^\s\[:]+)(?:\[\d+\])?: (?<msg>.*)$",
+        RegexOptions.Compiled);
+
+    // The senders the journald source is limited to (-t); auth.log lines from any other
+    // tag are ignored the same way.
+    private static readonly HashSet<string> AuthTags = new(StringComparer.Ordinal)
+    {
+        "sshd", "sshd-session", "sudo", "su", "login"
+    };
+
+    /// <summary>
+    /// The log message of <paramref name="line"/>: the line itself from journald, or the
+    /// line after its syslog prefix from auth.log. Null for an auth.log line some other
+    /// program wrote, which is not one this monitor reads.
+    /// </summary>
+    internal static string? MessageOf(string line)
+    {
+        var m = SyslogPrefix.Match(line);
+        if (!m.Success) return line;
+        return AuthTags.Contains(m.Groups["tag"].Value) ? m.Groups["msg"].Value : null;
+    }
 
     private readonly object _gate = new();
     private readonly Dictionary<string, IpFailures> _failures = new(StringComparer.OrdinalIgnoreCase);
@@ -214,6 +251,10 @@ public sealed class AuthLogMonitor : IDisposable
     /// <summary>Parses one log line; internal for tests / manual replay.</summary>
     internal void ProcessLine(string line, DateTime now)
     {
+        var message = MessageOf(line);
+        if (message == null) return;
+        line = message;
+
         string? ip = null, user = null;
         bool immediate = false;
 
