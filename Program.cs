@@ -91,7 +91,7 @@ internal static class Program
 
         if (WantsWeb(args, out var webPort))
         {
-            RunWeb(webPort, ParseTlsOptions(args));
+            RunWeb(webPort, ParseBindAddress(args), ParseTlsOptions(args));
             return;
         }
 
@@ -184,12 +184,12 @@ internal static class Program
         }
     }
 
-    private static void RunWeb(int? port, WebTlsOptions? tls)
+    private static void RunWeb(int? port, System.Net.IPAddress? bind, WebTlsOptions? tls)
     {
         FirewallService.Surface = FirewallUiSurface.Web;
         try
         {
-            using var app = new WebApp(port, bindAll: true, tlsOverrides: tls);
+            using var app = new WebApp(port, bind, tls);
             app.RunAsync().GetAwaiter().GetResult();
         }
         catch (Exception ex)
@@ -284,6 +284,55 @@ internal static class Program
         }
 
         return o.HasAny ? o : null;
+    }
+
+    /// <summary>
+    /// The address the web console listens on: --bind ADDR (or --bind=ADDR), else
+    /// NETWORKSENTINEL_WEB_BIND (settable in web.env for the service), else null — every
+    /// IPv4 interface, as before. There used to be no way to choose: the console always
+    /// listened everywhere, so a console meant to sit behind `tailscale serve` or an SSH
+    /// tunnel was reachable from the LAN as well. A value that does not parse stops the
+    /// start rather than falling back to "everywhere".
+    /// </summary>
+    private static System.Net.IPAddress? ParseBindAddress(string[] args)
+    {
+        string? value = null;
+        for (var i = 0; i < args.Length; i++)
+        {
+            if (args[i] == "--bind")
+                value = i + 1 < args.Length ? args[++i] : Fail("--bind needs an address, e.g. --bind 127.0.0.1");
+            else if (args[i].StartsWith("--bind=", StringComparison.Ordinal))
+                value = args[i]["--bind=".Length..];
+        }
+
+        value ??= Environment.GetEnvironmentVariable("NETWORKSENTINEL_WEB_BIND");
+        if (string.IsNullOrWhiteSpace(value))
+            return null;
+
+        if (TryParseBindAddress(value, out var address))
+            return address;
+
+        Fail($"Cannot listen on '{value}': give an IP address of this machine, 'localhost', or 'all'.");
+        return null;
+    }
+
+    /// <summary>"localhost", "all"/"any"/"*" (every IPv4 interface), "::" (IPv4 and IPv6), or a literal address.</summary>
+    internal static bool TryParseBindAddress(string value, out System.Net.IPAddress address)
+    {
+        value = value.Trim();
+        switch (value.ToLowerInvariant())
+        {
+            case "localhost":
+                address = System.Net.IPAddress.Loopback;
+                return true;
+            case "all" or "any" or "*" or "0.0.0.0":
+                address = System.Net.IPAddress.Any;
+                return true;
+        }
+
+        if (value.StartsWith('[') && value.EndsWith(']'))
+            value = value[1..^1];
+        return System.Net.IPAddress.TryParse(value, out address!);
     }
 
     private static string Fail(string message)
@@ -698,6 +747,9 @@ internal static class Program
               --console          Same as --tui
               -w, --web [PORT]   Headless web UI (browser). Auto-picks a free high port
                                  if PORT is omitted (prefers 18765, then nearby alternatives)
+              --bind ADDR        Address the web UI listens on: localhost, an IP of this
+                                 machine, :: for IPv4 + IPv6, or all (default: every IPv4
+                                 interface). Also NETWORKSENTINEL_WEB_BIND.
               --set-master-password    Set/reset the web UI master password from the
                                         terminal (no browser needed). Requires root:
                                         sudo networksentinel --set-master-password
@@ -723,6 +775,7 @@ internal static class Program
             Environment:
               NETWORKSENTINEL_TUI=1              Force TUI
               NETWORKSENTINEL_WEB=1              Force headless web UI
+              NETWORKSENTINEL_WEB_BIND=ADDR      Web UI listen address (as --bind)
               NETWORKSENTINEL_GUI=1              Force GUI even without DISPLAY
               NETWORKSENTINEL_ALLOW_ROOT_GUI=1   Allow root GUI (rare; X11 only)
 

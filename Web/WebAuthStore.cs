@@ -19,10 +19,23 @@ public sealed class WebAuthStore
     private const int Iterations = 200_000;
     private static readonly TimeSpan SessionLifetime = TimeSpan.FromHours(12);
 
+    /// <summary>
+    /// How long a session can live however busy it is. The idle expiry slides on every
+    /// request, and an open tab polls every few seconds, so on its own it never ran out:
+    /// a session left open on a wall display — or a cookie copied off one — stayed good
+    /// for as long as the process did.
+    /// </summary>
+    internal static readonly TimeSpan SessionMaxAge = TimeSpan.FromDays(7);
+
     private static readonly JsonSerializerOptions JsonOptions = new() { WriteIndented = true };
 
     private readonly object _fileGate = new();
-    private readonly ConcurrentDictionary<string, DateTime> _sessions = new(StringComparer.Ordinal);
+    private readonly ConcurrentDictionary<string, Session> _sessions = new(StringComparer.Ordinal);
+
+    private readonly record struct Session(DateTime Created, DateTime IdleExpires);
+
+    /// <summary>The clock; tests move it.</summary>
+    internal Func<DateTime> UtcNow { get; set; } = () => DateTime.UtcNow;
     private readonly string _dataDirectory;
     private AuthFile? _auth;
 
@@ -224,9 +237,19 @@ public sealed class WebAuthStore
 
     public string CreateSession()
     {
+        var now = UtcNow();
+
+        // Sessions are otherwise only dropped when presented after they expire, so ones
+        // abandoned in a closed browser stayed in memory until the process restarted.
+        foreach (var (key, session) in _sessions)
+        {
+            if (IsExpired(session, now))
+                _sessions.TryRemove(key, out _);
+        }
+
         var token = Convert.ToBase64String(RandomNumberGenerator.GetBytes(32))
             .TrimEnd('=').Replace('+', '-').Replace('/', '_');
-        _sessions[token] = DateTime.UtcNow + SessionLifetime;
+        _sessions[token] = new Session(now, now + SessionLifetime);
         return token;
     }
 
@@ -235,19 +258,23 @@ public sealed class WebAuthStore
         if (string.IsNullOrWhiteSpace(token))
             return false;
 
-        if (!_sessions.TryGetValue(token, out var expires))
+        if (!_sessions.TryGetValue(token, out var session))
             return false;
 
-        if (DateTime.UtcNow > expires)
+        var now = UtcNow();
+        if (IsExpired(session, now))
         {
             _sessions.TryRemove(token, out _);
             return false;
         }
 
-        // Sliding expiry while the tab is in use.
-        _sessions[token] = DateTime.UtcNow + SessionLifetime;
+        // Sliding expiry while the tab is in use — up to SessionMaxAge from sign-in.
+        _sessions[token] = session with { IdleExpires = now + SessionLifetime };
         return true;
     }
+
+    private static bool IsExpired(Session session, DateTime now)
+        => now > session.IdleExpires || now - session.Created > SessionMaxAge;
 
     public void RevokeSession(string? token)
     {

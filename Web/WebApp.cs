@@ -4,6 +4,7 @@ using System.Net.NetworkInformation;
 using System.Net.Sockets;
 using System.Reflection;
 using System.Text;
+using System.Text.RegularExpressions;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using Microsoft.AspNetCore.Builder;
@@ -157,8 +158,11 @@ public sealed class WebApp : IDisposable
     private const string TokenPlaceholder = "••••••••";
 
     private readonly int _port;
-    private readonly bool _bindAll;
+    private readonly IPAddress _bindAddress;
     private bool _listeningLocalOnly;
+
+    /// <summary>The page and the Content-Security-Policy that admits its one script.</summary>
+    private readonly Lazy<(string Html, string Csp)> _page;
     private WebApplication? _host;
     private readonly LoginThrottle _loginThrottle = new();
 
@@ -196,9 +200,15 @@ public sealed class WebApp : IDisposable
     /// <summary>HTTPS port actually in use, or 0 when TLS is off.</summary>
     public int HttpsPort => _httpsActive ? _httpsPort : 0;
 
-    public WebApp(int? requestedPort = null, bool bindAll = true, WebTlsOptions? tlsOverrides = null)
+    /// <param name="bindAddress">Where to listen; null is every IPv4 interface.</param>
+    public WebApp(int? requestedPort = null, IPAddress? bindAddress = null, WebTlsOptions? tlsOverrides = null)
     {
-        _bindAll = bindAll;
+        _bindAddress = bindAddress ?? IPAddress.Any;
+        _page = new Lazy<(string, string)>(() =>
+        {
+            var html = PageHtml();
+            return (html, BuildContentSecurityPolicy(html));
+        });
         _port = ResolvePort(requestedPort);
 
         // Never serve on defaults that stand in for a damaged settings file: they mean
@@ -313,8 +323,8 @@ public sealed class WebApp : IDisposable
         // Kestrel's own logs would interleave with the console banner and alert output.
         builder.Logging.ClearProviders();
 
-        var bindAddress = _bindAll ? IPAddress.Any : IPAddress.Loopback;
-        _listeningLocalOnly = !_bindAll;
+        var bindAddress = _bindAddress;
+        _listeningLocalOnly = IPAddress.IsLoopback(_bindAddress);
 
         var tlsError = ConfigureTls();
 
@@ -398,14 +408,23 @@ public sealed class WebApp : IDisposable
     private void PrintListenBanner()
     {
         Console.WriteLine();
-        var scope = _listeningLocalOnly ? "localhost only" : (_bindAll ? "all interfaces" : "localhost only");
+        var wildcard = _bindAddress.Equals(IPAddress.Any) || _bindAddress.Equals(IPAddress.IPv6Any);
+        var scope = _listeningLocalOnly ? "localhost only"
+            : _bindAddress.Equals(IPAddress.Any) ? "all IPv4 interfaces"
+            : _bindAddress.Equals(IPAddress.IPv6Any) ? "all interfaces"
+            : $"{_bindAddress} only";
+        // A wildcard or loopback listener answers on 127.0.0.1; one bound to a single
+        // address answers on that address alone.
+        var local = wildcard || _bindAddress.Equals(IPAddress.Loopback) ? "127.0.0.1"
+            : _bindAddress.AddressFamily == System.Net.Sockets.AddressFamily.InterNetworkV6 ? $"[{_bindAddress}]"
+            : _bindAddress.ToString();
         if (_httpOff)
         {
             // No HTTP listener at all, so the banner has to hand out working HTTPS URLs —
             // the bare-IP ones get a certificate warning, but they connect encrypted.
             Console.WriteLine($"  Listening on port {_httpsPort}  ({scope}) — HTTPS only, plain HTTP is off");
-            Console.WriteLine($"  Local:   https://127.0.0.1:{_httpsPort}/");
-            if (_bindAll && !_listeningLocalOnly)
+            Console.WriteLine($"  {(wildcard || _listeningLocalOnly ? "Local:  " : "URL:    ")} https://{local}:{_httpsPort}/");
+            if (wildcard)
             {
                 foreach (var ip in GetLanIpv4Addresses().Take(4))
                     Console.WriteLine($"  Network: https://{ip}:{_httpsPort}/");
@@ -414,8 +433,8 @@ public sealed class WebApp : IDisposable
         else
         {
             Console.WriteLine($"  Listening on port {_port}  ({scope})");
-            Console.WriteLine($"  Local:   http://127.0.0.1:{_port}/");
-            if (_bindAll && !_listeningLocalOnly)
+            Console.WriteLine($"  {(wildcard || _listeningLocalOnly ? "Local:  " : "URL:    ")} http://{local}:{_port}/");
+            if (wildcard)
             {
                 foreach (var ip in GetLanIpv4Addresses().Take(4))
                     Console.WriteLine($"  Network: http://{ip}:{_port}/");
@@ -514,6 +533,13 @@ public sealed class WebApp : IDisposable
         res.Headers["X-Frame-Options"] = "DENY";
         if (req.IsHttps)
             res.Headers["Strict-Transport-Security"] = "max-age=31536000";
+        res.Headers["Content-Security-Policy"] = _page.Value.Csp;
+
+        if (IsCrossSiteRequest(req.Method, req.Headers["Sec-Fetch-Site"], req.Headers.Origin, req.Host.Value))
+        {
+            WriteJson(res, 403, new { ok = false, message = "Cross-site request refused." });
+            return;
+        }
 
         var path = (req.Path.Value ?? "").TrimEnd('/');
         if (path.Length == 0)
@@ -533,7 +559,7 @@ public sealed class WebApp : IDisposable
 
         if (req.Method == "GET" && (path is "/" or "/index.html"))
         {
-            WriteHtml(res, PageHtml());
+            WriteHtml(res, _page.Value.Html);
             return;
         }
 
@@ -1607,13 +1633,21 @@ public sealed class WebApp : IDisposable
         return $"{(string.IsNullOrEmpty(name) ? cert.Subject : name)}, expires {cert.NotAfter:yyyy-MM-dd}.";
     }
 
-    /// <summary>Remote address for throttling. Kestrel gives the real peer — no proxy is assumed.</summary>
+    /// <summary>
+    /// Remote address for throttling. Kestrel gives the real peer — no proxy is assumed.
+    /// On a dual-stack listener (--bind ::) an IPv4 client arrives as ::ffff:a.b.c.d;
+    /// it is unmapped so throttling, the operator shield and token source pins all see
+    /// the address they would on an IPv4 listener.
+    /// </summary>
     private static string ClientAddress(HttpContext ctx)
-        => ctx.Connection.RemoteIpAddress?.ToString() ?? "unknown";
+        => ctx.Connection.RemoteIpAddress is { } ip
+            ? (ip.IsIPv4MappedToIPv6 ? ip.MapToIPv4() : ip).ToString()
+            : "unknown";
 
     /// <summary>IsLoopback handles the IPv4-mapped form Kestrel reports for dual-stack sockets.</summary>
     private static bool IsLoopbackClient(HttpContext ctx)
-        => ctx.Connection.RemoteIpAddress is { } ip && IPAddress.IsLoopback(ip);
+        => ctx.Connection.RemoteIpAddress is { } ip &&
+           IPAddress.IsLoopback(ip.IsIPv4MappedToIPv6 ? ip.MapToIPv4() : ip);
 
     /// <summary>
     /// One-time code for first-visit password setup from a non-loopback client.
@@ -3061,6 +3095,56 @@ public sealed class WebApp : IDisposable
     /// </summary>
     private string PageHtml() => IndexHtml.Replace("__NS_VERSION__", _appVersion);
 
+    /// <summary>
+    /// Whether a state-changing request was sent by a page on some other origin. The
+    /// session cookie is SameSite=Strict, but same-site is not same-origin: ports do not
+    /// count, and neither do sibling subdomains. Any other web app on this host (or one
+    /// with an XSS) could POST {"action":"remove_all_rules"} to /api/action as a "simple"
+    /// request that needs no preflight, and the cookie went with it.
+    ///
+    /// Browsers say where a request came from — Sec-Fetch-Site, or failing that Origin —
+    /// and both survive a reverse proxy, which rewrites neither. A client that sends
+    /// neither is not a browser (curl, the iOS app, a bot with a token) and cannot be
+    /// made to carry a victim's cookie, so it is let through.
+    /// </summary>
+    internal static bool IsCrossSiteRequest(string method, string? secFetchSite, string? origin, string? host)
+    {
+        if (HttpMethods.IsGet(method) || HttpMethods.IsHead(method) || HttpMethods.IsOptions(method))
+            return false;
+
+        if (!string.IsNullOrEmpty(secFetchSite))
+            return !secFetchSite.Equals("same-origin", StringComparison.OrdinalIgnoreCase);
+
+        if (string.IsNullOrEmpty(origin))
+            return false;
+        if (!Uri.TryCreate(origin, UriKind.Absolute, out var from))
+            return true;   // includes the opaque "null" origin of sandboxed frames and file:// pages
+        return !string.Equals(from.Authority, host, StringComparison.OrdinalIgnoreCase);
+    }
+
+    /// <summary>
+    /// The console's Content-Security-Policy. Every value the page renders goes through
+    /// esc() before it reaches innerHTML, and much of it is attacker-chosen (reverse DNS,
+    /// process names, Suricata signatures, DNS query names); the policy is the second
+    /// layer, so one missed esc() in a future edit is not script execution with firewall
+    /// control. The page's single inline script is admitted by its hash, nothing else
+    /// runs, and fetches can only go back to this console.
+    /// </summary>
+    internal static string BuildContentSecurityPolicy(string html)
+    {
+        var hashes = Regex.Matches(html, @"<script>(.*?)</script>", RegexOptions.Singleline)
+            .Select(m => "'sha256-" + Convert.ToBase64String(
+                System.Security.Cryptography.SHA256.HashData(Encoding.UTF8.GetBytes(m.Groups[1].Value))) + "'");
+        return "default-src 'none'; " +
+               $"script-src {string.Join(' ', hashes)}; " +
+               "style-src 'unsafe-inline'; " +
+               "img-src 'self' data:; " +
+               "connect-src 'self'; " +
+               "base-uri 'none'; " +
+               "form-action 'self'; " +
+               "frame-ancestors 'none'";
+    }
+
     private static void WriteHtml(HttpResponse res, string html)
     {
         var bytes = Encoding.UTF8.GetBytes(html);
@@ -3162,7 +3246,7 @@ public sealed class WebApp : IDisposable
         public static ActionResultDto Fail(string message) => new() { Ok = false, Message = message };
     }
 
-    private const string IndexHtml =
+    internal const string IndexHtml =
 """
 <!DOCTYPE html>
 <html lang="en">
@@ -4144,7 +4228,7 @@ public sealed class WebApp : IDisposable
       ? (needSetupCode
           ? 'Minimum 8 characters. The setup code is printed where the console runs (terminal, or journalctl -u networksentinel-web).'
           : 'Minimum 8 characters. Stored only as a one-way hash on this machine.')
-      : 'Session ends when you sign out, close the browser, or after 12 hours idle.';
+      : 'Session ends when you sign out, close the browser, after 12 hours idle, or 7 days after sign-in.';
     $('authError').textContent = message || '';
     $('pw').value = '';
     $('pwConfirm').value = '';

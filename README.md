@@ -572,7 +572,10 @@ The first button in the web console's hero action row is a single **Sleep ⇄ Wa
 - Every later visit **requires that password**; change it under **Settings → Master password**. Changing it signs out every other session and revokes every API token
 - Can't reach a browser yet (e.g. still opening the port in a cloud firewall)? Set/reset it from the terminal instead: `sudo networksentinel --set-master-password`
 - Hash stored as PBKDF2-SHA256 (random salt, 200k iterations) in `~/.local/share/NetworkSentinel/web-master.json` — never plain text
-- Session cookie until sign-out, browser close, or 12 hours idle
+- Session cookie until sign-out, browser close, 12 hours idle, or **7 days after sign-in** however busy the tab is (0.7.25 — an open tab polls every few seconds, so the idle limit alone never ended it)
+- **Cross-site writes are refused** (0.7.25). A state-changing request a browser marks as coming from another origin (`Sec-Fetch-Site`, or `Origin` from older browsers) gets `403`. The cookie is `SameSite=Strict`, but same-*site* ignores ports, so any other web app on the same host could otherwise drive `/api/action`. Clients that are not browsers send neither header and are unaffected
+- A **Content-Security-Policy** admits only the page's own script, by hash, and lets it talk only to the console (0.7.25). Every value the page shows is escaped already; this is the second layer
+- **Where it listens:** every IPv4 interface by default. `--bind 127.0.0.1` (or `NETWORKSENTINEL_WEB_BIND=127.0.0.1` in `web.env` for the service) keeps it to this machine — the right setting behind `tailscale serve`, a reverse proxy or an SSH tunnel. `--bind ::` listens on IPv6 as well, and `--bind <address>` on one interface (0.7.25)
 - Failed attempts are throttled **per client IP**: five wrong guesses trigger a lockout that doubles with each further attempt (1 minute up to 1 hour), answered with `429` and a `Retry-After`. A fixed delay alone only slows one connection at a time — this caps a parallel guesser
 
 ### API tokens — monitoring and control for a bot (0.7.18)
@@ -1394,7 +1397,7 @@ All three UIs write the same `~/.local/share/NetworkSentinel/settings.json`, so 
 - If the app ever exits unexpectedly, check `~/.local/share/NetworkSentinel/logs/crash.log` — unhandled errors are logged there with a stack trace.
 - Non-root runs still monitor connections for processes you can see; other users’ sockets may show as `Kernel / unknown`.
 - Existing TCP sessions may remain until they reconnect after a block; new matching traffic is stopped by the firewall.
-- The web UI binds all interfaces when started with `-w`; protect it with the master password and host firewall if exposed.
+- The web UI binds every IPv4 interface when started with `-w`; protect it with the master password and host firewall if exposed, or use `--bind 127.0.0.1` behind a proxy or tunnel.
 - Override (rare): `NETWORKSENTINEL_ALLOW_ROOT_GUI=1` forces allowing a root GUI (only useful on some X11 setups with `xhost`).
 
 ---
@@ -1430,7 +1433,7 @@ On GNOME / Pop!_OS the indicator appears in the top bar (StatusNotifier / AppInd
 | Firewall Config is empty and says no backend returned rules | Neither `ufw`, `nft` nor `iptables` answered. On a container or a minimal image none may be installed; `command -v ufw nft iptables` says which. |
 | A rule added here does not appear in `ufw status` | Only rules written **while UFW is active** go through UFW; the rest go into nftables, where they are still enforced but are not UFW's. Before 0.7.10 that included hosts where UFW *was* active: the probe ran `ufw status` as you, root-only, and read the refusal as "inactive". It now falls back to `ENABLED` in `/etc/ufw/ufw.conf` — the same flag `ufw status` reports — so on 0.7.10 and later the message on a rule that went into nftables says which of the three reasons it was. For a rule added by an older build, delete it and add it again. |
 | No tray icon | DE must support StatusNotifier/AppIndicator; window title still updates when minimized. |
-| Web UI asks for password every time | Expected after sign-out, browser close, or 12h idle. Reset: delete `web-master.json`. |
+| Web UI asks for password every time | Expected after sign-out, browser close, 12h idle, or 7 days after sign-in. Reset: delete `web-master.json`. |
 | Token API answers `403` | The message says which: the request came over **plain HTTP** from another machine (point the bot at the `https://` port — and revoke that token, it has been on the wire unencrypted); a **read-only** token was used on `/api/v1/control`; a token **not limited to source addresses** asked for the connection, firewall, allowlist or blocked-sites tables; or the action is one tokens may not run (Settings, certificates, token management). |
 | Creating a token answers that it "cannot be created over plain HTTP" | You are using the console over plain HTTP from another machine, and the new token would be shown to you unencrypted. Open the console on its `https://` port, or create the token on the machine it runs on. |
 | Creating a token answers "Incorrect master password" | Creating one asks for the master password again — being signed in is not enough. Five wrong tries lock that address out of the sign-in page too; it is the same guess. |
