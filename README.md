@@ -325,7 +325,7 @@ Heuristics flag patterns such as:
 - Multi-port scans / reconnaissance — fast (45 s window) **and slow/paced** (10 min window, catches `nmap -T1`-style scans)
 - **Scans of closed ports** (opt-in) — Windows Firewall drops those SYNs before the TCP stack sees them, so they never appear as connections; with dropped-packet logging on, a log watcher turns them into alerts within seconds
 - RDP, SSH, and SMB hammering
-- **Failed logon bursts** from the Windows Security event log (4625 / 4771) — catches RDP/SMB/WinRM brute-force even when it reuses one TCP session or paces below the connection-rate thresholds
+- **Failed logon bursts** from the Windows Security event log (4625 / 4771) — catches RDP/SMB/WinRM brute-force even when it reuses one TCP session or paces below the connection-rate thresholds. A successful remote logon (4624) from the address clears its count
 - Sensitive-port probing (admin, DB, remote access)
 - Short-lived / transitional TCP bursts
 - **Outbound beaconing** — regular-interval new sessions to an uncommon remote port (C2 "calling home" signature); common client ports and LAN peers are excluded
@@ -379,6 +379,7 @@ Gates, in order — a threat must clear all of them before a rule is written:
 | Not this machine | A detector that attributes a threat to the wrong end of a flow can never firewall the host off from itself — matters most on a cloud VM whose own address is public |
 | Not a configured resolver | A DNS server one of this machine's adapters is set to use is never auto-blocked — the block would take name resolution with it |
 | Not a WireGuard tunnel endpoint | A peer's public endpoint is where its tunnel packets come from; blocking it does not drop an attacker, it drops the tunnel and everything reached through it. Independent of the WireGuard *monitoring* setting, and remembered for 24 h — see [tunnel endpoints are never auto-blocked](#tunnel-endpoints-are-never-auto-blocked) |
+| Not a remote-logon address | An address someone is logged on to this machine from over Remote Desktop right now (IPv4 clients, read from Remote Desktop Services), or that logged on remotely in the last 30 days (Security-log 4624 of type network, unlock, network-cleartext or Remote Desktop — never ANONYMOUS LOGON or Guest — remembered in `remote-logons.json`), or that this process's own SSH session comes from. An address counts only once it has authenticated — a brute-forcer's connections are established TCP too. OpenSSH logons are otherwise not seen: the Security log records them without the client's address. A threat against one is reported with the reason, and the address can still be blocked by hand |
 | Not protected | See lockout protection below |
 | Not already blocked | No duplicate rules |
 | Not suppressed | An address you deliberately released stays released for 24 h |
