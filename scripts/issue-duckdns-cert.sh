@@ -81,16 +81,46 @@ fi
 export DuckDNS_Token
 
 # --- acme.sh ---------------------------------------------------------------
+# A pinned acme.sh release, checked against known hashes before anything runs. This
+# used to be `curl https://get.acme.sh | sh`: whatever that URL served at the time,
+# unverified, executed as this user — and, from the app's "Issue certificate" button,
+# with no prompt at all. Only the two files this needs are fetched: acme.sh itself and
+# its DuckDNS DNS hook (acme.sh --install copies whatever sits beside it in dnsapi/).
+#
+# To move to a newer release: take the tag's commit from
+#   git ls-remote https://github.com/acmesh-official/acme.sh 'refs/tags/v*^{}'
+# and the sha256 of acme.sh and dnsapi/dns_duckdns.sh at that commit.
+ACME_VERSION="3.1.6"
+ACME_COMMIT="807da6498377ee5e0cf43a78091f46f12dc59a89"
+ACME_SHA256="c7d68b021cfd6380ea83a82962abde5b484779fee0b97d38681dfa1396bbc8d7"
+DUCKDNS_HOOK_SHA256="8be535b8d6270b7a37671da954d89c896df7af29c2f38d5029054ec315fe77af"
+
+sha256_of() {
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$1" | awk '{print $1}'
+  else
+    shasum -a 256 "$1" | awk '{print $1}'
+  fi
+}
+
+# Downloads $1 to $2 and refuses to go on unless its sha256 is $3.
+fetch_verified() {
+  curl -fsSL --proto '=https' --tlsv1.2 -o "$2" "$1" || die "could not download $1"
+  local got
+  got="$(sha256_of "$2")"
+  [[ "$got" == "$3" ]] || die "checksum mismatch for $1 (expected $3, got $got) — not installing it"
+}
+
 if [[ ! -x "$ACME" ]]; then
   say ""
   say "acme.sh is not installed (looked for ${ACME})."
-  say "It is a shell ACME client; the installer writes to ~/.acme.sh and adds a renewal cron entry."
+  say "It is a shell ACME client; installing it writes to ~/.acme.sh and adds a renewal cron entry."
 
   if interactive; then
-    read -r -p "Install it now from https://get.acme.sh? [y/N] " reply
+    read -r -p "Install acme.sh ${ACME_VERSION} (pinned and checksum-verified, from GitHub) now? [y/N] " reply
     [[ "$reply" =~ ^[Yy]$ ]] || die "acme.sh is required — install it and re-run"
   else
-    say "Installing it now (NS_ASSUME_YES)."
+    say "Installing acme.sh ${ACME_VERSION} (pinned and checksum-verified)."
   fi
 
   ACCOUNT_EMAIL="${NS_ACME_EMAIL:-}"
@@ -102,7 +132,17 @@ if [[ ! -x "$ACME" ]]; then
   fi
   [[ -n "$ACCOUNT_EMAIL" ]] || die "an email is required to register an ACME account"
 
-  curl -fsSL https://get.acme.sh | sh -s "email=${ACCOUNT_EMAIL}"
+  ACME_SRC="$(mktemp -d "${TMPDIR:-/tmp}/ns-acme.XXXXXX")"
+  trap 'rm -rf "$ACME_SRC"' EXIT
+  mkdir -p "${ACME_SRC}/dnsapi"
+  ACME_BASE="https://raw.githubusercontent.com/acmesh-official/acme.sh/${ACME_COMMIT}"
+  fetch_verified "${ACME_BASE}/acme.sh" "${ACME_SRC}/acme.sh" "$ACME_SHA256"
+  fetch_verified "${ACME_BASE}/dnsapi/dns_duckdns.sh" "${ACME_SRC}/dnsapi/dns_duckdns.sh" "$DUCKDNS_HOOK_SHA256"
+
+  # --install copies acme.sh and the dnsapi/ beside it into ~/.acme.sh, so it has to
+  # run from the directory that holds them.
+  (cd "$ACME_SRC" && sh ./acme.sh --install -m "$ACCOUNT_EMAIL") \
+    || die "acme.sh ${ACME_VERSION} did not install (see its output above)"
   [[ -x "$ACME" ]] || die "acme.sh install did not produce ${ACME}"
 fi
 
