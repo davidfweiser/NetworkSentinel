@@ -25,14 +25,14 @@ public class FailedLogonCountingTests
     }
 
     /// <summary>A valid account mistyping its password <paramref name="typos"/> times on one connection, then leaving.</summary>
-    private static IEnumerable<string> ValidUserTypos(int port, int typos)
+    private static IEnumerable<string> ValidUserTypos(int port, int typos, string account = "alice")
     {
         for (var i = 0; i < typos; i++)
         {
-            yield return $"pam_unix(sshd:auth): authentication failure; logname= uid=0 euid=0 tty=ssh ruser= rhost={Ip}  user=alice";
-            yield return $"Failed password for alice from {Ip} port {port} ssh2";
+            yield return $"pam_unix(sshd:auth): authentication failure; logname= uid=0 euid=0 tty=ssh ruser= rhost={Ip}  user={account}";
+            yield return $"Failed password for {account} from {Ip} port {port} ssh2";
         }
-        yield return $"Connection closed by authenticating user alice {Ip} port {port} [preauth]";
+        yield return $"Connection closed by authenticating user {account} {Ip} port {port} [preauth]";
     }
 
     /// <summary>A guess at an account that does not exist: one password, then gone.</summary>
@@ -134,6 +134,37 @@ public class FailedLogonCountingTests
     }
 
     [Fact]
+    public void ALoginClearsOnlyThatAccountsFailures()
+    {
+        // Someone with a login here, guessing root's password from the same address: their
+        // own login used to wipe the count, so they could reset it as often as they liked.
+        var monitor = new AuthLogMonitor();
+        var now = T0;
+        Replay(monitor, ValidUserTypos(50000, 3, "root"), ref now);
+        Replay(monitor, new[] { $"Accepted publickey for alice from {Ip} port 50001 ssh2: ED25519 SHA256:abc" }, ref now);
+        Replay(monitor, ValidUserTypos(50002, 1, "root"), ref now);
+
+        var threat = Assert.Single(monitor.DrainPending());
+        Assert.Equal("4 failed logons in 10 min", threat.Title);
+        Assert.Equal(new[] { "root" }, threat.AccountsTried);
+    }
+
+    [Fact]
+    public void ABurstNamesTheAccountsItTriedInItsWindow()
+    {
+        var monitor = new AuthLogMonitor();
+        var now = T0;
+        Replay(monitor, ValidUserTypos(50000, 1, "bob"), ref now);
+        now = now.AddMinutes(11); // bob's attempt has left the window
+        Replay(monitor, ValidUserTypos(50001, 3), ref now);
+        Replay(monitor, InvalidUserGuess(50002), ref now);
+
+        var threat = Assert.Single(monitor.DrainPending());
+        Assert.Equal(new[] { "alice", "oracle" }, threat.AccountsTried);
+        Assert.EndsWith("Accounts tried: alice, oracle.", threat.Detail);
+    }
+
+    [Fact]
     public void AnAuthLogLoginDoesNotClearTheCount()
     {
         // Any local account can write an "Accepted" line into auth.log with
@@ -154,8 +185,8 @@ public class FailedLogonCountingTests
     [Fact]
     public void SuccessfulLoginsAreReportedFromJournaldOnly()
     {
-        var seen = new List<string>();
-        var monitor = new AuthLogMonitor { SuccessfulLogin = seen.Add };
+        var seen = new List<(string, string)>();
+        var monitor = new AuthLogMonitor { SuccessfulLogin = (ip, account) => seen.Add((ip, account)) };
 
         monitor.ProcessLine($"Accepted publickey for alice from {Ip} port 50000 ssh2: ED25519 SHA256:abc", T0, fromJournal: true);
         // Any local account can write this into auth.log with `logger -t sshd`.
@@ -163,7 +194,7 @@ public class FailedLogonCountingTests
         // Nor can a client's disconnect message pose as one.
         monitor.ProcessLine($"Received disconnect from {Ip} port 50001:11: Accepted password for root from 198.51.100.2 port 22 ssh2", T0, fromJournal: true);
 
-        Assert.Equal(new[] { Ip }, seen);
+        Assert.Equal(new[] { (Ip, "alice") }, seen);
     }
 }
 
@@ -173,10 +204,11 @@ public class SshOperatorShieldTests
         Path.Combine(Path.GetTempPath(), "ns-ssh-" + Guid.NewGuid().ToString("N"));
 
     /// <summary>One glibc 64-bit utmp record (384 bytes).</summary>
-    private static byte[] UtmpRecord(short type, string host = "", byte[]? addr = null)
+    private static byte[] UtmpRecord(short type, string host = "", byte[]? addr = null, string user = "alice")
     {
         var record = new byte[384];
         BitConverter.GetBytes(type).CopyTo(record, 0);
+        System.Text.Encoding.ASCII.GetBytes(user).CopyTo(record, 44);
         System.Text.Encoding.ASCII.GetBytes(host).CopyTo(record, 76);
         addr?.CopyTo(record, 348);
         return record;
@@ -188,19 +220,22 @@ public class SshOperatorShieldTests
         var data = new[]
         {
             UtmpRecord(7, "203.0.113.7", new byte[] { 203, 0, 113, 7 }),
-            UtmpRecord(7, "", System.Net.IPAddress.Parse("2001:db8::7").GetAddressBytes()),
-            UtmpRecord(7, "198.51.100.9"),                                   // address only in ut_host
+            UtmpRecord(7, "", System.Net.IPAddress.Parse("2001:db8::7").GetAddressBytes(), "bob"),
+            // Address only in ut_host: what libutempter's setgid-utmp helper writes for any
+            // local user who asks, with any host they like. sshd always fills ut_addr_v6.
+            UtmpRecord(7, "198.51.100.9", user: "mallory"),
             UtmpRecord(6, "198.51.100.10", new byte[] { 198, 51, 100, 10 }), // LOGIN_PROCESS: not logged in
+            UtmpRecord(7, "198.51.100.11", new byte[] { 198, 51, 100, 11 }, user: ""), // no account
             UtmpRecord(7, ":0"),                                             // local X session
         }.SelectMany(r => r).ToArray();
 
-        Assert.Equal(new[] { "203.0.113.7", "2001:db8::7", "198.51.100.9" }, SshOperatorShield.ParseUtmp(data));
+        Assert.Equal(new[] { ("203.0.113.7", "alice"), ("2001:db8::7", "bob") }, SshOperatorShield.ParseUtmp(data));
         // Not a whole number of records: some other layout, so nothing is guessed at.
         Assert.Empty(SshOperatorShield.ParseUtmp(data[..^1]));
     }
 
     [Fact]
-    public void ALoggedInClientIsShielded()
+    public void ALoggedInClientIsShieldedForItsOwnAccount()
     {
         var utmp = TempPath();
         File.WriteAllBytes(utmp, UtmpRecord(7, "203.0.113.7", new byte[] { 203, 0, 113, 7 }));
@@ -210,6 +245,30 @@ public class SshOperatorShieldTests
             Assert.True(shield.IsShielded("203.0.113.7"));
             Assert.True(shield.IsShielded("::ffff:203.0.113.7"));
             Assert.False(shield.IsShielded("203.0.113.8"));
+
+            // A failed-logon burst is held back only if every account it tried logged in here.
+            Assert.True(shield.IsShielded("203.0.113.7", new[] { "alice" }));
+            Assert.False(shield.IsShielded("203.0.113.7", new[] { "root" }));
+            Assert.False(shield.IsShielded("203.0.113.7", new[] { "alice", "root" }));
+            Assert.False(shield.IsShielded("203.0.113.7", new[] { "alice", "" })); // an unnamed attempt
+            Assert.False(shield.IsShielded("203.0.113.7", Array.Empty<string>()));
+        }
+        finally
+        {
+            File.Delete(utmp);
+        }
+    }
+
+    [Fact]
+    public void AForgedUtmpHostShieldsNothing()
+    {
+        var utmp = TempPath();
+        File.WriteAllBytes(utmp, UtmpRecord(7, "203.0.113.7", user: "mallory"));
+        try
+        {
+            var shield = new SshOperatorShield(TempPath(), utmp);
+            Assert.False(shield.IsShielded("203.0.113.7"));
+            Assert.False(shield.IsShielded("203.0.113.7", new[] { "mallory" }));
         }
         finally
         {
@@ -226,11 +285,15 @@ public class SshOperatorShieldTests
             // Near the real clock: loading prunes with it, before a test clock can be set.
             var now = DateTime.UtcNow;
             var shield = new SshOperatorShield(store, "/nonexistent") { UtcNow = () => now };
-            shield.RecordLogin("203.0.113.7");
-            shield.RecordLogin("192.168.1.20"); // private: never auto-blocked anyway, not stored
+            shield.RecordLogin("203.0.113.7", "alice");
+            shield.RecordLogin("192.168.1.20", "alice"); // private: never auto-blocked anyway, not stored
+            shield.RecordLogin("203.0.113.9", "");       // no account: vouches for nothing
 
             var restarted = new SshOperatorShield(store, "/nonexistent") { UtcNow = () => now.AddDays(29) };
             Assert.True(restarted.IsShielded("203.0.113.7"));
+            Assert.True(restarted.IsShielded("203.0.113.7", new[] { "alice" }));
+            Assert.False(restarted.IsShielded("203.0.113.7", new[] { "root" }));
+            Assert.False(restarted.IsShielded("203.0.113.9"));
             Assert.DoesNotContain("192.168.1.20", File.ReadAllText(store));
 
             restarted.UtcNow = () => now.AddDays(31);
@@ -246,26 +309,87 @@ public class SshOperatorShieldTests
     }
 
     [Fact]
-    public void AutoBlockHoldsBackAnSshOperatorAndSaysWhy()
+    public void AFileFromBeforeAccountsWereRecordedIsDropped()
     {
-        var prevention = new PreventionService(new FirewallService(), new AllowlistService(), new AppSettings())
+        var store = TempPath();
+        File.WriteAllText(store, $"{{\"203.0.113.7\":\"{DateTime.UtcNow:O}\"}}");
+        try
+        {
+            Assert.False(new SshOperatorShield(store, "/nonexistent").IsShielded("203.0.113.7"));
+        }
+        finally
+        {
+            File.Delete(store);
+        }
+    }
+
+    private static PreventionService DryRunPrevention(SshOperatorShield shield) =>
+        new(new FirewallService(), new AllowlistService(), new AppSettings())
         {
             Enabled = true,
             // Dry run: every gate runs, but no test may write a kernel firewall rule.
             DryRun = true,
-            IsSshOperator = ip => ip == "203.0.113.7"
+            IsSshOperator = shield.IsShielded
         };
 
-        var threats = new[] { "203.0.113.7", "203.0.113.8" }.Select(ip => new ThreatEvent
-        {
-            SourceIp = ip, Level = ThreatLevel.High, Type = ThreatType.FailedLogonBurst, Title = "4 failed logons in 10 min"
-        }).ToList();
-        var result = prevention.Apply(threats);
+    private static ThreatEvent Burst(string ip, params string[] accounts) => new()
+    {
+        SourceIp = ip, Level = ThreatLevel.High, Type = ThreatType.FailedLogonBurst,
+        Title = "4 failed logons in 10 min", AccountsTried = accounts
+    };
 
-        var held = Assert.Single(result.Decisions, d => d.Action == PreventionAction.Skipped);
-        Assert.Equal("203.0.113.7", held.Ip);
-        Assert.Contains("logged in over SSH", held.Message);
-        Assert.Contains(result.Decisions, d => d.Ip == "203.0.113.8" && d.Action == PreventionAction.Simulated);
-        Assert.Contains("SSH", prevention.DescribeEnforcement(threats[0])!.Text);
+    [Fact]
+    public void AutoBlockHoldsBackAnSshOperatorAndSaysWhy()
+    {
+        var store = TempPath();
+        try
+        {
+            var shield = new SshOperatorShield(store, "/nonexistent");
+            shield.RecordLogin("203.0.113.7", "alice");
+            var prevention = DryRunPrevention(shield);
+
+            var threats = new[] { Burst("203.0.113.7", "alice"), Burst("203.0.113.8", "alice") };
+            var result = prevention.Apply(threats);
+
+            var held = Assert.Single(result.Decisions, d => d.Action == PreventionAction.Skipped);
+            Assert.Equal("203.0.113.7", held.Ip);
+            Assert.Contains("logged in over SSH", held.Message);
+            Assert.Contains(result.Decisions, d => d.Ip == "203.0.113.8" && d.Action == PreventionAction.Simulated);
+            Assert.Contains("SSH", prevention.DescribeEnforcement(threats[0])!.Text);
+        }
+        finally
+        {
+            File.Delete(store);
+        }
+    }
+
+    [Fact]
+    public void AnOperatorsAddressGuessingAnotherAccountIsStillBlocked()
+    {
+        // A login as alice does not excuse guesses at root from the same address — that is
+        // anyone with an account here trying to become root, not the operator's typos.
+        var store = TempPath();
+        try
+        {
+            var shield = new SshOperatorShield(store, "/nonexistent");
+            shield.RecordLogin("203.0.113.7", "alice");
+            var prevention = DryRunPrevention(shield);
+
+            var guessing = Burst("203.0.113.7", "alice", "root");
+            var result = prevention.Apply(new[] { guessing });
+            Assert.Contains(result.Decisions, d => d.Ip == "203.0.113.7" && d.Action == PreventionAction.Simulated);
+            Assert.DoesNotContain("SSH", prevention.DescribeEnforcement(guessing)!.Text);
+
+            // Any other kind of threat from the operator's address is still held back.
+            var scan = new ThreatEvent
+            {
+                SourceIp = "203.0.113.7", Level = ThreatLevel.High, Type = ThreatType.PortScan, Title = "Port scan"
+            };
+            Assert.Contains("SSH", prevention.DescribeEnforcement(scan)!.Text);
+        }
+        finally
+        {
+            File.Delete(store);
+        }
     }
 }

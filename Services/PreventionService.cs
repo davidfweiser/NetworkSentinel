@@ -239,9 +239,19 @@ public sealed class PreventionService
     /// Whether an address is logged in over SSH now, or logged in recently — see
     /// <see cref="SshOperatorShield"/>. Such an address is not auto-blocked: a burst of
     /// mistyped passwords from the operator's own address used to be enough to firewall
-    /// them off the machine for a day.
+    /// them off the machine for a day. The second argument is null for most threats; for
+    /// a failed-logon burst it is the accounts the burst tried, and the address is held
+    /// back only if every one of them has logged in from it (see <see cref="ShieldAccounts"/>).
     /// </summary>
-    public Func<string, bool>? IsSshOperator { get; set; }
+    public Func<string, IReadOnlyCollection<string>?, bool>? IsSshOperator { get; set; }
+
+    /// <summary>
+    /// The accounts an SSH-operator check is limited to: those a failed-logon burst
+    /// tried, so a login as one account does not excuse guesses at another (root, say)
+    /// from the same address. Null — any login counts — for every other threat.
+    /// </summary>
+    private static IReadOnlyCollection<string>? ShieldAccounts(ThreatEvent threat) =>
+        threat.Type == ThreatType.FailedLogonBurst ? threat.AccountsTried ?? Array.Empty<string>() : null;
 
     /// <summary>Addresses currently blocked by rules this app owns.</summary>
     public IReadOnlySet<string> BlockedIps
@@ -495,7 +505,7 @@ public sealed class PreventionService
         if (IsProtectedAddress is { } externallyProtected && externallyProtected(ip))
             return new EnforcementStatus(BlockState.NotBlocked, "Not blocked — protected endpoint (blocking it would cut a VPN tunnel)");
 
-        if (IsSshOperator is { } sshOperator && sshOperator(ip))
+        if (IsSshOperator is { } sshOperator && sshOperator(ip, ShieldAccounts(threat)))
             return new EnforcementStatus(BlockState.NotBlocked, "Not blocked — someone logs in over SSH from this address");
 
         lock (_gate)
@@ -603,18 +613,21 @@ public sealed class PreventionService
             return false;
         }
 
-        if (IsSshOperator is { } sshOperator && sshOperator(normalized))
+        if (IsSshOperator is { } sshOperator && sshOperator(normalized, ShieldAccounts(threat)))
         {
             // Said out loud for the same reason as the tunnel shield: a threat was raised and
             // nothing was done about it, and the operator should know why.
             if (ShouldNote(normalized))
             {
+                var asWhom = threat.Type == ThreatType.FailedLogonBurst
+                    ? " as every account these attempts tried"
+                    : "";
                 heldBack = new PreventionDecision
                 {
                     Ip = normalized,
                     Action = PreventionAction.Skipped,
                     Message = $"Not blocking {normalized} ({threat.LevelText}: {threat.Title}) — someone is logged in over " +
-                              $"SSH from it, or logged in within the last {SshOperatorShield.RememberFor.TotalDays:0} days. " +
+                              $"SSH from it, or logged in within the last {SshOperatorShield.RememberFor.TotalDays:0} days{asWhom}. " +
                               "Blocking it could lock you out. Block it manually if you mean to.",
                     Threat = threat
                 };

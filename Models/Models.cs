@@ -293,6 +293,14 @@ public sealed class ThreatEvent : INotifyPropertyChanged
     /// </summary>
     public string? AutoBlockHoldReason { get; init; }
 
+    /// <summary>
+    /// For a failed-logon burst: the accounts its attempts named, within the burst's
+    /// window. An empty string stands for an attempt whose log line named none. Lets
+    /// auto-block tell an operator's own typos from someone with a login here trying
+    /// other accounts; null for every other kind of threat.
+    /// </summary>
+    public IReadOnlyList<string>? AccountsTried { get; init; }
+
     /// <summary>Mutable so async geo lookups can patch it in place after creation.</summary>
     public string Origin
     {

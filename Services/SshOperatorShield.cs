@@ -12,10 +12,14 @@ namespace NetworkSentinel.Services;
 /// directions, killing the session they were typing into.
 ///
 /// An address counts when it has *authenticated*, never merely connected: an
-/// attacker's brute-force connections are established TCP sessions too. Three
-/// sources, all of which only root can write:
+/// attacker's brute-force connections are established TCP sessions too. It counts for
+/// the accounts that logged in from it, which is what a failed-logon burst is held
+/// against: a login as one account does not excuse guesses at another. Three sources,
+/// none of which another local account can forge:
 /// <list type="bullet">
-/// <item>sessions logged in right now, from the utmp table (/run/utmp) sshd keeps;</item>
+/// <item>sessions logged in right now, from the utmp records (/run/utmp) sshd writes the
+/// client's address into — not ut_host, which libutempter's setgid-utmp helper lets any
+/// local user fill in;</item>
 /// <item>successful logins in the last <see cref="RememberFor"/>, from sshd's
 /// "Accepted …" lines in journald (see <see cref="AuthLogMonitor"/>), kept on disk so a
 /// restart does not forget them;</item>
@@ -36,15 +40,17 @@ public sealed class SshOperatorShield
     // glibc's struct utmp on 64-bit Linux (x86_64 and arm64 alike).
     private const int UtmpRecordSize = 384;
     private const short UserProcess = 7;
-    private const int UtHostOffset = 76;
-    private const int UtHostLength = 256;
+    private const int UtUserOffset = 44;
+    private const int UtUserLength = 32;
     private const int UtAddrOffset = 348;
 
     private readonly string _storePath;
     private readonly string _utmpPath;
     private readonly object _gate = new();
-    private readonly Dictionary<string, DateTime> _logins = new(StringComparer.OrdinalIgnoreCase);
-    private HashSet<string> _live = new(StringComparer.OrdinalIgnoreCase);
+    /// <summary>Address → account → when it last logged in from there.</summary>
+    private readonly Dictionary<string, Dictionary<string, DateTime>> _logins = new(StringComparer.OrdinalIgnoreCase);
+    /// <summary>Address → accounts logged in from it right now.</summary>
+    private Dictionary<string, HashSet<string>> _live = new(StringComparer.OrdinalIgnoreCase);
     private DateTime _liveReadAt = DateTime.MinValue;
 
     /// <summary>The clock; tests move it.</summary>
@@ -62,9 +68,11 @@ public sealed class SshOperatorShield
         Load();
     }
 
-    /// <summary>Remembers a successful SSH login from <paramref name="ip"/>.</summary>
-    public void RecordLogin(string ip)
+    /// <summary>Remembers a successful SSH login as <paramref name="account"/> from <paramref name="ip"/>.</summary>
+    public void RecordLogin(string ip, string account)
     {
+        if (!IsAccountName(account))
+            return;
         if (!FirewallService.TryNormalizeIp(ip, out var normalized, out _))
             return;
         // Never auto-blocked in the first place, so not worth a line on disk.
@@ -73,11 +81,18 @@ public sealed class SshOperatorShield
 
         lock (_gate)
         {
-            _logins[normalized] = UtcNow();
+            if (!_logins.TryGetValue(normalized, out var accounts))
+                _logins[normalized] = accounts = new Dictionary<string, DateTime>(StringComparer.Ordinal);
+            accounts[account] = UtcNow();
             PruneLocked();
             SaveLocked();
         }
     }
+
+    /// <summary>What sshd logs as an account that logged in: no whitespace, no control characters.</summary>
+    private static bool IsAccountName(string? account) =>
+        !string.IsNullOrEmpty(account) && account.Length <= 256
+        && !account.Any(c => char.IsWhiteSpace(c) || char.IsControl(c));
 
     /// <summary>
     /// Shields the client of the SSH session this process runs in, if it runs in one.
@@ -91,30 +106,43 @@ public sealed class SshOperatorShield
             var client = value?.Split(' ', StringSplitOptions.RemoveEmptyEntries).FirstOrDefault();
             if (client != null && IPAddress.TryParse(client, out _))
             {
-                RecordLogin(client);
+                RecordLogin(client, Environment.UserName);
                 return;
             }
         }
     }
 
-    /// <summary>Whether <paramref name="ip"/> is logged in over SSH now, or did so recently.</summary>
-    public bool IsShielded(string ip)
+    /// <summary>
+    /// Whether <paramref name="ip"/> is logged in over SSH now, or did so within
+    /// <see cref="RememberFor"/>. Given <paramref name="accounts"/> — the accounts a
+    /// failed-logon burst tried — only when every one of them is an account that did:
+    /// someone with a login here guessing root's password from the same address is not
+    /// the operator mistyping their own. An empty list, or an attempt that named no
+    /// account (""), is never shielded.
+    /// </summary>
+    public bool IsShielded(string ip, IReadOnlyCollection<string>? accounts = null)
     {
+        if (accounts is { Count: 0 })
+            return false;
         if (!FirewallService.TryNormalizeIp(ip, out var normalized, out _))
             return false;
 
         lock (_gate)
         {
             var now = UtcNow();
-            if (_logins.TryGetValue(normalized, out var at) && now - at <= RememberFor)
-                return true;
-
             if (now - _liveReadAt > LiveCacheFor)
             {
                 _live = ReadLiveSessions();
                 _liveReadAt = now;
             }
-            return _live.Contains(normalized);
+
+            var loggedIn = new HashSet<string>(StringComparer.Ordinal);
+            if (_logins.TryGetValue(normalized, out var remembered))
+                loggedIn.UnionWith(remembered.Where(kv => now - kv.Value <= RememberFor).Select(kv => kv.Key));
+            if (_live.TryGetValue(normalized, out var live))
+                loggedIn.UnionWith(live);
+
+            return accounts == null ? loggedIn.Count > 0 : accounts.All(loggedIn.Contains);
         }
     }
 
@@ -126,24 +154,27 @@ public sealed class SshOperatorShield
             lock (_gate)
             {
                 var now = UtcNow();
-                return _logins.Where(kv => now - kv.Value <= RememberFor).Select(kv => kv.Key)
-                    .Concat(_live)
+                return _logins.Where(kv => kv.Value.Values.Any(at => now - at <= RememberFor)).Select(kv => kv.Key)
+                    .Concat(_live.Keys)
                     .Distinct(StringComparer.OrdinalIgnoreCase)
                     .ToList();
             }
         }
     }
 
-    private HashSet<string> ReadLiveSessions()
+    private Dictionary<string, HashSet<string>> ReadLiveSessions()
     {
-        var result = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var result = new Dictionary<string, HashSet<string>>(StringComparer.OrdinalIgnoreCase);
         try
         {
             if (!File.Exists(_utmpPath)) return result;
-            foreach (var ip in ParseUtmp(File.ReadAllBytes(_utmpPath)))
+            foreach (var (ip, account) in ParseUtmp(File.ReadAllBytes(_utmpPath)))
             {
-                if (FirewallService.TryNormalizeIp(ip, out var normalized, out _))
-                    result.Add(normalized);
+                if (!FirewallService.TryNormalizeIp(ip, out var normalized, out _))
+                    continue;
+                if (!result.TryGetValue(normalized, out var accounts))
+                    result[normalized] = accounts = new HashSet<string>(StringComparer.Ordinal);
+                accounts.Add(account);
             }
         }
         catch
@@ -155,17 +186,21 @@ public sealed class SshOperatorShield
     }
 
     /// <summary>
-    /// Remote addresses of the logged-in sessions in a utmp file. A login over SSH is a
-    /// USER_PROCESS record whose ut_addr_v6 holds the client address (network byte order,
-    /// IPv4 in the first four bytes), with ut_host as a fallback when sshd left it empty.
-    /// A file that is not a whole number of records is not glibc's 64-bit layout and is
-    /// ignored rather than misread.
+    /// Remote addresses and accounts of the logged-in sessions in a utmp file. A login
+    /// over SSH is a USER_PROCESS record whose ut_addr_v6 holds the client address
+    /// (network byte order, IPv4 in the first four bytes) — sshd fills it in from the
+    /// socket. A record without one is not taken on the word of its ut_host: that is free
+    /// text, and libutempter's setgid-utmp helper (installed with most terminal emulators)
+    /// lets any local user add a record with whatever host they like. It never sets
+    /// ut_addr_v6, and the ut_user it writes is the caller's own. A file that is not a
+    /// whole number of records is not glibc's 64-bit layout and is ignored rather than
+    /// misread.
     /// </summary>
-    internal static List<string> ParseUtmp(byte[] data)
+    internal static List<(string Address, string Account)> ParseUtmp(byte[] data)
     {
-        var addresses = new List<string>();
+        var sessions = new List<(string, string)>();
         if (data.Length == 0 || data.Length % UtmpRecordSize != 0)
-            return addresses;
+            return sessions;
 
         for (var offset = 0; offset < data.Length; offset += UtmpRecordSize)
         {
@@ -173,35 +208,40 @@ public sealed class SshOperatorShield
                 continue;
 
             var addr = data.AsSpan(offset + UtAddrOffset, 16);
-            if (addr.IndexOfAnyExcept((byte)0) >= 0)
-            {
-                var v4 = addr[4..].IndexOfAnyExcept((byte)0) < 0;
-                addresses.Add(new IPAddress(v4 ? addr[..4] : addr).ToString());
+            if (addr.IndexOfAnyExcept((byte)0) < 0)
                 continue;
-            }
 
-            var hostBytes = data.AsSpan(offset + UtHostOffset, UtHostLength);
-            var end = hostBytes.IndexOf((byte)0);
-            var host = Encoding.ASCII.GetString(end >= 0 ? hostBytes[..end] : hostBytes);
-            if (IPAddress.TryParse(host, out var parsed))
-                addresses.Add(parsed.ToString());
+            var userBytes = data.AsSpan(offset + UtUserOffset, UtUserLength);
+            var end = userBytes.IndexOf((byte)0);
+            var account = Encoding.ASCII.GetString(end >= 0 ? userBytes[..end] : userBytes);
+            if (!IsAccountName(account))
+                continue;
+
+            var v4 = addr[4..].IndexOfAnyExcept((byte)0) < 0;
+            sessions.Add((new IPAddress(v4 ? addr[..4] : addr).ToString(), account));
         }
-        return addresses;
+        return sessions;
     }
 
     private void PruneLocked()
     {
         var now = UtcNow();
-        foreach (var stale in _logins.Where(kv => now - kv.Value > RememberFor).Select(kv => kv.Key).ToList())
-            _logins.Remove(stale);
+        foreach (var accounts in _logins.Values)
+        {
+            foreach (var stale in accounts.Where(kv => now - kv.Value > RememberFor).Select(kv => kv.Key).ToList())
+                accounts.Remove(stale);
+        }
 
         // Oldest first past the cap; a busy jump host does not need its whole history.
-        if (_logins.Count > MaxRemembered)
+        var logins = _logins.SelectMany(ip => ip.Value.Select(a => (Ip: ip.Key, Account: a.Key, At: a.Value))).ToList();
+        if (logins.Count > MaxRemembered)
         {
-            foreach (var oldest in _logins.OrderBy(kv => kv.Value).Take(_logins.Count - MaxRemembered)
-                         .Select(kv => kv.Key).ToList())
-                _logins.Remove(oldest);
+            foreach (var oldest in logins.OrderBy(l => l.At).Take(logins.Count - MaxRemembered))
+                _logins[oldest.Ip].Remove(oldest.Account);
         }
+
+        foreach (var empty in _logins.Where(kv => kv.Value.Count == 0).Select(kv => kv.Key).ToList())
+            _logins.Remove(empty);
     }
 
     private void Load()
@@ -209,21 +249,33 @@ public sealed class SshOperatorShield
         try
         {
             if (!File.Exists(_storePath)) return;
-            var saved = JsonSerializer.Deserialize<Dictionary<string, DateTime>>(File.ReadAllText(_storePath));
+            // { address: { account: last login } }. A file from before accounts were
+            // recorded ({ address: last login }) does not parse as this and is dropped:
+            // it cannot say whose logins it vouches for.
+            var saved = JsonSerializer.Deserialize<Dictionary<string, Dictionary<string, DateTime>>>(
+                File.ReadAllText(_storePath));
             if (saved == null) return;
             lock (_gate)
             {
-                foreach (var (ip, at) in saved)
+                foreach (var (ip, accounts) in saved)
                 {
-                    if (FirewallService.TryNormalizeIp(ip, out var normalized, out _))
-                        _logins[normalized] = DateTime.SpecifyKind(at, DateTimeKind.Utc);
+                    if (!FirewallService.TryNormalizeIp(ip, out var normalized, out _))
+                        continue;
+                    foreach (var (account, at) in accounts)
+                    {
+                        if (!IsAccountName(account))
+                            continue;
+                        if (!_logins.TryGetValue(normalized, out var known))
+                            _logins[normalized] = known = new Dictionary<string, DateTime>(StringComparer.Ordinal);
+                        known[account] = DateTime.SpecifyKind(at, DateTimeKind.Utc);
+                    }
                 }
                 PruneLocked();
             }
         }
         catch
         {
-            // A damaged file only means starting without remembered logins.
+            // A damaged or older file only means starting without remembered logins.
         }
     }
 

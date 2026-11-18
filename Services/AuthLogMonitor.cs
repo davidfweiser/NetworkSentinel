@@ -121,12 +121,12 @@ public sealed class AuthLogMonitor : IDisposable
     private static readonly TimeSpan LoginGrace = TimeSpan.FromMinutes(2);
 
     /// <summary>
-    /// Called with the client address of every successful SSH login read from journald —
-    /// see <see cref="SshOperatorShield"/>. Not for auth.log lines: any local account can
-    /// write those with `logger -t sshd`, and an "Accepted" line shields an address (and
-    /// clears its failure count, so auth.log ones do neither).
+    /// Called with the client address and account of every successful SSH login read from
+    /// journald — see <see cref="SshOperatorShield"/>. Not for auth.log lines: any local
+    /// account can write those with `logger -t sshd`, and an "Accepted" line shields an
+    /// address (and clears failures against its account, so auth.log ones do neither).
     /// </summary>
-    public Action<string>? SuccessfulLogin { get; set; }
+    public Action<string, string>? SuccessfulLogin { get; set; }
 
     private Process? _journal;
     private CancellationTokenSource? _cts;
@@ -293,8 +293,9 @@ public sealed class AuthLogMonitor : IDisposable
     /// <item>A connection closed before login counts only if nothing on it was counted —
     /// a scanner trying a user name and leaving.</item>
     /// </list>
-    /// A successful login from an address clears its count — read from journald only, where
-    /// the lines are known to come from root; an "Accepted" line in auth.log is ignored.
+    /// A successful login from an address clears the attempts against the account that
+    /// logged in, and only those — read from journald only, where the lines are known to
+    /// come from root; an "Accepted" line in auth.log is ignored.
     /// </summary>
     internal void ProcessLine(string line, DateTime now, bool fromJournal = true)
     {
@@ -306,15 +307,24 @@ public sealed class AuthLogMonitor : IDisposable
         if (accepted.Success)
         {
             var who = accepted.Groups["ip"].Value;
+            var account = accepted.Groups["user"].Value;
             if (!IPAddress.TryParse(who, out _)) return;
             // From auth.log it proves nothing: any local account can write it, and clearing
             // the count on its word would let one keep an attacker under the threshold.
             if (!fromJournal) return;
             lock (_gate)
             {
-                _failures.Remove(who);
+                // Only that account's failures. A login as one account says nothing about
+                // guesses at another: clearing them all let anyone with a login here keep
+                // resetting the count while trying root's password from the same address.
+                if (_failures.TryGetValue(who, out var f))
+                {
+                    f.ForgetAttemptsOn(account);
+                    if (f.Attempts.Count == 0)
+                        _failures.Remove(who);
+                }
             }
-            SuccessfulLogin?.Invoke(who);
+            SuccessfulLogin?.Invoke(who, account);
             return;
         }
 
@@ -406,12 +416,10 @@ public sealed class AuthLogMonitor : IDisposable
                 }
             }
 
+            var named = !string.IsNullOrWhiteSpace(user) && user != "from" ? user : "";
             if (counts)
-            {
-                f.Attempts.Enqueue(now);
-                if (!string.IsNullOrWhiteSpace(user) && user != "from") f.Users.Add(user);
-            }
-            while (f.Attempts.Count > 0 && now - f.Attempts.Peek() > Window)
+                f.Attempts.Enqueue((now, named));
+            while (f.Attempts.Count > 0 && now - f.Attempts.Peek().At > Window)
                 f.Attempts.Dequeue();
 
             if (!counts && !immediate) return;
@@ -428,8 +436,17 @@ public sealed class AuthLogMonitor : IDisposable
                 return;
             _lastEmit[emitKey] = now;
 
-            var users = f.Users.Count > 0
-                ? $" Accounts tried: {string.Join(", ", f.Users.Take(8))}{(f.Users.Count > 8 ? ", …" : "")}."
+            // The accounts of the attempts in this window (the max-attempts verdict names its
+            // own). Auto-block holds back an SSH operator's address only when every one of
+            // them has logged in from it.
+            var accounts = f.Attempts.Select(a => a.Account)
+                .Append(immediate ? named : null)
+                .OfType<string>()
+                .Distinct(StringComparer.Ordinal)
+                .ToList();
+            var shown = accounts.Where(a => a.Length > 0).ToList();
+            var users = shown.Count > 0
+                ? $" Accounts tried: {string.Join(", ", shown.Take(8))}{(shown.Count > 8 ? ", …" : "")}."
                 : "";
             _pending.Add(new ThreatEvent
             {
@@ -442,7 +459,8 @@ public sealed class AuthLogMonitor : IDisposable
                     : $"{count} failed logons in {Window.TotalMinutes:0} min",
                 Detail = $"{ip} produced {count} failed authentication attempts within {Window.TotalMinutes:0} minutes.{users}",
                 Origin = "Origin resolving…",
-                Method = "System auth log (sshd / PAM)"
+                Method = "System auth log (sshd / PAM)",
+                AccountsTried = accounts
             });
         }
     }
@@ -479,9 +497,18 @@ public sealed class AuthLogMonitor : IDisposable
 
     private sealed class IpFailures
     {
-        public Queue<DateTime> Attempts { get; } = new();
-        public HashSet<string> Users { get; } = new(StringComparer.Ordinal);
+        /// <summary>Counted attempts, each with the account it named ("" when none).</summary>
+        public Queue<(DateTime At, string Account)> Attempts { get; } = new();
         public DateTime LastSeen { get; set; }
+
+        /// <summary>Drops the attempts against <paramref name="account"/>, keeping the rest in order.</summary>
+        public void ForgetAttemptsOn(string account)
+        {
+            var keep = Attempts.Where(a => !string.Equals(a.Account, account, StringComparison.Ordinal)).ToList();
+            Attempts.Clear();
+            foreach (var attempt in keep)
+                Attempts.Enqueue(attempt);
+        }
 
         /// <summary>PAM failures not yet matched to the sshd line for the same attempt.</summary>
         public Queue<DateTime> UnpairedPam { get; } = new();
