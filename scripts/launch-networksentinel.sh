@@ -10,9 +10,12 @@ if [[ -x "$ROOT/bin/publish-sc/NetworkSentinel" ]]; then
   exec "$ROOT/bin/publish-sc/NetworkSentinel" "$@"
 elif [[ -x "$ROOT/bin/publish/NetworkSentinel" ]]; then
   exec "$ROOT/bin/publish/NetworkSentinel" "$@"
-elif [[ -x "$ROOT/bin/Release/net8.0/NetworkSentinel" ]]; then
-  exec "$ROOT/bin/Release/net8.0/NetworkSentinel" "$@"
+elif [[ -x "$ROOT/bin/Release/net10.0/NetworkSentinel" ]]; then
+  exec "$ROOT/bin/Release/net10.0/NetworkSentinel" "$@"
 else
+  # `dotnet run` builds first when it has to. The old `exec … --no-build || exec …`
+  # never reached its fallback (exec replaces the shell), and its 2>/dev/null hid
+  # every error the app printed, so a fresh clone exited silently.
   cd "$ROOT"
-  exec dotnet run -c Release --no-build "$@" 2>/dev/null || exec dotnet run -c Release "$@"
+  exec dotnet run -c Release -- "$@"
 fi

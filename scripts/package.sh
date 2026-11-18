@@ -51,9 +51,11 @@ dotnet publish NetworkSentinel.csproj \
 # this machine's SDK bundled — patching .NET on a server never reaches it. So a stale
 # SDK here ships a stale Kestrel to everyone: 0.7.22 went out on 8.0.29, after 8.0.32
 # had fixed two critical Kestrel request-smuggling flaws (CVE-2026-88092,
-# CVE-2026-70188). Refuse to package anything older than the latest .NET 8 security
-# release, and raise MIN_RUNTIME whenever Microsoft ships a new one.
-MIN_RUNTIME="8.0.33"
+# CVE-2026-70188). Refuse to package anything older than the latest .NET security
+# release on the line the app targets, and raise MIN_RUNTIME whenever Microsoft ships
+# a new one. .NET 8 reached end of support on 10 November 2026, so the app moved to
+# .NET 10 (LTS, supported to November 2028) in 0.7.25.
+MIN_RUNTIME="10.0.15"
 
 # True when $1 < $2, comparing major.minor.patch as numbers (a -preview suffix is dropped).
 version_lt() {
@@ -78,7 +80,7 @@ for fw in Microsoft.NETCore.App Microsoft.AspNetCore.App; do
     echo "error: no ${fw} version in NetworkSentinel.runtimeconfig.json — cannot tell whether the bundled runtime is patched" >&2
     exit 1
   fi
-  # A retarget to another .NET line would otherwise sail past an 8.0 floor unchecked.
+  # A retarget to another .NET line would otherwise sail past the floor unchecked.
   if [[ "${ver%%.*}" != "${MIN_RUNTIME%%.*}" ]]; then
     echo "error: bundled ${fw} is ${ver}, but MIN_RUNTIME (${MIN_RUNTIME}) tracks the .NET ${MIN_RUNTIME%%.*} line —" >&2
     echo "       set MIN_RUNTIME to the latest .NET ${ver%%.*} security release" >&2

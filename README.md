@@ -737,7 +737,7 @@ The token is stored in `~/.local/share/NetworkSentinel/duckdns.json` with mode `
 ## Requirements
 
 - **Linux only** (kernel `/proc` networking; tested on Pop!_OS / Ubuntu-class systems). There is no Windows or macOS build: the monitor reads `/proc/net` and conntrack netlink, and the firewall is `ufw`/`nft`/`iptables`. Under WSL2 it runs, but its rules belong to the Linux VM, not to Windows Defender Firewall
-- For **dev / `dotnet run`**: [.NET 8 SDK](https://dotnet.microsoft.com/download)
+- For **dev / `dotnet run`**: [.NET 10 SDK](https://dotnet.microsoft.com/download) (0.7.25 moved from .NET 8, which reached end of support in November 2026; `global.json` pins the 10.0 line)
 - For **server package**: nothing on the target — self-contained binary (no .NET install)
 - Desktop libraries for Avalonia GUI (usual X11/Wayland desktop)
 - **Text size (0.7.12, a setting in 0.7.13).** Every size in the GUI is an absolute device-independent pixel, so on a 4K panel whose desktop session does not scale, the window opened ~2000px wide with 11px labels. The content is drawn through a `LayoutTransformControl`, which scales during layout rather than at paint, so wrapping, trimming and the table columns all stay correct — the window gets bigger rather than clipped. Choose the step under **Settings → Display → Text size**: 100% is the original sizing, 175% the default (sized for an unscaled 4K panel), up to 250%. It applies straight away and persists as `UiScale` in `settings.json`, clamped to 1.0–2.5 on read. GUI only — the TUI is sized by the terminal and the web console by the browser
@@ -1375,7 +1375,7 @@ All three UIs write the same `~/.local/share/NetworkSentinel/settings.json`, so 
 
 | Windows | Linux |
 |---------|--------|
-| WPF (`net8.0-windows`) | Avalonia 11 (`net8.0`) |
+| WPF (`net8.0-windows`) | Avalonia 11 (`net10.0`) |
 | `iphlpapi` GetExtendedTcpTable | `/proc/net/tcp{,6}` + `/proc/*/fd` |
 | Windows Firewall COM / netsh | `nft` table `inet networksentinel` or `iptables` |
 | `%LocalAppData%\NetworkSentinel` | `~/.local/share/NetworkSentinel` |

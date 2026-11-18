@@ -95,7 +95,7 @@ public sealed class TlsCertificateProvider : IDisposable
 
             if (isPkcs12)
             {
-                loaded = new X509Certificate2(certPath, pfxPassword);
+                loaded = X509CertificateLoader.LoadPkcs12FromFile(certPath, pfxPassword);
             }
             else
             {
@@ -109,7 +109,7 @@ public sealed class TlsCertificateProvider : IDisposable
                 using var pem = X509Certificate2.CreateFromPemFile(certPath, key);
                 // PEM-derived certs carry an ephemeral key that some TLS stacks refuse to use.
                 // Round-tripping through PKCS#12 gives a handle SslStream always accepts.
-                loaded = new X509Certificate2(pem.Export(X509ContentType.Pkcs12));
+                loaded = X509CertificateLoader.LoadPkcs12(pem.Export(X509ContentType.Pkcs12), password: null);
             }
 
             if (!loaded.HasPrivateKey)
