@@ -48,8 +48,14 @@ public sealed class AllowlistService : IDisposable
     public string RemoteFeedUrl { get; set; } = DefaultRemoteUrl;
 
     public AllowlistService()
+        : this(Path.Combine(AppPaths.DataDirectory, "allowlist.json"))
     {
-        LocalDatabasePath = Path.Combine(AppPaths.DataDirectory, "allowlist.json");
+    }
+
+    /// <summary>For tests: a user database somewhere other than the data directory.</summary>
+    internal AllowlistService(string localDatabasePath)
+    {
+        LocalDatabasePath = localDatabasePath;
         _http.DefaultRequestHeaders.UserAgent.ParseAdd("NetworkSentinel/1.0 (allowlist)");
     }
 
@@ -539,12 +545,33 @@ public sealed class AllowlistService : IDisposable
                 userIps = _staticIps.Where(i => !defaultIps.Contains(i)).OrderBy(i => i).ToList();
             }
 
+            // Only domains and IPs are edited in the app; CIDR ranges and notes are added
+            // by hand (the UI says to edit this file for them), so they are carried over
+            // from what is on disk. Rewriting the file from memory used to drop them: an
+            // office range added under "cidrs" vanished the next time anyone added a
+            // domain, and that range became auto-blockable after the next reload.
+            AllowlistFile? existing = null;
+            if (File.Exists(LocalDatabasePath))
+            {
+                existing = LoadFromPath(LocalDatabasePath);
+                if (existing == null)
+                {
+                    // A hand edit that does not parse is still the operator's work. Writing
+                    // over it would lose every entry in it; leave it to be fixed instead.
+                    StatusText = $"{LocalDatabasePath} could not be read, so the change was not saved. " +
+                                 "Fix the file (it is JSON) and refresh the allowlist.";
+                    return;
+                }
+            }
+
             var file = new AllowlistFile
             {
                 Version = 1,
-                Description = "Your personal allowlist additions (merged with built-in defaults).",
+                Description = existing?.Description ?? "Your personal allowlist additions (merged with built-in defaults).",
                 Domains = userDomains,
-                Ips = userIps
+                Ips = userIps,
+                Cidrs = existing?.Cidrs is { Count: > 0 } cidrs ? cidrs : null,
+                Notes = existing?.Notes
             };
             AppPaths.WriteAtomic(LocalDatabasePath, JsonSerializer.Serialize(file, JsonOptions));
         }
